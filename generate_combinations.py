@@ -6,13 +6,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # Configuration
 MGRS_TILES = ["60HTB", "07VEK", "15TVG", "50HQJ", "49QGF", "45RVL", "32TQK", "12SUD", "40RCN", "28QCH"]
 DATES = ["2025/07/01", "2025/01/01"]
-FORMATS = ["webp", "jpg", "png"]
+FORMATS = ["webp", "jpg"]
 QUALITIES = [75, 80, 85]
-RESAMPLING = ["bilinear", "average", "lanczos"]
+RESAMPLING = ["bilinear", "average", "gauss", "lanczos"]
+MIN_ZOOM = 0
+MAX_ZOOM = 14
+BLOCKSIZE = 512
 
 OUTPUT_DIR = "combinations_output"
 CACHE_DIR = "cache"
-MAX_WORKERS = os.cpu_count() or 4
+MAX_WORKERS = min(8, os.cpu_count())
 
 def run_satmaps(mgrs: str, date: str, fmt: str, quality: int, resample: str, cache_dir: str, output_path: str) -> bool:
     """Helper to run a single satmaps generation command."""
@@ -22,6 +25,9 @@ def run_satmaps(mgrs: str, date: str, fmt: str, quality: int, resample: str, cac
         "--format", fmt,
         "--quality", str(quality),
         "--resample-alg", resample,
+        "--minzoom", str(MIN_ZOOM),
+        "--maxzoom", str(MAX_ZOOM),
+        "--blocksize", str(BLOCKSIZE),
         "--cache", cache_dir,
         "--output", output_path
     ]

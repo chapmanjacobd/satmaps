@@ -3,6 +3,7 @@ import argparse
 import os
 import subprocess
 import sys
+import uuid
 from osgeo import gdal
 
 from typing import Dict, List, Optional
@@ -84,10 +85,19 @@ def create_rgb_vrt(paths: Dict[str, str], output_vrt: str) -> None:
     band_list = [paths['red'], paths['green'], paths['blue']]
     gdal.BuildVRT(output_vrt, band_list, separate=True)
 
-def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional[str] = None) -> List[str]:
+def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional[str] = None, cache_dir: Optional[str] = None) -> List[str]:
     q = get_quarter(date_path)
     
     if mgrs_filter:
+        # User requested optimization: skip remote check if MGRS_0_0 exists locally
+        if cache_dir:
+            if os.path.exists(os.path.join(cache_dir, f"{mgrs_filter}_0_0_B04.tif")):
+                found_local = []
+                for x, y in [(0,0), (1,0), (0,1), (1,1)]:
+                    if os.path.exists(os.path.join(cache_dir, f"{mgrs_filter}_{x}_{y}_B04.tif")):
+                        found_local.append(f"Sentinel-2_mosaic_2025_{q}_{mgrs_filter}_{x}_{y}")
+                return sorted(found_local)
+
         # Optimized path: instead of listing the whole S3 bucket, check for expected sub-tiles
         # Grid segment indices are usually 0_0, 1_0, 0_1, 1_1
         potential_folders = []
@@ -131,7 +141,7 @@ def main():
     parser.add_argument("--output", "-o", default="output.pmtiles", help="Output PMTiles filename")
     parser.add_argument("--format", choices=["webp", "jpg", "png", "png8"], default="webp", help="Tile format (default: webp)")
     parser.add_argument("--quality", type=int, default=74, help="WebP/JPEG quality (default: 74)")
-    parser.add_argument("--resample-alg", default="bilinear", choices=["bilinear", "average", "gauss"], help="Resampling method (default: bilinear)")
+    parser.add_argument("--resample-alg", default="bilinear", choices=["bilinear", "average", "gauss", "lanczos"], help="Resampling method (default: bilinear)")
     parser.add_argument("--blocksize", type=int, default=512, help="MBTiles block size (default: 256)")
     parser.add_argument("--minzoom", type=int, default=0)
     parser.add_argument("--maxzoom", type=int, default=14)
@@ -146,17 +156,20 @@ def main():
     tileset_name = "Internet in a Box Maps - Sentinel-2"
     tileset_desc = f"Contains modified Copernicus Sentinel data {args.date[:4]}"
 
-    temp_vrt = "temp.vrt"
-    temp_mbtiles = "temp.mbtiles"
-    temp_warped_vrt = "temp_warped.vrt"
+    # Unique temp files to avoid race conditions in parallel mode
+    unique_id = uuid.uuid4().hex[:8]
+    temp_vrt = f"temp_{unique_id}.vrt"
+    temp_mbtiles = f"temp_{unique_id}.mbtiles"
+    temp_warped_vrt = f"temp_warped_{unique_id}.vrt"
 
     # Use cubic for reprojection as it's better for that step, regardless of the downsampling algorithm chosen
     warp_resample = "cubic"
 
+    tile_vrts = []
     try:
         if args.all_tiles:
             print(f"Listing all folders for global mosaic ({args.date})...")
-            all_folders = list_all_mosaic_folders(args.date)
+            all_folders = list_all_mosaic_folders(args.date, cache_dir=args.cache)
             print(f"Found {len(all_folders)} folders.")
 
             if args.download_only and not args.cache:
@@ -168,7 +181,7 @@ def main():
             group_vrts = []
             for i in range(0, len(all_folders), group_size):
                 chunk = all_folders[i:i + group_size]
-                chunk_vrt_name = f"group_{i // group_size}.vrt"
+                chunk_vrt_name = f"group_{i // group_size}_{unique_id}.vrt"
 
                 print(f"[{i+1}/{len(all_folders)}] Handling group {i // group_size}...")
                 chunk_tile_vrts = []
@@ -177,9 +190,10 @@ def main():
                         paths = get_tile_paths(None, args.date, args.cache, folder_name=folder)
                         if args.download_only: continue
 
-                        tile_vrt = f"tile_{folder}.vrt"
+                        tile_vrt = f"tile_{folder}_{unique_id}.vrt"
                         create_rgb_vrt(paths, tile_vrt)
                         chunk_tile_vrts.append(tile_vrt)
+                        tile_vrts.append(tile_vrt)
                     except Exception as e:
                         print(f"Warning: Could not process folder {folder}: {e}")
 
@@ -189,9 +203,6 @@ def main():
                     print(f"Building Group VRT {chunk_vrt_name}...")
                     gdal.BuildVRT(chunk_vrt_name, chunk_tile_vrts)
                     group_vrts.append(chunk_vrt_name)
-                    # Clean up individual tile VRTs
-                    for f in chunk_tile_vrts:
-                        if os.path.exists(f): os.remove(f)
 
             if args.download_only:
                 print("Download complete.")
@@ -205,18 +216,17 @@ def main():
         else:
             print(f"Processing tile: {args.mgrs} (Date: {args.date})")
             try:
-                folders = list_all_mosaic_folders(args.date, mgrs_filter=args.mgrs)
+                folders = list_all_mosaic_folders(args.date, mgrs_filter=args.mgrs, cache_dir=args.cache)
             except RuntimeError as e:
                 print(e)
                 sys.exit(1)
 
-            tile_vrts = []
             for folder in folders:
                 try:
                     paths = get_tile_paths(None, args.date, args.cache, folder_name=folder)
                     if args.download_only: continue
                     
-                    tile_vrt = f"tile_{folder}.vrt"
+                    tile_vrt = f"tile_{folder}_{unique_id}.vrt"
                     create_rgb_vrt(paths, tile_vrt)
                     tile_vrts.append(tile_vrt)
                 except Exception as e:
@@ -231,9 +241,6 @@ def main():
                 sys.exit(1)
 
             gdal.BuildVRT(temp_vrt, tile_vrts)
-            # Clean up tile VRTs
-            for f in tile_vrts:
-                if os.path.exists(f): os.remove(f)
 
         print("Step 1: Reprojecting to Web Mercator (VRT)...")
         warp_options = gdal.WarpOptions(
@@ -276,7 +283,8 @@ def main():
                 f"MINZOOM={args.minzoom}",
                 f"MAXZOOM={args.maxzoom}",
                 f"RESAMPLING={translate_resample}",
-                f"BLOCKSIZE={args.blocksize}"
+                f"BLOCKSIZE={args.blocksize}",
+                "ZOOM_LEVEL_STRATEGY=LOWER"
             ]
         )
 
@@ -320,7 +328,7 @@ def main():
         print(f"Success! Created {args.output}")
 
     finally:
-        for f in [temp_vrt, temp_warped_vrt, temp_mbtiles]:
+        for f in [temp_vrt, temp_warped_vrt, temp_mbtiles] + tile_vrts:
             if os.path.exists(f):
                 os.remove(f)
 
