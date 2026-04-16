@@ -1,0 +1,25 @@
+[project]
+name = "satmaps"
+version = "0.1.0"
+description = "High-performance PMTiles from Sentinel-2 Global Mosaics"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "gdal>=3.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+ignore_missing_imports = true

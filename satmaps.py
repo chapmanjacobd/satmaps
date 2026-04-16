@@ -5,10 +5,12 @@ import subprocess
 import sys
 from osgeo import gdal
 
+from typing import Dict, List, Optional
+
 # Setup GDAL exceptions
 gdal.UseExceptions()
 
-def setup_gdal_cdse():
+def setup_gdal_cdse() -> None:
     """Configure GDAL for CDSE S3 access."""
     gdal.SetConfigOption('AWS_S3_ENDPOINT', 'eodata.dataspace.copernicus.eu')
     gdal.SetConfigOption('AWS_HTTPS', 'YES')
@@ -20,7 +22,7 @@ def setup_gdal_cdse():
     gdal.SetConfigOption('GDAL_HTTP_MERGE_CONSECUTIVE_RANGES', 'YES')
     gdal.SetConfigOption('GDAL_HTTP_MAX_RETRY', '5')
 
-def get_tile_paths(mgrs_tile, date_path="2025/07/01", cache_dir=None, folder_name=None):
+def get_tile_paths(mgrs_tile: Optional[str], date_path: str = "2025/07/01", cache_dir: Optional[str] = None, folder_name: Optional[str] = None) -> Dict[str, str]:
     """Construct S3 paths for a given MGRS tile or specific folder."""
     if folder_name:
         folder = folder_name
@@ -68,7 +70,7 @@ def get_tile_paths(mgrs_tile, date_path="2025/07/01", cache_dir=None, folder_nam
 
     return paths
 
-def get_quarter(date_path):
+def get_quarter(date_path: str) -> str:
     """Determine quarter from date_path."""
     if "07/01" in date_path: return "Q3"
     if "10/01" in date_path: return "Q4"
@@ -76,8 +78,13 @@ def get_quarter(date_path):
     if "01/01" in date_path: return "Q1"
     return "Q3"
 
-def list_all_mosaic_folders(date_path="2025/07/01", mgrs_filter=None):
-    """List mosaic folders. Optimized for single tile by checking common sub-tiles."""
+def create_rgb_vrt(paths: Dict[str, str], output_vrt: str) -> None:
+    """Create a virtual RGB stack from individual band paths."""
+    # Stack bands in order: Red (B04), Green (B03), Blue (B02)
+    band_list = [paths['red'], paths['green'], paths['blue']]
+    gdal.BuildVRT(output_vrt, band_list, separate=True)
+
+def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional[str] = None) -> List[str]:
     q = get_quarter(date_path)
     
     if mgrs_filter:
