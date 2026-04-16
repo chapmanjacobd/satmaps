@@ -51,7 +51,7 @@ python3 generate_combinations.py
 To compare the outputs, serve the directory via HTTP and open the viewer:
 
 ```bash
-python3 -m http.server 8000
+python3 serve.py
 ```
 Then visit `http://localhost:8000/viewer.html`.
 
