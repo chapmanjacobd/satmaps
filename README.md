@@ -26,7 +26,7 @@ You must configure an AWS profile named `cdse` to access the Copernicus data:
 ```bash
 aws configure --profile cdse
 ```
-Use your CDSE credentials. The endpoint used is `eodata.dataspace.copernicus.eu`.
+Use your [CDSE](https://documentation.dataspace.copernicus.eu/APIs/S3.html) credentials.
 
 ## Usage
 
