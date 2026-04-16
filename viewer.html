@@ -8,19 +8,19 @@
     <link href="https://unpkg.com/maplibre-gl@3.3.1/dist/maplibre-gl.css" rel="stylesheet" />
     <script src="https://unpkg.com/pmtiles@3.2.0/dist/pmtiles.js"></script>
     <style>
-        body { margin: 0; padding: 0; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; }
-        #header { padding: 10px; background: #eee; border-bottom: 1px solid #ccc; display: flex; flex-wrap: wrap; gap: 15px; align-items: center; z-index: 10;}
+        body { margin: 0; padding: 0; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; background: #111; }
+        #header { padding: 10px; background: #222; color: #eee; border-bottom: 1px solid #444; display: flex; flex-wrap: wrap; gap: 15px; align-items: center; z-index: 10;}
         #maps-container { display: flex; flex: 1; position: relative; }
-        .map-wrapper { flex: 1; position: relative; border-right: 2px solid #333; }
+        .map-wrapper { flex: 1; position: relative; border-right: 2px solid #000; }
         .map-wrapper:last-child { border-right: none; }
-        .map { position: absolute; top: 0; bottom: 0; width: 100%; }
-        .controls { position: absolute; top: 10px; left: 10px; z-index: 1; background: rgba(255,255,255,0.9); padding: 10px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
-        select { margin-left: 5px; }
+        .map { position: absolute; top: 0; bottom: 0; width: 100%; background: #111; }
+        .controls { position: absolute; top: 10px; left: 10px; z-index: 1; background: rgba(30,30,30,0.8); color: #fff; padding: 10px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.5); font-size: 13px; }
+        select { background: #333; color: #fff; border: 1px solid #555; margin-left: 5px; }
         
         .sync-label { font-weight: bold; display: flex; align-items: center; }
         .sync-label input { margin-right: 5px; }
         
-        .file-info { font-size: 11px; margin-top: 5px; color: #555; word-wrap: break-word; }
+        .file-info { font-size: 11px; margin-top: 5px; color: #aaa; word-wrap: break-word; font-family: monospace; }
     </style>
 </head>
 <body>
@@ -46,6 +46,9 @@
         <div>
             <label class="sync-label"><input type="checkbox" id="sync-views" checked> Sync Map Views</label>
         </div>
+        <div style="flex: 1; text-align: right; padding-right: 20px; font-size: 12px; color: #888;">
+            Make sure <code>python3 serve.py</code> is running!
+        </div>
     </div>
     
     <div id="maps-container">
@@ -54,10 +57,10 @@
             <div id="map1" class="map"></div>
             <div class="controls">
                 <strong>Map 1</strong><br>
-                Date: <select id="date1"><option value="2025-07-01">2025/07/01</option><option value="2025-01-01">2025/01/01</option></select><br>
+                Date: <select id="date1"><option value="2025-07-01">2025-07-01</option><option value="2025-01-01">2025-01-01</option></select><br>
                 Format: <select id="format1"><option value="webp">webp</option><option value="jpg">jpg</option><option value="png">png</option></select><br>
                 Quality: <select id="quality1"><option value="75">75</option><option value="80">80</option><option value="85">85</option></select><br>
-                Resample: <select id="resample1"><option value="bilinear">bilinear</option><option value="average">average</option><option value="gauss">gauss</option></select><br>
+                Resample: <select id="resample1"><option value="average">average</option><option value="bilinear">bilinear</option><option value="gauss">gauss</option></select><br>
                 <div id="file1-info" class="file-info"></div>
             </div>
         </div>
@@ -67,7 +70,7 @@
             <div id="map2" class="map"></div>
             <div class="controls">
                 <strong>Map 2</strong><br>
-                Date: <select id="date2"><option value="2025-07-01">2025/07/01</option><option value="2025-01-01">2025/01/01</option></select><br>
+                Date: <select id="date2"><option value="2025-07-01">2025-07-01</option><option value="2025-01-01">2025-01-01</option></select><br>
                 Format: <select id="format2"><option value="jpg">jpg</option><option value="webp">webp</option><option value="png">png</option></select><br>
                 Quality: <select id="quality2"><option value="80">80</option><option value="75">75</option><option value="85">85</option></select><br>
                 Resample: <select id="resample2"><option value="average">average</option><option value="bilinear">bilinear</option><option value="gauss">gauss</option></select><br>
@@ -83,6 +86,7 @@
         
         let maps = [];
         let isSyncing = false;
+        let initialLoadDone = false;
         
         function getMapStyle(url) {
             return {
@@ -91,9 +95,26 @@
                     "sat": {
                         "type": "raster",
                         "url": `pmtiles://${url}`
+                    },
+                    "bg": {
+                        "type": "raster",
+                        "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+                        "tileSize": 256,
+                        "attribution": "&copy; OpenStreetMap contributors"
                     }
                 },
                 "layers": [
+                    {
+                        "id": "background",
+                        "type": "background",
+                        "paint": { "background-color": "#111" }
+                    },
+                    {
+                        "id": "osm",
+                        "type": "raster",
+                        "source": "bg",
+                        "paint": { "raster-opacity": 0.2, "raster-brightness-max": 0.3 }
+                    },
                     {
                         "id": "sat-layer",
                         "type": "raster",
@@ -108,8 +129,7 @@
                 container: containerId,
                 style: { version: 8, sources: {}, layers: [] },
                 center: [0, 0],
-                zoom: 2,
-                hash: true // Use hash for position if you want, but might conflict
+                zoom: 1
             });
             map.addControl(new maplibregl.NavigationControl());
             return map;
@@ -135,16 +155,26 @@
             console.log(`Updating Map ${index} with URL: ${absoluteUrl}`);
             document.getElementById(`file${index}-info`).innerText = filename;
             
+            const map = maps[index-1];
+            
             try {
-                maps[index-1].setStyle(getMapStyle(absoluteUrl));
+                map.setStyle(getMapStyle(absoluteUrl));
                 
                 const p = new pmtiles.PMTiles(absoluteUrl);
                 p.getHeader().then(header => {
                     console.log(`Successfully loaded header for Map ${index}`, header);
-                    // Successfully loaded
+                    
+                    // Fit bounds if it's the first time or if requested
+                    if (!initialLoadDone && index === 1) {
+                        map.fitBounds([
+                            [header.minLon, header.minLat],
+                            [header.maxLon, header.maxLat]
+                        ], { padding: 50, duration: 1000 });
+                        initialLoadDone = true;
+                    }
                 }).catch(e => {
                     console.error(`Error loading PMTiles header for Map ${index}:`, e);
-                    document.getElementById(`file${index}-info`).innerText += ` (File not found or invalid: ${e.message || "check console"})`;
+                    document.getElementById(`file${index}-info`).innerText += ` (Error: ${e.message})`;
                 });
             } catch (err) {
                 console.error(`Error updating Map ${index}:`, err);
@@ -153,23 +183,22 @@
         }
         
         // Syncing logic
-        const syncCheckbox = document.getElementById('sync-views');
-        
         function syncMaps(e) {
+            const syncCheckbox = document.getElementById('sync-views');
             if (!syncCheckbox.checked || isSyncing) return;
             isSyncing = true;
             
             const changedMap = e.target;
-            const otherMaps = maps.filter(m => m !== changedMap);
+            const otherMap = maps.find(m => m !== changedMap);
             
-            const center = changedMap.getCenter();
-            const zoom = changedMap.getZoom();
-            const bearing = changedMap.getBearing();
-            const pitch = changedMap.getPitch();
-            
-            otherMaps.forEach(m => {
-                m.jumpTo({ center, zoom, bearing, pitch });
-            });
+            if (otherMap) {
+                otherMap.jumpTo({
+                    center: changedMap.getCenter(),
+                    zoom: changedMap.getZoom(),
+                    bearing: changedMap.getBearing(),
+                    pitch: changedMap.getPitch()
+                });
+            }
             
             isSyncing = false;
         }

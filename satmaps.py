@@ -199,6 +199,11 @@ def main():
             outputType=gdal.GDT_Byte,
             scaleParams=[[0, 4000, 0, 255]],
             callback=gdal.TermProgress_nocb,
+            metadataOptions=[
+                f"format={tile_format.lower()}",
+                f"name={tileset_name}",
+                f"description={tileset_desc}"
+            ],
             creationOptions=[
                 f"NAME={tileset_name}",
                 f"DESCRIPTION={tileset_desc}",
