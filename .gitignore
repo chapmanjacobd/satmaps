@@ -1,6 +1,6 @@
-/*.mbtiles
-/*.pmtiles
-/*.vrt
-/*.tif
-/*.db
-/*.mbtiles-journal
+*.mbtiles
+*.pmtiles
+*.vrt
+*.tif
+*.db
+*.mbtiles-journal
