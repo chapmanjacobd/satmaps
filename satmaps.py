@@ -23,8 +23,20 @@ def setup_gdal_cdse():
 
 def get_tile_paths(mgrs_tile, date_path="2025/07/01"):
     """Construct S3 paths for a given MGRS tile."""
+    # Determine quarter from date_path
+    if "07/01" in date_path:
+        q = "Q3"
+    elif "10/01" in date_path:
+        q = "Q4"
+    elif "04/01" in date_path:
+        q = "Q2"
+    elif "01/01" in date_path:
+        q = "Q1"
+    else:
+        q = "Q3" # Default
+
     base = (
-        f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/Sentinel-2_mosaic_2025_Q4_{mgrs_tile}_0_0"
+        f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/Sentinel-2_mosaic_2025_{q}_{mgrs_tile}_0_0"
     )
     return {'red': f"{base}/B04.tif", 'green': f"{base}/B03.tif", 'blue': f"{base}/B02.tif"}
 
@@ -32,6 +44,8 @@ def get_tile_paths(mgrs_tile, date_path="2025/07/01"):
 def create_rgb_vrt(paths, output_vrt):
     vrt_options = gdal.BuildVRTOptions(separate=True)
     vrt = gdal.BuildVRT(output_vrt, [paths['red'], paths['green'], paths['blue']], options=vrt_options)
+    if vrt is None:
+        raise RuntimeError(f"Failed to create VRT: {output_vrt}")
     vrt.FlushCache()
     return output_vrt
 
@@ -63,12 +77,13 @@ def list_all_mgrs_tiles(date_path="2025/07/01"):
 def main():
     parser = argparse.ArgumentParser(description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE.")
     parser.add_argument("mgrs", nargs="?", default="31TDF", help="MGRS tile ID (default: 31TDF for Barcelona)")
-    parser.add_argument("--all", action="store_true", help="Process all available tiles")
+    parser.add_argument("--global", dest="all_tiles", action="store_true", help="Process all available tiles")
+    parser.add_argument("--date", default="2025/07/01", help="Mosaic date path (default: 2025/07/01)")
     parser.add_argument("--output", "-o", default="output.pmtiles", help="Output PMTiles filename")
     parser.add_argument("--format", choices=["webp", "jpg"], default="webp", help="Tile format (default: webp)")
     parser.add_argument("--quality", type=int, default=74, help="WebP/JPEG quality (default: 74)")
     parser.add_argument("--minzoom", type=int, default=0)
-    parser.add_argument("--maxzoom", type=int, default=13)
+    parser.add_argument("--maxzoom", type=int, default=9)
 
     args = parser.parse_args()
 
@@ -78,28 +93,33 @@ def main():
     temp_mbtiles = "temp.mbtiles"
 
     try:
-        if args.all:
-            print("Listing all tiles for global mosaic...")
-            tiles = list_all_mgrs_tiles()
+        if args.all_tiles:
+            print(f"Listing all tiles for global mosaic ({args.date})...")
+            tiles = list_all_mgrs_tiles(args.date)
             print(f"Found {len(tiles)} tiles.")
 
             tile_vrts = []
             for i, mgrs in enumerate(tiles):
-                paths = get_tile_paths(mgrs)
+                paths = get_tile_paths(mgrs, args.date)
                 tile_vrt = f"tile_{mgrs}.vrt"
-                create_rgb_vrt(paths, tile_vrt)
-                tile_vrts.append(tile_vrt)
-                if (i + 1) % 10 == 0:
+                try:
+                    create_rgb_vrt(paths, tile_vrt)
+                    tile_vrts.append(tile_vrt)
+                except Exception as e:
+                    print(f"Warning: Could not process tile {mgrs}: {e}")
+                
+                if (i + 1) % 50 == 0:
                     print(f"Prepared {i+1}/{len(tiles)} tile VRTs...")
 
             print("Building global VRT...")
             gdal.BuildVRT(temp_vrt, tile_vrts)
             # Clean up tile VRTs
             for f in tile_vrts:
-                os.remove(f)
+                if os.path.exists(f):
+                    os.remove(f)
         else:
-            print(f"Processing tile: {args.mgrs}")
-            paths = get_tile_paths(args.mgrs)
+            print(f"Processing tile: {args.mgrs} (Date: {args.date})")
+            paths = get_tile_paths(args.mgrs, args.date)
             create_rgb_vrt(paths, temp_vrt)
 
         print(f"Generating MBTiles ({args.format})...")
