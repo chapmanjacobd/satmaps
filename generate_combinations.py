@@ -2,7 +2,6 @@ import os
 import subprocess
 from itertools import product
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List, Tuple
 
 # Configuration
 MGRS_TILES = ["60HTB", "07VEK", "15TVG", "50HQJ", "49QGF", "45RVL", "32TQK", "12SUD", "40RCN", "28QCH"]

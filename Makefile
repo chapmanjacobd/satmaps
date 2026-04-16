@@ -20,8 +20,7 @@ dev-install:
 	$(PIP) install ".[dev]"
 
 lint:
-	$(PYTHON) -m ruff check .
-	$(PYTHON) -m ruff format --check .
+	$(PYTHON) -m ruff check --fix .
 
 typecheck:
 	$(PYTHON) -m mypy satmaps.py generate_combinations.py

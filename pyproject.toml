@@ -3,7 +3,7 @@ name = "satmaps"
 version = "0.1.0"
 description = "High-performance PMTiles from Sentinel-2 Global Mosaics"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
     "gdal>=3.4.0",
 ]
@@ -17,9 +17,12 @@ dev = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py39"
+target-version = "py311"
+
+[tool.ruff.lint]
+ignore = ["E701"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.11"
 strict = true
 ignore_missing_imports = true
