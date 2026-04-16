@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://unpkg.com/maplibre-gl@3.3.1/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@3.3.1/dist/maplibre-gl.css" rel="stylesheet" />
-    <script src="https://unpkg.com/pmtiles@2.11.0/dist/index.js"></script>
+    <script src="https://unpkg.com/pmtiles@3.2.0/dist/pmtiles.js"></script>
     <style>
         body { margin: 0; padding: 0; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; }
         #header { padding: 10px; background: #eee; border-bottom: 1px solid #ccc; display: flex; flex-wrap: wrap; gap: 15px; align-items: center; z-index: 10;}
@@ -132,21 +132,24 @@
             const filename = buildFilename(mgrs, date, format, quality, resample);
             const absoluteUrl = new URL(filename, window.location.href).href;
             
+            console.log(`Updating Map ${index} with URL: ${absoluteUrl}`);
             document.getElementById(`file${index}-info`).innerText = filename;
             
-            maps[index-1].setStyle(getMapStyle(absoluteUrl));
-            
-            // Auto center based on PMTiles metadata if needed
-            // But MapLibre doesn't automatically fit bounds for raster PMTiles easily without fetching header.
-            const p = new pmtiles.PMTiles(absoluteUrl);
-            p.getHeader().then(header => {
-                if(header) {
-                    // Only fit bounds if we just loaded or are far away (optional)
-                    // For now, let user pan around.
-                }
-            }).catch(e => {
-                document.getElementById(`file${index}-info`).innerText += " (File not found!)";
-            });
+            try {
+                maps[index-1].setStyle(getMapStyle(absoluteUrl));
+                
+                const p = new pmtiles.PMTiles(absoluteUrl);
+                p.getHeader().then(header => {
+                    console.log(`Successfully loaded header for Map ${index}`, header);
+                    // Successfully loaded
+                }).catch(e => {
+                    console.error(`Error loading PMTiles header for Map ${index}:`, e);
+                    document.getElementById(`file${index}-info`).innerText += ` (File not found or invalid: ${e.message || "check console"})`;
+                });
+            } catch (err) {
+                console.error(`Error updating Map ${index}:`, err);
+                document.getElementById(`file${index}-info`).innerText += ` (Error: ${err.message})`;
+            }
         }
         
         // Syncing logic

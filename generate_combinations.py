@@ -7,7 +7,7 @@ MGRS_TILES = ["60HTB", "07VEK", "15TVG", "50HQJ", "49QGF", "45RVL", "32TQK", "12
 DATES = ["2025/07/01", "2025/01/01"]
 FORMATS = ["webp", "jpg", "png"]
 QUALITIES = [75, 80, 85]
-RESAMPLING = ["bilinear", "average", "gauss"]
+RESAMPLING = ["bilinear", "average"]
 
 OUTPUT_DIR = "combinations_output"
 CACHE_DIR = "cache"

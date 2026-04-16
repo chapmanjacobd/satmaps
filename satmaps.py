@@ -112,6 +112,9 @@ def main():
     temp_mbtiles = "temp.mbtiles"
     temp_warped_vrt = "temp_warped.vrt"
 
+    # Use cubic for reprojection as it's better for that step, regardless of the downsampling algorithm chosen
+    warp_resample = "cubic"
+
     try:
         if args.all_tiles:
             print(f"Listing all tiles for global mosaic ({args.date})...")
@@ -173,12 +176,24 @@ def main():
         warp_options = gdal.WarpOptions(
             format="VRT",
             dstSRS="EPSG:3857",
-            resampleAlg=args.resample_alg,
+            resampleAlg=warp_resample,
             callback=gdal.TermProgress_nocb
         )
         gdal.Warp(temp_warped_vrt, temp_vrt, options=warp_options)
 
         print(f"Step 2: Generating MBTiles ({args.format}) with zoom {args.minzoom}-{args.maxzoom}...")
+        
+        tile_format = args.format.upper()
+        if tile_format == "JPG":
+            tile_format = "JPEG"
+        if tile_format == "PNG8":
+            tile_format = "PNG"
+
+        # Handle resampling for Translate: gauss is not supported there
+        translate_resample = args.resample_alg
+        if args.resample_alg == "gauss":
+            translate_resample = "bilinear"
+
         translate_options = gdal.TranslateOptions(
             format="MBTiles",
             outputType=gdal.GDT_Byte,
@@ -188,11 +203,11 @@ def main():
                 f"NAME={tileset_name}",
                 f"DESCRIPTION={tileset_desc}",
                 "TYPE=baselayer",
-                f"TILE_FORMAT={args.format.upper()}",
+                f"TILE_FORMAT={tile_format}",
                 f"QUALITY={args.quality}",
                 f"MINZOOM={args.minzoom}",
                 f"MAXZOOM={args.maxzoom}",
-                f"RESAMPLING={args.resample_alg}",
+                f"RESAMPLING={translate_resample}",
                 f"BLOCKSIZE={args.blocksize}"
             ]
         )
