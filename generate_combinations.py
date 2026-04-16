@@ -4,10 +4,10 @@ from itertools import product
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Configuration
-MGRS_TILES = ["60HTB", "07VEK", "15TVG", "50HQJ", "49QGF", "45RVL", "32TQK", "12SUD", "40RCN", "28QCH"]
+MGRS_TILES = ["07VEK", "50HQJ", "49QGF", "45RVL", "32TQK", "12SUD", "40RCN", "28QCH"]
 DATES = ["2025/07/01", "2025/01/01"]
 FORMATS = ["webp", "jpg"]
-QUALITIES = [75, 80, 85]
+QUALITIES = [75, 85]
 RESAMPLING = ["bilinear", "average", "gauss", "lanczos"]
 MIN_ZOOM = 0
 MAX_ZOOM = 14

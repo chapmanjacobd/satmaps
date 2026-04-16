@@ -135,7 +135,7 @@ def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional
 
 def main():
     parser = argparse.ArgumentParser(description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE.")
-    parser.add_argument("mgrs", nargs="?", default="31TDF", help="MGRS tile ID (default: 31TDF for Barcelona. Other interesting ones: 60HTB, 07VEK, 15TVG, 50HQJ, 49QGF, 45RVL, 32TQK, 12SUD, 40RCN, 28QCH)")
+    parser.add_argument("mgrs", nargs="?", default="31TDF", help="MGRS tile ID (default: 31TDF for Barcelona. Other interesting ones: 60HTB, 07VEK, 50HQJ, 49QGF, 45RVL, 32TQK, 12SUD, 40RCN, 28QCH)")
     parser.add_argument("--global", dest="all_tiles", action="store_true", help="Process all available tiles")
     parser.add_argument("--date", default="2025/07/01", help="Mosaic date path (default: 2025/07/01)")
     parser.add_argument("--output", "-o", default="output.pmtiles", help="Output PMTiles filename")
@@ -268,6 +268,7 @@ def main():
             format="MBTiles",
             outputType=gdal.GDT_Byte,
             scaleParams=[[0, 4000, 0, 255]],
+            exponent=0.6,
             callback=gdal.TermProgress_nocb,
             metadataOptions=[
                 f"format={tile_format.lower()}",
