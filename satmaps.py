@@ -174,8 +174,6 @@ def main():
             format="VRT",
             dstSRS="EPSG:3857",
             resampleAlg=args.resample_alg,
-            srcNodata=0,
-            dstNodata=0,
             callback=gdal.TermProgress_nocb
         )
         gdal.Warp(temp_warped_vrt, temp_vrt, options=warp_options)
