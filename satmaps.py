@@ -87,7 +87,7 @@ def list_all_mgrs_tiles(date_path="2025/07/01"):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE.")
-    parser.add_argument("mgrs", nargs="?", default="31TDF", help="MGRS tile ID (default: 31TDF for Barcelona. Other interesting ones: 60TVK, 07VEK, 15TVG, 50HQJ, 49QGF, 45RVL, 32TQK, 12SUD, 40RCN, 28QCH)")
+    parser.add_argument("mgrs", nargs="?", default="31TDF", help="MGRS tile ID (default: 31TDF for Barcelona. Other interesting ones: 60HTB, 07VEK, 15TVG, 50HQJ, 49QGF, 45RVL, 32TQK, 12SUD, 40RCN, 28QCH)")
     parser.add_argument("--global", dest="all_tiles", action="store_true", help="Process all available tiles")
     parser.add_argument("--date", default="2025/07/01", help="Mosaic date path (default: 2025/07/01)")
     parser.add_argument("--output", "-o", default="output.pmtiles", help="Output PMTiles filename")
@@ -173,7 +173,7 @@ def main():
         warp_options = gdal.WarpOptions(
             format="VRT",
             dstSRS="EPSG:3857",
-            resampleAlg=args.resampling,
+            resampleAlg=args.resample_alg,
             srcNodata=0,
             dstNodata=0,
             callback=gdal.TermProgress_nocb

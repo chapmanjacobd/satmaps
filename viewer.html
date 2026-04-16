@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Satmaps PMTiles Comparison</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://unpkg.com/maplibre-gl@3.3.1/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@3.3.1/dist/maplibre-gl.css" rel="stylesheet" />
+    <script src="https://unpkg.com/pmtiles@2.11.0/dist/index.js"></script>
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; }
+        #header { padding: 10px; background: #eee; border-bottom: 1px solid #ccc; display: flex; flex-wrap: wrap; gap: 15px; align-items: center; z-index: 10;}
+        #maps-container { display: flex; flex: 1; position: relative; }
+        .map-wrapper { flex: 1; position: relative; border-right: 2px solid #333; }
+        .map-wrapper:last-child { border-right: none; }
+        .map { position: absolute; top: 0; bottom: 0; width: 100%; }
+        .controls { position: absolute; top: 10px; left: 10px; z-index: 1; background: rgba(255,255,255,0.9); padding: 10px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+        select { margin-left: 5px; }
+        
+        .sync-label { font-weight: bold; display: flex; align-items: center; }
+        .sync-label input { margin-right: 5px; }
+        
+        .file-info { font-size: 11px; margin-top: 5px; color: #555; word-wrap: break-word; }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <div>
+            <label><strong>Global Settings</strong></label>
+        </div>
+        <div>
+            <label>MGRS Tile:</label>
+            <select id="global-mgrs">
+                <option value="60HTB">60HTB</option>
+                <option value="07VEK">07VEK</option>
+                <option value="15TVG">15TVG</option>
+                <option value="50HQJ">50HQJ</option>
+                <option value="49QGF">49QGF</option>
+                <option value="45RVL">45RVL</option>
+                <option value="32TQK">32TQK</option>
+                <option value="12SUD">12SUD</option>
+                <option value="40RCN">40RCN</option>
+                <option value="28QCH">28QCH</option>
+            </select>
+        </div>
+        <div>
+            <label class="sync-label"><input type="checkbox" id="sync-views" checked> Sync Map Views</label>
+        </div>
+    </div>
+    
+    <div id="maps-container">
+        <!-- Map 1 -->
+        <div class="map-wrapper">
+            <div id="map1" class="map"></div>
+            <div class="controls">
+                <strong>Map 1</strong><br>
+                Date: <select id="date1"><option value="2025-07-01">2025/07/01</option><option value="2025-01-01">2025/01/01</option></select><br>
+                Format: <select id="format1"><option value="webp">webp</option><option value="jpg">jpg</option><option value="png">png</option></select><br>
+                Quality: <select id="quality1"><option value="75">75</option><option value="80">80</option><option value="85">85</option></select><br>
+                Resample: <select id="resample1"><option value="bilinear">bilinear</option><option value="average">average</option><option value="gauss">gauss</option></select><br>
+                <div id="file1-info" class="file-info"></div>
+            </div>
+        </div>
+        
+        <!-- Map 2 -->
+        <div class="map-wrapper">
+            <div id="map2" class="map"></div>
+            <div class="controls">
+                <strong>Map 2</strong><br>
+                Date: <select id="date2"><option value="2025-07-01">2025/07/01</option><option value="2025-01-01">2025/01/01</option></select><br>
+                Format: <select id="format2"><option value="jpg">jpg</option><option value="webp">webp</option><option value="png">png</option></select><br>
+                Quality: <select id="quality2"><option value="80">80</option><option value="75">75</option><option value="85">85</option></select><br>
+                Resample: <select id="resample2"><option value="average">average</option><option value="bilinear">bilinear</option><option value="gauss">gauss</option></select><br>
+                <div id="file2-info" class="file-info"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize PMTiles
+        let protocol = new pmtiles.Protocol();
+        maplibregl.addProtocol("pmtiles", protocol.tile);
+        
+        let maps = [];
+        let isSyncing = false;
+        
+        function getMapStyle(url) {
+            return {
+                "version": 8,
+                "sources": {
+                    "sat": {
+                        "type": "raster",
+                        "url": `pmtiles://${url}`
+                    }
+                },
+                "layers": [
+                    {
+                        "id": "sat-layer",
+                        "type": "raster",
+                        "source": "sat"
+                    }
+                ]
+            };
+        }
+        
+        function initMap(containerId) {
+            const map = new maplibregl.Map({
+                container: containerId,
+                style: { version: 8, sources: {}, layers: [] },
+                center: [0, 0],
+                zoom: 2,
+                hash: true // Use hash for position if you want, but might conflict
+            });
+            map.addControl(new maplibregl.NavigationControl());
+            return map;
+        }
+        
+        maps.push(initMap("map1"));
+        maps.push(initMap("map2"));
+        
+        function buildFilename(mgrs, date, format, quality, resample) {
+            return `combinations_output/${mgrs}_${date}_${format}_q${quality}_${resample}.pmtiles`;
+        }
+        
+        function updateMap(index) {
+            const mgrs = document.getElementById("global-mgrs").value;
+            const date = document.getElementById(`date${index}`).value;
+            const format = document.getElementById(`format${index}`).value;
+            const quality = document.getElementById(`quality${index}`).value;
+            const resample = document.getElementById(`resample${index}`).value;
+            
+            const filename = buildFilename(mgrs, date, format, quality, resample);
+            const absoluteUrl = new URL(filename, window.location.href).href;
+            
+            document.getElementById(`file${index}-info`).innerText = filename;
+            
+            maps[index-1].setStyle(getMapStyle(absoluteUrl));
+            
+            // Auto center based on PMTiles metadata if needed
+            // But MapLibre doesn't automatically fit bounds for raster PMTiles easily without fetching header.
+            const p = new pmtiles.PMTiles(absoluteUrl);
+            p.getHeader().then(header => {
+                if(header) {
+                    // Only fit bounds if we just loaded or are far away (optional)
+                    // For now, let user pan around.
+                }
+            }).catch(e => {
+                document.getElementById(`file${index}-info`).innerText += " (File not found!)";
+            });
+        }
+        
+        // Syncing logic
+        const syncCheckbox = document.getElementById('sync-views');
+        
+        function syncMaps(e) {
+            if (!syncCheckbox.checked || isSyncing) return;
+            isSyncing = true;
+            
+            const changedMap = e.target;
+            const otherMaps = maps.filter(m => m !== changedMap);
+            
+            const center = changedMap.getCenter();
+            const zoom = changedMap.getZoom();
+            const bearing = changedMap.getBearing();
+            const pitch = changedMap.getPitch();
+            
+            otherMaps.forEach(m => {
+                m.jumpTo({ center, zoom, bearing, pitch });
+            });
+            
+            isSyncing = false;
+        }
+        
+        maps.forEach(map => {
+            map.on('move', syncMaps);
+        });
+        
+        // Listeners
+        document.getElementById("global-mgrs").addEventListener("change", () => { updateMap(1); updateMap(2); });
+        
+        ['1', '2'].forEach(idx => {
+            ['date', 'format', 'quality', 'resample'].forEach(prop => {
+                document.getElementById(`${prop}${idx}`).addEventListener("change", () => updateMap(idx));
+            });
+        });
+        
+        // Init
+        updateMap(1);
+        updateMap(2);
+        
+    </script>
+</body>
+</html>
