@@ -20,21 +20,23 @@ def setup_gdal_cdse():
     gdal.SetConfigOption('GDAL_HTTP_MERGE_CONSECUTIVE_RANGES', 'YES')
     gdal.SetConfigOption('GDAL_HTTP_MAX_RETRY', '5')
 
-def get_tile_paths(mgrs_tile, date_path="2025/07/01", cache_dir=None):
-    """Construct S3 paths for a given MGRS tile."""
-    # Determine quarter from date_path
-    if "07/01" in date_path:
-        q = "Q3"
-    elif "10/01" in date_path:
-        q = "Q4"
-    elif "04/01" in date_path:
-        q = "Q2"
-    elif "01/01" in date_path:
-        q = "Q1"
+def get_tile_paths(mgrs_tile, date_path="2025/07/01", cache_dir=None, folder_name=None):
+    """Construct S3 paths for a given MGRS tile or specific folder."""
+    if folder_name:
+        folder = folder_name
+        # Extract a shorter name for caching if folder_name is the full Sentinel-2_mosaic...
+        if folder.startswith("Sentinel-2_mosaic_"):
+            # Sentinel-2_mosaic_2025_Q3_31TDF_0_0 -> 31TDF_0_0
+            parts = folder.split('_')
+            cache_prefix = "_".join(parts[4:])
+        else:
+            cache_prefix = folder
     else:
-        q = "Q3"
+        # Fallback for when list_all_mosaic_folders isn't used (though it should be)
+        q = get_quarter(date_path)
+        folder = f"Sentinel-2_mosaic_2025_{q}_{mgrs_tile}_0_0"
+        cache_prefix = f"{mgrs_tile}_0_0"
 
-    folder = f"Sentinel-2_mosaic_2025_{q}_{mgrs_tile}_0_0"
     base_s3 = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder}"
 
     bands = {'B04': 'red', 'B03': 'green', 'B02': 'blue'}
@@ -43,47 +45,76 @@ def get_tile_paths(mgrs_tile, date_path="2025/07/01", cache_dir=None):
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
         for b, name in bands.items():
-            local_path = os.path.join(cache_dir, f"{mgrs_tile}_{b}.tif")
-            if not os.path.exists(local_path):
-                s3_path = f"{base_s3}/{b}.tif"
-                print(f"Downloading {s3_path} to {local_path}...")
+            local_path = os.path.join(cache_dir, f"{cache_prefix}_{b}.tif")
+            if os.path.exists(local_path):
+                print(f"Warning: Local file {local_path} already exists, skipping download.")
+                paths[name] = local_path
+                continue
+
+            s3_path = f"{base_s3}/{b}.tif"
+            print(f"Downloading {s3_path} to {local_path}...")
+            try:
                 src_ds = gdal.Open(s3_path)
+                if src_ds is None:
+                    raise RuntimeError(f"Could not open {s3_path}")
                 gdal.GetDriverByName('GTiff').CreateCopy(local_path, src_ds, callback=gdal.TermProgress_nocb)
-            paths[name] = local_path
+                paths[name] = local_path
+            except Exception as e:
+                print(f"Error downloading {s3_path}: {e}")
+                raise
     else:
         for b, name in bands.items():
             paths[name] = f"{base_s3}/{b}.tif"
 
     return paths
 
-def create_rgb_vrt(paths, output_vrt):
-    """Create a 3-band RGB VRT from separate band files."""
-    vrt_options = gdal.BuildVRTOptions(
-        separate=True,
-        callback=gdal.TermProgress_nocb
-    )
-    vrt = gdal.BuildVRT(output_vrt, [paths['red'], paths['green'], paths['blue']], options=vrt_options)
-    if vrt is None:
-        raise RuntimeError(f"Failed to create VRT: {output_vrt}")
-    vrt.FlushCache()
-    return output_vrt
+def get_quarter(date_path):
+    """Determine quarter from date_path."""
+    if "07/01" in date_path: return "Q3"
+    if "10/01" in date_path: return "Q4"
+    if "04/01" in date_path: return "Q2"
+    if "01/01" in date_path: return "Q1"
+    return "Q3"
 
-def list_all_mgrs_tiles(date_path="2025/07/01"):
-    """List all MGRS tiles available for the given date."""
+def list_all_mosaic_folders(date_path="2025/07/01", mgrs_filter=None):
+    """List mosaic folders. Optimized for single tile by checking common sub-tiles."""
+    q = get_quarter(date_path)
+    
+    if mgrs_filter:
+        # Optimized path: instead of listing the whole S3 bucket, check for expected sub-tiles
+        # Grid segment indices are usually 0_0, 1_0, 0_1, 1_1
+        potential_folders = []
+        for x, y in [(0,0), (1,0), (0,1), (1,1)]:
+            potential_folders.append(f"Sentinel-2_mosaic_2025_{q}_{mgrs_filter}_{x}_{y}")
+        
+        found_folders = []
+        for folder in potential_folders:
+            # Check if B04.tif exists as a proxy for folder existence
+            s3_path = f"s3://eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder}/B04.tif"
+            cmd = ["aws", "--endpoint-url", "https://eodata.dataspace.copernicus.eu", "--profile", "cdse", "s3", "ls", s3_path]
+            # Use run instead of check=True to handle non-zero exits (file not found)
+            result = subprocess.run(cmd, capture_output=True)
+            if result.returncode == 0:
+                found_folders.append(folder)
+        
+        if not found_folders:
+            raise RuntimeError(f"Error: No folders found for MGRS {mgrs_filter} at {date_path}")
+            
+        return sorted(found_folders)
+    
+    # Global mode still needs the full list
     s3_prefix = f"s3://eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/"
     cmd = ["aws", "--endpoint-url", "https://eodata.dataspace.copernicus.eu", "--profile", "cdse", "s3", "ls", s3_prefix]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
 
-    tiles = []
+    folders = []
     for line in result.stdout.splitlines():
         if "PRE Sentinel-2_mosaic" in line:
-            parts = line.strip().split('_')
-            # Example: Sentinel-2_mosaic_2025_Q3_31TDF_0_0/
-            if len(parts) >= 4:
-                mgrs = parts[4] if parts[3].startswith('Q') else parts[3]
-                if mgrs.endswith('/'): mgrs = mgrs[:-1]
-                tiles.append(mgrs)
-    return sorted(list(set(tiles)))
+            folder = line.strip().split("PRE ")[1].strip()
+            if folder.endswith('/'): folder = folder[:-1]
+            folders.append(folder)
+                
+    return sorted(folders)
 
 def main():
     parser = argparse.ArgumentParser(description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE.")
@@ -117,9 +148,9 @@ def main():
 
     try:
         if args.all_tiles:
-            print(f"Listing all tiles for global mosaic ({args.date})...")
-            all_tiles = list_all_mgrs_tiles(args.date)
-            print(f"Found {len(all_tiles)} tiles.")
+            print(f"Listing all folders for global mosaic ({args.date})...")
+            all_folders = list_all_mosaic_folders(args.date)
+            print(f"Found {len(all_folders)} folders.")
 
             if args.download_only and not args.cache:
                 print("Error: --download-only requires --cache")
@@ -128,22 +159,22 @@ def main():
             # Use Grouped VRTs to avoid too many open files
             group_size = 50
             group_vrts = []
-            for i in range(0, len(all_tiles), group_size):
-                chunk = all_tiles[i:i + group_size]
+            for i in range(0, len(all_folders), group_size):
+                chunk = all_folders[i:i + group_size]
                 chunk_vrt_name = f"group_{i // group_size}.vrt"
 
-                print(f"[{i+1}/{len(all_tiles)}] Handling group {i // group_size}...")
+                print(f"[{i+1}/{len(all_folders)}] Handling group {i // group_size}...")
                 chunk_tile_vrts = []
-                for mgrs in chunk:
+                for folder in chunk:
                     try:
-                        paths = get_tile_paths(mgrs, args.date, args.cache)
+                        paths = get_tile_paths(None, args.date, args.cache, folder_name=folder)
                         if args.download_only: continue
 
-                        tile_vrt = f"tile_{mgrs}.vrt"
+                        tile_vrt = f"tile_{folder}.vrt"
                         create_rgb_vrt(paths, tile_vrt)
                         chunk_tile_vrts.append(tile_vrt)
                     except Exception as e:
-                        print(f"Warning: Could not process tile {mgrs}: {e}")
+                        print(f"Warning: Could not process folder {folder}: {e}")
 
                 if args.download_only: continue
 
@@ -166,11 +197,36 @@ def main():
                 if os.path.exists(f): os.remove(f)
         else:
             print(f"Processing tile: {args.mgrs} (Date: {args.date})")
-            paths = get_tile_paths(args.mgrs, args.date, args.cache)
+            try:
+                folders = list_all_mosaic_folders(args.date, mgrs_filter=args.mgrs)
+            except RuntimeError as e:
+                print(e)
+                sys.exit(1)
+
+            tile_vrts = []
+            for folder in folders:
+                try:
+                    paths = get_tile_paths(None, args.date, args.cache, folder_name=folder)
+                    if args.download_only: continue
+                    
+                    tile_vrt = f"tile_{folder}.vrt"
+                    create_rgb_vrt(paths, tile_vrt)
+                    tile_vrts.append(tile_vrt)
+                except Exception as e:
+                    print(f"Warning: Could not process folder {folder}: {e}")
+
             if args.download_only:
                 print(f"Download of {args.mgrs} complete.")
                 return
-            create_rgb_vrt(paths, temp_vrt)
+            
+            if not tile_vrts:
+                print(f"Error: No data found for {args.mgrs}")
+                sys.exit(1)
+
+            gdal.BuildVRT(temp_vrt, tile_vrts)
+            # Clean up tile VRTs
+            for f in tile_vrts:
+                if os.path.exists(f): os.remove(f)
 
         print("Step 1: Reprojecting to Web Mercator (VRT)...")
         warp_options = gdal.WarpOptions(

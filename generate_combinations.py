@@ -7,7 +7,7 @@ MGRS_TILES = ["60HTB", "07VEK", "15TVG", "50HQJ", "49QGF", "45RVL", "32TQK", "12
 DATES = ["2025/07/01", "2025/01/01"]
 FORMATS = ["webp", "jpg", "png"]
 QUALITIES = [75, 80, 85]
-RESAMPLING = ["bilinear", "average"]
+RESAMPLING = ["bilinear", "average", "lanczos"]
 
 OUTPUT_DIR = "combinations_output"
 CACHE_DIR = "cache"
@@ -23,13 +23,6 @@ def main():
         date_cache_dir = os.path.join(CACHE_DIR, date_flat)
         os.makedirs(date_cache_dir, exist_ok=True)
         
-        # Check if files already exist to skip unnecessary download calls
-        # satmaps.py downloads 3 bands (B04, B03, B02)
-        expected_files = [os.path.join(date_cache_dir, f"{mgrs}_{b}.tif") for b in ['B04', 'B03', 'B02']]
-        if all(os.path.exists(f) for f in expected_files):
-            print(f"Skipping download for {mgrs} ({date}) - already cached.")
-            continue
-
         print(f"Downloading {mgrs} for {date} to {date_cache_dir}...")
         cmd = [
             "python3", "satmaps.py", mgrs,

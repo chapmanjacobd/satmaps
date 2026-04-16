@@ -6,3 +6,4 @@
 *.mbtiles-journal
 *.xml
 /cache
+__pycache__
