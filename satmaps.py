@@ -133,6 +133,43 @@ def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional
                 
     return sorted(folders)
 
+def get_percentiles(ds: gdal.Dataset, low: float = 2.0, high: float = 98.0) -> List[List[float]]:
+    """Calculate the low and high percentiles for each band in the dataset."""
+    scale_params = []
+    for i in range(1, ds.RasterCount + 1):
+        band = ds.GetRasterBand(i)
+        # Use a 1000-bucket histogram for range 0-10000 (Sentinel-2 typical reflectance range)
+        # approx_ok=True for speed
+        hist = band.GetHistogram(min=0.0, max=10000.0, buckets=1000, approx_ok=True)
+        total = sum(hist)
+        
+        if total == 0:
+            scale_params.append([0, 4000, 0, 255])
+            continue
+            
+        low_threshold = total * (low / 100.0)
+        high_threshold = total * (high / 100.0)
+        
+        accum = 0
+        low_val = 0.0
+        high_val = 4000.0
+        
+        for idx, count in enumerate(hist):
+            accum += count
+            if low_val == 0.0 and accum >= low_threshold:
+                low_val = idx * 10.0 # (idx / 1000) * 10000
+            if accum >= high_threshold:
+                high_val = idx * 10.0
+                break
+        
+        # Ensure some contrast even if the range is tight
+        if high_val <= low_val:
+            high_val = low_val + 100.0
+            
+        scale_params.append([low_val, high_val, 0, 255])
+    
+    return scale_params
+
 def main():
     parser = argparse.ArgumentParser(description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE.")
     parser.add_argument("mgrs", nargs="?", default="31TDF", help="MGRS tile ID (default: 31TDF for Barcelona. Other interesting ones: 60HTB, 07VEK, 50HQJ, 49QGF, 45RVL, 32TQK, 12SUD, 40RCN, 28QCH)")
@@ -264,10 +301,15 @@ def main():
         if args.resample_alg == "gauss":
             translate_resample = "bilinear"
 
+        # Calculate percentiles (2nd and 98th) for dynamic scaling
+        ds_for_stats = gdal.Open(temp_warped_vrt)
+        scale_params = get_percentiles(ds_for_stats)
+        ds_for_stats = None
+
         translate_options = gdal.TranslateOptions(
             format="MBTiles",
             outputType=gdal.GDT_Byte,
-            scaleParams=[[0, 4000, 0, 255]],
+            scaleParams=scale_params,
             exponent=0.6,
             callback=gdal.TermProgress_nocb,
             metadataOptions=[

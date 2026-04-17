@@ -63,6 +63,7 @@ Then visit `http://localhost:8000/viewer.html`.
     1. Direct VSI S3 reading of B04, B03, B02 bands.
     2. Virtual Raster (VRT) creation for RGB stacking.
     3. `gdalwarp` to EPSG:3857.
-    4. `gdal_translate` to MBTiles with internal scale parameters (`0, 4000, 0, 255`).
-    5. `gdaladdo` for overview generation.
-    6. `pmtiles convert` for final packaging.
+    4. `gdal_translate` to MBTiles with dynamic scaling (2nd and 98th percentiles).
+    5. `exponent=0.6` for gamma correction to lift shadows.
+    6. `gdaladdo` for overview generation.
+    7. `pmtiles convert` for final packaging.
