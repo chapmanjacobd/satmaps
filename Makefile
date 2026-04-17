@@ -32,6 +32,6 @@ generate:
 	$(PYTHON) generate_combinations.py
 
 clean:
-	rm -f *.vrt temp.mbtiles temp.vrt temp_warped.vrt
-	rm -rf __pycache__
+	rm -f *.vrt temp* tile*
+	rm -rf __pycache__ combinations_output
 	@echo "Cleaned up temporary files."

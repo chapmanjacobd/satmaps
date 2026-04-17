@@ -133,42 +133,44 @@ def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional
                 
     return sorted(folders)
 
-def get_percentiles(ds: gdal.Dataset, low: float = 2.0, high: float = 98.0) -> List[List[float]]:
-    """Calculate the low and high percentiles for each band in the dataset."""
-    scale_params = []
+def get_percentiles(ds: gdal.Dataset, low: float = 2.0, high: float = 98.0, shared: bool = True) -> List[List[float]]:
+    """
+    Calculate the low and high percentiles for each band.
+    If shared=True, the same min/max is used for all bands to preserve color balance.
+    """
+    band_stats = []
     for i in range(1, ds.RasterCount + 1):
         band = ds.GetRasterBand(i)
-        # Use a 1000-bucket histogram for range 0-10000 (Sentinel-2 typical reflectance range)
-        # approx_ok=True for speed
         hist = band.GetHistogram(min=0.0, max=10000.0, buckets=1000, approx_ok=True)
         total = sum(hist)
         
         if total == 0:
-            scale_params.append([0, 4000, 0, 255])
+            band_stats.append((0.0, 4000.0))
             continue
             
         low_threshold = total * (low / 100.0)
         high_threshold = total * (high / 100.0)
         
         accum = 0
-        low_val = 0.0
-        high_val = 4000.0
+        l_val = 0.0
+        h_val = 4000.0
         
         for idx, count in enumerate(hist):
             accum += count
-            if low_val == 0.0 and accum >= low_threshold:
-                low_val = idx * 10.0 # (idx / 1000) * 10000
+            if l_val == 0.0 and accum >= low_threshold:
+                l_val = idx * 10.0
             if accum >= high_threshold:
-                high_val = idx * 10.0
+                h_val = idx * 10.0
                 break
-        
-        # Ensure some contrast even if the range is tight
-        if high_val <= low_val:
-            high_val = low_val + 100.0
-            
-        scale_params.append([low_val, high_val, 0, 255])
+        band_stats.append((l_val, h_val))
+
+    if shared:
+        # Use the global min (lowest of lows) and global max (highest of highs)
+        global_low = min(s[0] for s in band_stats)
+        global_high = max(s[1] for s in band_stats)
+        return [[global_low, global_high, 0, 255]] * ds.RasterCount
     
-    return scale_params
+    return [[s[0], s[1], 0, 255] for s in band_stats]
 
 def main():
     parser = argparse.ArgumentParser(description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE.")
@@ -176,11 +178,11 @@ def main():
     parser.add_argument("--global", dest="all_tiles", action="store_true", help="Process all available tiles")
     parser.add_argument("--date", default="2025/07/01", help="Mosaic date path (default: 2025/07/01)")
     parser.add_argument("--output", "-o", default="output.pmtiles", help="Output PMTiles filename")
-    parser.add_argument("--format", choices=["webp", "jpg", "png", "png8"], default="webp", help="Tile format (default: webp)")
-    parser.add_argument("--quality", type=int, default=74, help="WebP/JPEG quality (default: 74)")
-    parser.add_argument("--resample-alg", default="bilinear", choices=["bilinear", "average", "gauss", "lanczos"], help="Resampling method (default: bilinear)")
-    parser.add_argument("--exponent", type=float, default=0.6, help="Exponent for power law scaling (default: 0.6)")
-    parser.add_argument("--blocksize", type=int, default=512, help="MBTiles block size (default: 256)")
+    parser.add_argument("--format", choices=["webp", "jpg", "png", "png8"], default="webp", help="Tile format")
+    parser.add_argument("--quality", type=int, default=74, help="WebP/JPEG quality")
+    parser.add_argument("--resample-alg", default="lanczos", choices=["bilinear", "average", "gauss", "lanczos"], help="Downsampling method")
+    parser.add_argument("--exponent", type=float, default=0.75, help="Exponent for power law scaling")
+    parser.add_argument("--blocksize", type=int, default=512, help="MBTiles block size")
     parser.add_argument("--minzoom", type=int, default=0)
     parser.add_argument("--maxzoom", type=int, default=14)
     parser.add_argument("--cache", help="Local directory to cache downloaded TIFs")
@@ -304,14 +306,18 @@ def main():
 
         # Calculate percentiles (2nd and 98th) for dynamic scaling
         ds_for_stats = gdal.Open(temp_warped_vrt)
-        scale_params = get_percentiles(ds_for_stats)
+        # Use shared=True to preserve color balance (fix "strange colors")
+        scale_params = get_percentiles(ds_for_stats, shared=True)
         ds_for_stats = None
+
+        # Exponent 0 means "don't apply"
+        exponents = [args.exponent, args.exponent, args.exponent] if args.exponent != 0 else None
 
         translate_options = gdal.TranslateOptions(
             format="MBTiles",
             outputType=gdal.GDT_Byte,
             scaleParams=scale_params,
-            exponent=args.exponent,
+            exponents=exponents,
             callback=gdal.TermProgress_nocb,
             metadataOptions=[
                 f"format={tile_format.lower()}",

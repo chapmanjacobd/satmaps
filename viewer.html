@@ -249,7 +249,9 @@
                 const exponentSelect = document.getElementById(`exponent${idx}`);
                 config.exponents.forEach(e => {
                     const opt = document.createElement("option");
-                    opt.value = opt.innerText = e;
+                    // Ensure 0.0 stays "0.0" to match Python f-string filenames
+                    const val = (typeof e === 'number') ? (e % 1 === 0 ? e.toFixed(1) : e.toString()) : e;
+                    opt.value = opt.innerText = val;
                     exponentSelect.appendChild(opt);
                 });
 
