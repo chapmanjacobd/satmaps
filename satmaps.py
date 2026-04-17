@@ -174,9 +174,9 @@ def get_percentiles(ds: gdal.Dataset, low: float = 2.0, high: float = 98.0, shar
 
 def main():
     parser = argparse.ArgumentParser(description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE.")
-    parser.add_argument("mgrs", nargs="?", default="31TDF", help="MGRS tile ID (default: 31TDF for Barcelona. Other interesting ones: 60HTB, 07VEK, 50HQJ, 49QGF, 45RVL, 32TQK, 12SUD, 40RCN, 28QCH)")
+    parser.add_argument("mgrs", nargs="?", default="31TDF", help="MGRS tile ID (default: 31TDF for Barcelona. Other interesting ones: 60HTB, 07VEK, 50HQJ, 49QGF, 45RVL, 12SUD, 40RCN, 28QCH)")
     parser.add_argument("--global", dest="all_tiles", action="store_true", help="Process all available tiles")
-    parser.add_argument("--date", default="2025/07/01", help="Mosaic date path (default: 2025/07/01)")
+    parser.add_argument("--date", default="2025/07/01", help="Mosaic date path (default: 2025/07/01). Can be a comma-separated list of dates.")
     parser.add_argument("--output", "-o", default="output.pmtiles", help="Output PMTiles filename")
     parser.add_argument("--format", choices=["webp", "jpg", "png", "png8"], default="webp", help="Tile format")
     parser.add_argument("--quality", type=int, default=74, help="WebP/JPEG quality")
@@ -185,16 +185,30 @@ def main():
     parser.add_argument("--blocksize", type=int, default=512, help="MBTiles block size")
     parser.add_argument("--minzoom", type=int, default=0)
     parser.add_argument("--maxzoom", type=int, default=14)
-    parser.add_argument("--cache", help="Local directory to cache downloaded TIFs")
+    parser.add_argument("--cache", help="Local directory to cache downloaded TIFs. If multiple dates are used, subdirectories for each date will be created.")
     parser.add_argument("--download-only", action="store_true", help="Only download files to cache, don't process")
+    parser.add_argument("--land-only", help="Path to HLS.land.tiles.txt. If provided, tiles NOT in this list will be skipped (only in --global mode).")
 
     args = parser.parse_args()
 
     setup_gdal_cdse()
 
+    dates = [d.strip() for d in args.date.split(",")]
+    num_dates = len(dates)
+
+    # Load land tiles if provided
+    land_tiles = None
+    if args.land_only:
+        if os.path.exists(args.land_only):
+            with open(args.land_only, 'r') as f:
+                land_tiles = set(line.strip() for line in f if line.strip())
+            print(f"Loaded {len(land_tiles)} land tiles from {args.land_only}")
+        else:
+            print(f"Warning: Land tile list {args.land_only} not found.")
+
     # Metadata
     tileset_name = "Internet in a Box Maps - Sentinel-2"
-    tileset_desc = f"Contains modified Copernicus Sentinel data {args.date[:4]}"
+    tileset_desc = f"Contains modified Copernicus Sentinel data {', '.join(dates)}"
 
     # Unique temp files to avoid race conditions in parallel mode
     unique_id = uuid.uuid4().hex[:8]
@@ -207,80 +221,107 @@ def main():
 
     tile_vrts = []
     try:
-        if args.all_tiles:
-            print(f"Listing all folders for global mosaic ({args.date})...")
-            all_folders = list_all_mosaic_folders(args.date, cache_dir=args.cache)
-            print(f"Found {len(all_folders)} folders.")
+        all_date_vrts = []
+        for date in dates:
+            date_tile_vrts = []
+            date_cache = os.path.join(args.cache, date.replace("/", "-")) if args.cache else None
+            
+            if args.all_tiles:
+                print(f"Listing all folders for global mosaic ({date})...")
+                all_folders = list_all_mosaic_folders(date, cache_dir=date_cache)
+                
+                if land_tiles:
+                    # Filter folders by land tiles
+                    # Sentinel-2_mosaic_2025_Q3_31TDF_0_0 -> 31TDF
+                    original_len = len(all_folders)
+                    all_folders = [f for f in all_folders if f.split('_')[4] in land_tiles]
+                    print(f"Filtered {original_len} -> {len(all_folders)} tiles using land mask for {date}.")
+                else:
+                    print(f"Found {len(all_folders)} folders for {date}.")
 
-            if args.download_only and not args.cache:
-                print("Error: --download-only requires --cache")
-                sys.exit(1)
+                if args.download_only and not args.cache:
+                    print("Error: --download-only requires --cache")
+                    sys.exit(1)
 
-            # Use Grouped VRTs to avoid too many open files
-            group_size = 50
-            group_vrts = []
-            for i in range(0, len(all_folders), group_size):
-                chunk = all_folders[i:i + group_size]
-                chunk_vrt_name = f"group_{i // group_size}_{unique_id}.vrt"
+                # Use Grouped VRTs to avoid too many open files
+                group_size = 50
+                group_vrts = []
+                for i in range(0, len(all_folders), group_size):
+                    chunk = all_folders[i:i + group_size]
+                    chunk_vrt_name = f"group_{date.replace('/', '-')}_{i // group_size}_{unique_id}.vrt"
 
-                print(f"[{i+1}/{len(all_folders)}] Handling group {i // group_size}...")
-                chunk_tile_vrts = []
-                for folder in chunk:
+                    print(f"[{date}] [{i+1}/{len(all_folders)}] Handling group {i // group_size}...")
+                    chunk_tile_vrts = []
+                    for folder in chunk:
+                        try:
+                            paths = get_tile_paths(None, date, date_cache, folder_name=folder)
+                            if args.download_only: continue
+
+                            tile_vrt = f"tile_{folder}_{unique_id}.vrt"
+                            create_rgb_vrt(paths, tile_vrt)
+                            chunk_tile_vrts.append(tile_vrt)
+                            tile_vrts.append(tile_vrt)
+                        except Exception as e:
+                            print(f"Warning: Could not process folder {folder}: {e}")
+
+                    if args.download_only: continue
+
+                    if chunk_tile_vrts:
+                        print(f"Building Group VRT {chunk_vrt_name}...")
+                        gdal.BuildVRT(chunk_vrt_name, chunk_tile_vrts)
+                        group_vrts.append(chunk_vrt_name)
+
+                if args.download_only:
+                    continue
+
+                if group_vrts:
+                    date_vrt = f"date_{date.replace('/', '-')}_{unique_id}.vrt"
+                    print(f"Building date VRT {date_vrt} from groups...")
+                    gdal.BuildVRT(date_vrt, group_vrts)
+                    all_date_vrts.append(date_vrt)
+                    # Clean up group VRTs
+                    for f in group_vrts:
+                        if os.path.exists(f): os.remove(f)
+            else:
+                print(f"Processing tile: {args.mgrs} (Date: {date})")
+                try:
+                    folders = list_all_mosaic_folders(date, mgrs_filter=args.mgrs, cache_dir=date_cache)
+                except RuntimeError as e:
+                    print(e)
+                    continue
+
+                for folder in folders:
                     try:
-                        paths = get_tile_paths(None, args.date, args.cache, folder_name=folder)
+                        paths = get_tile_paths(None, date, date_cache, folder_name=folder)
                         if args.download_only: continue
-
+                        
                         tile_vrt = f"tile_{folder}_{unique_id}.vrt"
                         create_rgb_vrt(paths, tile_vrt)
-                        chunk_tile_vrts.append(tile_vrt)
+                        date_tile_vrts.append(tile_vrt)
                         tile_vrts.append(tile_vrt)
                     except Exception as e:
                         print(f"Warning: Could not process folder {folder}: {e}")
 
-                if args.download_only: continue
+                if args.download_only:
+                    continue
+                
+                if date_tile_vrts:
+                    date_vrt = f"date_{date.replace('/', '-')}_{unique_id}.vrt"
+                    gdal.BuildVRT(date_vrt, date_tile_vrts)
+                    all_date_vrts.append(date_vrt)
 
-                if chunk_tile_vrts:
-                    print(f"Building Group VRT {chunk_vrt_name}...")
-                    gdal.BuildVRT(chunk_vrt_name, chunk_tile_vrts)
-                    group_vrts.append(chunk_vrt_name)
+        if args.download_only:
+            print("Download complete.")
+            return
 
-            if args.download_only:
-                print("Download complete.")
-                return
+        if not all_date_vrts:
+            print("Error: No data found for any of the specified dates.")
+            sys.exit(1)
 
-            print("Building master VRT from groups...")
-            gdal.BuildVRT(temp_vrt, group_vrts)
-            # Clean up group VRTs
-            for f in group_vrts:
-                if os.path.exists(f): os.remove(f)
-        else:
-            print(f"Processing tile: {args.mgrs} (Date: {args.date})")
-            try:
-                folders = list_all_mosaic_folders(args.date, mgrs_filter=args.mgrs, cache_dir=args.cache)
-            except RuntimeError as e:
-                print(e)
-                sys.exit(1)
-
-            for folder in folders:
-                try:
-                    paths = get_tile_paths(None, args.date, args.cache, folder_name=folder)
-                    if args.download_only: continue
-                    
-                    tile_vrt = f"tile_{folder}_{unique_id}.vrt"
-                    create_rgb_vrt(paths, tile_vrt)
-                    tile_vrts.append(tile_vrt)
-                except Exception as e:
-                    print(f"Warning: Could not process folder {folder}: {e}")
-
-            if args.download_only:
-                print(f"Download of {args.mgrs} complete.")
-                return
-            
-            if not tile_vrts:
-                print(f"Error: No data found for {args.mgrs}")
-                sys.exit(1)
-
-            gdal.BuildVRT(temp_vrt, tile_vrts)
+        print("Building master VRT from all dates...")
+        gdal.BuildVRT(temp_vrt, all_date_vrts)
+        # Add all_date_vrts to cleanup list
+        tile_vrts.extend(all_date_vrts)
 
         print("Step 1: Reprojecting to Web Mercator (VRT)...")
         warp_options = gdal.WarpOptions(
@@ -309,6 +350,16 @@ def main():
         # Use shared=True to preserve color balance (fix "strange colors")
         scale_params = get_percentiles(ds_for_stats, shared=True)
         ds_for_stats = None
+
+        # Adjust scaleParams if multiple dates are used to avoid "washed out" look
+        # This effectively divides the summed values by the number of dates
+        if num_dates > 1:
+            print(f"Adjusting scaleParams for {num_dates} dates to avoid washed-out colors...")
+            for i in range(len(scale_params)):
+                # scale_params[i] is [low, high, 0, 255]
+                # We want to divide the input by num_dates, which means multiplying the input thresholds by num_dates
+                scale_params[i][0] *= num_dates
+                scale_params[i][1] *= num_dates
 
         # Exponent 0 means "don't apply"
         exponents = [args.exponent, args.exponent, args.exponent] if args.exponent != 0 else None

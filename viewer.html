@@ -37,6 +37,12 @@
         <div>
             <label class="sync-label"><input type="checkbox" id="sync-views" checked> Sync Map Views</label>
         </div>
+        <div>
+            <label>Zoom Level:</label>
+            <select id="global-zoom">
+                <!-- Populated 0-14 -->
+            </select>
+        </div>
         <div style="flex: 1; text-align: right; padding-right: 20px; font-size: 12px; color: #888;">
             Make sure <code>python3 serve.py</code> is running!
         </div>
@@ -194,6 +200,13 @@
                     pitch: changedMap.getPitch()
                 });
             }
+
+            // Update zoom dropdown
+            const currentZoom = Math.round(changedMap.getZoom());
+            const zoomSelect = document.getElementById("global-zoom");
+            if (zoomSelect.value != currentZoom) {
+                zoomSelect.value = currentZoom;
+            }
             
             isSyncing = false;
         }
@@ -207,6 +220,12 @@
             updateMap(1, true); 
             updateMap(2, true); 
         });
+
+        document.getElementById("global-zoom").addEventListener("change", (e) => {
+            const z = parseInt(e.target.value);
+            maps[0].setZoom(z);
+            // syncMaps will handle updating the other map if sync is on
+        });
         
         function setupDropdowns(config) {
             const mgrsSelect = document.getElementById("global-mgrs");
@@ -215,6 +234,15 @@
                 opt.value = opt.innerText = mgrs;
                 mgrsSelect.appendChild(opt);
             });
+
+            // Populate Zoom Dropdown 0-14
+            const zoomSelect = document.getElementById("global-zoom");
+            for (let z = 0; z <= 14; z++) {
+                const opt = document.createElement("option");
+                opt.value = opt.innerText = z;
+                zoomSelect.appendChild(opt);
+            }
+            zoomSelect.value = 1;
 
             ['1', '2'].forEach(idx => {
                 const dateSelect = document.getElementById(`date${idx}`);

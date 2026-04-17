@@ -4,8 +4,8 @@ from itertools import product
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Configuration
-MGRS_TILES = ["50HQJ", "49QGF", "45RVL", "32TQK", "12SUD", "40RCN", "28QCH"]
-DATES = ["2025/07/01", "2025/01/01"]
+MGRS_TILES = ["50HQJ", "49QGF", "45RVL", "12SUD", "40RCN", "28QCH"]
+DATES = [["2025/07/01"], ["2025/01/01"], ["2025/07/01", "2025/01/01"]]
 FORMATS = ["webp"]
 QUALITIES = [74]
 RESAMPLING = ["lanczos"]
@@ -18,11 +18,12 @@ OUTPUT_DIR = "combinations_output"
 CACHE_DIR = "cache"
 MAX_WORKERS = min(8, os.cpu_count())
 
-def run_satmaps(mgrs: str, date: str, fmt: str, quality: int, resample: str, exponent: float, cache_dir: str, output_path: str) -> bool:
+def run_satmaps(mgrs: str, dates: list, fmt: str, quality: int, resample: str, exponent: float, cache_dir: str, output_path: str) -> bool:
     """Helper to run a single satmaps generation command."""
+    date_arg = ",".join(dates)
     cmd = [
         "python3", "satmaps.py", mgrs,
-        "--date", date,
+        "--date", date_arg,
         "--format", fmt,
         "--quality", str(quality),
         "--resample-alg", resample,
@@ -47,16 +48,17 @@ def main() -> None:
     
     # Phase 1: Download to cache (sequential to avoid overloading S3/bandwidth)
     print("--- Phase 1: Downloading source files to cache ---")
-    for mgrs, date in product(MGRS_TILES, DATES):
-        date_flat = date.replace("/", "-")
-        date_cache_dir = os.path.join(CACHE_DIR, date_flat)
-        os.makedirs(date_cache_dir, exist_ok=True)
-        
+    unique_dates = set()
+    for date_list in DATES:
+        for d in date_list:
+            unique_dates.add(d)
+
+    for mgrs, date in product(MGRS_TILES, unique_dates):
         print(f"Checking/Downloading {mgrs} for {date}...")
         cmd = [
             "python3", "satmaps.py", mgrs,
             "--date", date,
-            "--cache", date_cache_dir,
+            "--cache", CACHE_DIR,
             "--download-only"
         ]
         try:
@@ -66,16 +68,19 @@ def main() -> None:
 
     # Phase 2: Generation (Parallel)
     tasks = []
-    for mgrs, date, fmt, quality, resample, exponent in product(MGRS_TILES, DATES, FORMATS, QUALITIES, RESAMPLING, EXPONENTS):
-        date_flat = date.replace("/", "-")
-        date_cache_dir = os.path.join(CACHE_DIR, date_flat)
+    for mgrs, date_list, fmt, quality, resample, exponent in product(MGRS_TILES, DATES, FORMATS, QUALITIES, RESAMPLING, EXPONENTS):
+        if len(date_list) == 1:
+            date_flat = date_list[0].replace("/", "-")
+        else:
+            date_flat = "combined_" + "_".join([d.replace("/", "-") for d in date_list])
+            
         output_name = f"{mgrs}_{date_flat}_{fmt}_q{quality}_{resample}_e{exponent}.pmtiles"
         output_path = os.path.join(OUTPUT_DIR, output_name)
         
         if os.path.exists(output_path):
             continue
             
-        tasks.append((mgrs, date, fmt, quality, resample, exponent, date_cache_dir, output_path))
+        tasks.append((mgrs, date_list, fmt, quality, resample, exponent, CACHE_DIR, output_path))
 
     total_tasks = len(tasks)
     print(f"\n--- Phase 2: Generating {total_tasks} combinations (using {MAX_WORKERS} workers) ---")
