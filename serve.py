@@ -9,37 +9,32 @@ PORT = 8000
 
 def get_config():
     """Extract configuration constants from generate_combinations.py."""
-    config = {}
+    config = {
+        "mgrs_tiles": ["31TDF"],
+        "dates": ["2025/07/01"],
+        "formats": ["webp"],
+        "qualities": [75],
+        "resampling": ["bilinear"],
+        "exponents": [0.6]
+    }
     try:
+        if not os.path.exists("generate_combinations.py"):
+            return config
+
         with open("generate_combinations.py", "r") as f:
-            content = f.read()
+            tree = ast.parse(f.read())
             
-            # Simple regex to extract list constants
-            patterns = {
-                "mgrs_tiles": r"MGRS_TILES\s*=\s*(\[.*?\])",
-                "dates": r"DATES\s*=\s*(\[.*?\])",
-                "formats": r"FORMATS\s*=\s*(\[.*?\])",
-                "qualities": r"QUALITIES\s*=\s*(\[.*?\])",
-                "resampling": r"RESAMPLING\s*=\s*(\[.*?\])",
-                "exponents": r"EXPONENTS\s*=\s*(\[.*?\])"
-            }
-            
-            for key, pattern in patterns.items():
-                match = re.search(pattern, content, re.DOTALL)
-                if match:
-                    # Use literal_eval safely for python list literals
-                    config[key] = ast.literal_eval(match.group(1))
+        target_keys = set(config.keys())
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id.lower() in target_keys:
+                        try:
+                            config[target.id.lower()] = ast.literal_eval(node.value)
+                        except (ValueError, TypeError, SyntaxError):
+                            pass
     except Exception as e:
         print(f"Error reading config: {e}")
-        # Fallback defaults
-        config = {
-            "mgrs_tiles": ["31TDF"],
-            "dates": ["2025/07/01"],
-            "formats": ["webp"],
-            "qualities": [75],
-            "resampling": ["bilinear"],
-            "exponents": [0.6]
-        }
     return config
 
 class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):

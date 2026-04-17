@@ -248,8 +248,19 @@
                 const dateSelect = document.getElementById(`date${idx}`);
                 config.dates.forEach(date => {
                     const opt = document.createElement("option");
-                    opt.value = date.replace(/\//g, "-"); // File naming uses '-'
-                    opt.innerText = date;
+                    if (Array.isArray(date)) {
+                        if (date.length === 1) {
+                            opt.value = date[0].replace(/\//g, "-");
+                            opt.innerText = date[0];
+                        } else {
+                            opt.value = "combined_" + date.map(d => d.replace(/\//g, "-")).join("_");
+                            opt.innerText = "Combined: " + date.join(", ");
+                        }
+                    } else {
+                        // Fallback for single string
+                        opt.value = date.replace(/\//g, "-");
+                        opt.innerText = date;
+                    }
                     dateSelect.appendChild(opt);
                 });
 

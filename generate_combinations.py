@@ -4,12 +4,15 @@ from itertools import product
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Configuration
-MGRS_TILES = ["50HQJ", "49QGF", "45RVL", "12SUD", "40RCN", "28QCH"]
+#MGRS_TILES = ["50HQJ", "49QGF", "45RVL", "12SUD", "40RCN", "28QCH"]
+MGRS_TILES = ["28QCH"]
 DATES = [["2025/07/01"], ["2025/01/01"], ["2025/07/01", "2025/01/01"]]
 FORMATS = ["webp"]
 QUALITIES = [74]
 RESAMPLING = ["lanczos"]
 EXPONENTS = [0.75]
+SRC_MIN = 0
+SRC_MAX = 6000
 MIN_ZOOM = 0
 MAX_ZOOM = 14
 BLOCKSIZE = 512
@@ -28,6 +31,8 @@ def run_satmaps(mgrs: str, dates: list, fmt: str, quality: int, resample: str, e
         "--quality", str(quality),
         "--resample-alg", resample,
         "--exponent", str(exponent),
+        "--stats-min", str(SRC_MIN),
+        "--stats-max", str(SRC_MAX),
         "--minzoom", str(MIN_ZOOM),
         "--maxzoom", str(MAX_ZOOM),
         "--blocksize", str(BLOCKSIZE),

@@ -85,9 +85,33 @@ def create_rgb_vrt(paths: Dict[str, str], output_vrt: str) -> None:
     band_list = [paths['red'], paths['green'], paths['blue']]
     gdal.BuildVRT(output_vrt, band_list, separate=True)
 
+def merge_vrts(output_vrt: str, input_vrts: List[str]) -> None:
+    # First build a standard VRT
+    gdal.BuildVRT(output_vrt, input_vrts)
+
+    # Now modify it to use a pixel function by editing the XML
+    with open(output_vrt, 'r') as f:
+        xml = f.read()
+
+    # We want average of non-nodata pixels.
+    # We'll use the 'expression' pixel function which is available in GDAL 3.11.
+    # Formula for N bands: ( (B1 != 0) + ... + (BN != 0) > 0 ) ? ( (B1 != 0 ? B1 : 0) + ... + (BN != 0 ? BN : 0) ) / ( (B1 != 0) + ... + (BN != 0) ) : 0
+    # Note: 0 is used as NoData value for Sentinel-2 mosaics in this project.
+    
+    num_bands = len(input_vrts)
+    counts = " + ".join([f"(B{i+1} != 0)" for i in range(num_bands)])
+    sums = " + ".join([f"(B{i+1} != 0 ? B{i+1} : 0)" for i in range(num_bands)])
+    expr = f"( ({counts}) > 0 ) ? ( ({sums}) ) / ({counts}) : 0"
+
+    xml = xml.replace('<VRTRasterBand', '<VRTRasterBand subClass="VRTDerivedRasterBand"')
+    xml = xml.replace('</VRTRasterBand>', f'    <PixelFunctionType>expression</PixelFunctionType>\n    <PixelFunctionArguments expression="{expr}" />\n    <NoDataValue>0</NoDataValue>\n  </VRTRasterBand>')
+
+    with open(output_vrt, 'w') as f:
+        f.write(xml)
+
 def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional[str] = None, cache_dir: Optional[str] = None) -> List[str]:
     q = get_quarter(date_path)
-    
+
     if mgrs_filter:
         # User requested optimization: skip remote check if MGRS_0_0 exists locally
         if cache_dir:
@@ -103,7 +127,7 @@ def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional
         potential_folders = []
         for x, y in [(0,0), (1,0), (0,1), (1,1)]:
             potential_folders.append(f"Sentinel-2_mosaic_2025_{q}_{mgrs_filter}_{x}_{y}")
-        
+
         found_folders = []
         for folder in potential_folders:
             # Check if B04.tif exists as a proxy for folder existence
@@ -113,12 +137,12 @@ def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional
             result = subprocess.run(cmd, capture_output=True)
             if result.returncode == 0:
                 found_folders.append(folder)
-        
+
         if not found_folders:
             raise RuntimeError(f"Error: No folders found for MGRS {mgrs_filter} at {date_path}")
-            
+
         return sorted(found_folders)
-    
+
     # Global mode still needs the full list
     s3_prefix = f"s3://eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/"
     cmd = ["aws", "--endpoint-url", "https://eodata.dataspace.copernicus.eu", "--profile", "cdse", "s3", "ls", s3_prefix]
@@ -130,7 +154,7 @@ def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional
             folder = line.strip().split("PRE ")[1].strip()
             if folder.endswith('/'): folder = folder[:-1]
             folders.append(folder)
-                
+
     return sorted(folders)
 
 def get_percentiles(ds: gdal.Dataset, low: float = 2.0, high: float = 98.0, shared: bool = True) -> List[List[float]]:
@@ -141,20 +165,21 @@ def get_percentiles(ds: gdal.Dataset, low: float = 2.0, high: float = 98.0, shar
     band_stats = []
     for i in range(1, ds.RasterCount + 1):
         band = ds.GetRasterBand(i)
-        hist = band.GetHistogram(min=0.0, max=10000.0, buckets=1000, approx_ok=True)
+        # Summed values can exceed 10000, so we increase the histogram range
+        hist = band.GetHistogram(min=0.0, max=40000.0, buckets=4000, approx_ok=True)
         total = sum(hist)
-        
+
         if total == 0:
             band_stats.append((0.0, 4000.0))
             continue
-            
+
         low_threshold = total * (low / 100.0)
         high_threshold = total * (high / 100.0)
-        
+
         accum = 0
         l_val = 0.0
         h_val = 4000.0
-        
+
         for idx, count in enumerate(hist):
             accum += count
             if l_val == 0.0 and accum >= low_threshold:
@@ -168,8 +193,9 @@ def get_percentiles(ds: gdal.Dataset, low: float = 2.0, high: float = 98.0, shar
         # Use the global min (lowest of lows) and global max (highest of highs)
         global_low = min(s[0] for s in band_stats)
         global_high = max(s[1] for s in band_stats)
+        print('min/max values', global_low, global_high)
         return [[global_low, global_high, 0, 255]] * ds.RasterCount
-    
+
     return [[s[0], s[1], 0, 255] for s in band_stats]
 
 def main():
@@ -182,6 +208,8 @@ def main():
     parser.add_argument("--quality", type=int, default=74, help="WebP/JPEG quality")
     parser.add_argument("--resample-alg", default="lanczos", choices=["bilinear", "average", "gauss", "lanczos"], help="Downsampling method")
     parser.add_argument("--exponent", type=float, default=0.75, help="Exponent for power law scaling")
+    parser.add_argument("--stats-min", type=float, help="Hardcoded source minimum value for scaling (bypasses band stats)")
+    parser.add_argument("--stats-max", type=float, help="Hardcoded source maximum value for scaling (bypasses band stats)")
     parser.add_argument("--blocksize", type=int, default=512, help="MBTiles block size")
     parser.add_argument("--minzoom", type=int, default=0)
     parser.add_argument("--maxzoom", type=int, default=14)
@@ -225,11 +253,11 @@ def main():
         for date in dates:
             date_tile_vrts = []
             date_cache = os.path.join(args.cache, date.replace("/", "-")) if args.cache else None
-            
+
             if args.all_tiles:
                 print(f"Listing all folders for global mosaic ({date})...")
                 all_folders = list_all_mosaic_folders(date, cache_dir=date_cache)
-                
+
                 if land_tiles:
                     # Filter folders by land tiles
                     # Sentinel-2_mosaic_2025_Q3_31TDF_0_0 -> 31TDF
@@ -294,7 +322,7 @@ def main():
                     try:
                         paths = get_tile_paths(None, date, date_cache, folder_name=folder)
                         if args.download_only: continue
-                        
+
                         tile_vrt = f"tile_{folder}_{unique_id}.vrt"
                         create_rgb_vrt(paths, tile_vrt)
                         date_tile_vrts.append(tile_vrt)
@@ -304,7 +332,7 @@ def main():
 
                 if args.download_only:
                     continue
-                
+
                 if date_tile_vrts:
                     date_vrt = f"date_{date.replace('/', '-')}_{unique_id}.vrt"
                     gdal.BuildVRT(date_vrt, date_tile_vrts)
@@ -319,7 +347,11 @@ def main():
             sys.exit(1)
 
         print("Building master VRT from all dates...")
-        gdal.BuildVRT(temp_vrt, all_date_vrts)
+        if len(all_date_vrts) > 1:
+            merge_vrts(temp_vrt, all_date_vrts)
+        else:
+            gdal.BuildVRT(temp_vrt, all_date_vrts)
+
         # Add all_date_vrts to cleanup list
         tile_vrts.extend(all_date_vrts)
 
@@ -333,7 +365,7 @@ def main():
         gdal.Warp(temp_warped_vrt, temp_vrt, options=warp_options)
 
         print(f"Step 2: Generating MBTiles ({args.format}) with zoom {args.minzoom}-{args.maxzoom}...")
-        
+
         tile_format = args.format.upper()
         if tile_format == "JPG":
             tile_format = "JPEG"
@@ -345,21 +377,18 @@ def main():
         if args.resample_alg == "gauss":
             translate_resample = "bilinear"
 
-        # Calculate percentiles (2nd and 98th) for dynamic scaling
-        ds_for_stats = gdal.Open(temp_warped_vrt)
-        # Use shared=True to preserve color balance (fix "strange colors")
-        scale_params = get_percentiles(ds_for_stats, shared=True)
-        ds_for_stats = None
-
-        # Adjust scaleParams if multiple dates are used to avoid "washed out" look
-        # This effectively divides the summed values by the number of dates
-        if num_dates > 1:
-            print(f"Adjusting scaleParams for {num_dates} dates to avoid washed-out colors...")
-            for i in range(len(scale_params)):
-                # scale_params[i] is [low, high, 0, 255]
-                # We want to divide the input by num_dates, which means multiplying the input thresholds by num_dates
-                scale_params[i][0] *= num_dates
-                scale_params[i][1] *= num_dates
+        # Calculate or use hardcoded scaling parameters
+        if args.stats_min is not None and args.stats_max is not None:
+            print(f"Using hardcoded scaling: {args.stats_min} to {args.stats_max}")
+            ds_temp = gdal.Open(temp_warped_vrt)
+            scale_params = [[args.stats_min, args.stats_max, 0, 255]] * ds_temp.RasterCount
+            ds_temp = None
+        else:
+            # Calculate percentiles (2nd and 98th) for dynamic scaling
+            ds_for_stats = gdal.Open(temp_warped_vrt)
+            # Use shared=True to preserve color balance (fix "strange colors")
+            scale_params = get_percentiles(ds_for_stats, shared=True)
+            ds_for_stats = None
 
         # Exponent 0 means "don't apply"
         exponents = [args.exponent, args.exponent, args.exponent] if args.exponent != 0 else None
