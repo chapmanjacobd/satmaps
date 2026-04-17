@@ -3,15 +3,13 @@ import subprocess
 from itertools import product
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-#MGRS_TILES = ["50HQJ", "49QGF", "45RVL", "12SUD", "40RCN", "28QCH"]
-MGRS_TILES = ["49QGF"]
-DATES = [["2025/07/01"], ["2025/07/01", "2025/01/01"]]
+MGRS_TILES = ["45RVL", "28QCH"]
+DATES = [["2025/07/01", "2025/01/01"]]
 FORMATS = ["webp"]
 QUALITIES = [74]
 RESAMPLING = ["lanczos"]
-EXPONENTS = [0.6]
-SRC_MIN = 0
-SRC_MAX = 5000
+EXPONENTS = [0.1, 0.25, 0.5]
+SCALING_RANGES = [(0, 10000), (0, 13000), (0, 16000)]
 MIN_ZOOM = 0
 MAX_ZOOM = 14
 BLOCKSIZE = 512
@@ -20,7 +18,7 @@ OUTPUT_DIR = "combinations_output"
 CACHE_DIR = "cache"
 MAX_WORKERS = min(8, os.cpu_count())
 
-def run_satmaps(mgrs: str, dates: list, fmt: str, quality: int, resample: str, exponent: float, cache_dir: str, output_path: str) -> bool:
+def run_satmaps(mgrs: str, dates: list, fmt: str, quality: int, resample: str, exponent: float, src_min: int, src_max: int, cache_dir: str, output_path: str) -> bool:
     """Helper to run a single satmaps generation command."""
     date_arg = ",".join(dates)
     cmd = [
@@ -30,8 +28,8 @@ def run_satmaps(mgrs: str, dates: list, fmt: str, quality: int, resample: str, e
         "--quality", str(quality),
         "--resample-alg", resample,
         "--exponent", str(exponent),
-        "--stats-min", str(SRC_MIN),
-        "--stats-max", str(SRC_MAX),
+        "--stats-min", str(src_min),
+        "--stats-max", str(src_max),
         "--minzoom", str(MIN_ZOOM),
         "--maxzoom", str(MAX_ZOOM),
         "--blocksize", str(BLOCKSIZE),
@@ -72,19 +70,19 @@ def main() -> None:
 
     # Phase 2: Generation (Parallel)
     tasks = []
-    for mgrs, date_list, fmt, quality, resample, exponent in product(MGRS_TILES, DATES, FORMATS, QUALITIES, RESAMPLING, EXPONENTS):
+    for mgrs, date_list, fmt, quality, resample, exponent, (src_min, src_max) in product(MGRS_TILES, DATES, FORMATS, QUALITIES, RESAMPLING, EXPONENTS, SCALING_RANGES):
         if len(date_list) == 1:
             date_flat = date_list[0].replace("/", "-")
         else:
             date_flat = "combined_" + "_".join([d.replace("/", "-") for d in date_list])
             
-        output_name = f"{mgrs}_{date_flat}_{fmt}_q{quality}_{resample}_e{exponent}.pmtiles"
+        output_name = f"{mgrs}_{date_flat}_{fmt}_q{quality}_{resample}_e{exponent}_s{src_min}-{src_max}.pmtiles"
         output_path = os.path.join(OUTPUT_DIR, output_name)
         
         if os.path.exists(output_path):
             continue
             
-        tasks.append((mgrs, date_list, fmt, quality, resample, exponent, CACHE_DIR, output_path))
+        tasks.append((mgrs, date_list, fmt, quality, resample, exponent, src_min, src_max, CACHE_DIR, output_path))
 
     total_tasks = len(tasks)
     print(f"\n--- Phase 2: Generating {total_tasks} combinations (using {MAX_WORKERS} workers) ---")

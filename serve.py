@@ -15,7 +15,8 @@ def get_config():
         "formats": ["webp"],
         "qualities": [75],
         "resampling": ["bilinear"],
-        "exponents": [0.6]
+        "exponents": [0.6],
+        "scaling_ranges": [[0, 5000]]
     }
     try:
         if not os.path.exists("generate_combinations.py"):

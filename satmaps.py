@@ -84,18 +84,18 @@ def create_rgb_vrt(paths: Dict[str, str], output_vrt: str) -> None:
     """Create a virtual RGB stack from individual band paths."""
     # Stack bands in order: Red (B04), Green (B03), Blue (B02)
     band_list = [paths['red'], paths['green'], paths['blue']]
-    gdal.BuildVRT(output_vrt, band_list, separate=True)
+    gdal.BuildVRT(output_vrt, band_list, separate=True, srcNodata=-32768, VRTNodata=-32768)
 
 def merge_vrts(output_vrt: str, input_vrts: List[str]) -> None:
     # First build a standard VRT
-    gdal.BuildVRT(output_vrt, input_vrts)
+    gdal.BuildVRT(output_vrt, input_vrts, srcNodata=-32768, VRTNodata=-32768)
 
     # Now modify it to use a pixel function by editing the XML
     tree = ET.parse(output_vrt)
     root = tree.getroot()
 
-    # Sentinel-2 mosaics in this project use 0 as NoData
-    nodata_val = "0"
+    # Sentinel-2 mosaics in this project use -32768 as NoData
+    nodata_val = "-32768"
     num_bands = len(input_vrts)
     counts = " + ".join([f"(B{i+1} != {nodata_val})" for i in range(num_bands)])
     sums = " + ".join([f"(B{i+1} != {nodata_val} ? B{i+1} : 0)" for i in range(num_bands)])
@@ -121,7 +121,7 @@ def run_warp(input_vrt: str, output_vrt: str) -> None:
         format="VRT",
         dstSRS="EPSG:3857",
         resampleAlg="cubic",
-        callback=gdal.TermProgress_nocb, srcNodata=0, dstNodata=0)
+        callback=gdal.TermProgress_nocb, srcNodata=-32768, dstNodata=0)
     gdal.Warp(output_vrt, input_vrt, options=warp_options)
 
 def run_translate(input_vrt: str, output_file: str, format: str, scale_params: List[List[float]], exponents: Optional[List[float]], resample_alg: str, options: Dict[str, str]) -> None:
@@ -141,6 +141,7 @@ def run_translate(input_vrt: str, output_file: str, format: str, scale_params: L
         outputType=gdal.GDT_Byte,
         scaleParams=scale_params,
         exponents=exponents,
+        noData=0,
         callback=gdal.TermProgress_nocb,
         metadataOptions=[
             f"format={tile_format.lower()}",
@@ -157,7 +158,7 @@ def run_translate(input_vrt: str, output_file: str, format: str, scale_params: L
             f"MAXZOOM={options['maxzoom']}",
             f"RESAMPLING={resample_alg}",
             f"BLOCKSIZE={options['blocksize']}",
-            "ZOOM_LEVEL_STRATEGY=LOWER"
+            "ZOOM_LEVEL_STRATEGY=UPPER"
         ]
     )
     
@@ -349,7 +350,7 @@ def main():
 
                     if chunk_tile_vrts:
                         print(f"Building Group VRT {chunk_vrt_name}...")
-                        gdal.BuildVRT(chunk_vrt_name, chunk_tile_vrts)
+                        gdal.BuildVRT(chunk_vrt_name, chunk_tile_vrts, srcNodata=-32768, VRTNodata=-32768)
                         group_vrts.append(chunk_vrt_name)
 
                 if args.download_only:
@@ -358,7 +359,7 @@ def main():
                 if group_vrts:
                     date_vrt = f"date_{date.replace('/', '-')}_{unique_id}.vrt"
                     print(f"Building date VRT {date_vrt} from groups...")
-                    gdal.BuildVRT(date_vrt, group_vrts)
+                    gdal.BuildVRT(date_vrt, group_vrts, srcNodata=-32768, VRTNodata=-32768)
                     all_date_vrts.append(date_vrt)
                     # Clean up group VRTs
                     for f in group_vrts:
@@ -388,7 +389,7 @@ def main():
 
                 if date_tile_vrts:
                     date_vrt = f"date_{date.replace('/', '-')}_{unique_id}.vrt"
-                    gdal.BuildVRT(date_vrt, date_tile_vrts)
+                    gdal.BuildVRT(date_vrt, date_tile_vrts, srcNodata=-32768, VRTNodata=-32768)
                     all_date_vrts.append(date_vrt)
 
         if args.download_only:
@@ -403,7 +404,7 @@ def main():
         if len(all_date_vrts) > 1:
             merge_vrts(temp_vrt, all_date_vrts)
         else:
-            gdal.BuildVRT(temp_vrt, all_date_vrts)
+            gdal.BuildVRT(temp_vrt, all_date_vrts, srcNodata=-32768, VRTNodata=-32768)
 
         # Add all_date_vrts to cleanup list
         tile_vrts.extend(all_date_vrts)

@@ -17,6 +17,22 @@
         .controls { position: absolute; top: 10px; left: 10px; z-index: 1; background: rgba(30,30,30,0.8); color: #fff; padding: 10px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.5); font-size: 13px; }
         select { background: #333; color: #fff; border: 1px solid #555; margin-left: 5px; }
         
+        .zoom-shortcuts { display: inline-flex; gap: 5px; align-items: center; margin-left: 5px; }
+        .zoom-link {
+            display: inline-block;
+            padding: 2px 8px;
+            background: #333;
+            color: #ccc;
+            text-decoration: none;
+            border-radius: 3px;
+            font-size: 12px;
+            cursor: pointer;
+            border: 1px solid #444;
+            transition: all 0.2s;
+        }
+        .zoom-link:hover { background: #444; color: #fff; border-color: #666; }
+        .zoom-link.active { background: #007bff; color: #fff; border-color: #0056b3; font-weight: bold; }
+        
         .sync-label { font-weight: bold; display: flex; align-items: center; }
         .sync-label input { margin-right: 5px; }
         
@@ -39,12 +55,9 @@
         </div>
         <div>
             <label>Zoom Level:</label>
-            <select id="global-zoom">
-                <!-- Populated 0-14 -->
-            </select>
-        </div>
-        <div style="flex: 1; text-align: right; padding-right: 20px; font-size: 12px; color: #888;">
-            Make sure <code>python3 serve.py</code> is running!
+            <div id="global-zoom" class="zoom-shortcuts">
+                <!-- Links added dynamically -->
+            </div>
         </div>
     </div>
     
@@ -59,6 +72,7 @@
                 Quality: <select id="quality1"><!-- Populated --></select><br>
                 Resample: <select id="resample1"><!-- Populated --></select><br>
                 Exponent: <select id="exponent1"><!-- Populated --></select><br>
+                Scaling: <select id="scaling1"><!-- Populated --></select><br>
                 <div id="file1-info" class="file-info"></div>
             </div>
         </div>
@@ -73,6 +87,7 @@
                 Quality: <select id="quality2"><!-- Populated --></select><br>
                 Resample: <select id="resample2"><!-- Populated --></select><br>
                 Exponent: <select id="exponent2"><!-- Populated --></select><br>
+                Scaling: <select id="scaling2"><!-- Populated --></select><br>
                 <div id="file2-info" class="file-info"></div>
             </div>
         </div>
@@ -137,8 +152,8 @@
         maps.push(initMap("map1"));
         maps.push(initMap("map2"));
         
-        function buildFilename(mgrs, date, format, quality, resample, exponent) {
-            return `combinations_output/${mgrs}_${date}_${format}_q${quality}_${resample}_e${exponent}.pmtiles`;
+        function buildFilename(mgrs, date, format, quality, resample, exponent, scaling) {
+            return `combinations_output/${mgrs}_${date}_${format}_q${quality}_${resample}_e${exponent}_s${scaling.replace(",", "-")}.pmtiles`;
         }
         
         function updateMap(index, triggerFit = false) {
@@ -148,8 +163,9 @@
             const quality = document.getElementById(`quality${index}`).value;
             const resample = document.getElementById(`resample${index}`).value;
             const exponent = document.getElementById(`exponent${index}`).value;
+            const scaling = document.getElementById(`scaling${index}`).value;
             
-            const filename = buildFilename(mgrs, date, format, quality, resample, exponent);
+            const filename = buildFilename(mgrs, date, format, quality, resample, exponent, scaling);
             const absoluteUrl = new URL(filename, window.location.href).href;
             
             console.log(`Updating Map ${index} with URL: ${absoluteUrl}`);
@@ -163,6 +179,18 @@
                 const p = new pmtiles.PMTiles(absoluteUrl);
                 p.getHeader().then(header => {
                     console.log(`Successfully loaded header for Map ${index}`, header);
+                    
+                    if (index === 1) {
+                        updateZoomLinks(header.minZoom, header.maxZoom);
+                    }
+                    
+                    // Preserve and clamp zoom
+                    const currentZoom = map.getZoom();
+                    if (currentZoom < header.minZoom) {
+                        map.setZoom(header.minZoom);
+                    } else if (currentZoom > header.maxZoom) {
+                        map.setZoom(header.maxZoom);
+                    }
                     
                     // Fit bounds if it's the first time or if requested
                     if ((!initialLoadDone && index === 1) || triggerFit) {
@@ -201,14 +229,34 @@
                 });
             }
 
-            // Update zoom dropdown
-            const currentZoom = Math.round(changedMap.getZoom());
-            const zoomSelect = document.getElementById("global-zoom");
-            if (zoomSelect.value != currentZoom) {
-                zoomSelect.value = currentZoom;
-            }
+            // Update zoom highlights
+            highlightZoom(Math.round(changedMap.getZoom()));
             
             isSyncing = false;
+        }
+
+        function updateZoomLinks(minZoom, maxZoom) {
+            const container = document.getElementById("global-zoom");
+            container.innerHTML = "";
+            for (let z = minZoom; z <= maxZoom; z++) {
+                const link = document.createElement("a");
+                link.className = "zoom-link";
+                link.innerText = z;
+                link.id = `zoom-${z}`;
+                link.onclick = (e) => {
+                    e.preventDefault();
+                    maps[0].setZoom(z);
+                    highlightZoom(z);
+                };
+                container.appendChild(link);
+            }
+            highlightZoom(Math.round(maps[0].getZoom()));
+        }
+
+        function highlightZoom(zoom) {
+            document.querySelectorAll(".zoom-link").forEach(link => {
+                link.classList.toggle("active", parseInt(link.innerText) === zoom);
+            });
         }
         
         maps.forEach(map => {
@@ -221,12 +269,6 @@
             updateMap(2, true); 
         });
 
-        document.getElementById("global-zoom").addEventListener("change", (e) => {
-            const z = parseInt(e.target.value);
-            maps[0].setZoom(z);
-            // syncMaps will handle updating the other map if sync is on
-        });
-        
         function setupDropdowns(config) {
             const mgrsSelect = document.getElementById("global-mgrs");
             config.mgrs_tiles.forEach(mgrs => {
@@ -234,15 +276,6 @@
                 opt.value = opt.innerText = mgrs;
                 mgrsSelect.appendChild(opt);
             });
-
-            // Populate Zoom Dropdown 0-14
-            const zoomSelect = document.getElementById("global-zoom");
-            for (let z = 0; z <= 14; z++) {
-                const opt = document.createElement("option");
-                opt.value = opt.innerText = z;
-                zoomSelect.appendChild(opt);
-            }
-            zoomSelect.value = 1;
 
             ['1', '2'].forEach(idx => {
                 const dateSelect = document.getElementById(`date${idx}`);
@@ -294,7 +327,15 @@
                     exponentSelect.appendChild(opt);
                 });
 
-                ['date', 'format', 'quality', 'resample', 'exponent'].forEach(prop => {
+                const scalingSelect = document.getElementById(`scaling${idx}`);
+                config.scaling_ranges.forEach(s => {
+                    const opt = document.createElement("option");
+                    opt.value = s.join(",");
+                    opt.innerText = `${s[0]} - ${s[1]}`;
+                    scalingSelect.appendChild(opt);
+                });
+
+                ['date', 'format', 'quality', 'resample', 'exponent', 'scaling'].forEach(prop => {
                     document.getElementById(`${prop}${idx}`).addEventListener("change", () => updateMap(idx));
                 });
             });
