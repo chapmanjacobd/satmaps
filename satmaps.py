@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import uuid
+import xml.etree.ElementTree as ET
 from osgeo import gdal
 
 from typing import Dict, List, Optional
@@ -90,24 +91,80 @@ def merge_vrts(output_vrt: str, input_vrts: List[str]) -> None:
     gdal.BuildVRT(output_vrt, input_vrts)
 
     # Now modify it to use a pixel function by editing the XML
-    with open(output_vrt, 'r') as f:
-        xml = f.read()
+    tree = ET.parse(output_vrt)
+    root = tree.getroot()
 
-    # We want average of non-nodata pixels.
-    # We'll use the 'expression' pixel function which is available in GDAL 3.11.
-    # Formula for N bands: ( (B1 != 0) + ... + (BN != 0) > 0 ) ? ( (B1 != 0 ? B1 : 0) + ... + (BN != 0 ? BN : 0) ) / ( (B1 != 0) + ... + (BN != 0) ) : 0
-    # Note: 0 is used as NoData value for Sentinel-2 mosaics in this project.
-    
+    # Sentinel-2 mosaics in this project use 0 as NoData
+    nodata_val = "0"
     num_bands = len(input_vrts)
-    counts = " + ".join([f"(B{i+1} != 0)" for i in range(num_bands)])
-    sums = " + ".join([f"(B{i+1} != 0 ? B{i+1} : 0)" for i in range(num_bands)])
-    expr = f"( ({counts}) > 0 ) ? ( ({sums}) ) / ({counts}) : 0"
+    counts = " + ".join([f"(B{i+1} != {nodata_val})" for i in range(num_bands)])
+    sums = " + ".join([f"(B{i+1} != {nodata_val} ? B{i+1} : 0)" for i in range(num_bands)])
+    expr = f"( ({counts}) > 0 ) ? ( ({sums}) ) / ({counts}) : {nodata_val}"
 
-    xml = xml.replace('<VRTRasterBand', '<VRTRasterBand subClass="VRTDerivedRasterBand"')
-    xml = xml.replace('</VRTRasterBand>', f'    <PixelFunctionType>expression</PixelFunctionType>\n    <PixelFunctionArguments expression="{expr}" />\n    <NoDataValue>0</NoDataValue>\n  </VRTRasterBand>')
+    for band in root.findall("VRTRasterBand"):
+        band.set("subClass", "VRTDerivedRasterBand")
+        
+        pix_func = ET.SubElement(band, "PixelFunctionType")
+        pix_func.text = "expression"
+        
+        pix_args = ET.SubElement(band, "PixelFunctionArguments")
+        pix_args.set("expression", expr)
+        
+        nodata = ET.SubElement(band, "NoDataValue")
+        nodata.text = nodata_val
 
-    with open(output_vrt, 'w') as f:
-        f.write(xml)
+    tree.write(output_vrt, encoding="UTF-8", xml_declaration=True)
+
+def run_warp(input_vrt: str, output_vrt: str) -> None:
+    """Reproject to Web Mercator using GDAL Warp."""
+    warp_options = gdal.WarpOptions(
+        format="VRT",
+        dstSRS="EPSG:3857",
+        resampleAlg="cubic",
+        callback=gdal.TermProgress_nocb, srcNodata=0, dstNodata=0)
+    gdal.Warp(output_vrt, input_vrt, options=warp_options)
+
+def run_translate(input_vrt: str, output_file: str, format: str, scale_params: List[List[float]], exponents: Optional[List[float]], resample_alg: str, options: Dict[str, str]) -> None:
+    """Convert to final format (MBTiles/PMTiles) using GDAL Translate."""
+    tile_format = format.upper()
+    if tile_format == "JPG":
+        tile_format = "JPEG"
+    if tile_format == "PNG8":
+        tile_format = "PNG"
+
+    # Handle resampling for Translate: gauss is not supported there
+    if resample_alg == "gauss":
+        resample_alg = "bilinear"
+
+    translate_options = gdal.TranslateOptions(
+        format="MBTiles",
+        outputType=gdal.GDT_Byte,
+        scaleParams=scale_params,
+        exponents=exponents,
+        callback=gdal.TermProgress_nocb,
+        metadataOptions=[
+            f"format={tile_format.lower()}",
+            f"name={options['name']}",
+            f"description={options['description']}"
+        ],
+        creationOptions=[
+            f"NAME={options['name']}",
+            f"DESCRIPTION={options['description']}",
+            "TYPE=baselayer",
+            f"TILE_FORMAT={tile_format}",
+            f"QUALITY={options['quality']}",
+            f"MINZOOM={options['minzoom']}",
+            f"MAXZOOM={options['maxzoom']}",
+            f"RESAMPLING={resample_alg}",
+            f"BLOCKSIZE={options['blocksize']}",
+            "ZOOM_LEVEL_STRATEGY=LOWER"
+        ]
+    )
+    
+    if format == "webp":
+        gdal.SetConfigOption('WEBP_LEVEL', str(options['quality']))
+
+    gdal.Translate(output_file, input_vrt, options=translate_options)
 
 def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional[str] = None, cache_dir: Optional[str] = None) -> List[str]:
     q = get_quarter(date_path)
@@ -222,7 +279,6 @@ def main():
     setup_gdal_cdse()
 
     dates = [d.strip() for d in args.date.split(",")]
-    num_dates = len(dates)
 
     # Load land tiles if provided
     land_tiles = None
@@ -243,9 +299,6 @@ def main():
     temp_vrt = f"temp_{unique_id}.vrt"
     temp_mbtiles = f"temp_{unique_id}.mbtiles"
     temp_warped_vrt = f"temp_warped_{unique_id}.vrt"
-
-    # Use cubic for reprojection as it's better for that step, regardless of the downsampling algorithm chosen
-    warp_resample = "cubic"
 
     tile_vrts = []
     try:
@@ -356,26 +409,9 @@ def main():
         tile_vrts.extend(all_date_vrts)
 
         print("Step 1: Reprojecting to Web Mercator (VRT)...")
-        warp_options = gdal.WarpOptions(
-            format="VRT",
-            dstSRS="EPSG:3857",
-            resampleAlg=warp_resample,
-            callback=gdal.TermProgress_nocb
-        )
-        gdal.Warp(temp_warped_vrt, temp_vrt, options=warp_options)
+        run_warp(temp_vrt, temp_warped_vrt)
 
         print(f"Step 2: Generating MBTiles ({args.format}) with zoom {args.minzoom}-{args.maxzoom}...")
-
-        tile_format = args.format.upper()
-        if tile_format == "JPG":
-            tile_format = "JPEG"
-        if tile_format == "PNG8":
-            tile_format = "PNG"
-
-        # Handle resampling for Translate: gauss is not supported there
-        translate_resample = args.resample_alg
-        if args.resample_alg == "gauss":
-            translate_resample = "bilinear"
 
         # Calculate or use hardcoded scaling parameters
         if args.stats_min is not None and args.stats_max is not None:
@@ -393,35 +429,22 @@ def main():
         # Exponent 0 means "don't apply"
         exponents = [args.exponent, args.exponent, args.exponent] if args.exponent != 0 else None
 
-        translate_options = gdal.TranslateOptions(
-            format="MBTiles",
-            outputType=gdal.GDT_Byte,
-            scaleParams=scale_params,
-            exponents=exponents,
-            callback=gdal.TermProgress_nocb,
-            metadataOptions=[
-                f"format={tile_format.lower()}",
-                f"name={tileset_name}",
-                f"description={tileset_desc}"
-            ],
-            creationOptions=[
-                f"NAME={tileset_name}",
-                f"DESCRIPTION={tileset_desc}",
-                "TYPE=baselayer",
-                f"TILE_FORMAT={tile_format}",
-                f"QUALITY={args.quality}",
-                f"MINZOOM={args.minzoom}",
-                f"MAXZOOM={args.maxzoom}",
-                f"RESAMPLING={translate_resample}",
-                f"BLOCKSIZE={args.blocksize}",
-                "ZOOM_LEVEL_STRATEGY=LOWER"
-            ]
+        run_translate(
+            temp_warped_vrt,
+            temp_mbtiles,
+            args.format,
+            scale_params,
+            exponents,
+            args.resample_alg,
+            {
+                "name": tileset_name,
+                "description": tileset_desc,
+                "quality": args.quality,
+                "minzoom": args.minzoom,
+                "maxzoom": args.maxzoom,
+                "blocksize": args.blocksize
+            }
         )
-
-        if args.format == "webp":
-            gdal.SetConfigOption('WEBP_LEVEL', str(args.quality))
-
-        gdal.Translate(temp_mbtiles, temp_warped_vrt, options=translate_options)
 
         print("Step 2.5: Building overviews...")
         gdaladdo_cmd = [
