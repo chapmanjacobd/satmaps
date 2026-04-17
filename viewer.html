@@ -31,15 +31,7 @@
         <div>
             <label>MGRS Tile:</label>
             <select id="global-mgrs">
-                <option value="60HTB">60HTB</option>
-                <option value="07VEK">07VEK</option>
-                <option value="50HQJ">50HQJ</option>
-                <option value="49QGF">49QGF</option>
-                <option value="45RVL">45RVL</option>
-                <option value="32TQK">32TQK</option>
-                <option value="12SUD">12SUD</option>
-                <option value="40RCN">40RCN</option>
-                <option value="28QCH">28QCH</option>
+                <!-- Dynamically populated -->
             </select>
         </div>
         <div>
@@ -56,10 +48,11 @@
             <div id="map1" class="map"></div>
             <div class="controls">
                 <strong>Map 1</strong><br>
-                Date: <select id="date1"><option value="2025-07-01">2025-07-01</option><option value="2025-01-01">2025-01-01</option></select><br>
-                Format: <select id="format1"><option value="webp">webp</option><option value="jpg">jpg</option></select><br>
-                Quality: <select id="quality1"><option value="75">75</option><option value="85">85</option></select><br>
-                Resample: <select id="resample1"><option value="average">average</option><option value="bilinear">bilinear</option><option value="gauss">gauss</option><option value="lanczos">lanczos</option></select><br>
+                Date: <select id="date1"><!-- Populated --></select><br>
+                Format: <select id="format1"><!-- Populated --></select><br>
+                Quality: <select id="quality1"><!-- Populated --></select><br>
+                Resample: <select id="resample1"><!-- Populated --></select><br>
+                Exponent: <select id="exponent1"><!-- Populated --></select><br>
                 <div id="file1-info" class="file-info"></div>
             </div>
         </div>
@@ -69,10 +62,11 @@
             <div id="map2" class="map"></div>
             <div class="controls">
                 <strong>Map 2</strong><br>
-                Date: <select id="date2"><option value="2025-07-01">2025-07-01</option><option value="2025-01-01">2025-01-01</option></select><br>
-                Format: <select id="format2"><option value="webp">webp</option><option value="jpg">jpg</option></select><br>
-                Quality: <select id="quality2"><option value="75">75</option><option value="85">85</option></select><br>
-                Resample: <select id="resample2"><option value="average">average</option><option value="bilinear">bilinear</option><option value="gauss">gauss</option><option value="lanczos">lanczos</option></select><br>
+                Date: <select id="date2"><!-- Populated --></select><br>
+                Format: <select id="format2"><!-- Populated --></select><br>
+                Quality: <select id="quality2"><!-- Populated --></select><br>
+                Resample: <select id="resample2"><!-- Populated --></select><br>
+                Exponent: <select id="exponent2"><!-- Populated --></select><br>
                 <div id="file2-info" class="file-info"></div>
             </div>
         </div>
@@ -137,18 +131,19 @@
         maps.push(initMap("map1"));
         maps.push(initMap("map2"));
         
-        function buildFilename(mgrs, date, format, quality, resample) {
-            return `combinations_output/${mgrs}_${date}_${format}_q${quality}_${resample}.pmtiles`;
+        function buildFilename(mgrs, date, format, quality, resample, exponent) {
+            return `combinations_output/${mgrs}_${date}_${format}_q${quality}_${resample}_e${exponent}.pmtiles`;
         }
         
-        function updateMap(index) {
+        function updateMap(index, triggerFit = false) {
             const mgrs = document.getElementById("global-mgrs").value;
             const date = document.getElementById(`date${index}`).value;
             const format = document.getElementById(`format${index}`).value;
             const quality = document.getElementById(`quality${index}`).value;
             const resample = document.getElementById(`resample${index}`).value;
+            const exponent = document.getElementById(`exponent${index}`).value;
             
-            const filename = buildFilename(mgrs, date, format, quality, resample);
+            const filename = buildFilename(mgrs, date, format, quality, resample, exponent);
             const absoluteUrl = new URL(filename, window.location.href).href;
             
             console.log(`Updating Map ${index} with URL: ${absoluteUrl}`);
@@ -164,12 +159,13 @@
                     console.log(`Successfully loaded header for Map ${index}`, header);
                     
                     // Fit bounds if it's the first time or if requested
-                    if (!initialLoadDone && index === 1) {
+                    if ((!initialLoadDone && index === 1) || triggerFit) {
                         map.fitBounds([
                             [header.minLon, header.minLat],
                             [header.maxLon, header.maxLat]
-                        ], { padding: 50, duration: 1000 });
-                        initialLoadDone = true;
+                        ], { padding: 50, animate: !triggerFit ? true : false });
+                        
+                        if (!initialLoadDone && index === 1) initialLoadDone = true;
                     }
                 }).catch(e => {
                     console.error(`Error loading PMTiles header for Map ${index}:`, e);
@@ -207,17 +203,76 @@
         });
         
         // Listeners
-        document.getElementById("global-mgrs").addEventListener("change", () => { updateMap(1); updateMap(2); });
-        
-        ['1', '2'].forEach(idx => {
-            ['date', 'format', 'quality', 'resample'].forEach(prop => {
-                document.getElementById(`${prop}${idx}`).addEventListener("change", () => updateMap(idx));
-            });
+        document.getElementById("global-mgrs").addEventListener("change", () => { 
+            updateMap(1, true); 
+            updateMap(2, true); 
         });
         
+        function setupDropdowns(config) {
+            const mgrsSelect = document.getElementById("global-mgrs");
+            config.mgrs_tiles.forEach(mgrs => {
+                const opt = document.createElement("option");
+                opt.value = opt.innerText = mgrs;
+                mgrsSelect.appendChild(opt);
+            });
+
+            ['1', '2'].forEach(idx => {
+                const dateSelect = document.getElementById(`date${idx}`);
+                config.dates.forEach(date => {
+                    const opt = document.createElement("option");
+                    opt.value = date.replace(/\//g, "-"); // File naming uses '-'
+                    opt.innerText = date;
+                    dateSelect.appendChild(opt);
+                });
+
+                const formatSelect = document.getElementById(`format${idx}`);
+                config.formats.forEach(fmt => {
+                    const opt = document.createElement("option");
+                    opt.value = opt.innerText = fmt;
+                    formatSelect.appendChild(opt);
+                });
+
+                const qualitySelect = document.getElementById(`quality${idx}`);
+                config.qualities.forEach(q => {
+                    const opt = document.createElement("option");
+                    opt.value = opt.innerText = q;
+                    qualitySelect.appendChild(opt);
+                });
+
+                const resampleSelect = document.getElementById(`resample${idx}`);
+                config.resampling.forEach(r => {
+                    const opt = document.createElement("option");
+                    opt.value = opt.innerText = r;
+                    resampleSelect.appendChild(opt);
+                });
+
+                const exponentSelect = document.getElementById(`exponent${idx}`);
+                config.exponents.forEach(e => {
+                    const opt = document.createElement("option");
+                    opt.value = opt.innerText = e;
+                    exponentSelect.appendChild(opt);
+                });
+
+                ['date', 'format', 'quality', 'resample', 'exponent'].forEach(prop => {
+                    document.getElementById(`${prop}${idx}`).addEventListener("change", () => updateMap(idx));
+                });
+            });
+
+            // Trigger initial load after dropdowns are ready
+            updateMap(1);
+            updateMap(2);
+        }
+
         // Init
-        updateMap(1);
-        updateMap(2);
+        fetch('/config')
+            .then(response => response.json())
+            .then(config => {
+                setupDropdowns(config);
+            })
+            .catch(err => {
+                console.error("Failed to load config:", err);
+                // Fallback or alert user
+            });
         
     </script>
 </body>

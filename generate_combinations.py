@@ -7,8 +7,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 MGRS_TILES = ["07VEK", "50HQJ", "49QGF", "45RVL", "32TQK", "12SUD", "40RCN", "28QCH"]
 DATES = ["2025/07/01", "2025/01/01"]
 FORMATS = ["webp", "jpg"]
-QUALITIES = [75, 85]
-RESAMPLING = ["bilinear", "average", "gauss", "lanczos"]
+QUALITIES = [80]
+RESAMPLING = ["gauss", "lanczos"]
+EXPONENTS = [0.5, 0.6, 0.7]
 MIN_ZOOM = 0
 MAX_ZOOM = 14
 BLOCKSIZE = 512
@@ -17,7 +18,7 @@ OUTPUT_DIR = "combinations_output"
 CACHE_DIR = "cache"
 MAX_WORKERS = min(8, os.cpu_count())
 
-def run_satmaps(mgrs: str, date: str, fmt: str, quality: int, resample: str, cache_dir: str, output_path: str) -> bool:
+def run_satmaps(mgrs: str, date: str, fmt: str, quality: int, resample: str, exponent: float, cache_dir: str, output_path: str) -> bool:
     """Helper to run a single satmaps generation command."""
     cmd = [
         "python3", "satmaps.py", mgrs,
@@ -25,12 +26,14 @@ def run_satmaps(mgrs: str, date: str, fmt: str, quality: int, resample: str, cac
         "--format", fmt,
         "--quality", str(quality),
         "--resample-alg", resample,
+        "--exponent", str(exponent),
         "--minzoom", str(MIN_ZOOM),
         "--maxzoom", str(MAX_ZOOM),
         "--blocksize", str(BLOCKSIZE),
         "--cache", cache_dir,
         "--output", output_path
     ]
+
     try:
         subprocess.run(cmd, check=True, capture_output=True)
         return True
@@ -63,16 +66,16 @@ def main() -> None:
 
     # Phase 2: Generation (Parallel)
     tasks = []
-    for mgrs, date, fmt, quality, resample in product(MGRS_TILES, DATES, FORMATS, QUALITIES, RESAMPLING):
+    for mgrs, date, fmt, quality, resample, exponent in product(MGRS_TILES, DATES, FORMATS, QUALITIES, RESAMPLING, EXPONENTS):
         date_flat = date.replace("/", "-")
         date_cache_dir = os.path.join(CACHE_DIR, date_flat)
-        output_name = f"{mgrs}_{date_flat}_{fmt}_q{quality}_{resample}.pmtiles"
+        output_name = f"{mgrs}_{date_flat}_{fmt}_q{quality}_{resample}_e{exponent}.pmtiles"
         output_path = os.path.join(OUTPUT_DIR, output_name)
         
         if os.path.exists(output_path):
             continue
             
-        tasks.append((mgrs, date, fmt, quality, resample, date_cache_dir, output_path))
+        tasks.append((mgrs, date, fmt, quality, resample, exponent, date_cache_dir, output_path))
 
     total_tasks = len(tasks)
     print(f"\n--- Phase 2: Generating {total_tasks} combinations (using {MAX_WORKERS} workers) ---")

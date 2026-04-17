@@ -179,6 +179,7 @@ def main():
     parser.add_argument("--format", choices=["webp", "jpg", "png", "png8"], default="webp", help="Tile format (default: webp)")
     parser.add_argument("--quality", type=int, default=74, help="WebP/JPEG quality (default: 74)")
     parser.add_argument("--resample-alg", default="bilinear", choices=["bilinear", "average", "gauss", "lanczos"], help="Resampling method (default: bilinear)")
+    parser.add_argument("--exponent", type=float, default=0.6, help="Exponent for power law scaling (default: 0.6)")
     parser.add_argument("--blocksize", type=int, default=512, help="MBTiles block size (default: 256)")
     parser.add_argument("--minzoom", type=int, default=0)
     parser.add_argument("--maxzoom", type=int, default=14)
@@ -310,7 +311,7 @@ def main():
             format="MBTiles",
             outputType=gdal.GDT_Byte,
             scaleParams=scale_params,
-            exponent=0.6,
+            exponent=args.exponent,
             callback=gdal.TermProgress_nocb,
             metadataOptions=[
                 f"format={tile_format.lower()}",

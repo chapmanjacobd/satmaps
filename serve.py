@@ -2,8 +2,45 @@ import http.server
 import socketserver
 import os
 import re
+import json
+import ast
 
 PORT = 8000
+
+def get_config():
+    """Extract configuration constants from generate_combinations.py."""
+    config = {}
+    try:
+        with open("generate_combinations.py", "r") as f:
+            content = f.read()
+            
+            # Simple regex to extract list constants
+            patterns = {
+                "mgrs_tiles": r"MGRS_TILES\s*=\s*(\[.*?\])",
+                "dates": r"DATES\s*=\s*(\[.*?\])",
+                "formats": r"FORMATS\s*=\s*(\[.*?\])",
+                "qualities": r"QUALITIES\s*=\s*(\[.*?\])",
+                "resampling": r"RESAMPLING\s*=\s*(\[.*?\])",
+                "exponents": r"EXPONENTS\s*=\s*(\[.*?\])"
+            }
+            
+            for key, pattern in patterns.items():
+                match = re.search(pattern, content, re.DOTALL)
+                if match:
+                    # Use literal_eval safely for python list literals
+                    config[key] = ast.literal_eval(match.group(1))
+    except Exception as e:
+        print(f"Error reading config: {e}")
+        # Fallback defaults
+        config = {
+            "mgrs_tiles": ["31TDF"],
+            "dates": ["2025/07/01"],
+            "formats": ["webp"],
+            "qualities": [75],
+            "resampling": ["bilinear"],
+            "exponents": [0.6]
+        }
+    return config
 
 class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
@@ -52,6 +89,14 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(f.read(end_byte - start_byte + 1))
 
     def do_GET(self):
+        if self.path == '/config':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(get_config()).encode())
+            return
+            
         self.handle_range(is_head=False)
 
     def do_HEAD(self):
