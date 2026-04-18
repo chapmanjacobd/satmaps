@@ -10,8 +10,6 @@ QUALITIES = [74]
 RESAMPLING = ["lanczos"]
 EXPONENTS = [0.4]
 SCALING_RANGES = [(0, 9000)]
-MIN_ZOOM = 0
-MAX_ZOOM = 14
 BLOCKSIZE = 512
 
 OUTPUT_DIR = "combinations_output"
@@ -30,8 +28,6 @@ def run_satmaps(mgrs: str, dates: list, fmt: str, quality: int, resample: str, e
         "--exponent", str(exponent),
         "--stats-min", str(src_min),
         "--stats-max", str(src_max),
-        "--minzoom", str(MIN_ZOOM),
-        "--maxzoom", str(MAX_ZOOM),
         "--blocksize", str(BLOCKSIZE),
         "--cache", cache_dir,
         "--output", output_path

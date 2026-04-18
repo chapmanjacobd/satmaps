@@ -21,8 +21,7 @@ def run_gdal2tiles(input_vrt: str, output_mbtiles: str, tile_format: str, scale_
         format="VRT",
         outputType=gdal.GDT_Byte,
         scaleParams=scale_params,
-        exponents=exponents,
-        noData=0
+        exponents=exponents
     )
     gdal.Translate(scaled_vrt, input_vrt, options=translate_options)
 
@@ -34,7 +33,6 @@ def run_gdal2tiles(input_vrt: str, output_mbtiles: str, tile_format: str, scale_
     cmd = [
         "gdal2tiles.py",
         "--resume",
-        "-z", f"{options['minzoom']}-{options['maxzoom']}",
         f"--processes={num_cpus}",
         "-r", resample_alg if resample_alg != "gauss" else "bilinear",
         "--tiledriver", tile_driver,
@@ -50,7 +48,7 @@ def run_gdal2tiles(input_vrt: str, output_mbtiles: str, tile_format: str, scale_
     # S3 Environment configuration for gdal2tiles subprocess
     env = os.environ.copy()
     env.update({
-        'GDAL_PYTHON_EXCEPTIONS': 'YES',
+        'PYTHONWARNINGS': 'ignore',
         'AWS_S3_ENDPOINT': 'eodata.dataspace.copernicus.eu',
         'AWS_HTTPS': 'YES',
         'AWS_VIRTUAL_HOSTING': 'FALSE',
@@ -93,8 +91,6 @@ def pack_tiles_to_mbtiles(tiles_dir: str, output_mbtiles: str, tile_format: str,
         ("format", tile_format.lower()),
         ("type", "baselayer"),
         ("version", "1.1"),
-        ("minzoom", str(options['minzoom'])),
-        ("maxzoom", str(options['maxzoom'])),
     ]
     cursor.executemany("INSERT INTO metadata VALUES (?, ?)", metadata)
     

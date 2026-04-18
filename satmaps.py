@@ -21,8 +21,6 @@ class ProcessingOptions:
     quality: int
     resample_alg: str
     exponent: float
-    min_zoom: int
-    max_zoom: int
     blocksize: int
     name: str
     description: str
@@ -197,17 +195,16 @@ def run_translate_to_mbtiles(input_vrt: str, output_file: str, opts: ProcessingO
     """Convert VRT to MBTiles using native GDAL Translate."""
     driver_map = {"jpg": "JPEG", "png8": "PNG", "png": "PNG", "webp": "WEBP"}
     tile_driver = driver_map.get(opts.format.lower(), opts.format.upper())
-    
+
     exponents = [opts.exponent] * 3 if opts.exponent != 0 else None
     
     translate_options = gdal.TranslateOptions(
         format="MBTiles", outputType=gdal.GDT_Byte, scaleParams=scale_params,
-        exponents=exponents, noData=0, callback=gdal.TermProgress_nocb,
+        exponents=exponents, callback=gdal.TermProgress_nocb,
         metadataOptions=[f"format={opts.format.lower()}", f"name={opts.name}", f"description={opts.description}"],
         creationOptions=[
             f"NAME={opts.name}", f"DESCRIPTION={opts.description}", "TYPE=baselayer",
             f"TILE_FORMAT={tile_driver}", f"QUALITY={opts.quality}",
-            f"MINZOOM={opts.min_zoom}", f"MAXZOOM={opts.max_zoom}",
             f"RESAMPLING={opts.resample_alg if opts.resample_alg != 'gauss' else 'bilinear'}",
             f"BLOCKSIZE={opts.blocksize}", "ZOOM_LEVEL_STRATEGY=UPPER"
         ]
@@ -294,16 +291,14 @@ def main():
     parser.add_argument("--stats-min", type=float, default=0, help="Hardcoded source min")
     parser.add_argument("--stats-max", type=float, default=9000, help="Hardcoded source max")
     parser.add_argument("--blocksize", type=int, default=512)
-    parser.add_argument("--minzoom", type=int, default=0)
-    parser.add_argument("--maxzoom", type=int, default=14)
-    parser.add_argument("--cache", help="Cache directory")
+    parser.add_argument("--cache", default=".cache", help="Cache directory")
     parser.add_argument("--download-only", action="store_true", help="Download only")
     parser.add_argument("--land-only", help="Path to land tile list txt")
     args = parser.parse_args()
 
     opts = ProcessingOptions(
         format=args.format, quality=args.quality, resample_alg=args.resample_alg,
-        exponent=args.exponent, min_zoom=args.minzoom, max_zoom=args.maxzoom,
+        exponent=args.exponent,
         blocksize=args.blocksize, name="Sentinel-2 Mosaic", description="Copernicus Sentinel data",
         stats_min=args.stats_min, stats_max=args.stats_max
     )
