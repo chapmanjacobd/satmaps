@@ -6,6 +6,8 @@ import multiprocessing
 from osgeo import gdal
 from typing import Dict, List, Optional
 
+gdal.UseExceptions()
+
 def run_gdal2tiles(input_vrt: str, output_mbtiles: str, tile_format: str, scale_params: List[List[float]], exponents: Optional[List[float]], resample_alg: str, options: Dict) -> None:
     """Convert to final format (MBTiles) using gdal2tiles.py with a scaled VRT."""
     # Standardize format naming
@@ -35,7 +37,6 @@ def run_gdal2tiles(input_vrt: str, output_mbtiles: str, tile_format: str, scale_
         "-z", f"{options['minzoom']}-{options['maxzoom']}",
         f"--processes={num_cpus}",
         "-r", resample_alg if resample_alg != "gauss" else "bilinear",
-        "-a", "0",
         "--tiledriver", tile_driver,
         scaled_vrt,
         tiles_dir
@@ -49,6 +50,7 @@ def run_gdal2tiles(input_vrt: str, output_mbtiles: str, tile_format: str, scale_
     # S3 Environment configuration for gdal2tiles subprocess
     env = os.environ.copy()
     env.update({
+        'GDAL_PYTHON_EXCEPTIONS': 'YES',
         'AWS_S3_ENDPOINT': 'eodata.dataspace.copernicus.eu',
         'AWS_HTTPS': 'YES',
         'AWS_VIRTUAL_HOSTING': 'FALSE',

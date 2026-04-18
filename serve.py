@@ -8,7 +8,7 @@ import ast
 PORT = 8000
 
 def get_config():
-    """Extract configuration constants from generate_combinations.py."""
+    """Extract configuration constants from testbench.py."""
     config = {
         "mgrs_tiles": ["31TDF"],
         "dates": ["2025/07/01"],
@@ -19,10 +19,10 @@ def get_config():
         "scaling_ranges": [[0, 5000]]
     }
     try:
-        if not os.path.exists("generate_combinations.py"):
+        if not os.path.exists("testbench.py"):
             return config
 
-        with open("generate_combinations.py", "r") as f:
+        with open("testbench.py", "r") as f:
             tree = ast.parse(f.read())
             
         target_keys = set(config.keys())

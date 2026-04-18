@@ -25,7 +25,7 @@ lint:
 	$(PYTHON) -m ruff check --fix .
 
 typecheck:
-	$(PYTHON) -m mypy satmaps.py generate_combinations.py
+	$(PYTHON) -m mypy satmaps.py testbench.py
 
 test:
 	$(PYTHON) -m pytest
@@ -34,7 +34,7 @@ serve:
 	$(PYTHON) serve.py
 
 generate:
-	$(PYTHON) generate_combinations.py
+	$(PYTHON) testbench.py
 
 clean:
 	rm -rf __pycache__ .ruff_cache .mypy_cache combinations_output .temp

@@ -10,7 +10,7 @@ This repository provides tools to fetch, process, and package Sentinel-2 mosaic 
 
 - `satmaps.py`: The primary engine. Handles GDAL S3 configuration, band merging (RGB), multi-date mosaicking, reprojection to Web Mercator (EPSG:3857), and MBTiles/PMTiles generation.
 - `tiler.py`: Dedicated module for robust tiling using `gdal2tiles.py` for large-scale (global) processing.
-- `generate_combinations.py`: A batch processing script to generate a matrix of comparisons across different MGRS tiles, dates, and compression settings.
+- `testbench.py`: A batch processing script to generate a matrix of comparisons across different MGRS tiles, dates, and compression settings.
 - `viewer.html`: A side-by-side MapLibre GL JS viewer with dynamic configuration, synchronized views, and zoom shortcuts.
 
 ## Prerequisites
@@ -60,12 +60,12 @@ python3 satmaps.py --global --land-only HLS.land.tiles.txt -o global.pmtiles
 
 ### Batch Comparison
 
-The `generate_combinations.py` script runs in two phases:
+The `testbench.py` script runs in two phases:
 1. Phase 1: Downloads required MGRS tiles for specified dates into a local `cache/` to avoid redundant S3 requests.
 2. Phase 2: Iterates through permutations of format, quality, resampling, exponents, and scaling to generate comparison files in `combinations_output/`.
 
 ```bash
-python3 generate_combinations.py
+python3 testbench.py
 ```
 
 ### Viewing Results
@@ -75,7 +75,7 @@ To compare the outputs, serve the directory via HTTP and open the viewer:
 ```bash
 python3 serve.py
 ```
-Then visit `http://localhost:8000/viewer.html`. The viewer dynamically reads the configuration from `generate_combinations.py` to populate its controls.
+Then visit `http://localhost:8000/viewer.html`. The viewer dynamically reads the configuration from `testbench.py` to populate its controls.
 
 ## Technical Details
 
