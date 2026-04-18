@@ -82,17 +82,17 @@ Then visit `http://localhost:8000/viewer.html`. The viewer dynamically reads the
 - Source: `s3://eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/`
 - Projection: Source data is reprojected from UTM (MGRS) to Web Mercator (EPSG:3857).
 - Processing Pipeline:
-    1. **Discovery:** List S3 folders for requested MGRS tiles and dates.
-    2. **RGB Stacking:** Create VRTs from B04, B03, B02 bands (VSI S3 or local cache).
-    3. **Mosaicking:** Merge multiple dates using a mean pixel function (VRT derived band).
-    4. **Reprojection:** `gdalwarp` to Web Mercator (EPSG:3857) using cubic resampling.
-    5. **Tiling & Packaging:**
-        - **Individual MGRS Tile (`gdal_translate`):**
+    1. Discovery: List S3 folders for requested MGRS tiles and dates.
+    2. RGB Stacking: Create VRTs from B04, B03, B02 bands (VSI S3 or local cache).
+    3. Mosaicking: Merge multiple dates using a mean pixel function (VRT derived band).
+    4. Reprojection: `gdalwarp` to Web Mercator (EPSG:3857) using cubic resampling.
+    5. Tiling & Packaging:
+        - Individual MGRS Tile (`gdal_translate`):
             - One-pass conversion to MBTiles (8-bit scaling + power-law exponent).
             - `gdaladdo` to generate overviews inside the MBTiles.
-        - **Global Tiles takes a slightly different path by using `gdal2tiles` because it supports resuming:**
+        - Global Tiles takes a slightly different path by using `gdal2tiles` because it supports resuming:
             - Convert to 8-bit scaled VRT (applying exponent).
             - `gdal2tiles.py` for parallel, resumable tile pyramid generation.
             - Custom SQLite packing of raw tiles into MBTiles.
-    6. **Final Delivery:** `pmtiles convert` for optimized distribution.
+    6. Final Delivery: `pmtiles convert` for optimized distribution.
 
