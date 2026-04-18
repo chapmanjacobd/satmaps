@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import uuid
+import sqlite3
 import xml.etree.ElementTree as ET
 from osgeo import gdal
 
@@ -124,7 +125,7 @@ def run_warp(input_vrt: str, output_vrt: str) -> None:
         callback=gdal.TermProgress_nocb, srcNodata=-32768, dstNodata=0)
     gdal.Warp(output_vrt, input_vrt, options=warp_options)
 
-def run_translate(input_vrt: str, output_file: str, format: str, scale_params: List[List[float]], exponents: Optional[List[float]], resample_alg: str, options: Dict[str, str]) -> None:
+def run_translate(input_vrt: str, output_file: str, format: str, scale_params: List[List[float]], exponents: Optional[List[float]], resample_alg: str, options: Dict[str, str], projWin: Optional[List[float]] = None) -> None:
     """Convert to final format (MBTiles/PMTiles) using GDAL Translate."""
     tile_format = format.upper()
     if tile_format == "JPG":
@@ -132,7 +133,6 @@ def run_translate(input_vrt: str, output_file: str, format: str, scale_params: L
     if tile_format == "PNG8":
         tile_format = "PNG"
 
-    # Handle resampling for Translate: gauss is not supported there
     if resample_alg == "gauss":
         resample_alg = "bilinear"
 
@@ -141,6 +141,7 @@ def run_translate(input_vrt: str, output_file: str, format: str, scale_params: L
         outputType=gdal.GDT_Byte,
         scaleParams=scale_params,
         exponents=exponents,
+        projWin=projWin,
         noData=0,
         callback=gdal.TermProgress_nocb,
         metadataOptions=[
@@ -166,6 +167,115 @@ def run_translate(input_vrt: str, output_file: str, format: str, scale_params: L
         gdal.SetConfigOption('WEBP_LEVEL', str(options['quality']))
 
     gdal.Translate(output_file, input_vrt, options=translate_options)
+
+def run_gdal2tiles(input_vrt: str, output_mbtiles: str, format: str, scale_params: List[List[float]], exponents: Optional[List[float]], resample_alg: str, options: Dict[str, str]) -> None:
+    """Convert to final format (MBTiles) using gdal2tiles.py with a scaled VRT."""
+    tile_format = format.upper()
+    if tile_format == "JPG": tile_format = "JPEG"
+    if tile_format == "PNG8": tile_format = "PNG"
+    
+    # 1. Translate to 8-bit scaled VRT
+    scaled_vrt = input_vrt.replace(".vrt", "_scaled.vrt")
+    print(f"Step 2a: Generating 8-bit scaled VRT ({scaled_vrt})...")
+    translate_options = gdal.TranslateOptions(
+        format="VRT",
+        outputType=gdal.GDT_Byte,
+        scaleParams=scale_params,
+        exponents=exponents,
+        noData=0
+    )
+    gdal.Translate(scaled_vrt, input_vrt, options=translate_options)
+
+    # 2. Run gdal2tiles.py
+    print(f"Step 2b: Running gdal2tiles.py with tile format {tile_format}...")
+    tiles_dir = ".temp/raw_tiles_" + os.path.basename(output_mbtiles).replace(".mbtiles", "")
+    import multiprocessing
+    num_cpus = multiprocessing.cpu_count()
+    
+    cmd = [
+        "gdal2tiles.py",
+        "--resume",
+        "-z", f"{options['minzoom']}-{options['maxzoom']}",
+        f"--processes={num_cpus}",
+        "-r", resample_alg if resample_alg != "gauss" else "bilinear",
+        "-a", "0",
+        "--tiledriver", tile_format,
+        scaled_vrt,
+        tiles_dir
+    ]
+    if format == "webp":
+        cmd.extend(["--webp-quality", str(options['quality'])])
+    elif format == "jpg":
+        cmd.extend(["--jpeg-quality", str(options['quality'])])
+
+    env = os.environ.copy()
+    env['AWS_S3_ENDPOINT'] = 'eodata.dataspace.copernicus.eu'
+    env['AWS_HTTPS'] = 'YES'
+    env['AWS_VIRTUAL_HOSTING'] = 'FALSE'
+    env['AWS_PROFILE'] = 'cdse'
+    env['VSI_CACHE'] = 'TRUE'
+    env['GDAL_CACHEMAX'] = '1024'
+    env['GDAL_DISABLE_READDIR_ON_OPEN'] = 'EMPTY_DIR'
+    env['GDAL_HTTP_MERGE_CONSECUTIVE_RANGES'] = 'YES'
+    env['GDAL_HTTP_MAX_RETRY'] = '5'
+
+    subprocess.run(cmd, env=env, check=True)
+
+    # 3. Pack into MBTiles
+    print("Step 2c: Packing tiles into MBTiles...")
+    if os.path.exists(output_mbtiles):
+        os.remove(output_mbtiles)
+
+    conn = sqlite3.connect(output_mbtiles)
+    
+    conn.execute("PRAGMA synchronous = OFF")
+    conn.execute("PRAGMA journal_mode = MEMORY")
+    
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE metadata (name text, value text);")
+    cursor.execute("CREATE TABLE tiles (zoom_level integer, tile_column integer, tile_row integer, tile_data blob);")
+    
+    metadata = [
+        ("name", options['name']),
+        ("description", options['description']),
+        ("format", tile_format.lower()),
+        ("type", "baselayer"),
+        ("version", "1.1"),
+        ("minzoom", str(options['minzoom'])),
+        ("maxzoom", str(options['maxzoom'])),
+    ]
+    cursor.executemany("INSERT INTO metadata VALUES (?, ?)", metadata)
+    
+    count = 0
+    # Walk directory. Note: gdal2tiles.py produces TMS tiles by default (no --xyz flag used)
+    # The structure is tiles_dir/z/x/y.ext
+    for root, dirs, files in os.walk(tiles_dir):
+        for file in files:
+            if file.endswith(f".{tile_format.lower()}") or file.endswith(format):
+                path = os.path.join(root, file)
+                parts = os.path.relpath(path, tiles_dir).split(os.sep)
+                if len(parts) == 3:
+                    z, x, y_ext = parts
+                    y = os.path.splitext(y_ext)[0]
+                    with open(path, "rb") as f:
+                        blob = f.read()
+                    cursor.execute("INSERT INTO tiles VALUES (?, ?, ?, ?)", (int(z), int(x), int(y), blob))
+                    count += 1
+                    if count % 10000 == 0:
+                        print(f"Packed {count} tiles...")
+                        conn.commit()
+    conn.commit()
+    cursor.execute("CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);")
+    conn.close()
+    
+    print(f"Total packed: {count} tiles. Cleaning up...")
+    if os.path.exists(scaled_vrt):
+        os.remove(scaled_vrt)
+    # Keep tiles_dir if user wants to see it, or clean it up? The plan said clean it up.
+    # But rm -rf in python:
+    import shutil
+    if os.path.exists(tiles_dir):
+        shutil.rmtree(tiles_dir)
 
 def list_all_mosaic_folders(date_path: str = "2025/07/01", mgrs_filter: Optional[str] = None, cache_dir: Optional[str] = None) -> List[str]:
     q = get_quarter(date_path)
@@ -296,10 +406,11 @@ def main():
     tileset_desc = f"Contains modified Copernicus Sentinel data {', '.join(dates)}"
 
     # Unique temp files to avoid race conditions in parallel mode
+    os.makedirs(".temp", exist_ok=True)
     unique_id = uuid.uuid4().hex[:8]
-    temp_vrt = f"temp_{unique_id}.vrt"
-    temp_mbtiles = f"temp_{unique_id}.mbtiles"
-    temp_warped_vrt = f"temp_warped_{unique_id}.vrt"
+    temp_vrt = f".temp/combined_{unique_id}.vrt"
+    temp_mbtiles = f".temp/tiles_{unique_id}.mbtiles"
+    temp_warped_vrt = f".temp/warped_{unique_id}.vrt"
 
     tile_vrts = []
     try:
@@ -330,7 +441,7 @@ def main():
                 group_vrts = []
                 for i in range(0, len(all_folders), group_size):
                     chunk = all_folders[i:i + group_size]
-                    chunk_vrt_name = f"group_{date.replace('/', '-')}_{i // group_size}_{unique_id}.vrt"
+                    chunk_vrt_name = f".temp/group_{date.replace('/', '-')}_{i // group_size}_{unique_id}.vrt"
 
                     print(f"[{date}] [{i+1}/{len(all_folders)}] Handling group {i // group_size}...")
                     chunk_tile_vrts = []
@@ -339,7 +450,7 @@ def main():
                             paths = get_tile_paths(None, date, date_cache, folder_name=folder)
                             if args.download_only: continue
 
-                            tile_vrt = f"tile_{folder}_{unique_id}.vrt"
+                            tile_vrt = f".temp/tile_{folder}_{unique_id}.vrt"
                             create_rgb_vrt(paths, tile_vrt)
                             chunk_tile_vrts.append(tile_vrt)
                             tile_vrts.append(tile_vrt)
@@ -357,8 +468,8 @@ def main():
                     continue
 
                 if group_vrts:
-                    date_vrt = f"date_{date.replace('/', '-')}_{unique_id}.vrt"
-                    print(f"Building date VRT {date_vrt} from groups...")
+                    date_vrt = f".temp/mosaic_{date.replace('/', '-')}_{unique_id}.vrt"
+                    print(f"Building mosaic VRT {date_vrt} from groups...")
                     gdal.BuildVRT(date_vrt, group_vrts, srcNodata=-32768, VRTNodata=-32768)
                     all_date_vrts.append(date_vrt)
                     # Clean up group VRTs
@@ -377,7 +488,7 @@ def main():
                         paths = get_tile_paths(None, date, date_cache, folder_name=folder)
                         if args.download_only: continue
 
-                        tile_vrt = f"tile_{folder}_{unique_id}.vrt"
+                        tile_vrt = f".temp/tile_{folder}_{unique_id}.vrt"
                         create_rgb_vrt(paths, tile_vrt)
                         date_tile_vrts.append(tile_vrt)
                         tile_vrts.append(tile_vrt)
@@ -388,7 +499,7 @@ def main():
                     continue
 
                 if date_tile_vrts:
-                    date_vrt = f"date_{date.replace('/', '-')}_{unique_id}.vrt"
+                    date_vrt = f".temp/mosaic_{date.replace('/', '-')}_{unique_id}.vrt"
                     gdal.BuildVRT(date_vrt, date_tile_vrts, srcNodata=-32768, VRTNodata=-32768)
                     all_date_vrts.append(date_vrt)
 
@@ -430,50 +541,63 @@ def main():
         # Exponent 0 means "don't apply"
         exponents = [args.exponent, args.exponent, args.exponent] if args.exponent != 0 else None
 
-        run_translate(
-            temp_warped_vrt,
-            temp_mbtiles,
-            args.format,
-            scale_params,
-            exponents,
-            args.resample_alg,
-            {
-                "name": tileset_name,
-                "description": tileset_desc,
-                "quality": args.quality,
-                "minzoom": args.minzoom,
-                "maxzoom": args.maxzoom,
-                "blocksize": args.blocksize
-            }
-        )
+        options_dict = {
+            "name": tileset_name,
+            "description": tileset_desc,
+            "quality": args.quality,
+            "minzoom": args.minzoom,
+            "maxzoom": args.maxzoom,
+            "blocksize": args.blocksize
+        }
 
-        print("Step 2.5: Building overviews...")
-        gdaladdo_cmd = [
-            "gdaladdo",
-            "-r", args.resample_alg,
-            "--config", "GDAL_NUM_THREADS", "ALL_CPUS",
-            "--config", "GDAL_TIFF_OVR_BLOCKSIZE", str(args.blocksize)
-        ]
+        if args.all_tiles:
+            run_gdal2tiles(
+                temp_warped_vrt,
+                temp_mbtiles,
+                args.format,
+                scale_params,
+                exponents,
+                args.resample_alg,
+                options_dict
+            )
+        else:
+            run_translate(
+                temp_warped_vrt,
+                temp_mbtiles,
+                args.format,
+                scale_params,
+                exponents,
+                args.resample_alg,
+                options_dict
+            )
 
-        if args.format == "webp":
-            gdaladdo_cmd.extend([
-                "--config", "COMPRESS_OVERVIEW", "WEBP",
-                "--config", "WEBP_LEVEL_OVERVIEW", str(args.quality)
-            ])
-        elif args.format == "jpg":
-            gdaladdo_cmd.extend([
-                "--config", "COMPRESS_OVERVIEW", "JPEG",
-                "--config", "JPEG_QUALITY_OVERVIEW", str(args.quality),
-                "--config", "PHOTOMETRIC_OVERVIEW", "YCBCR",
-                "--config", "INTERLEAVE_OVERVIEW", "PIXEL"
-            ])
-        elif args.format in ["png", "png8"]:
-            gdaladdo_cmd.extend([
-                "--config", "COMPRESS_OVERVIEW", "PNG"
-            ])
+            print("Step 2.5: Building overviews...")
+            gdaladdo_cmd = [
+                "gdaladdo",
+                "-r", args.resample_alg,
+                "--config", "GDAL_NUM_THREADS", "ALL_CPUS",
+                "--config", "GDAL_TIFF_OVR_BLOCKSIZE", str(args.blocksize)
+            ]
 
-        gdaladdo_cmd.append(temp_mbtiles)
-        subprocess.run(gdaladdo_cmd, check=True)
+            if args.format == "webp":
+                gdaladdo_cmd.extend([
+                    "--config", "COMPRESS_OVERVIEW", "WEBP",
+                    "--config", "WEBP_LEVEL_OVERVIEW", str(args.quality)
+                ])
+            elif args.format == "jpg":
+                gdaladdo_cmd.extend([
+                    "--config", "COMPRESS_OVERVIEW", "JPEG",
+                    "--config", "JPEG_QUALITY_OVERVIEW", str(args.quality),
+                    "--config", "PHOTOMETRIC_OVERVIEW", "YCBCR",
+                    "--config", "INTERLEAVE_OVERVIEW", "PIXEL"
+                ])
+            elif args.format in ["png", "png8"]:
+                gdaladdo_cmd.extend([
+                    "--config", "COMPRESS_OVERVIEW", "PNG"
+                ])
+
+            gdaladdo_cmd.append(temp_mbtiles)
+            subprocess.run(gdaladdo_cmd, check=True)
 
         print("Step 3: Converting MBTiles to PMTiles...")
         pmtiles_cmd = ["pmtiles", "convert", temp_mbtiles, args.output]  # --no-deduplication
