@@ -3,13 +3,13 @@ import subprocess
 from itertools import product
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-MGRS_TILES = ["45RVL", "28QCH"]
+MGRS_TILES = ["60HTB", "07VEK", "15TVG", "50HQJ", "49QGF", "32TQK", "12SUD", "40RCN"]
 DATES = [["2025/07/01", "2025/01/01"]]
 FORMATS = ["webp"]
 QUALITIES = [74]
 RESAMPLING = ["lanczos"]
-EXPONENTS = [0.3, 0.4, 0.5, 0.6, 0.8]
-SCALING_RANGES = [(0, 6000), (0, 9000), (0, 11000), (0, 13000)]
+EXPONENTS = [0.4]
+SCALING_RANGES = [(0, 9000)]
 MIN_ZOOM = 0
 MAX_ZOOM = 14
 BLOCKSIZE = 512

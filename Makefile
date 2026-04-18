@@ -37,6 +37,5 @@ generate:
 	$(PYTHON) generate_combinations.py
 
 clean:
-	rm -f *.vrt temp* tile* chunk*
-	rm -rf __pycache__ .ruff_cache .mypy_cache combinations_output
+	rm -rf __pycache__ .ruff_cache .mypy_cache combinations_output .temp
 	@echo "Cleaned up temporary files."
