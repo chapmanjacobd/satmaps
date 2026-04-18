@@ -3,12 +3,15 @@ import subprocess
 import sqlite3
 import shutil
 import math
-import multiprocessing
+import time
 from concurrent.futures import ProcessPoolExecutor
 from osgeo import gdal
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 gdal.UseExceptions()
+
+WEB_MERCATOR_LIMIT = 20037508.342789244
+ProjWin = Tuple[float, float, float, float]
 
 def get_web_mercator_bounds(z: int, x: int, y: int) -> Tuple[float, float, float, float]:
     """Calculate Web Mercator (EPSG:3857) bounds for a given XYZ tile."""
@@ -20,8 +23,8 @@ def get_web_mercator_bounds(z: int, x: int, y: int) -> Tuple[float, float, float
     lat2 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
     
     def lonlat_to_3857(lon, lat):
-        x = lon * 20037508.34 / 180
-        y = math.log(math.tan((90 + lat) * math.pi / 360)) / (math.pi / 180) * 20037508.34 / 180
+        x = lon * WEB_MERCATOR_LIMIT / 180
+        y = math.log(math.tan((90 + lat) * math.pi / 360)) / (math.pi / 180) * WEB_MERCATOR_LIMIT / 180
         return x, y
         
     x1, y1 = lonlat_to_3857(lon1, lat1)
@@ -31,10 +34,49 @@ def get_web_mercator_bounds(z: int, x: int, y: int) -> Tuple[float, float, float
 
 def meters_to_tile(x_meters: float, y_meters: float, z: int) -> Tuple[int, int]:
     """Convert Web Mercator meters to tile coordinates at zoom z."""
-    res = 20037508.34 * 2 / (2**z)
-    tx = int((x_meters + 20037508.34) / res)
-    ty = int((20037508.34 - y_meters) / res)
+    res = WEB_MERCATOR_LIMIT * 2 / (2**z)
+    tx = math.floor((x_meters + WEB_MERCATOR_LIMIT) / res)
+    ty = math.floor((WEB_MERCATOR_LIMIT - y_meters) / res)
     return tx, ty
+
+def get_dataset_bounds(dataset: gdal.Dataset) -> ProjWin:
+    """Return dataset bounds as a projWin-style tuple."""
+    gt = dataset.GetGeoTransform()
+    minx, maxy = gt[0], gt[3]
+    maxx = minx + gt[1] * dataset.RasterXSize
+    miny = maxy + gt[5] * dataset.RasterYSize
+    return minx, maxy, maxx, miny
+
+def get_chunk_tile_range(bounds: ProjWin, zoom: int) -> Tuple[int, int, int, int]:
+    """Return inclusive XYZ tile indices covering raster bounds at the chunk zoom."""
+    minx, maxy, maxx, miny = bounds
+    max_t = (2 ** zoom) - 1
+
+    tx_min, ty_min = meters_to_tile(minx, maxy, zoom)
+    tx_max, ty_max = meters_to_tile(
+        math.nextafter(maxx, float("-inf")),
+        math.nextafter(miny, float("inf")),
+        zoom,
+    )
+
+    return (
+        max(0, min(tx_min, max_t)),
+        max(0, min(ty_min, max_t)),
+        max(0, min(tx_max, max_t)),
+        max(0, min(ty_max, max_t)),
+    )
+
+def intersect_proj_win(proj_win: ProjWin, dataset_bounds: ProjWin) -> Optional[ProjWin]:
+    """Clamp a projWin to the dataset extent, returning None for empty intersections."""
+    ulx = max(proj_win[0], dataset_bounds[0])
+    uly = min(proj_win[1], dataset_bounds[1])
+    lrx = min(proj_win[2], dataset_bounds[2])
+    lry = max(proj_win[3], dataset_bounds[3])
+
+    if ulx >= lrx or lry >= uly:
+        return None
+
+    return ulx, uly, lrx, lry
 
 def create_color_corrected_vrt(input_vrt: str, output_vrt: str, 
                                scale_params: List[List[float]],
@@ -94,14 +136,23 @@ def create_color_corrected_vrt(input_vrt: str, output_vrt: str,
 def process_chunk(args: Tuple) -> str:
     """Worker function for parallel gdal.Translate."""
     input_vrt, chunk_file, format, options, proj_win = args
+    ds = None
     try:
         gdal.UseExceptions()
         
+        # Open VRT to check intersection
+        ds = gdal.Open(input_vrt)
+        if ds is None:
+            return ""
+
+        clipped_proj_win = intersect_proj_win(proj_win, get_dataset_bounds(ds))
+        if clipped_proj_win is None:
+            return ""
+
         translate_options = gdal.TranslateOptions(
             format="MBTiles",
             outputType=gdal.GDT_Byte,
-            projWin=proj_win,
-            noData=0,
+            projWin=clipped_proj_win,
             metadataOptions=[
                 f"format={format.lower()}",
                 f"name={options['name']}",
@@ -129,6 +180,8 @@ def process_chunk(args: Tuple) -> str:
         if os.path.exists(chunk_file):
             os.remove(chunk_file)
         return ""
+    finally:
+        ds = None
 
 def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     """Merge multiple MBTiles chunks into a single file."""
@@ -145,18 +198,47 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     shutil.copyfile(input_mbtiles[0], output_mbtiles)
     
     conn = sqlite3.connect(output_mbtiles)
+    conn.execute("PRAGMA busy_timeout = 30000") # 30 seconds
     cursor = conn.cursor()
     cursor.execute("PRAGMA synchronous = OFF")
     cursor.execute("PRAGMA journal_mode = MEMORY")
     
     for i, db_path in enumerate(input_mbtiles[1:]):
-        cursor.execute(f"ATTACH DATABASE '{db_path}' AS db")
+        # Retry logic for ATTACH in case of locks
+        attached = False
+        for retry in range(5):
+            try:
+                cursor.execute(f"ATTACH DATABASE '{db_path}' AS db")
+                attached = True
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower():
+                    time.sleep(0.5)
+                else:
+                    print(f"Failed to attach {db_path}: {e}")
+                    break
+        
+        if not attached:
+            continue
+
         try:
-            cursor.execute("INSERT OR IGNORE INTO map SELECT * FROM db.map")
-            cursor.execute("INSERT OR IGNORE INTO images SELECT * FROM db.images")
-        except sqlite3.OperationalError:
-            cursor.execute("INSERT OR IGNORE INTO tiles SELECT * FROM db.tiles")
-        cursor.execute("DETACH DATABASE db")
+            # Check which tables exist in db
+            cursor.execute("SELECT name FROM db.sqlite_master WHERE type='table' AND name='map'")
+            has_map = cursor.fetchone()
+            
+            if has_map:
+                cursor.execute("INSERT OR IGNORE INTO map SELECT * FROM db.map")
+                cursor.execute("INSERT OR IGNORE INTO images SELECT * FROM db.images")
+            else:
+                cursor.execute("INSERT OR IGNORE INTO tiles SELECT * FROM db.tiles")
+        except sqlite3.OperationalError as e:
+            print(f"Error merging {db_path}: {e}")
+        finally:
+            try:
+                cursor.execute("DETACH DATABASE db")
+            except sqlite3.OperationalError:
+                pass # Already detached or other issue
+                
         if i % 10 == 0:
             conn.commit()
     
@@ -182,18 +264,10 @@ def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str,
     
     # 2. Determine chunks
     ds = gdal.Open(color_vrt)
-    gt = ds.GetGeoTransform()
-    minx, maxy = gt[0], gt[3]
-    maxx = minx + gt[1] * ds.RasterXSize
-    miny = maxy + gt[5] * ds.RasterYSize
+    bounds = get_dataset_bounds(ds)
     ds = None
     
-    tx_min, ty_max = meters_to_tile(minx, miny, chunk_zoom)
-    tx_max, ty_min = meters_to_tile(maxx, maxy, chunk_zoom)
-    
-    max_t = (2 ** chunk_zoom) - 1
-    tx_min, tx_max = max(0, min(tx_min, max_t)), max(0, min(tx_max, max_t))
-    ty_min, ty_max = max(0, min(ty_min, max_t)), max(0, min(ty_max, max_t))
+    tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, chunk_zoom)
     
     tasks = []
     chunk_files = []
