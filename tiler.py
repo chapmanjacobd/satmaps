@@ -5,13 +5,130 @@ import shutil
 import math
 import time
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 from osgeo import gdal
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 gdal.UseExceptions()
 
 WEB_MERCATOR_LIMIT = 20037508.342789244
 ProjWin = Tuple[float, float, float, float]
+ChunkTask = Tuple[str, str, str, Dict[str, Any], ProjWin]
+RGB_COLOR_INTERPRETATIONS = ("Red", "Green", "Blue")
+SOFT_KNEE_SHADOW_BREAK = 0.3
+SOFT_KNEE_HIGHLIGHT_BREAK = 0.75
+SOFT_KNEE_SHADOW_SLOPE = 1.4
+SOFT_KNEE_MID_SLOPE = 0.9
+SOFT_KNEE_HIGHLIGHT_SLOPE = 0.5
+
+
+@dataclass(frozen=True)
+class TilingArtifacts:
+    """Paths created during tiling so the caller can preserve or clean them up."""
+
+    final_vrt: str
+    cleanup_paths: List[str]
+
+
+def ternary_expr(condition: str, true_value: str, false_value: str) -> str:
+    """Build a parenthesized ternary expression for GDAL's expression dialect."""
+    return f"(({condition}) ? ({true_value}) : ({false_value}))"
+
+
+def clamp_expr(expression: str, lower: str, upper: str) -> str:
+    """Clamp an expression to an inclusive range using nested ternaries."""
+    return ternary_expr(
+        f"({expression}) < {lower}",
+        lower,
+        ternary_expr(f"({expression}) > {upper}", upper, expression),
+    )
+
+
+def expression_literal(value: float) -> str:
+    """Format a numeric literal for GDAL expression strings."""
+    return repr(float(value))
+
+
+def nodata_match_expr(band_ref: str, nodata_value: float) -> str:
+    """Return an expression that matches a band's explicit nodata value."""
+    if math.isnan(nodata_value):
+        return f"({band_ref} != {band_ref})"
+    return f"({band_ref} == {expression_literal(nodata_value)})"
+
+
+def explicit_nodata_expr(dataset: gdal.Dataset, band_count: int = 3) -> Optional[str]:
+    """Return an expression that masks only pixels matching explicit band nodata values."""
+    nodata_matches: List[str] = []
+    for band_index in range(1, band_count + 1):
+        nodata_value = dataset.GetRasterBand(band_index).GetNoDataValue()
+        if nodata_value is None:
+            return None
+        nodata_matches.append(nodata_match_expr(f"B{band_index}", nodata_value))
+
+    return " && ".join(nodata_matches)
+
+
+def soft_knee_tone_curve_expr(expression: str) -> str:
+    """Lift shadows and roll off highlights with a monotonic piecewise-linear curve."""
+    clamped = clamp_expr(expression, "0.0", "1.0")
+    shadow_break = expression_literal(SOFT_KNEE_SHADOW_BREAK)
+    highlight_break = expression_literal(SOFT_KNEE_HIGHLIGHT_BREAK)
+    shadow_slope = expression_literal(SOFT_KNEE_SHADOW_SLOPE)
+    mid_slope = expression_literal(SOFT_KNEE_MID_SLOPE)
+    highlight_slope = expression_literal(SOFT_KNEE_HIGHLIGHT_SLOPE)
+    shadow_output = expression_literal(SOFT_KNEE_SHADOW_BREAK * SOFT_KNEE_SHADOW_SLOPE)
+    highlight_output = expression_literal(
+        (SOFT_KNEE_SHADOW_BREAK * SOFT_KNEE_SHADOW_SLOPE)
+        + ((SOFT_KNEE_HIGHLIGHT_BREAK - SOFT_KNEE_SHADOW_BREAK) * SOFT_KNEE_MID_SLOPE)
+    )
+
+    shadow_expr = f"({clamped} * {shadow_slope})"
+    mid_expr = f"({shadow_output} + (({clamped} - {shadow_break}) * {mid_slope}))"
+    highlight_expr = f"({highlight_output} + (({clamped} - {highlight_break}) * {highlight_slope}))"
+    return clamp_expr(
+        ternary_expr(
+            f"({clamped}) < {shadow_break}",
+            shadow_expr,
+            ternary_expr(f"({clamped}) < {highlight_break}", mid_expr, highlight_expr),
+        ),
+        "0.0",
+        "1.0",
+    )
+
+
+def vrt_dataset_preamble(dataset: gdal.Dataset) -> List[str]:
+    """Return the opening XML for a VRT mirroring an existing dataset."""
+    return [
+        f'<VRTDataset rasterXSize="{dataset.RasterXSize}" rasterYSize="{dataset.RasterYSize}">',
+        f'  <SRS>{dataset.GetProjection()}</SRS>',
+        f'  <GeoTransform>{", ".join(map(str, dataset.GetGeoTransform()))}</GeoTransform>',
+    ]
+
+
+def apply_rgb_color_interpretation_to_vrt(vrt_path: str) -> None:
+    """Set RGB color interpretation on the first three bands of a VRT."""
+    tree = ET.parse(vrt_path)
+    root = tree.getroot()
+
+    for band_index, color_name in enumerate(RGB_COLOR_INTERPRETATIONS, start=1):
+        band = root.find(f"./VRTRasterBand[@band='{band_index}']")
+        if band is None:
+            continue
+
+        color_interp = band.find("ColorInterp")
+        if color_interp is None:
+            color_interp = ET.Element("ColorInterp")
+            band.insert(0, color_interp)
+        color_interp.text = color_name
+
+    tree.write(vrt_path, encoding="UTF-8", xml_declaration=True)
+
+
+def make_step_vrt_path(step: int, label: str, unique_id: str) -> str:
+    """Return a temporary VRT path with an explicit pipeline step prefix."""
+    return f".temp/step{step}_{label}_{unique_id}.vrt"
 
 def get_web_mercator_bounds(z: int, x: int, y: int) -> Tuple[float, float, float, float]:
     """Calculate Web Mercator (EPSG:3857) bounds for a given XYZ tile."""
@@ -22,10 +139,10 @@ def get_web_mercator_bounds(z: int, x: int, y: int) -> Tuple[float, float, float
     lat1 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
     lat2 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
     
-    def lonlat_to_3857(lon, lat):
-        x = lon * WEB_MERCATOR_LIMIT / 180
-        y = math.log(math.tan((90 + lat) * math.pi / 360)) / (math.pi / 180) * WEB_MERCATOR_LIMIT / 180
-        return x, y
+    def lonlat_to_3857(lon: float, lat: float) -> Tuple[float, float]:
+        x_meters = lon * WEB_MERCATOR_LIMIT / 180
+        y_meters = math.log(math.tan((90 + lat) * math.pi / 360)) / (math.pi / 180) * WEB_MERCATOR_LIMIT / 180
+        return x_meters, y_meters
         
     x1, y1 = lonlat_to_3857(lon1, lat1)
     x2, y2 = lonlat_to_3857(lon2, lat2)
@@ -78,41 +195,56 @@ def intersect_proj_win(proj_win: ProjWin, dataset_bounds: ProjWin) -> Optional[P
 
     return ulx, uly, lrx, lry
 
-def create_color_corrected_vrt(input_vrt: str, output_vrt: str, 
-                               scale_params: List[List[float]],
-                               brightness: float, contrast: float, saturation: float) -> None:
-    """Create a VRT that scales 16-bit to 8-bit and applies color corrections."""
+
+def proj_win_to_src_win(dataset: gdal.Dataset, proj_win: ProjWin) -> Tuple[int, int, int, int]:
+    """Convert a georeferenced projWin into a clipped pixel srcWin for a north-up raster."""
+    inv_gt = gdal.InvGeoTransform(dataset.GetGeoTransform())
+    px_ul, py_ul = gdal.ApplyGeoTransform(inv_gt, proj_win[0], proj_win[1])
+    px_lr, py_lr = gdal.ApplyGeoTransform(inv_gt, proj_win[2], proj_win[3])
+
+    xoff = max(0, math.floor(min(px_ul, px_lr)))
+    yoff = max(0, math.floor(min(py_ul, py_lr)))
+    xend = min(dataset.RasterXSize, math.ceil(max(px_ul, px_lr)))
+    yend = min(dataset.RasterYSize, math.ceil(max(py_ul, py_lr)))
+
+    return xoff, yoff, max(0, xend - xoff), max(0, yend - yoff)
+
+def create_color_corrected_vrt(
+    input_vrt: str,
+    output_vrt: str,
+    scale_params: List[List[float]],
+) -> None:
+    """Create a VRT that normalizes source data and applies a soft-knee tone curve."""
     ds = gdal.Open(input_vrt)
+    if ds is None:
+        raise RuntimeError(f"Could not open input VRT {input_vrt}")
     width, height = ds.RasterXSize, ds.RasterYSize
+    nodata_expr = explicit_nodata_expr(ds)
     
-    vrt_content = [
-        f'<VRTDataset rasterXSize="{width}" rasterYSize="{height}">',
-        f'  <SRS>{ds.GetProjection()}</SRS>',
-        f'  <GeoTransform>{", ".join(map(str, ds.GetGeoTransform()))}</GeoTransform>'
-    ]
+    vrt_content = vrt_dataset_preamble(ds)
     
     for b_idx in range(1, 4):
-        s_min, s_max, d_min, d_max = scale_params[b_idx-1]
-        
-        # Coefficients for luminance (CCIR 601)
-        # L = 0.299*R + 0.587*G + 0.114*B
-        # Normalize each band based on its scale_params
-        def norm_expr(idx):
+        def norm_expr(idx: int) -> str:
             sm, sx = scale_params[idx-1][0], scale_params[idx-1][1]
-            return f"( (B{idx} - {sm}) / ({sx - sm}) )"
-        
-        luma = f"( 0.299*{norm_expr(1)} + 0.587*{norm_expr(2)} + 0.114*{norm_expr(3)} )"
-        norm = norm_expr(b_idx)
-        
-        sat_expr = f"( {luma} + {saturation} * ({norm} - {luma}) )"
-        bright_expr = f"( {sat_expr} * {brightness} )"
-        cont_expr = f"( ({bright_expr} - 0.5) * {contrast} + 0.5 )"
-        final_expr = f"min(255, max(0, {cont_expr} * 255))"
+            band_range = sx - sm
+            if band_range <= 0:
+                band_range = 1.0
+            sm_value = expression_literal(sm)
+            band_range_value = expression_literal(band_range)
+            raw = f"((B{idx} - {sm_value}) / {band_range_value})"
+            return clamp_expr(raw, "0.0", "1.0")
+
+        toned_expr = soft_knee_tone_curve_expr(norm_expr(b_idx))
+        scaled_expr = f"({toned_expr} * 255.0)"
+        clamped_expr = clamp_expr(scaled_expr, "0.0", "255.0")
+        final_expr = clamped_expr if nodata_expr is None else ternary_expr(nodata_expr, "0.0", clamped_expr)
+        escaped_expr = escape(final_expr, {'"': '&quot;'})
         
         vrt_content.extend([
-            f'  <VRTRasterBand dataType="Byte" band="{b_idx}" subClass="VRTDerivedRasterBand">',
+            f'  <VRTRasterBand dataType="Float32" band="{b_idx}" subClass="VRTDerivedRasterBand">',
+            f'    <ColorInterp>{RGB_COLOR_INTERPRETATIONS[b_idx - 1]}</ColorInterp>',
             '    <PixelFunctionType>expression</PixelFunctionType>',
-            f'    <PixelFunctionArguments expression="{final_expr}" />',
+            f'    <PixelFunctionArguments expression="{escaped_expr}" />',
             '    <NoDataValue>0</NoDataValue>'
         ])
         
@@ -133,10 +265,41 @@ def create_color_corrected_vrt(input_vrt: str, output_vrt: str,
     with open(output_vrt, 'w') as f:
         f.write("\n".join(vrt_content))
 
-def process_chunk(args: Tuple) -> str:
+
+def create_byte_conversion_vrt(input_vrt: str, output_vrt: str) -> None:
+    """Create a Byte VRT that clamps a Float32 RGB VRT into MBTiles-safe 8-bit bands."""
+    ds = gdal.Open(input_vrt)
+    width, height = ds.RasterXSize, ds.RasterYSize
+
+    vrt_content = vrt_dataset_preamble(ds)
+
+    for band_index in range(1, ds.RasterCount + 1):
+        escaped_expr = escape(clamp_expr("B1", "0.0", "255.0"), {'"': '&quot;'})
+        vrt_content.extend([
+            f'  <VRTRasterBand dataType="Byte" band="{band_index}" subClass="VRTDerivedRasterBand">',
+            f'    <ColorInterp>{RGB_COLOR_INTERPRETATIONS[band_index - 1]}</ColorInterp>',
+            '    <PixelFunctionType>expression</PixelFunctionType>',
+            f'    <PixelFunctionArguments expression="{escaped_expr}" />',
+            '    <NoDataValue>0</NoDataValue>',
+            '    <SimpleSource>',
+            f'      <SourceFilename relativeToVRT="0">{os.path.abspath(input_vrt)}</SourceFilename>',
+            f'      <SourceBand>{band_index}</SourceBand>',
+            f'      <SrcRect xOff="0" yOff="0" xSize="{width}" ySize="{height}" />',
+            f'      <DstRect xOff="0" yOff="0" xSize="{width}" ySize="{height}" />',
+            '    </SimpleSource>',
+            '  </VRTRasterBand>',
+        ])
+
+    vrt_content.append('</VRTDataset>')
+
+    with open(output_vrt, 'w') as f:
+        f.write("\n".join(vrt_content))
+
+def process_chunk(args: ChunkTask) -> str:
     """Worker function for parallel gdal.Translate."""
     input_vrt, chunk_file, format, options, proj_win = args
     ds = None
+    temp_chunk_raster = chunk_file.replace(".mbtiles", ".tif")
     try:
         gdal.UseExceptions()
         
@@ -149,10 +312,24 @@ def process_chunk(args: Tuple) -> str:
         if clipped_proj_win is None:
             return ""
 
+        src_win = proj_win_to_src_win(ds, clipped_proj_win)
+        if src_win[2] <= 0 or src_win[3] <= 0:
+            return ""
+
+        temp_ds = gdal.Translate(
+            temp_chunk_raster,
+            input_vrt,
+            options=gdal.TranslateOptions(
+                format="GTiff",
+                srcWin=src_win,
+            ),
+        )
+        temp_ds.FlushCache()
+        temp_ds = None
+
         translate_options = gdal.TranslateOptions(
             format="MBTiles",
             outputType=gdal.GDT_Byte,
-            projWin=clipped_proj_win,
             metadataOptions=[
                 f"format={format.lower()}",
                 f"name={options['name']}",
@@ -173,7 +350,7 @@ def process_chunk(args: Tuple) -> str:
         if format.lower() == "webp":
             gdal.SetConfigOption('WEBP_LEVEL', str(options['quality']))
 
-        gdal.Translate(chunk_file, input_vrt, options=translate_options)
+        gdal.Translate(chunk_file, temp_chunk_raster, options=translate_options)
         return chunk_file
     except Exception as e:
         print(f"Error processing chunk {chunk_file}: {e}")
@@ -182,6 +359,8 @@ def process_chunk(args: Tuple) -> str:
         return ""
     finally:
         ds = None
+        if os.path.exists(temp_chunk_raster):
+            os.remove(temp_chunk_raster)
 
 def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     """Merge multiple MBTiles chunks into a single file."""
@@ -204,85 +383,87 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     cursor.execute("PRAGMA journal_mode = MEMORY")
     
     for i, db_path in enumerate(input_mbtiles[1:]):
+        alias = f"chunk_{i}"
+
         # Retry logic for ATTACH in case of locks
         attached = False
         for retry in range(5):
             try:
-                cursor.execute(f"ATTACH DATABASE '{db_path}' AS db")
+                cursor.execute(f"ATTACH DATABASE '{db_path}' AS {alias}")
                 attached = True
                 break
             except sqlite3.OperationalError as e:
                 if "locked" in str(e).lower():
                     time.sleep(0.5)
                 else:
-                    print(f"Failed to attach {db_path}: {e}")
-                    break
+                    raise RuntimeError(f"Failed to attach {db_path}: {e}") from e
         
         if not attached:
-            continue
+            raise RuntimeError(f"Failed to attach {db_path} after retries due to database locks")
 
         try:
             # Check which tables exist in db
-            cursor.execute("SELECT name FROM db.sqlite_master WHERE type='table' AND name='map'")
+            cursor.execute(f"SELECT name FROM {alias}.sqlite_master WHERE type='table' AND name='map'")
             has_map = cursor.fetchone()
             
             if has_map:
-                cursor.execute("INSERT OR IGNORE INTO map SELECT * FROM db.map")
-                cursor.execute("INSERT OR IGNORE INTO images SELECT * FROM db.images")
+                cursor.execute(f"INSERT OR IGNORE INTO map SELECT * FROM {alias}.map")
+                cursor.execute(f"INSERT OR IGNORE INTO images SELECT * FROM {alias}.images")
             else:
-                cursor.execute("INSERT OR IGNORE INTO tiles SELECT * FROM db.tiles")
-        except sqlite3.OperationalError as e:
-            print(f"Error merging {db_path}: {e}")
-        finally:
-            try:
-                cursor.execute("DETACH DATABASE db")
-            except sqlite3.OperationalError:
-                pass # Already detached or other issue
-                
-        if i % 10 == 0:
+                cursor.execute(f"INSERT OR IGNORE INTO tiles SELECT * FROM {alias}.tiles")
             conn.commit()
+        except sqlite3.OperationalError as e:
+            raise RuntimeError(f"Error merging {db_path}: {e}") from e
+        finally:
+            if attached:
+                try:
+                    cursor.execute(f"DETACH DATABASE {alias}")
+                except sqlite3.OperationalError as e:
+                    raise RuntimeError(f"Failed to detach {db_path}: {e}") from e
     
     conn.commit()
     conn.close()
 
-def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str, 
-               scale_params: List[List[float]], options: Dict) -> None:
-    """Main entry point for tiling. Handles chunking, parallel processing, and merging."""
-    
+def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str,
+               scale_params: List[List[float]], options: Dict[str, Any]) -> TilingArtifacts:
+    """Main entry point for tiling. Handles staging, chunking, and merging."""
     unique_id = options.get('unique_id', 'tiles')
     chunk_zoom = options.get('chunk_zoom', 4)
-    
-    # 1. Create color-corrected and scaled VRT
-    color_vrt = f".temp/color_corrected_{unique_id}.vrt"
-    run_tiling.color_vrt = color_vrt # Store for cleanup
-    
-    print(f"Applying color correction (B:{options['brightness']} C:{options['contrast']} S:{options['saturation']})...")
-    create_color_corrected_vrt(
-        input_vrt, color_vrt, scale_params,
-        options['brightness'], options['contrast'], options['saturation']
-    )
-    
-    # 2. Determine chunks
-    ds = gdal.Open(color_vrt)
+    vrt_only = options.get('vrt', False)
+
+    # 6. Create color-corrected and scaled VRT
+    color_vrt = make_step_vrt_path(6, "color_corrected", unique_id)
+    print("Applying step 6 soft-knee tone mapping...")
+    create_color_corrected_vrt(input_vrt, color_vrt, scale_params)
+
+    # 7. Materialize the final byte VRT used for packaging or QGIS inspection.
+    byte_vrt = make_step_vrt_path(7, "byte_conversion", unique_id)
+    create_byte_conversion_vrt(color_vrt, byte_vrt)
+
+    if vrt_only:
+        return TilingArtifacts(final_vrt=byte_vrt, cleanup_paths=[color_vrt])
+
+    # 8. Determine chunks from the final Byte VRT.
+    ds = gdal.Open(byte_vrt)
     bounds = get_dataset_bounds(ds)
     ds = None
-    
+
     tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, chunk_zoom)
-    
-    tasks = []
-    chunk_files = []
+
+    tasks: List[ChunkTask] = []
+    chunk_files: List[str] = []
     for ty in range(ty_min, ty_max + 1):
         for tx in range(tx_min, tx_max + 1):
             chunk_file = f".temp/chunk_{chunk_zoom}_{tx}_{ty}_{unique_id}.mbtiles"
             chunk_files.append(chunk_file)
-            
+
             if os.path.exists(chunk_file):
                 continue
-                
-            ulx, uly, lrx, lry = get_web_mercator_bounds(chunk_zoom, tx, ty)
-            tasks.append((color_vrt, chunk_file, tile_format, options, [ulx, uly, lrx, lry]))
 
-    # 3. Parallel Execution
+            ulx, uly, lrx, lry = get_web_mercator_bounds(chunk_zoom, tx, ty)
+            tasks.append((byte_vrt, chunk_file, tile_format, options, (ulx, uly, lrx, lry)))
+
+    # 9. Parallel execution.
     if tasks:
         num_workers = options.get('processes', 1)
         print(f"Processing {len(tasks)} chunk(s) at zoom {chunk_zoom} with {num_workers} worker(s)...")
@@ -292,11 +473,11 @@ def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str,
         else:
             for task in tasks:
                 process_chunk(task)
-            
-    # 4. Merge Chunks
+
+    # 10. Merge chunks.
     merge_mbtiles(output_mbtiles, chunk_files)
-    
-    # 5. Build Overviews
+
+    # 11. Build overviews.
     print("Building overviews...")
     gdaladdo_cmd = [
         "gdaladdo", "-r", options['resample_alg'], 
@@ -304,11 +485,5 @@ def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str,
         output_mbtiles
     ]
     subprocess.run(gdaladdo_cmd, check=True)
-    
-    # Cleanup chunk files only if merge was successful
-    if os.path.exists(output_mbtiles):
-        for f in chunk_files:
-            if f and os.path.exists(f):
-                os.remove(f)
-        if os.path.exists(color_vrt):
-            os.remove(color_vrt)
+
+    return TilingArtifacts(final_vrt=byte_vrt, cleanup_paths=[color_vrt, byte_vrt, *chunk_files])

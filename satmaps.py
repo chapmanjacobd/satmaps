@@ -5,11 +5,12 @@ import subprocess
 import sys
 import uuid
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 from osgeo import gdal
 
-from tiler import run_tiling
+import tiler
 
 # Setup GDAL exceptions
 gdal.UseExceptions()
@@ -20,14 +21,13 @@ class ProcessingOptions:
     format: str
     quality: int
     resample_alg: str
-    brightness: float
-    contrast: float
-    saturation: float
     chunk_zoom: int
     processes: int
     blocksize: int
     name: str
     description: str
+    vrt: bool = False
+    step5: bool = False
     stats_min: Optional[float] = None
     stats_max: Optional[float] = None
 
@@ -139,6 +139,68 @@ def create_rgb_vrt(band_paths: Dict[str, str], output_vrt: str) -> None:
     """Create a virtual RGB stack from separate R, G, B files."""
     ordered_bands = [band_paths['red'], band_paths['green'], band_paths['blue']]
     gdal.BuildVRT(output_vrt, ordered_bands, separate=True, srcNodata=-32768, VRTNodata=-32768)
+    tiler.apply_rgb_color_interpretation_to_vrt(output_vrt)
+
+
+def prepare_folder_source(
+    folder_name: str,
+    date_path: str,
+    cache_dir: Optional[str],
+    unique_id: str,
+    download_only: bool,
+) -> Tuple[str, Optional[str], int, int, Optional[str]]:
+    """Prepare one folder's source paths and optional RGB VRT."""
+    try:
+        paths, cached, downloaded = get_tile_paths(folder_name, date_path, cache_dir)
+        tile_vrt = None
+        if not download_only:
+            tile_vrt = tiler.make_step_vrt_path(1, f"tile_{folder_name}", unique_id)
+            create_rgb_vrt(paths, tile_vrt)
+        return folder_name, tile_vrt, cached, downloaded, None
+    except Exception as exc:
+        return folder_name, None, 0, 0, str(exc)
+
+
+def prepare_group_sources(
+    folders: List[str],
+    date_path: str,
+    cache_dir: Optional[str],
+    unique_id: str,
+    download_only: bool,
+    max_workers: int,
+) -> Tuple[List[str], int, int]:
+    """Prepare a group of folders, parallelizing per-folder I/O when helpful."""
+    if not folders:
+        return [], 0, 0
+
+    worker_count = max(1, min(max_workers, len(folders)))
+    if worker_count > 1:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(
+                executor.map(
+                    lambda folder: prepare_folder_source(folder, date_path, cache_dir, unique_id, download_only),
+                    folders,
+                )
+            )
+    else:
+        results = [
+            prepare_folder_source(folder, date_path, cache_dir, unique_id, download_only)
+            for folder in folders
+        ]
+
+    tile_vrts: List[str] = []
+    total_cached = 0
+    total_downloaded = 0
+    for folder_name, tile_vrt, cached, downloaded, error in results:
+        if error is not None:
+            print(f"Warning: Skipping {folder_name}: {error}")
+            continue
+        total_cached += cached
+        total_downloaded += downloaded
+        if tile_vrt is not None:
+            tile_vrts.append(tile_vrt)
+
+    return tile_vrts, total_cached, total_downloaded
 
 def merge_date_vrts(output_vrt: str, input_vrts: List[str]) -> None:
     """Merge multiple date VRTs using a mean pixel function to handle overlaps."""
@@ -156,6 +218,13 @@ def merge_date_vrts(output_vrt: str, input_vrts: List[str]) -> None:
 
     for band in root.findall("VRTRasterBand"):
         band.set("subClass", "VRTDerivedRasterBand")
+        band_index = int(band.get("band", "0"))
+        if 1 <= band_index <= 3:
+            color_interp = band.find("ColorInterp")
+            if color_interp is None:
+                color_interp = ET.Element("ColorInterp")
+                band.insert(0, color_interp)
+            color_interp.text = tiler.RGB_COLOR_INTERPRETATIONS[band_index - 1]
         ET.SubElement(band, "PixelFunctionType").text = "expression"
         ET.SubElement(band, "PixelFunctionArguments").set("expression", expr)
         ET.SubElement(band, "NoDataValue").text = nodata_val
@@ -194,17 +263,35 @@ def calculate_scaling_params(dataset: gdal.Dataset, shared: bool = True) -> List
 
     return [[s[0], s[1], 0, 255] for s in band_stats]
 
-def run_warp(input_vrt: str, output_vrt: str) -> None:
+def run_warp(input_vrt: str, output_path: str, materialize_geotiff: bool = False) -> None:
     """Reproject to Web Mercator (EPSG:3857) for tiling."""
+    creation_options = None
+    output_format = "VRT"
+    if materialize_geotiff:
+        output_format = "GTiff"
+        creation_options = [
+            "COMPRESS=ZSTD",
+            "ZSTD_LEVEL=3",
+            "PREDICTOR=2",
+            "TILED=YES",
+        ]
+
     warp_options = gdal.WarpOptions(
-        format="VRT", dstSRS="EPSG:3857", resampleAlg="cubic",
-        srcNodata=-32768, dstNodata=0, callback=gdal.TermProgress_nocb
+        format=output_format,
+        creationOptions=creation_options,
+        dstSRS="EPSG:3857",
+        resampleAlg="cubic",
+        srcNodata=-32768,
+        dstNodata=0,
+        callback=gdal.TermProgress_nocb,
     )
-    gdal.Warp(output_vrt, input_vrt, options=warp_options)
+    gdal.Warp(output_path, input_vrt, options=warp_options)
 
 # --- Execution Layer (High-level Workflows) ---
 
-def process_date(date: str, args: argparse.Namespace, unique_id: str, land_tiles: Optional[Set[str]]) -> List[str]:
+def process_date(
+    date: str, args: argparse.Namespace, unique_id: str, land_tiles: Optional[Set[str]]
+) -> Tuple[List[str], List[str]]:
     """Discover folders and create individual tile VRTs for a specific date."""
     date_cache = os.path.join(args.cache, date.replace("/", "-")) if args.cache else None
     
@@ -220,41 +307,42 @@ def process_date(date: str, args: argparse.Namespace, unique_id: str, land_tiles
         print("Error: --download-only requires --cache")
         sys.exit(1)
 
-    tile_vrts = []
+    tile_vrts: List[str] = []
     total_cached = 0
     total_downloaded = 0
     # Always group VRTs to avoid "too many open files"
     group_size, group_vrts = 50, []
     for i in range(0, len(folders), group_size):
         chunk = folders[i:i + group_size]
-        chunk_vrt = f".temp/group_{date.replace('/', '-')}_{i // group_size}_{unique_id}.vrt"
-        chunk_tiles = []
-        for folder in chunk:
-            try:
-                paths, cached, downloaded = get_tile_paths(folder, date, date_cache)
-                total_cached += cached
-                total_downloaded += downloaded
-                if args.download_only: continue
-                t_vrt = f".temp/tile_{folder}_{unique_id}.vrt"
-                create_rgb_vrt(paths, t_vrt)
-                chunk_tiles.append(t_vrt)
-                tile_vrts.append(t_vrt)
-            except Exception as e: print(f"Warning: Skipping {folder}: {e}")
+        chunk_vrt = tiler.make_step_vrt_path(2, f"group_{date.replace('/', '-')}_{i // group_size}", unique_id)
+        chunk_tiles, chunk_cached, chunk_downloaded = prepare_group_sources(
+            chunk,
+            date,
+            date_cache,
+            unique_id,
+            args.download_only,
+            args.processes,
+        )
+        total_cached += chunk_cached
+        total_downloaded += chunk_downloaded
+        tile_vrts.extend(chunk_tiles)
         
         if not args.download_only and chunk_tiles:
             gdal.BuildVRT(chunk_vrt, chunk_tiles, srcNodata=-32768, VRTNodata=-32768)
+            tiler.apply_rgb_color_interpretation_to_vrt(chunk_vrt)
             group_vrts.append(chunk_vrt)
     
     print(f"Date {date} summary: {total_cached} bands cached, {total_downloaded} bands downloaded.")
     
     if not args.download_only and group_vrts:
-        date_vrt = f".temp/mosaic_{date.replace('/', '-')}_{unique_id}.vrt"
+        date_vrt = tiler.make_step_vrt_path(3, f"mosaic_{date.replace('/', '-')}", unique_id)
         gdal.BuildVRT(date_vrt, group_vrts, srcNodata=-32768, VRTNodata=-32768)
+        tiler.apply_rgb_color_interpretation_to_vrt(date_vrt)
         return [date_vrt], tile_vrts + group_vrts
 
     return [], tile_vrts
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE.")
     parser.add_argument("mgrs", nargs="?", default="31TDF", help="MGRS tile ID")
     parser.add_argument("--global", dest="all_tiles", action="store_true", help="Process all available tiles")
@@ -263,40 +351,46 @@ def main():
     parser.add_argument("--format", choices=["webp", "jpg", "png", "png8"], default="webp", help="Tile format")
     parser.add_argument("--quality", type=int, default=74, help="Quality (0-100)")
     parser.add_argument("--resample-alg", default="lanczos", choices=["bilinear", "average", "gauss", "lanczos"])
-    parser.add_argument("--brightness", type=float, default=1.0, help="Brightness multiplier")
-    parser.add_argument("--contrast", type=float, default=1.1, help="Contrast multiplier")
-    parser.add_argument("--saturation", type=float, default=1.1, help="Saturation multiplier")
     parser.add_argument("--chunk-zoom", type=int, default=4, help="Zoom level to chunk the processing at (for resumability)")
-    parser.add_argument("--processes", type=int, default=1, help="Number of parallel processes for tiling")
+    parser.add_argument("--processes", type=int, default=4, help="Number of parallel processes for tiling")
     parser.add_argument("--stats-min", type=float, default=0, help="Hardcoded source min")
     parser.add_argument("--stats-max", type=float, default=9000, help="Hardcoded source max")
     parser.add_argument("--blocksize", type=int, default=512)
     parser.add_argument("--cache", default=".cache", help="Cache directory")
     parser.add_argument("--download-only", action="store_true", help="Download only")
     parser.add_argument("--land-only", help="Path to land tile list txt")
+    parser.add_argument("--vrt", action="store_true", help="Write the final inspection VRT in .temp and skip MBTiles/PMTiles output")
+    parser.add_argument("--step5", action="store_true", help="Materialize step 5 as a compressed tiled GeoTIFF instead of a VRT")
     args = parser.parse_args()
 
     opts = ProcessingOptions(
         format=args.format, quality=args.quality, resample_alg=args.resample_alg,
-        brightness=args.brightness, contrast=args.contrast, saturation=args.saturation,
         chunk_zoom=args.chunk_zoom, processes=args.processes,
         blocksize=args.blocksize, name="Sentinel-2 Mosaic", description="Copernicus Sentinel data",
+        vrt=args.vrt, step5=args.step5,
         stats_min=args.stats_min, stats_max=args.stats_max
     )
 
     setup_gdal_cdse()
     os.makedirs(".temp", exist_ok=True)
     unique_id = uuid.uuid4().hex[:8]
-    temp_vrt, temp_warped_vrt, temp_mbtiles = f".temp/master_{unique_id}.vrt", f".temp/warped_{unique_id}.vrt", f".temp/tiles_{unique_id}.mbtiles"
+    temp_vrt = tiler.make_step_vrt_path(4, "master", unique_id)
+    temp_warped_vrt = (
+        f".temp/step5_warped_3857_{unique_id}.tif"
+        if args.step5
+        else tiler.make_step_vrt_path(5, "warped_3857", unique_id)
+    )
+    temp_mbtiles = f".temp/tiles_{unique_id}.mbtiles"
     
     land_tiles = None
     if args.land_only and os.path.exists(args.land_only):
-        with open(args.land_only, 'r') as f:
-            land_tiles = {line.strip() for line in f if line.strip()}
+        with open(args.land_only, 'r') as land_file:
+            land_tiles = {line.strip() for line in land_file if line.strip()}
 
-    cleanup_list = []
+    cleanup_list: List[str] = []
+    tiling_artifacts: Optional[tiler.TilingArtifacts] = None
     try:
-        all_date_vrts = []
+        all_date_vrts: List[str] = []
         for d in [date.strip() for date in args.date.split(",")]:
             date_vrts, tile_vrts = process_date(d, args, unique_id, land_tiles)
             all_date_vrts.extend(date_vrts)
@@ -310,32 +404,56 @@ def main():
 
         print("Building master VRT...")
         if len(all_date_vrts) > 1: merge_date_vrts(temp_vrt, all_date_vrts)
-        else: gdal.BuildVRT(temp_vrt, all_date_vrts, srcNodata=-32768, VRTNodata=-32768)
+        else:
+            gdal.BuildVRT(temp_vrt, all_date_vrts, srcNodata=-32768, VRTNodata=-32768)
+            tiler.apply_rgb_color_interpretation_to_vrt(temp_vrt)
         cleanup_list.extend(all_date_vrts)
 
         print("Reprojecting...")
-        run_warp(temp_vrt, temp_warped_vrt)
+        run_warp(temp_vrt, temp_warped_vrt, materialize_geotiff=args.step5)
+        if not args.step5:
+            tiler.apply_rgb_color_interpretation_to_vrt(temp_warped_vrt)
 
         # Scaling setup
         ds = gdal.Open(temp_warped_vrt)
+        if ds is None:
+            raise RuntimeError(f"Could not open warped VRT {temp_warped_vrt}")
         if opts.stats_min is not None and opts.stats_max is not None:
             scale_params = [[opts.stats_min, opts.stats_max, 0, 255]] * ds.RasterCount
         else:
             scale_params = calculate_scaling_params(ds)
         ds = None
 
-        print(f"Generating MBTiles ({args.format}) via chunking...")
-        run_tiling(temp_warped_vrt, temp_mbtiles, args.format, scale_params, vars(opts) | {"unique_id": unique_id})
+        stage_label = "final VRT" if args.vrt else f"MBTiles ({args.format}) via chunking"
+        print(f"Generating {stage_label}...")
+        tiling_artifacts = tiler.run_tiling(
+            temp_warped_vrt,
+            temp_mbtiles,
+            args.format,
+            scale_params,
+            vars(opts) | {"unique_id": unique_id},
+        )
+
+        if args.vrt:
+            print(f"Success! {tiling_artifacts.final_vrt}")
+            return
 
         print("Converting to PMTiles...")
         subprocess.run(["pmtiles", "convert", temp_mbtiles, args.output], check=True)
         print(f"Success! {args.output}")
 
     finally:
-        for f in [temp_vrt, temp_warped_vrt, temp_mbtiles] + cleanup_list:
+        cleanup_candidates = [temp_vrt, temp_warped_vrt, temp_mbtiles, *cleanup_list]
+        if tiling_artifacts is not None:
+            cleanup_candidates.extend(tiling_artifacts.cleanup_paths)
+        preserved_paths = {
+            path for path in cleanup_candidates
+            if args.vrt and (path.endswith(".vrt") or path.endswith(".tif"))
+        }
+        for f in cleanup_candidates:
+            if f in preserved_paths:
+                continue
             if os.path.exists(f): os.remove(f)
-        if hasattr(run_tiling, 'color_vrt') and os.path.exists(run_tiling.color_vrt):
-            os.remove(run_tiling.color_vrt)
 
 if __name__ == "__main__":
     main()
