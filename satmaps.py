@@ -52,31 +52,33 @@ def get_quarter(date_path: str) -> str:
     return "Q3"
 
 def list_mosaic_folders(date_path: str, mgrs_filter: Optional[str] = None, cache_dir: Optional[str] = None) -> List[str]:
-    """Retrieve list of S3 folders for a given date, optionally filtered by MGRS tile."""
+    """Retrieve list of S3 folders for a given date, optionally filtered by one or more MGRS tiles."""
     quarter = get_quarter(date_path)
     year = date_path.split('/')[0]
 
     if mgrs_filter:
-        # Optimization: Check local cache first
-        if cache_dir and os.path.exists(os.path.join(cache_dir, f"{mgrs_filter}_0_0_B04.tif")):
-            found_local = []
-            for x, y in [(0,0), (1,0), (0,1), (1,1)]:
-                if os.path.exists(os.path.join(cache_dir, f"{mgrs_filter}_{x}_{y}_B04.tif")):
-                    found_local.append(f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs_filter}_{x}_{y}")
-            return sorted(found_local)
+        mgrs_list = [m.strip() for m in mgrs_filter.split(',')]
+        all_found_folders = []
+        
+        for mgrs in mgrs_list:
+            # Optimization: Check local cache first
+            if cache_dir and os.path.exists(os.path.join(cache_dir, f"{mgrs}_0_0_B04.tif")):
+                for x, y in [(0,0), (1,0), (0,1), (1,1)]:
+                    if os.path.exists(os.path.join(cache_dir, f"{mgrs}_{x}_{y}_B04.tif")):
+                        all_found_folders.append(f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs}_{x}_{y}")
+                continue
 
-        # Standard grid indices for Sentinel-2 mosaic sub-tiles
-        potential_folders = [f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs_filter}_{x}_{y}" for x, y in [(0,0), (1,0), (0,1), (1,1)]]
-        found_folders = []
-        for folder in potential_folders:
-            s3_path = f"s3://eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder}/B04.tif"
-            cmd = ["aws", "--endpoint-url", "https://eodata.dataspace.copernicus.eu", "--profile", "cdse", "s3", "ls", s3_path]
-            if subprocess.run(cmd, capture_output=True).returncode == 0:
-                found_folders.append(folder)
+            # Standard grid indices for Sentinel-2 mosaic sub-tiles
+            potential_folders = [f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs}_{x}_{y}" for x, y in [(0,0), (1,0), (0,1), (1,1)]]
+            for folder in potential_folders:
+                s3_path = f"s3://eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder}/B04.tif"
+                cmd = ["aws", "--endpoint-url", "https://eodata.dataspace.copernicus.eu", "--profile", "cdse", "s3", "ls", s3_path]
+                if subprocess.run(cmd, capture_output=True).returncode == 0:
+                    all_found_folders.append(folder)
 
-        if not found_folders:
+        if not all_found_folders:
             raise RuntimeError(f"No folders found for MGRS {mgrs_filter} at {date_path}")
-        return sorted(found_folders)
+        return sorted(all_found_folders)
 
     # Full bucket listing for global mode
     s3_prefix = f"s3://eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/"
@@ -218,10 +220,13 @@ def run_translate_to_mbtiles(input_vrt: str, output_file: str, opts: ProcessingO
 
 # --- Execution Layer (High-level Workflows) ---
 
-def process_date(date: str, args: argparse.Namespace, unique_id: str, land_tiles: Optional[Set[str]]) -> List[str]:
+def process_date(date: str, args: argparse.Namespace, unique_id: str, land_tiles: Optional[Set[str]], use_tiler: bool) -> List[str]:
     """Discover folders and create individual tile VRTs for a specific date."""
     date_cache = os.path.join(args.cache, date.replace("/", "-")) if args.cache else None
-    folders = list_mosaic_folders(date, mgrs_filter=None if args.all_tiles else args.mgrs, cache_dir=date_cache)
+    
+    # Use mgrs_filter if it's not a global run OR if specific tiles are provided
+    mgrs_filter = args.mgrs if not args.all_tiles or (args.mgrs and args.mgrs != "31TDF") else None
+    folders = list_mosaic_folders(date, mgrs_filter=mgrs_filter, cache_dir=date_cache)
     
     if args.all_tiles and land_tiles:
         folders = [f for f in folders if f.split('_')[4] in land_tiles]
@@ -232,7 +237,7 @@ def process_date(date: str, args: argparse.Namespace, unique_id: str, land_tiles
         sys.exit(1)
 
     tile_vrts = []
-    if args.all_tiles:
+    if use_tiler:
         # Group VRTs to avoid "too many open files"
         group_size, group_vrts = 50, []
         for i in range(0, len(folders), group_size):
@@ -256,9 +261,7 @@ def process_date(date: str, args: argparse.Namespace, unique_id: str, land_tiles
         if not args.download_only and group_vrts:
             date_vrt = f".temp/mosaic_{date.replace('/', '-')}_{unique_id}.vrt"
             gdal.BuildVRT(date_vrt, group_vrts, srcNodata=-32768, VRTNodata=-32768)
-            for f in group_vrts: 
-                if os.path.exists(f): os.remove(f)
-            return [date_vrt], tile_vrts
+            return [date_vrt], tile_vrts + group_vrts
     else:
         date_tiles = []
         for folder in folders:
@@ -315,11 +318,13 @@ def main():
         with open(args.land_only, 'r') as f:
             land_tiles = {line.strip() for line in f if line.strip()}
 
+    use_tiler = args.all_tiles or "," in args.mgrs
+
     cleanup_list = []
     try:
         all_date_vrts = []
         for d in [date.strip() for date in args.date.split(",")]:
-            date_vrts, tile_vrts = process_date(d, args, unique_id, land_tiles)
+            date_vrts, tile_vrts = process_date(d, args, unique_id, land_tiles, use_tiler)
             all_date_vrts.extend(date_vrts)
             cleanup_list.extend(tile_vrts)
         
@@ -347,7 +352,7 @@ def main():
         ds = None
 
         print(f"Generating MBTiles ({args.format})...")
-        if args.all_tiles:
+        if use_tiler:
             run_gdal2tiles(temp_warped_vrt, temp_mbtiles, args.format, scale_params, [opts.exponent]*3 if opts.exponent!=0 else None, args.resample_alg, vars(args) | {"name": opts.name, "description": opts.description})
         else:
             run_translate_to_mbtiles(temp_warped_vrt, temp_mbtiles, opts, scale_params)
