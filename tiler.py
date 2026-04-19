@@ -309,6 +309,10 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
                     cursor.execute(f"DETACH DATABASE {alias}")
                 except sqlite3.OperationalError as e:
                     raise RuntimeError(f"Failed to detach {db_path}: {e}") from e
+                try:
+                    os.remove(db_path)
+                except OSError:
+                    pass
     
     conn.commit()
     conn.close()

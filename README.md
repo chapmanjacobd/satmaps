@@ -1,94 +1,90 @@
 # Satmaps
 
-A toolkit for generating high-performance PMTiles from Sentinel-2 Global Mosaics hosted on the Copernicus Data Space Ecosystem (CDSE).
+A toolkit for generating high-performance PMTiles from Sentinel-2 Global Mosaics hosted on the Copernicus Data Space Ecosystem (CDSE), featuring a high-fidelity NumPy-based processing pipeline.
 
 ## Overview
 
-This repository provides tools to fetch, process, and package Sentinel-2 mosaic data directly from CDSE S3 storage into reprojected, optimized PMTiles. It supports multiple image formats, quality levels, and resampling algorithms for comparison and production use.
+This repository provides tools to fetch, process, and package Sentinel-2 mosaic data directly from CDSE S3 storage into reprojected, optimized PMTiles. It features a custom tone-mapping engine to handle the high dynamic range of satellite data, producing visually balanced results for web mapping.
 
 ## Core Components
 
-- `satmaps.py`: The primary engine. Handles GDAL S3 configuration, band merging (RGB), multi-date mosaicking, reprojection to Web Mercator (EPSG:3857), and MBTiles/PMTiles or inspection-VRT generation.
-- `tiler.py`: Dedicated module for robust tiling using `gdal2tiles.py` for large-scale (global) processing.
-- `testbench.py`: A batch processing script to generate a matrix of comparisons across different MGRS tiles, dates, and compression settings.
-- `viewer.html`: A side-by-side MapLibre GL JS viewer with dynamic configuration, synchronized views, and zoom shortcuts.
+- `satmaps.py`: The primary engine. Handles GDAL S3 configuration, multi-date mosaicking, reprojection to Web Mercator (EPSG:3857), and PMTiles generation. Uses a NumPy-based pipeline for tone mapping and grading.
+- `tuner_ui.py`: A Flask-based interactive web interface to fine-tune tone mapping parameters (exposure, contrast, saturation) in real-time on sample data.
+- `tiler.py`: Core logic for tile processing, tone mapping algorithms, and parallelized chunk execution.
 
 ## Prerequisites
 
-- GDAL: Must be compiled with S3 support. `gdal2tiles.py` is required for global runs.
-- Python 3: With `gdal` bindings installed.
-- PMTiles CLI: For converting MBTiles to PMTiles.
+- Python 3.11+
+- GDAL: Must be compiled with S3 support.
+- PMTiles CLI: For final conversion from MBTiles to PMTiles.
 - AWS CLI: For tile discovery and S3 access.
 
 ### Configuration
 
-You must configure an AWS profile named `cdse` to access the Copernicus data:
+Configure an AWS profile named `cdse` with your [CDSE S3 credentials](https://documentation.dataspace.copernicus.eu/APIs/S3.html):
 
 ```bash
 aws configure --profile cdse
 ```
-Use your [CDSE](https://documentation.dataspace.copernicus.eu/APIs/S3.html) credentials.
 
 ## Usage
 
-### Single or Multiple MGRS tiles
+### 1. Tune Visuals (Optional)
 
-Generate PMTiles for one or more specific MGRS tiles:
+Before a large run, use the Tuner UI to find the best visual parameters:
 
 ```bash
-# Single tile
-python3 satmaps.py 31TDF --format webp --quality 75 -o output.pmtiles
-
-# Multiple tiles (comma-separated)
-python3 satmaps.py 31TCF,31TDF,31TCE,31TDE --date 2025/07/01 -o region.pmtiles
+python3 tuner_ui.py
 ```
+Visit `http://localhost:5001` to adjust exposure, soft-knee curves, and saturation. Note: Requires some data in `.cache/2025-07-01` (e.g., from a small `satmaps.py` run).
 
-### Global Run
+### 2. Generate PMTiles
 
-Process all available mosaic tiles. It is recommended to use a land-only filter:
+Generate PMTiles for specific MGRS tiles or a global run:
 
 ```bash
+# Single tile (defaults to 2025/07/01 and 2025/01/01 mosaics)
+python3 satmaps.py 31TDF -o barcelona.pmtiles
+
+# Multiple tiles with custom quality and format
+python3 satmaps.py 31TCF,31TDF,31TCE,31TDE --format webp --quality 80 -o region.pmtiles
+
+# Global run using a land-only filter
 python3 satmaps.py --global --land-only HLS.land.tiles.txt -o global.pmtiles
 ```
 
-### Advanced Options
+### 3. Estimate Resources
 
-- `--date`: Comma-separated list of mosaic dates (e.g., `2025/07/01,2025/01/01`). Multiple dates are averaged to handle overlaps and reduce cloud artifacts.
-- `--stats-min`/`--stats-max`: Optional hardcoded source min/max values for consistent scaling across different runs. If omitted, step 6 auto-scales from 0 to the source histogram's 99.6th percentile before applying its soft-knee tone curve.
-- `--cache`: Local directory to store downloaded `.tif` files.
-- `--vrt`: Stop after generating the step 6 inspection VRT in `.temp/` for quick QGIS review, skipping MBTiles/PMTiles packaging.
-- `--step5`: Materialize step 5 as a tiled ZSTD-compressed GeoTIFF so downstream VRT stages reference a real raster file instead of a warped VRT.
-
-### Batch Comparison
-
-The `testbench.py` script runs in two phases:
-1. Phase 1: Downloads required MGRS tiles for specified dates into a local `cache/` to avoid redundant S3 requests.
-2. Phase 2: Iterates through permutations of format, quality, resampling, exponents, and scaling to generate comparison files in `combinations_output/`.
+Before a global run, estimate the time and storage required:
 
 ```bash
-python3 testbench.py
+python3 satmaps.py --global --land-only HLS.land.tiles.txt --estimate
 ```
 
-### Viewing Results
+## Advanced Options
 
-To compare the outputs, serve the directory via HTTP and open the viewer:
+- `--date`: Comma-separated list of mosaic dates (default: `2025/07/01,2025/01/01`). Overlapping areas are averaged.
+- `--resample-alg`: Resampling algorithm (`lanczos`, `bilinear`, `average`, `gauss`).
+- `--no-soft-knee`: Disable the multi-segment tone mapping curve.
+- `--no-grading`: Disable final saturation and gamma adjustments.
+- `--cache`: Local directory for downloaded tiles (default: `.cache`).
+- `--vrt`: Generate the final VRT and exit (useful for inspection in QGIS).
 
-```bash
-python3 serve.py
-```
-Then visit `http://localhost:8000/viewer.html`. The viewer dynamically reads the configuration from `testbench.py` to populate its controls.
+### Tone Mapping Parameters
+
+You can override the defaults (tuned via `tuner_ui.py`):
+- `--exposure`: Global brightness multiplier.
+- `--sb`, `--hb`: Shadow and highlight "break" points for the soft-knee curve.
+- `--ss`, `--ms`, `--hs`: Slopes for shadow, mid-tone, and highlight segments.
+- `--sat`: Final saturation adjustment.
+- `--gamma`: Final gamma correction.
 
 ## Technical Details
 
-- Source: `s3://eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/`
-- Projection: Source data is reprojected from UTM (MGRS) to Web Mercator (EPSG:3857).
-- Processing Pipeline:
-    1. Discovery: List S3 folders for requested MGRS tiles and dates.
-    2. Step 1: Create per-tile RGB VRTs from B04, B03, B02 bands (VSI S3 or local cache).
-    3. Step 2: Build grouped VRT mosaics to keep the number of open files manageable.
-    4. Step 3: Build per-date mosaic VRTs and average overlaps with a derived-band expression.
-    5. Step 4: Merge the requested date mosaics into a master VRT.
-    6. Step 5: Reproject the master VRT to Web Mercator (EPSG:3857), optionally materialized as a tiled ZSTD GeoTIFF with `--step5`.
-    7. Step 6: Create a tone-mapped Float32 VRT with a built-in soft-knee curve plus mild preview desaturation and a darker gamma-like rolloff for fast QGIS inspection.
-    8. Step 7: Create the final Byte-conversion VRT used for chunked packaging.
-    9. Packaging: Translate chunk MBTiles, merge them, build overviews, and optionally run `pmtiles convert` for distribution.
+1.  Discovery: Lists S3 folders for requested MGRS tiles and dates.
+2.  Mosaicking: Builds VRTs that combine bands (B04, B03, B02) and average multiple dates to reduce cloud artifacts.
+3.  Reprojection: Warps data to Web Mercator (EPSG:3857).
+4.  Processing (NumPy):
+    - Soft-Knee Tone Mapping: A 3-segment linear curve to compress high dynamic range while preserving local contrast.
+    - Color Grading: Saturation adjustment and gamma correction for a "natural" look.
+5.  Packaging: Tiles are generated in chunks, merged into an MBTiles database, and converted to PMTiles.

@@ -1,4 +1,4 @@
-.PHONY: help install dev-install lint format typecheck test serve generate clean clean-cache
+.PHONY: help install dev-install lint typecheck test tune clean clean-cache
 
 PYTHON := python3
 PIP := $(PYTHON) -m pip
@@ -10,9 +10,8 @@ help:
 	@echo "  lint         : Run ruff for linting"
 	@echo "  typecheck    : Run mypy for type checking"
 	@echo "  test         : Run pytest"
-	@echo "  serve        : Start the local server for the viewer (port 8000)"
-	@echo "  generate     : Run the batch combination generator"
-	@echo "  clean        : Remove temporary files and VRTs"
+	@echo "  tune         : Start the Tuner UI (port 5001)"
+	@echo "  clean        : Remove temporary files and build artifacts"
 	@echo "  clean-cache  : Remove cached tiles"
 
 install:
@@ -30,9 +29,14 @@ typecheck:
 test:
 	$(PYTHON) -m pytest
 
-serve:
-	$(PYTHON) serve.py
+tune:
+	$(PYTHON) tuner_ui.py
 
 clean:
-	rm -rf __pycache__ .ruff_cache .mypy_cache combinations_output .temp
+	rm -rf __pycache__ .ruff_cache .mypy_cache .temp
+	find . -name "*.vrt" -delete
 	@echo "Cleaned up temporary files."
+
+clean-cache:
+	rm -rf .cache/*
+	@echo "Cache cleared."

@@ -55,8 +55,17 @@ def list_mosaic_folders_for_tile(mgrs_tile: str, date_paths: List[str], cache_di
             continue
 
         # 2. Check pre-populated S3 cache
-        if date_path in S3_FOLDER_CACHE and folder in S3_FOLDER_CACHE[date_path]:
-            found.append((folder, date_path))
+        if date_path in S3_FOLDER_CACHE:
+            if folder in S3_FOLDER_CACHE[date_path]:
+                found.append((folder, date_path))
+        else:
+            # Fallback for non-global runs: check S3 directly for this specific folder
+            s3_path = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder}"
+            try:
+                if gdal.ReadDir(s3_path):
+                    found.append((folder, date_path))
+            except:
+                pass
             
     return found
 
@@ -202,12 +211,68 @@ def process_single_tile(
         resampleAlg=args.resample_alg,
         srcNodata=0,
         dstNodata=0,
-        creationOptions=["COMPRESS=ZSTD", "TILED=YES"]
+        creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "PREDICTOR=2", "TILED=YES"]
     )
     gdal.Warp(temp_3857_path, temp_utm_path, options=warp_options)
     os.remove(temp_utm_path)
     
     return temp_3857_path
+
+def calculate_estimates(args: argparse.Namespace) -> None:
+    """Calculate and print estimations for the given command."""
+    date_paths = [d.strip() for d in args.date.split(",")]
+    num_dates = len(date_paths)
+
+    if args.all_tiles and args.land_only:
+        try:
+            with open(args.land_only, 'r') as f:
+                mgrs_bases = [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            print(f"Error: Land-only file not found: {args.land_only}")
+            sys.exit(1)
+    else:
+        mgrs_bases = [m.strip() for m in args.mgrs.split(",") if m.strip()]
+
+    num_mgrs = len(mgrs_bases)
+    num_subtiles = num_mgrs * 4
+    total_tile_dates = num_subtiles * num_dates
+
+    # Rough estimations based on 5000x5000 float32 subtiles
+    # Network: ~200MB per band * 3 bands = 600MB per tile-date
+    network_gb = (total_tile_dates * 600) / 1024
+
+    # RAM: ~8GB per process for NumPy stack/mean operations
+    ram_gb = args.parallel * 8
+
+    # Time: ~15s per tile-date processing + ~30s per subtile for warping/tiling
+    total_seconds = (total_tile_dates * 15 / args.parallel) + (num_subtiles * 30 / args.parallel)
+    total_seconds += (num_subtiles * 2) 
+    
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+
+    # Disk Space Peak (Optimized):
+    # 1. Cached raw bands: 60MB * total_tile_dates (if using --cache)
+    # 2. Processed intermediate TIFs: ~50MB * num_subtiles (ZSTD Predictor=2)
+    # 3. MBTiles chunks: Now deleted during merge, peak is small (~100MB)
+    disk_peak_gb = (total_tile_dates * 60 + num_subtiles * 50 + 100) / 1024
+    
+    # Disk Space End:
+    # Final PMTiles: ~40MB * num_subtiles (very rough)
+    disk_end_gb = (num_subtiles * 40) / 1024
+
+    print(f"--- Processing Estimates ---")
+    print(f"MGRS Tiles (100km): {num_mgrs}")
+    print(f"MGRS Sub-tiles (4x): {num_subtiles}")
+    print(f"Date(s):            {num_dates} ({', '.join(date_paths)})")
+    print(f"Total tile-dates:    {total_tile_dates} (3 bands each)")
+    print(f"---------------------------")
+    print(f"Estimated Time:       {hours}h {minutes}m")
+    print(f"Estimated RAM Usage:  {ram_gb:.1f} GB (peak)")
+    print(f"Estimated Disk Peak:  {disk_peak_gb:.2f} GB")
+    print(f"Estimated Disk End:   {disk_end_gb:.2f} GB")
+    print(f"Estimated Network:    {network_gb:.2f} GB")
+    print(f"---------------------------")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE (NumPy Refactor).")
@@ -219,7 +284,7 @@ def main() -> None:
     parser.add_argument("--quality", type=int, default=74, help="Quality (0-100)")
     parser.add_argument("--resample-alg", default="lanczos", choices=["bilinear", "average", "gauss", "lanczos"])
     parser.add_argument("--chunk-zoom", type=int, default=4, help="Zoom level to chunk the processing at")
-    parser.add_argument("--processes", type=int, default=4, help="Number of parallel processes")
+    parser.add_argument("--parallel", type=int, default=2, help="Number of parallel processes")
     parser.add_argument("--stats-min", type=float, help="Hardcoded source min")
     parser.add_argument("--stats-max", type=float, help="Hardcoded source max")
     
@@ -245,36 +310,43 @@ def main() -> None:
     parser.add_argument("--download", action="store_true", help="Download S3 tiles to local cache and exit")
     parser.add_argument("--land-only", help="Path to land tile list txt")
     parser.add_argument("--vrt", action="store_true", help="Write final VRT and skip MBTiles")
+    parser.add_argument("--estimate", action="store_true", help="Print estimated time, RAM, disk space, and network size then exit")
     args = parser.parse_args()
+
+    if args.estimate:
+        calculate_estimates(args)
+        return
 
     setup_gdal_cdse()
     os.makedirs(".temp", exist_ok=True)
     unique_id = uuid.uuid4().hex[:8]
     date_paths = [d.strip() for d in args.date.split(",")]
 
-    # 1. Tile Discovery - Pre-populate S3 cache with a single listing per date
-    print("Populating S3 folder cache...")
-    for dp in date_paths:
-        s3_base = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{dp}"
-        dirs = gdal.ReadDir(s3_base)
-        if dirs:
-            S3_FOLDER_CACHE[dp] = set(dirs)
-        else:
-            print(f"Warning: Could not list folders for {dp}")
+    # 1. Tile Discovery - Pre-populate S3 cache only for global runs
+    if args.all_tiles:
+        print("Populating S3 folder cache...")
+        for dp in date_paths:
+            s3_base = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{dp}"
+            dirs = gdal.ReadDir(s3_base)
+            if dirs:
+                S3_FOLDER_CACHE[dp] = set(dirs)
+            else:
+                print(f"Warning: Could not list folders for {dp}")
 
     # 2. Sub-tile Expansion
     if args.all_tiles and args.land_only:
         with open(args.land_only, 'r') as f:
             mgrs_bases = [line.strip() for line in f if line.strip()]
-        subtiles = [f"{m}_{x}_{y}" for m in mgrs_bases for x in [0, 1] for y in [0, 1]]
     else:
-        subtiles = [f"{args.mgrs}_{x}_{y}" for x in [0, 1] for y in [0, 1]]
+        mgrs_bases = [m.strip() for m in args.mgrs.split(",") if m.strip()]
+        
+    subtiles = [f"{m}_{x}_{y}" for m in mgrs_bases for x in [0, 1] for y in [0, 1]]
 
     # 2. Parallel Tile Processing
     processed_tifs = []
     print(f"Starting processing for {len(subtiles)} sub-tiles...")
     
-    with ThreadPoolExecutor(max_workers=args.processes) as executor:
+    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         futures = [executor.submit(process_single_tile, st, date_paths, args, unique_id) for st in subtiles]
         for future in futures:
             res = future.result()
@@ -303,7 +375,7 @@ def main() -> None:
         "quality": args.quality,
         "resample_alg": args.resample_alg,
         "chunk_zoom": args.chunk_zoom,
-        "processes": args.processes,
+        "processes": args.parallel,
         "blocksize": args.blocksize,
         "name": "Sentinel-2 Mosaic",
         "description": "Copernicus Sentinel data",
