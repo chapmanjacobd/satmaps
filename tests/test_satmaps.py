@@ -69,14 +69,14 @@ def test_process_single_tile_full_pipeline(monkeypatch: object, tmp_path: Path) 
         download=False,
         stats_min=0,
         stats_max=10000,
-        no_soft_knee=False,
-        no_grading=False,
+        tonemap=True,
+        grade=True,
         sb=0.3, hb=0.75, ss=1.4, ms=0.9, hs=0.5, exposure=1.0,
         gamma=1.0, sat=0.9, db=0.7, ls=0.7,
         resample_alg="bilinear"
     )
     
-    out_path = process_single_tile("31TDF_0_0", ["2025/07/01"], args, "abc")
+    out_path = process_single_tile("31TDF_0_0", ["2025/07/01"], args, "abc", None)
     
     assert out_path is not None
     assert Path(out_path).exists()
@@ -98,7 +98,7 @@ def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     
     # Mock process_single_tile to return a fake path
-    def fake_process_single_tile(st, dates, args, uid):
+    def fake_process_single_tile(st, dates, args, uid, gebco_src=None):
         path = tmp_path / f"processed_{st}.tif"
         path.write_text("fake tif")
         return str(path)
@@ -106,7 +106,7 @@ def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
     
     # Mock gdal.BuildVRT
-    monkeypatch.setattr("satmaps.gdal.BuildVRT", lambda out, src: Path(out).write_text("fake vrt"))
+    monkeypatch.setattr("satmaps.gdal.BuildVRT", lambda out, src, **kwargs: Path(out).write_text("fake vrt"))
     
     main()
     

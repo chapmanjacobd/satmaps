@@ -105,11 +105,39 @@ def get_tile_paths(folder_name: str, date_path: str, cache_dir: Optional[str] = 
 
 # --- Processing Layer (NumPy Manipulation) ---
 
+def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
+    """Check if an MGRS tile contains land according to GEBCO (sampling)."""
+    m = mgrs.MGRS()
+    try:
+        clat, clon = m.toLatLon(mgrs_tile)
+    except:
+        return True
+    
+    # 100km is roughly 1 degree. We'll sample a grid around the center.
+    ds = gdal.Open(gebco_src)
+    gt = ds.GetGeoTransform()
+    inv_gt = gdal.InvGeoTransform(gt)
+    
+    # Sample a 1.2 degree box (13x13 points)
+    has_land = False
+    for dlat in np.linspace(-0.6, 0.6, 13):
+        for dlon in np.linspace(-0.6, 0.6, 13):
+            px, py = gdal.ApplyGeoTransform(inv_gt, clon + dlon, clat + dlat)
+            px, py = int(px), int(py)
+            if 0 <= px < ds.RasterXSize and 0 <= py < ds.RasterYSize:
+                val = ds.GetRasterBand(1).ReadAsArray(px, py, 1, 1)[0, 0]
+                if val > 0.001:
+                    has_land = True
+                    break
+        if has_land: break
+    return has_land
+
 def process_single_tile(
     mgrs_subtile: str,
     date_paths: List[str],
     args: argparse.Namespace,
-    unique_id: str
+    unique_id: str,
+    gebco_src: Optional[str] = None
 ) -> Optional[str]:
     """Process a single MGRS sub-tile: fetch dates, average, tone-map, and warp to Web Mercator."""
     folders = list_mosaic_folders_for_tile(mgrs_subtile, date_paths, args.cache)
@@ -121,8 +149,6 @@ def process_single_tile(
             get_tile_paths(folder_name, date_path, args.cache, download=True)
         return None
 
-    print(f"Processing tile {mgrs_subtile} across {len(folders)} date(s)...")
-    
     # 1. Load all dates into memory
     date_stacks = []
     projection = None
@@ -151,6 +177,34 @@ def process_single_tile(
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', r'Mean of empty slice')
         averaged = np.nanmean(full_stack, axis=0)
+
+    # --- GEBCO Masking ---
+    if gebco_src:
+        try:
+            gebco_ds = gdal.Open(gebco_src)
+            # Create in-memory dataset matching the averaged data grid
+            mem_driver = gdal.GetDriverByName('MEM')
+            gebco_mem_ds = mem_driver.Create('', averaged.shape[2], averaged.shape[1], 1, gdal.GDT_Float32)
+            gebco_mem_ds.SetProjection(projection)
+            gebco_mem_ds.SetGeoTransform(geotransform)
+            
+            # Warp GEBCO into the Sentinel-2 grid
+            gdal.Warp(gebco_mem_ds, gebco_ds, options=gdal.WarpOptions(resampleAlg='bilinear'))
+            gebco_data = gebco_mem_ds.GetRasterBand(1).ReadAsArray()
+            
+            # Mask pixels where bathymetry <= 0.001 (ocean)
+            ocean_mask = gebco_data <= 0.001
+            
+            # Optimization: If the whole tile is ocean, we can skip it
+            if np.all(ocean_mask):
+                return None
+                
+            for i in range(3):
+                averaged[i][ocean_mask] = np.nan
+        except Exception as e:
+            print(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
+
+    print(f"Processing tile {mgrs_subtile} across {len(folders)} date(s)...")
     
     # 3. Tone Mapping
     # Determine scaling (either hardcoded or via percentile)
@@ -364,6 +418,19 @@ def main() -> None:
     unique_id = uuid.uuid4().hex[:8]
     date_paths = [d.strip() for d in args.date.split(",")]
 
+    # 0. GEBCO Discovery (for both filtering and background)
+    gebco_zip = "gebco_2025_sub_ice_topo_geotiff.zip"
+    gebco_vrt_source = None
+    if os.path.exists(gebco_zip):
+        print("Opening GEBCO bathymetry zip...")
+        gebco_vsi = f"/vsizip/{gebco_zip}"
+        files_in_zip = gdal.ReadDir(gebco_vsi)
+        tif_files = [f for f in files_in_zip if f.lower().endswith(".tif")]
+        if tif_files:
+            gebco_vrt_source = f".temp/gebco_source_{unique_id}.vrt"
+            tif_paths = [f"{gebco_vsi}/{f}" for f in tif_files]
+            gdal.BuildVRT(gebco_vrt_source, tif_paths)
+
     # 1. Tile Discovery - Pre-populate S3 cache only for global runs
     if args.all_tiles:
         print("Populating S3 folder cache...")
@@ -408,13 +475,22 @@ def main() -> None:
         
         discovered_mgrs = list(discovered_mgrs)
         
-        # Cross-reference with land-only if provided
-        if land_set is not None:
-            mgrs_bases = [m for m in discovered_mgrs if m in land_set]
-            print(f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} are land tiles (filtered by {land_only_file}).")
-        else:
-            mgrs_bases = list(discovered_mgrs)
-            print(f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox.")
+        # Filter tiles using land_set AND GEBCO
+        mgrs_bases = []
+        for m in discovered_mgrs:
+            is_land = False
+            if land_set and m in land_set:
+                is_land = True
+            elif gebco_vrt_source:
+                if check_land_gebco(m, gebco_vrt_source):
+                    is_land = True
+            elif land_set is None:
+                is_land = True
+            
+            if is_land:
+                mgrs_bases.append(m)
+        
+        print(f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} kept after GEBCO/land filtering.")
 
     elif args.all_tiles:
         if land_set is not None:
@@ -432,7 +508,7 @@ def main() -> None:
     if args.land:
         print(f"Starting processing for {len(subtiles)} sub-tiles...")
         with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-            futures = [executor.submit(process_single_tile, st, date_paths, args, unique_id) for st in subtiles]
+            futures = [executor.submit(process_single_tile, st, date_paths, args, unique_id, gebco_vrt_source) for st in subtiles]
             for future in futures:
                 res = future.result()
                 if res: processed_tifs.append(res)
@@ -449,125 +525,109 @@ def main() -> None:
 
     # 3. Bathymetry Background (Ocean)
     # If --bbox is provided, we fill non-land with GEBCO bathymetry
-    if args.bbox:
-        gebco_zip = "gebco_2025_sub_ice_topo_geotiff.zip"
-        if os.path.exists(gebco_zip):
-            print("Generating bathymetry background...")
-            gebco_vsi = f"/vsizip/{gebco_zip}"
-            files_in_zip = gdal.ReadDir(gebco_vsi)
-            tif_files = [f for f in files_in_zip if f.lower().endswith(".tif")]
+    if args.bbox and gebco_vrt_source:
+        print("Generating bathymetry background...")
+        gebco_src = gebco_vrt_source
+        
+        # Create color file based on 'Mako' color ramp
+        color_file = f".temp/gebco_colors_{unique_id}.txt"
+        
+        # Mako-inspired stops (fraction 0.0 to 1.0)
+        mako_ramp = [
+            (0.00, 11, 4, 5),
+            (0.05, 25, 14, 24),
+            (0.10, 38, 23, 43),
+            (0.15, 49, 33, 64),
+            (0.20, 56, 42, 84),
+            (0.25, 62, 53, 107),
+            (0.30, 65, 64, 130),
+            (0.35, 62, 79, 148),
+            (0.40, 57, 93, 156),
+            (0.45, 54, 108, 160),
+            (0.50, 53, 122, 162),
+            (0.55, 52, 137, 166),
+            (0.60, 52, 153, 170),
+            (0.65, 55, 166, 172),
+            (0.70, 63, 181, 173),
+            (0.75, 75, 194, 173),
+            (0.80, 101, 208, 173),
+            (0.85, 136, 217, 177),
+            (0.90, 171, 226, 190),
+            (0.95, 198, 235, 209),
+            (1.00, 222, 245, 229)
+        ]
+        
+        if args.tonemap:
+            # Apply same tone mapping (soft-knee) as land to ocean ramp
+            # Extract RGB colors (0-255) and normalize to 0-1
+            mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
+            mako_arr = mako_colors.T.reshape(3, -1, 1)
+            toned_mako = tiler.apply_soft_knee_numpy(
+                mako_arr,
+                shadow_break=args.sb,
+                highlight_break=args.hb,
+                shadow_slope=args.ss,
+                mid_slope=args.ms,
+                highlight_slope=args.hs,
+                exposure=args.exposure
+            )
+            # Convert back for potential grading or final use
+            mako_colors = toned_mako.reshape(3, -1).T
+
+        if args.grade:
+            # Apply same grading as land to ocean ramp to maximize contrast and consistency
+            if not args.tonemap:
+                mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
             
-            if tif_files:
-                # Build a VRT of all TIFFs in the zip to handle global coverage
-                gebco_vrt_source = f".temp/gebco_source_{unique_id}.vrt"
-                tif_paths = [f"{gebco_vsi}/{f}" for f in tif_files]
-                gdal.BuildVRT(gebco_vrt_source, tif_paths)
-                
-                gebco_src = gebco_vrt_source
-                
-                # Create color file based on 'Mako' color ramp
-                color_file = f".temp/gebco_colors_{unique_id}.txt"
-                
-                # Mako-inspired stops (fraction 0.0 to 1.0)
-                mako_ramp = [
-                    (0.00, 11, 4, 5),
-                    (0.05, 25, 14, 24),
-                    (0.10, 38, 23, 43),
-                    (0.15, 49, 33, 64),
-                    (0.20, 56, 42, 84),
-                    (0.25, 62, 53, 107),
-                    (0.30, 65, 64, 130),
-                    (0.35, 62, 79, 148),
-                    (0.40, 57, 93, 156),
-                    (0.45, 54, 108, 160),
-                    (0.50, 53, 122, 162),
-                    (0.55, 52, 137, 166),
-                    (0.60, 52, 153, 170),
-                    (0.65, 55, 166, 172),
-                    (0.70, 63, 181, 173),
-                    (0.75, 75, 194, 173),
-                    (0.80, 101, 208, 173),
-                    (0.85, 136, 217, 177),
-                    (0.90, 171, 226, 190),
-                    (0.95, 198, 235, 209),
-                    (1.00, 222, 245, 229)
-                ]
-                
-                if args.tonemap:
-                    # Apply same tone mapping (soft-knee) as land to ocean ramp
-                    # Extract RGB colors (0-255) and normalize to 0-1
-                    mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
-                    mako_arr = mako_colors.T.reshape(3, -1, 1)
-                    toned_mako = tiler.apply_soft_knee_numpy(
-                        mako_arr,
-                        shadow_break=args.sb,
-                        highlight_break=args.hb,
-                        shadow_slope=args.ss,
-                        mid_slope=args.ms,
-                        highlight_slope=args.hs,
-                        exposure=args.exposure
-                    )
-                    # Convert back for potential grading or final use
-                    mako_colors = toned_mako.reshape(3, -1).T
+            mako_arr = mako_colors.T.reshape(3, -1, 1)
+            graded_mako = tiler.apply_preview_correction_numpy(
+                mako_arr,
+                saturation=args.sat,
+                darken_break=args.db,
+                low_slope=args.ls,
+                gamma=args.gamma
+            )
+            mako_colors = graded_mako.reshape(3, -1).T
 
-                if args.grade:
-                    # Apply same grading as land to ocean ramp to maximize contrast and consistency
-                    if not args.tonemap:
-                        mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
-                    
-                    mako_arr = mako_colors.T.reshape(3, -1, 1)
-                    graded_mako = tiler.apply_preview_correction_numpy(
-                        mako_arr,
-                        saturation=args.sat,
-                        darken_break=args.db,
-                        low_slope=args.ls,
-                        gamma=args.gamma
-                    )
-                    mako_colors = graded_mako.reshape(3, -1).T
+        if args.tonemap or args.grade:
+            # Convert back to uint8 and rebuild the ramp
+            graded_uint8 = (mako_colors * 255).astype(np.uint8)
+            mako_ramp = [(mako_ramp[i][0], *graded_uint8[i]) for i in range(len(mako_ramp))]
 
-                if args.tonemap or args.grade:
-                    # Convert back to uint8 and rebuild the ramp
-                    graded_uint8 = (mako_colors * 255).astype(np.uint8)
-                    mako_ramp = [(mako_ramp[i][0], *graded_uint8[i]) for i in range(len(mako_ramp))]
+        # Map -11000m to 0.0 and 0m to 1.0
+        depth_min = -11000
+        depth_max = 0
+        
+        with open(color_file, "w") as f:
+            for frac, r, g, b in mako_ramp:
+                val = depth_min + frac * (depth_max - depth_min)
+                f.write(f"{val} {r} {g} {b} 255\n")
+            # Explicitly make land transparent (0m and above)
+            f.write("0.0001 0 0 0 0\n")
+            f.write("nv 0 0 0 0\n")
 
-                # Map -11000m to 0.0 and 0m to 1.0
-                depth_min = -11000
-                depth_max = 0
-                
-                with open(color_file, "w") as f:
-                    for frac, r, g, b in mako_ramp:
-                        val = depth_min + frac * (depth_max - depth_min)
-                        f.write(f"{val} {r} {g} {b} 255\n")
-                    # Explicitly make land transparent (0m and above)
-                    f.write("0.0001 0 0 0 0\n")
-                    f.write("nv 0 0 0 0\n")
-
-                # Colorize using DEMProcessing (format=VRT to avoid intermediate write)
-                colored_vrt = f".temp/gebco_colored_{unique_id}.vrt"
-                gdal.DEMProcessing(colored_vrt, gebco_src, 'color-relief', colorFilename=color_file, format='VRT', addAlpha=True)
-                
-                # Warp to EPSG:3857 and crop to bbox
-                gebco_3857 = f".temp/gebco_3857_{unique_id}.vrt"
-                min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
-                # Using -te minx miny maxx maxy in dstSRS
-                warp_opts = gdal.WarpOptions(
-                    format="VRT",
-                    dstSRS="EPSG:3857",
-                    outputBounds=(min_lon, min_lat, max_lon, max_lat),
-                    outputBoundsSRS="EPSG:4326"
-                )
-                gdal.Warp(gebco_3857, colored_vrt, options=warp_opts)
-                
-                # Prepend to the processed list to make it the bottom layer
-                processed_tifs.insert(0, gebco_3857)
-            else:
-                print("Warning: No .tif found in GEBCO zip.")
-        else:
-            print(f"Warning: GEBCO bathymetry zip not found at {gebco_zip}. Skipping ocean background.")
+        # Colorize using DEMProcessing (format=VRT to avoid intermediate write)
+        colored_vrt = f".temp/gebco_colored_{unique_id}.vrt"
+        gdal.DEMProcessing(colored_vrt, gebco_src, 'color-relief', colorFilename=color_file, format='VRT', addAlpha=True)
+        
+        # Warp to EPSG:3857 and crop to bbox
+        gebco_3857 = f".temp/gebco_3857_{unique_id}.vrt"
+        min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
+        # Using -te minx miny maxx maxy in dstSRS
+        warp_opts = gdal.WarpOptions(
+            format="VRT",
+            dstSRS="EPSG:3857",
+            outputBounds=(min_lon, min_lat, max_lon, max_lat),
+            outputBoundsSRS="EPSG:4326"
+        )
+        gdal.Warp(gebco_3857, colored_vrt, options=warp_opts)
+        
+        # Prepend to the processed list to make it the bottom layer
+        processed_tifs.insert(0, gebco_3857)
 
     # 4. Build Master VRT (Flat, over Web Mercator Byte TIFFs)
     master_vrt = f".temp/master_{unique_id}.vrt"
-    gdal.BuildVRT(master_vrt, processed_tifs)
+    gdal.BuildVRT(master_vrt, processed_tifs, resolution='highest')
 
     if args.vrt:
         print(f"Success! Master VRT: {master_vrt}")
