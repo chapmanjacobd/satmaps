@@ -5,6 +5,7 @@ import subprocess
 import sys
 import uuid
 import warnings
+import mgrs
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
@@ -232,7 +233,35 @@ def calculate_estimates(args: argparse.Namespace) -> None:
     date_paths = [d.strip() for d in args.date.split(",")]
     num_dates = len(date_paths)
 
-    if args.all_tiles and args.land_only:
+    if args.bbox:
+        try:
+            min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
+        except ValueError:
+            print(f"Error: Invalid bbox format: {args.bbox}")
+            sys.exit(1)
+        
+        m_converter = mgrs.MGRS()
+        discovered_mgrs = set()
+        lon_steps = int((max_lon - min_lon) / 0.1) + 2
+        lat_steps = int((max_lat - min_lat) / 0.1) + 2
+        for i in range(lon_steps):
+            lon = min(min_lon + i * 0.1, max_lon)
+            for j in range(lat_steps):
+                lat = min(min_lat + j * 0.1, max_lat)
+                try:
+                    mgrs_res = m_converter.toMGRS(lat, lon, MGRSPrecision=0)
+                    mgrs_str = mgrs_res.decode('utf-8') if isinstance(mgrs_res, bytes) else mgrs_res
+                    discovered_mgrs.add(mgrs_str)
+                except Exception:
+                    continue
+        
+        if args.land_only:
+            with open(args.land_only, 'r') as f:
+                land_set = {line.strip() for line in f if line.strip()}
+            mgrs_bases = [m for m in discovered_mgrs if m in land_set]
+        else:
+            mgrs_bases = list(discovered_mgrs)
+    elif args.all_tiles and args.land_only:
         try:
             with open(args.land_only, 'r') as f:
                 mgrs_bases = [line.strip() for line in f if line.strip()]
@@ -318,6 +347,7 @@ def main() -> None:
     parser.add_argument("--cache", default=".cache", help="Cache directory")
     parser.add_argument("--download", action="store_true", help="Download S3 tiles to local cache and exit")
     parser.add_argument("--land-only", help="Path to land tile list txt")
+    parser.add_argument("--bbox", help="WGS84 bounding box as min_lon,min_lat,max_lon,max_lat")
     parser.add_argument("--vrt", action="store_true", help="Write final VRT and skip MBTiles")
     parser.add_argument("--estimate", action="store_true", help="Print estimated time, RAM, disk space, and network size then exit")
     args = parser.parse_args()
@@ -343,7 +373,43 @@ def main() -> None:
                 print(f"Warning: Could not list folders for {dp}")
 
     # 2. Sub-tile Expansion
-    if args.all_tiles and args.land_only:
+    if args.bbox:
+        try:
+            min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
+        except ValueError:
+            print(f"Error: Invalid bbox format: {args.bbox}")
+            sys.exit(1)
+        
+        m_converter = mgrs.MGRS()
+        discovered_mgrs = set()
+        # Sample coordinates within bbox every 0.1 degree (robust for 100km MGRS squares)
+        lon_steps = int((max_lon - min_lon) / 0.1) + 2
+        lat_steps = int((max_lat - min_lat) / 0.1) + 2
+        for i in range(lon_steps):
+            lon = min(min_lon + i * 0.1, max_lon)
+            for j in range(lat_steps):
+                lat = min(min_lat + j * 0.1, max_lat)
+                try:
+                    # Convert to MGRS string, e.g., '4QFJ' (precision 0 gives 100km square ID)
+                    mgrs_res = m_converter.toMGRS(lat, lon, MGRSPrecision=0)
+                    mgrs_str = mgrs_res.decode('utf-8') if isinstance(mgrs_res, bytes) else mgrs_res
+                    discovered_mgrs.add(mgrs_str)
+                except Exception:
+                    continue
+        
+        discovered_mgrs = list(discovered_mgrs)
+        
+        # Cross-reference with land-only if provided
+        if args.land_only:
+            with open(args.land_only, 'r') as f:
+                land_set = {line.strip() for line in f if line.strip()}
+            mgrs_bases = [m for m in discovered_mgrs if m in land_set]
+        else:
+            mgrs_bases = list(discovered_mgrs)
+            
+        print(f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} are land tiles.")
+
+    elif args.all_tiles and args.land_only:
         with open(args.land_only, 'r') as f:
             mgrs_bases = [line.strip() for line in f if line.strip()]
     else:
@@ -365,11 +431,65 @@ def main() -> None:
         print("Download complete.")
         return
 
-    if not processed_tifs:
+    if not processed_tifs and not args.bbox:
         print("Error: No data processed.")
         sys.exit(1)
 
-    # 3. Build Master VRT (Flat, over Web Mercator Byte TIFFs)
+    # 3. Bathymetry Background (Ocean)
+    # If --bbox is provided, we fill non-land with GEBCO bathymetry
+    if args.bbox:
+        gebco_zip = "gebco_2025_sub_ice_topo_geotiff.zip"
+        if os.path.exists(gebco_zip):
+            print("Generating bathymetry background...")
+            gebco_vsi = f"/vsizip/{gebco_zip}"
+            files_in_zip = gdal.ReadDir(gebco_vsi)
+            tif_files = [f for f in files_in_zip if f.lower().endswith(".tif")]
+            
+            if tif_files:
+                # Build a VRT of all TIFFs in the zip to handle global coverage
+                gebco_vrt_source = f".temp/gebco_source_{unique_id}.vrt"
+                tif_paths = [f"{gebco_vsi}/{f}" for f in tif_files]
+                gdal.BuildVRT(gebco_vrt_source, tif_paths)
+                
+                gebco_src = gebco_vrt_source
+                
+                # Create color file
+                color_file = f".temp/gebco_colors_{unique_id}.txt"
+                with open(color_file, "w") as f:
+                    # Blue gradient for bathymetry
+                    f.write("-11000 0 0 40 255\n")
+                    f.write("-5000 0 0 100 255\n")
+                    f.write("-1000 0 50 200 255\n")
+                    f.write("-100 0 255 255 255\n")
+                    f.write("0 150 200 255 255\n")
+                    # Land is transparent
+                    f.write("0.0001 0 0 0 0\n")
+                    f.write("nv 0 0 0 0\n")
+
+                # Colorize using DEMProcessing (format=VRT to avoid intermediate write)
+                colored_vrt = f".temp/gebco_colored_{unique_id}.vrt"
+                gdal.DEMProcessing(colored_vrt, gebco_src, 'color-relief', colorFilename=color_file, format='VRT', addAlpha=True)
+                
+                # Warp to EPSG:3857 and crop to bbox
+                gebco_3857 = f".temp/gebco_3857_{unique_id}.vrt"
+                min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
+                # Using -te minx miny maxx maxy in dstSRS
+                warp_opts = gdal.WarpOptions(
+                    format="VRT",
+                    dstSRS="EPSG:3857",
+                    outputBounds=(min_lon, min_lat, max_lon, max_lat),
+                    outputBoundsSRS="EPSG:4326"
+                )
+                gdal.Warp(gebco_3857, colored_vrt, options=warp_opts)
+                
+                # Prepend to the processed list to make it the bottom layer
+                processed_tifs.insert(0, gebco_3857)
+            else:
+                print("Warning: No .tif found in GEBCO zip.")
+        else:
+            print(f"Warning: GEBCO bathymetry zip not found at {gebco_zip}. Skipping ocean background.")
+
+    # 4. Build Master VRT (Flat, over Web Mercator Byte TIFFs)
     master_vrt = f".temp/master_{unique_id}.vrt"
     gdal.BuildVRT(master_vrt, processed_tifs)
 
