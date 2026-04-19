@@ -28,15 +28,15 @@
     <div class="container">
         <div class="controls">
             <div style="display: flex; justify-content: space-between; align-items: center;">
-                <h3 style="margin: 0; border: none;">Soft Knee (Tone Mapping)</h3>
-                <input type="checkbox" id="sk_on" checked>
+                <h3 style="margin: 0; border: none;">Tone Mapping</h3>
+                <input type="checkbox" id="tm_on" checked>
             </div>
             
-            <div class="viz-container" id="soft_knee_viz">
+            <div class="viz-container" id="tone_map_viz">
                 <div class="viz-label">INPUT → TONE MAPPED</div>
-                <svg id="sk_svg" viewBox="0 0 256 128" preserveAspectRatio="none">
-                    <path id="sk_hist" fill="#333" d=""></path>
-                    <path id="sk_curve" stroke="#fb0" stroke-width="2" fill="none" d=""></path>
+                <svg id="tm_svg" viewBox="0 0 256 128" preserveAspectRatio="none">
+                    <path id="tm_hist" fill="#333" d=""></path>
+                    <path id="tm_curve" stroke="#fb0" stroke-width="2" fill="none" d=""></path>
                     <line x1="0" y1="0" x2="256" y2="128" stroke="#222" stroke-dasharray="4"></line>
                 </svg>
             </div>
@@ -113,7 +113,7 @@
         const rawHist = {{ raw_hist | tojson }};
 
         function drawHist() {
-            const path = document.getElementById('sk_hist');
+            const path = document.getElementById('tm_hist');
             if (!rawHist || rawHist.length === 0) return;
             
             let d = "M 0 128 ";
@@ -126,7 +126,7 @@
             path.setAttribute('d', d);
         }
 
-        function drawSoftKneeCurve() {
+        function drawToneMapCurve() {
             const exp = parseFloat(document.getElementById('exp').value);
             const sb = parseFloat(document.getElementById('sb').value);
             const hb = parseFloat(document.getElementById('hb').value);
@@ -134,7 +134,7 @@
             const ms = parseFloat(document.getElementById('ms').value);
             const hs = parseFloat(document.getElementById('hs').value);
 
-            const path = document.getElementById('sk_curve');
+            const path = document.getElementById('tm_curve');
             
             function transform(x) {
                 let val = Math.min(1.0, x * exp);
@@ -202,12 +202,12 @@
             sliders.forEach(s => {
                 document.getElementById(`${s}_val`).innerText = document.getElementById(s).value;
             });
-            drawSoftKneeCurve();
+            drawToneMapCurve();
             drawFinalGradeCurve();
 
             // Throttle image update
             updateTimeout = setTimeout(() => {
-                const skOn = document.getElementById('sk_on').checked ? '1' : '0';
+                const tmOn = document.getElementById('tm_on').checked ? '1' : '0';
                 const fgOn = document.getElementById('fg_on').checked ? '1' : '0';
                 
                 const params = sliders.map(s => {
@@ -219,7 +219,7 @@
                     };
                     return `${map[s]}=${el.value}`;
                 }).join('&');
-                img.src = `/render?${params}&sk=${skOn}&fg=${fgOn}&t=${Date.now()}`;
+                img.src = `/render?${params}&tm=${tmOn}&fg=${fgOn}&t=${Date.now()}`;
             }, 100);
         }
 
@@ -261,7 +261,7 @@
         sliders.forEach(s => {
             document.getElementById(s).addEventListener('input', update);
         });
-        document.getElementById('sk_on').addEventListener('change', update);
+        document.getElementById('tm_on').addEventListener('change', update);
         document.getElementById('fg_on').addEventListener('change', update);
 
         drawHist();

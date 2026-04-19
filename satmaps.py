@@ -169,8 +169,8 @@ def process_single_tile(
     normalized = np.clip((averaged - s_min) / (s_max - s_min), 0.0, 1.0)
     normalized[np.isnan(normalized)] = 0.0
     
-    # Apply soft-knee tone mapping
-    if not args.no_soft_knee:
+    # Apply tone mapping (soft-knee)
+    if args.tonemap:
         toned = tiler.apply_soft_knee_numpy(normalized, 
                                            shadow_break=args.sb, 
                                            highlight_break=args.hb,
@@ -182,7 +182,7 @@ def process_single_tile(
         toned = np.clip(normalized * args.exposure, 0.0, 1.0)
     
     # Apply final grading (preview correction)
-    if not args.no_grading:
+    if args.grade:
         toned = tiler.apply_preview_correction_numpy(toned,
                                                     saturation=args.sat,
                                                     darken_break=args.db,
@@ -340,8 +340,8 @@ def main() -> None:
     parser.add_argument("--db", "--black-break", type=float, default=tiler.PREVIEW_DARKEN_BREAK)
     parser.add_argument("--ls", "--black-slope", type=float, default=tiler.PREVIEW_DARKEN_LOW_SLOPE)
 
-    parser.add_argument("--no-soft-knee", action="store_true", help="Disable soft-knee tone mapping")
-    parser.add_argument("--no-grading", action="store_true", help="Disable final grading")
+    parser.add_argument("--tonemap", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable tone mapping (soft-knee)")
+    parser.add_argument("--grade", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable final grading")
 
     parser.add_argument("--blocksize", type=int, default=512)
     parser.add_argument("--cache", default=".cache", help="Cache directory")
@@ -453,16 +453,80 @@ def main() -> None:
                 
                 gebco_src = gebco_vrt_source
                 
-                # Create color file
+                # Create color file based on 'Mako' color ramp
                 color_file = f".temp/gebco_colors_{unique_id}.txt"
+                
+                # Mako-inspired stops (fraction 0.0 to 1.0)
+                mako_ramp = [
+                    (0.00, 11, 4, 5),
+                    (0.05, 25, 14, 24),
+                    (0.10, 38, 23, 43),
+                    (0.15, 49, 33, 64),
+                    (0.20, 56, 42, 84),
+                    (0.25, 62, 53, 107),
+                    (0.30, 65, 64, 130),
+                    (0.35, 62, 79, 148),
+                    (0.40, 57, 93, 156),
+                    (0.45, 54, 108, 160),
+                    (0.50, 53, 122, 162),
+                    (0.55, 52, 137, 166),
+                    (0.60, 52, 153, 170),
+                    (0.65, 55, 166, 172),
+                    (0.70, 63, 181, 173),
+                    (0.75, 75, 194, 173),
+                    (0.80, 101, 208, 173),
+                    (0.85, 136, 217, 177),
+                    (0.90, 171, 226, 190),
+                    (0.95, 198, 235, 209),
+                    (1.00, 222, 245, 229)
+                ]
+                
+                if args.tonemap:
+                    # Apply same tone mapping (soft-knee) as land to ocean ramp
+                    # Extract RGB colors (0-255) and normalize to 0-1
+                    mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
+                    mako_arr = mako_colors.T.reshape(3, -1, 1)
+                    toned_mako = tiler.apply_soft_knee_numpy(
+                        mako_arr,
+                        shadow_break=args.sb,
+                        highlight_break=args.hb,
+                        shadow_slope=args.ss,
+                        mid_slope=args.ms,
+                        highlight_slope=args.hs,
+                        exposure=args.exposure
+                    )
+                    # Convert back for potential grading or final use
+                    mako_colors = toned_mako.reshape(3, -1).T
+
+                if args.grade:
+                    # Apply same grading as land to ocean ramp to maximize contrast and consistency
+                    if not args.tonemap:
+                        mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
+                    
+                    mako_arr = mako_colors.T.reshape(3, -1, 1)
+                    graded_mako = tiler.apply_preview_correction_numpy(
+                        mako_arr,
+                        saturation=args.sat,
+                        darken_break=args.db,
+                        low_slope=args.ls,
+                        gamma=args.gamma
+                    )
+                    mako_colors = graded_mako.reshape(3, -1).T
+
+                if args.tonemap or args.grade:
+                    # Convert back to uint8 and rebuild the ramp
+                    graded_uint8 = (mako_colors * 255).astype(np.uint8)
+                    mako_ramp = [(mako_ramp[i][0], *graded_uint8[i]) for i in range(len(mako_ramp))]
+
+                # Map -11000m to 0.0 and 0m to 1.0
+                depth_min = -11000
+                depth_max = 0
+                
                 with open(color_file, "w") as f:
-                    # Blue gradient for bathymetry
-                    f.write("-11000 0 0 40 255\n")
-                    f.write("-5000 0 0 100 255\n")
-                    f.write("-1000 0 50 200 255\n")
-                    f.write("-100 0 255 255 255\n")
-                    f.write("0 150 200 255 255\n")
-                    # Land is transparent
+                    for frac, r, g, b in mako_ramp:
+                        val = depth_min + frac * (depth_max - depth_min)
+                        f.write(f"{val} {r} {g} {b} 255\n")
+                    # Explicitly make land transparent (0m and above)
                     f.write("0.0001 0 0 0 0\n")
                     f.write("nv 0 0 0 0\n")
 

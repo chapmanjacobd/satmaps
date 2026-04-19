@@ -101,12 +101,12 @@ def render():
         "ls": float(request.args.get('ls', tiler.PREVIEW_DARKEN_LOW_SLOPE))
     }
     
-    # 1. Apply Soft Knee
-    sk_on = request.args.get('sk', '1') == '1'
-    if sk_on:
+    # 1. Apply Tone Mapping
+    tm_on = request.args.get('tm', '1') == '1'
+    if tm_on:
         toned = tiler.apply_soft_knee_numpy(RAW_RGB, p["sb"], p["hb"], p["ss"], p["ms"], p["hs"], p["exp"])
     else:
-        # Just apply exposure if SK is off
+        # Just apply exposure if TM is off
         toned = np.clip(RAW_RGB * p["exp"], 0.0, 1.0)
     
     # 2. Apply Preview Correction
