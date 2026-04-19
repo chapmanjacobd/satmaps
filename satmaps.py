@@ -279,7 +279,8 @@ def process_single_tile(
     driver = gdal.GetDriverByName("GTiff")
     
     # Calculate alpha mask from finite values (non-NaN) AND the GEBCO alpha weight
-    finite_mask = np.isfinite(toned[0]).astype(np.float32)
+    # We check 'averaged' because NaNs are filled with 0 in 'toned'
+    finite_mask = np.isfinite(averaged[0]).astype(np.float32)
     if alpha_weight is not None:
         combined_alpha = (finite_mask * alpha_weight * 255).astype(np.uint8)
     else:
@@ -657,7 +658,8 @@ def main() -> None:
                 val = depth_min + frac * (depth_max - depth_min)
                 f.write(f"{val} {r} {g} {b} 255\n")
             # Explicitly make land transparent (above max depth)
-            f.write(f"{depth_max + 0.0001} 0 0 0 0\n")
+            f.write(f"{depth_max + 0.01} 0 0 0 0\n")
+            f.write("10000 0 0 0 0\n")
             f.write("nv 0 0 0 0\n")
 
         # Colorize using DEMProcessing (format=VRT to avoid intermediate write)
