@@ -82,8 +82,9 @@ def test_process_single_tile_full_pipeline(monkeypatch: object, tmp_path: Path) 
     assert Path(out_path).exists()
     
     ds = gdal.Open(out_path)
-    assert ds.RasterCount == 3
+    assert ds.RasterCount == 4
     assert ds.GetRasterBand(1).DataType == gdal.GDT_Byte
+    assert ds.GetRasterBand(4).GetColorInterpretation() == gdal.GCI_AlphaBand
     # Check projection is 3857
     srs = osr.SpatialReference(ds.GetProjection())
     assert srs.GetAttrValue("AUTHORITY", 1) == "3857"

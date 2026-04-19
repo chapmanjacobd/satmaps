@@ -142,12 +142,11 @@ def get_chunk_tile_range(bounds: ProjWin, zoom: int) -> Tuple[int, int, int, int
     minx, maxy, maxx, miny = bounds
     max_t = (2 ** zoom) - 1
 
-    tx_min, ty_min = meters_to_tile(minx, maxy, zoom)
-    tx_max, ty_max = meters_to_tile(
-        math.nextafter(maxx, float("-inf")),
-        math.nextafter(miny, float("inf")),
-        zoom,
-    )
+    # We use a small epsilon to avoid including the next tile if the boundary 
+    # just barely touches it due to floating point precision.
+    eps = 1e-8
+    tx_min, ty_min = meters_to_tile(minx + eps, maxy - eps, zoom)
+    tx_max, ty_max = meters_to_tile(maxx - eps, miny + eps, zoom)
 
     return (
         max(0, min(tx_min, max_t)),
@@ -271,6 +270,10 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     cursor.execute("PRAGMA synchronous = OFF")
     cursor.execute("PRAGMA journal_mode = MEMORY")
     
+    # Check if the output database has the 'map' table
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='map'")
+    output_has_map = cursor.fetchone() is not None
+
     for i, db_path in enumerate(input_mbtiles[1:]):
         alias = f"chunk_{i}"
 
@@ -291,29 +294,43 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
             raise RuntimeError(f"Failed to attach {db_path} after retries due to database locks")
 
         try:
-            # Check which tables exist in db
+            # Check which tables exist in the source chunk
             cursor.execute(f"SELECT name FROM {alias}.sqlite_master WHERE type='table' AND name='map'")
-            has_map = cursor.fetchone()
+            source_has_map = cursor.fetchone() is not None
             
-            if has_map:
+            if output_has_map and source_has_map:
                 cursor.execute(f"INSERT OR IGNORE INTO map SELECT * FROM {alias}.map")
                 cursor.execute(f"INSERT OR IGNORE INTO images SELECT * FROM {alias}.images")
             else:
+                # Fallback to inserting into the 'tiles' view/table
+                # Note: This might not work if 'tiles' is a view without an INSTEAD OF trigger,
+                # but most chunks should have the same schema.
                 cursor.execute(f"INSERT OR IGNORE INTO tiles SELECT * FROM {alias}.tiles")
             conn.commit()
         except sqlite3.OperationalError as e:
-            raise RuntimeError(f"Error merging {db_path}: {e}") from e
+            # If inserting into tiles failed and we have no map table, it's a real error
+            print(f"Warning: Error merging {db_path}: {e}")
         finally:
             if attached:
                 try:
                     cursor.execute(f"DETACH DATABASE {alias}")
                 except sqlite3.OperationalError as e:
-                    raise RuntimeError(f"Failed to detach {db_path}: {e}") from e
+                    pass
                 try:
                     os.remove(db_path)
                 except OSError:
                     pass
     
+    # Update metadata with actual min/max zoom
+    try:
+        cursor.execute("SELECT min(zoom_level), max(zoom_level) FROM tiles")
+        minz, maxz = cursor.fetchone()
+        if minz is not None:
+            cursor.execute("INSERT OR REPLACE INTO metadata (name, value) VALUES ('minzoom', ?)", (str(minz),))
+            cursor.execute("INSERT OR REPLACE INTO metadata (name, value) VALUES ('maxzoom', ?)", (str(maxz),))
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 

@@ -88,3 +88,8 @@ You can override the defaults (tuned via `tuner_ui.py`):
     - Soft-Knee Tone Mapping: A 3-segment linear curve to compress high dynamic range while preserving local contrast.
     - Color Grading: Saturation adjustment and gamma correction for a "natural" look.
 5.  Packaging: Tiles are generated in chunks, merged into an MBTiles database, and converted to PMTiles.
+
+## Datasets
+
+- European Space Agency -- Copernicus Sentinel data 2025
+- GEBCO Compilation Group -- GEBCO 2025 Grid (doi:10.5285/37c52e96-24ea-67ce-e063-7086abc05f29)

@@ -193,17 +193,24 @@ def process_single_tile(
     temp_3857_path = f".temp/processed_{mgrs_subtile}_{unique_id}_3857.tif"
     
     driver = gdal.GetDriverByName("GTiff")
-    byte_arr = (toned * 255).astype(np.uint8)
     
-    ds_out = driver.Create(temp_utm_path, byte_arr.shape[2], byte_arr.shape[1], 3, gdal.GDT_Byte, 
+    # Calculate alpha mask from finite values (non-NaN)
+    mask = np.isfinite(toned[0]).astype(np.uint8) * 255
+    byte_arr = np.nan_to_num(toned * 255, nan=0).astype(np.uint8)
+    
+    ds_out = driver.Create(temp_utm_path, byte_arr.shape[2], byte_arr.shape[1], 4, gdal.GDT_Byte, 
                            options=["COMPRESS=ZSTD", "TILED=YES"])
     ds_out.SetProjection(projection)
     ds_out.SetGeoTransform(geotransform)
     for i in range(3):
         out_band = ds_out.GetRasterBand(i + 1)
         out_band.WriteArray(byte_arr[i])
-        out_band.SetNoDataValue(0)
         out_band.SetColorInterpretation(getattr(gdal, f"GCI_{['RedBand', 'GreenBand', 'BlueBand'][i]}"))
+    
+    alpha_band = ds_out.GetRasterBand(4)
+    alpha_band.WriteArray(mask)
+    alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
+    
     ds_out.FlushCache()
     ds_out = None
 
@@ -212,8 +219,7 @@ def process_single_tile(
         format="GTiff",
         dstSRS="EPSG:3857",
         resampleAlg=args.resample_alg,
-        srcNodata=0,
-        dstNodata=0,
+        # Using 4th band as alpha for transparency, no need for srcNodata/dstNodata
         creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "PREDICTOR=2", "TILED=YES"]
     )
     gdal.Warp(temp_3857_path, temp_utm_path, options=warp_options)
