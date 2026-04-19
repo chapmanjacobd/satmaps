@@ -149,42 +149,27 @@ def process_single_tile(
             get_tile_paths(folder_name, date_path, args.cache, download=True)
         return None
 
-    # 1. Load all dates into memory
-    date_stacks = []
-    projection = None
-    geotransform = None
-    
-    for folder_name, date_path in folders:
-        # Default to streaming (download=False) since --download exits early
-        paths = get_tile_paths(folder_name, date_path, args.cache, download=False)
-        bands_data = []
-        for color in ['red', 'green', 'blue']:
-            ds = gdal.Open(paths[color])
-            if projection is None:
-                projection = ds.GetProjection()
-                geotransform = ds.GetGeoTransform()
-            arr = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
-            # Use NaN for nodata -32768
-            arr[arr == -32768] = np.nan
-            bands_data.append(arr)
-        date_stacks.append(np.stack(bands_data)) # (3, H, W)
+    # 1. Get Metadata and GEBCO Mask
+    first_folder, first_date = folders[0]
+    paths = get_tile_paths(first_folder, first_date, args.cache, download=False)
+    ds_init = gdal.Open(paths['red'])
+    projection = ds_init.GetProjection()
+    geotransform = ds_init.GetGeoTransform()
+    width, height = ds_init.RasterXSize, ds_init.RasterYSize
+    ds_init = None
 
-    if not date_stacks:
-        return None
+    ocean_mask = None
+    alpha_weight = None
+    # Transition constants
+    LAND_STAY = -30.0    # 100% Sentinel-2 above this depth
+    OCEAN_FADE = -100.0  # 0% Sentinel-2 below this depth
 
-    # 2. Average dates (ignoring NaNs)
-    full_stack = np.stack(date_stacks) # (D, 3, H, W)
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', r'Mean of empty slice')
-        averaged = np.nanmean(full_stack, axis=0)
-
-    # --- GEBCO Masking ---
     if gebco_src:
         try:
             gebco_ds = gdal.Open(gebco_src)
-            # Create in-memory dataset matching the averaged data grid
+            # Create in-memory dataset matching the Sentinel-2 grid
             mem_driver = gdal.GetDriverByName('MEM')
-            gebco_mem_ds = mem_driver.Create('', averaged.shape[2], averaged.shape[1], 1, gdal.GDT_Float32)
+            gebco_mem_ds = mem_driver.Create('', width, height, 1, gdal.GDT_Float32)
             gebco_mem_ds.SetProjection(projection)
             gebco_mem_ds.SetGeoTransform(geotransform)
             
@@ -192,20 +177,64 @@ def process_single_tile(
             gdal.Warp(gebco_mem_ds, gebco_ds, options=gdal.WarpOptions(resampleAlg='bilinear'))
             gebco_data = gebco_mem_ds.GetRasterBand(1).ReadAsArray()
             
-            # Mask pixels where bathymetry <= 0.001 (ocean)
-            ocean_mask = gebco_data <= 0.001
+            # Create a smooth alpha weight based on depth
+            alpha_weight = np.clip((gebco_data - OCEAN_FADE) / (LAND_STAY - OCEAN_FADE), 0.0, 1.0)
             
-            # Optimization: If the whole tile is ocean, we can skip it
-            if np.all(ocean_mask):
+            # Optimization: If the whole tile is deep ocean (below OCEAN_FADE), skip it
+            if np.all(gebco_data <= OCEAN_FADE):
                 return None
-                
-            for i in range(3):
-                averaged[i][ocean_mask] = np.nan
         except Exception as e:
             print(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
 
     print(f"Processing tile {mgrs_subtile} across {len(folders)} date(s)...")
-    
+
+    # 2. Load all dates into memory (with block-level skipping to save bandwidth)
+    date_stacks = []
+    for folder_name, date_path in folders:
+        paths = get_tile_paths(folder_name, date_path, args.cache, download=False)
+        bands_data = [np.full((height, width), np.nan, dtype=np.float32) for _ in range(3)]
+        
+        # Open datasets once per folder
+        dss = [gdal.Open(paths[color]) for color in ['red', 'green', 'blue']]
+        bands = [ds.GetRasterBand(1) for ds in dss]
+
+        # Use large blocks to skip ocean regions efficiently while maintaining throughput
+        block_size = 2048 
+        for yoff in range(0, height, block_size):
+            bh = min(block_size, height - yoff)
+            for xoff in range(0, width, block_size):
+                bw = min(block_size, width - xoff)
+                
+                # If this block is 100% deep ocean according to GEBCO, skip the S3 request
+                if gebco_src and np.all(gebco_data[yoff:yoff+bh, xoff:xoff+bw] <= OCEAN_FADE):
+                    continue
+                
+                for i in range(3):
+                    block_arr = bands[i].ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+                    # Use NaN for nodata -32768
+                    block_arr[block_arr == -32768] = np.nan
+                    bands_data[i][yoff:yoff+bh, xoff:xoff+bw] = block_arr
+        
+        # Close datasets for this date
+        for ds in dss: ds = None 
+        date_stacks.append(np.stack(bands_data)) # (3, H, W)
+
+    if not date_stacks:
+        return None
+
+    # 3. Average dates (ignoring NaNs)
+    full_stack = np.stack(date_stacks) # (D, 3, H, W)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', r'Mean of empty slice')
+        averaged = np.nanmean(full_stack, axis=0)
+
+    # 4. Final Masking (clean up ocean pixels within land blocks)
+    if alpha_weight is not None:
+        # Hard cut only at the very end of the fade to prevent NaN pollution in blend
+        deep_ocean_mask = gebco_data <= OCEAN_FADE
+        for i in range(3):
+            averaged[i][deep_ocean_mask] = np.nan
+
     # 3. Tone Mapping
     # Determine scaling (either hardcoded or via percentile)
     if args.stats_min is not None:
@@ -249,8 +278,13 @@ def process_single_tile(
     
     driver = gdal.GetDriverByName("GTiff")
     
-    # Calculate alpha mask from finite values (non-NaN)
-    mask = np.isfinite(toned[0]).astype(np.uint8) * 255
+    # Calculate alpha mask from finite values (non-NaN) AND the GEBCO alpha weight
+    finite_mask = np.isfinite(toned[0]).astype(np.float32)
+    if alpha_weight is not None:
+        combined_alpha = (finite_mask * alpha_weight * 255).astype(np.uint8)
+    else:
+        combined_alpha = (finite_mask * 255).astype(np.uint8)
+    
     byte_arr = np.nan_to_num(toned * 255, nan=0).astype(np.uint8)
     
     ds_out = driver.Create(temp_utm_path, byte_arr.shape[2], byte_arr.shape[1], 4, gdal.GDT_Byte, 
@@ -263,7 +297,7 @@ def process_single_tile(
         out_band.SetColorInterpretation(getattr(gdal, f"GCI_{['RedBand', 'GreenBand', 'BlueBand'][i]}"))
     
     alpha_band = ds_out.GetRasterBand(4)
-    alpha_band.WriteArray(mask)
+    alpha_band.WriteArray(combined_alpha)
     alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
     
     ds_out.FlushCache()
