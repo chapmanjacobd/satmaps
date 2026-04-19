@@ -1,4 +1,4 @@
-from array import array
+import numpy as np
 import os
 import subprocess
 import sqlite3
@@ -7,8 +7,6 @@ import math
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-import xml.etree.ElementTree as ET
-from xml.sax.saxutils import escape
 from osgeo import gdal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,141 +16,88 @@ WEB_MERCATOR_LIMIT = 20037508.342789244
 ProjWin = Tuple[float, float, float, float]
 ChunkTask = Tuple[str, str, str, Dict[str, Any], ProjWin]
 RGB_COLOR_INTERPRETATIONS = ("Red", "Green", "Blue")
+
+# Tone-mapping constants
 SOFT_KNEE_SHADOW_BREAK = 0.3
 SOFT_KNEE_HIGHLIGHT_BREAK = 0.75
 SOFT_KNEE_SHADOW_SLOPE = 1.4
 SOFT_KNEE_MID_SLOPE = 0.9
 SOFT_KNEE_HIGHLIGHT_SLOPE = 0.5
+
+# Preview constants
 PREVIEW_SATURATION = 0.9
 PREVIEW_DARKEN_BREAK = 0.7
 PREVIEW_DARKEN_LOW_SLOPE = 0.7
-PREVIEW_DARKEN_HIGH_SLOPE = (1.0 - (PREVIEW_DARKEN_BREAK * PREVIEW_DARKEN_LOW_SLOPE)) / (1.0 - PREVIEW_DARKEN_BREAK)
+
+# New default constants
+DEFAULT_EXPOSURE = 1.0
+DEFAULT_GAMMA = 1.0
+
 LUMA_RED = 0.2126
 LUMA_GREEN = 0.7152
 LUMA_BLUE = 0.0722
+
+def apply_soft_knee_numpy(arr: np.ndarray, 
+                          shadow_break: float = SOFT_KNEE_SHADOW_BREAK,
+                          highlight_break: float = SOFT_KNEE_HIGHLIGHT_BREAK,
+                          shadow_slope: float = SOFT_KNEE_SHADOW_SLOPE,
+                          mid_slope: float = SOFT_KNEE_MID_SLOPE,
+                          highlight_slope: float = SOFT_KNEE_HIGHLIGHT_SLOPE,
+                          exposure: float = DEFAULT_EXPOSURE) -> np.ndarray:
+    """Apply soft-knee tone mapping using NumPy."""
+    arr = np.clip(arr * exposure, 0.0, 1.0)
+    
+    shadow_output = shadow_break * shadow_slope
+    highlight_output = shadow_output + (highlight_break - shadow_break) * mid_slope
+    
+    out = np.zeros_like(arr)
+    
+    # Shadow region
+    mask_shadow = arr < shadow_break
+    out[mask_shadow] = arr[mask_shadow] * shadow_slope
+    
+    # Mid region
+    mask_mid = (arr >= shadow_break) & (arr < highlight_break)
+    out[mask_mid] = shadow_output + (arr[mask_mid] - shadow_break) * mid_slope
+    
+    # Highlight region
+    mask_highlight = arr >= highlight_break
+    out[mask_highlight] = highlight_output + (arr[mask_highlight] - highlight_break) * highlight_slope
+    
+    return np.clip(out, 0.0, 1.0)
+
+def apply_preview_correction_numpy(rgb_arr: np.ndarray,
+                                   saturation: float = PREVIEW_SATURATION,
+                                   darken_break: float = PREVIEW_DARKEN_BREAK,
+                                   low_slope: float = PREVIEW_DARKEN_LOW_SLOPE,
+                                   gamma: float = DEFAULT_GAMMA) -> np.ndarray:
+    """Apply mild desaturation and preview darkening using NumPy. Expects (C, H, W) float32 [0,1]."""
+    # 1. Gamma
+    if gamma != 1.0:
+        rgb_arr = np.power(np.clip(rgb_arr, 0.0, 1.0), 1.0 / gamma)
+
+    # 2. Calculate luminance
+    luma = LUMA_RED * rgb_arr[0] + LUMA_GREEN * rgb_arr[1] + LUMA_BLUE * rgb_arr[2]
+    
+    # 3. Desaturate
+    out = luma + (rgb_arr - luma) * saturation
+    
+    # 4. Darken curve
+    high_slope = (1.0 - (darken_break * low_slope)) / (1.0 - darken_break)
+    break_output = darken_break * low_slope
+    
+    mask_low = out < darken_break
+    out[mask_low] = out[mask_low] * low_slope
+    out[~mask_low] = break_output + (out[~mask_low] - darken_break) * high_slope
+    
+    return np.clip(out, 0.0, 1.0)
 
 
 @dataclass(frozen=True)
 class TilingArtifacts:
     """Paths created during tiling so the caller can preserve or clean them up."""
-
     final_vrt: str
     cleanup_paths: List[str]
-
-
-def ternary_expr(condition: str, true_value: str, false_value: str) -> str:
-    """Build a parenthesized ternary expression for GDAL's expression dialect."""
-    return f"(({condition}) ? ({true_value}) : ({false_value}))"
-
-
-def clamp_expr(expression: str, lower: str, upper: str) -> str:
-    """Clamp an expression to an inclusive range using nested ternaries."""
-    return ternary_expr(
-        f"({expression}) < {lower}",
-        lower,
-        ternary_expr(f"({expression}) > {upper}", upper, expression),
-    )
-
-
-def expression_literal(value: float) -> str:
-    """Format a numeric literal for GDAL expression strings."""
-    return repr(float(value))
-
-
-def nodata_match_expr(band_ref: str, nodata_value: float) -> str:
-    """Return an expression that matches a band's explicit nodata value."""
-    if math.isnan(nodata_value):
-        return f"({band_ref} != {band_ref})"
-    return f"({band_ref} == {expression_literal(nodata_value)})"
-
-
-def explicit_nodata_expr(dataset: gdal.Dataset, band_count: int = 3) -> Optional[str]:
-    """Return an expression that masks only pixels matching explicit band nodata values."""
-    nodata_matches: List[str] = []
-    for band_index in range(1, band_count + 1):
-        nodata_value = dataset.GetRasterBand(band_index).GetNoDataValue()
-        if nodata_value is None:
-            return None
-        nodata_matches.append(nodata_match_expr(f"B{band_index}", nodata_value))
-
-    return " && ".join(nodata_matches)
-
-
-def soft_knee_tone_curve_expr(expression: str) -> str:
-    """Lift shadows and roll off highlights with a monotonic piecewise-linear curve."""
-    clamped = clamp_expr(expression, "0.0", "1.0")
-    shadow_break = expression_literal(SOFT_KNEE_SHADOW_BREAK)
-    highlight_break = expression_literal(SOFT_KNEE_HIGHLIGHT_BREAK)
-    shadow_slope = expression_literal(SOFT_KNEE_SHADOW_SLOPE)
-    mid_slope = expression_literal(SOFT_KNEE_MID_SLOPE)
-    highlight_slope = expression_literal(SOFT_KNEE_HIGHLIGHT_SLOPE)
-    shadow_output = expression_literal(SOFT_KNEE_SHADOW_BREAK * SOFT_KNEE_SHADOW_SLOPE)
-    highlight_output = expression_literal(
-        (SOFT_KNEE_SHADOW_BREAK * SOFT_KNEE_SHADOW_SLOPE)
-        + ((SOFT_KNEE_HIGHLIGHT_BREAK - SOFT_KNEE_SHADOW_BREAK) * SOFT_KNEE_MID_SLOPE)
-    )
-
-    shadow_expr = f"({clamped} * {shadow_slope})"
-    mid_expr = f"({shadow_output} + (({clamped} - {shadow_break}) * {mid_slope}))"
-    highlight_expr = f"({highlight_output} + (({clamped} - {highlight_break}) * {highlight_slope}))"
-    return clamp_expr(
-        ternary_expr(
-            f"({clamped}) < {shadow_break}",
-            shadow_expr,
-            ternary_expr(f"({clamped}) < {highlight_break}", mid_expr, highlight_expr),
-        ),
-        "0.0",
-        "1.0",
-    )
-
-
-def vrt_dataset_preamble(dataset: gdal.Dataset) -> List[str]:
-    """Return the opening XML for a VRT mirroring an existing dataset."""
-    return [
-        f'<VRTDataset rasterXSize="{dataset.RasterXSize}" rasterYSize="{dataset.RasterYSize}">',
-        f'  <SRS>{dataset.GetProjection()}</SRS>',
-        f'  <GeoTransform>{", ".join(map(str, dataset.GetGeoTransform()))}</GeoTransform>',
-    ]
-
-
-def apply_rgb_color_interpretation_to_vrt(vrt_path: str) -> None:
-    """Set RGB color interpretation on the first three bands of a VRT."""
-    tree = ET.parse(vrt_path)
-    root = tree.getroot()
-
-    for band_index, color_name in enumerate(RGB_COLOR_INTERPRETATIONS, start=1):
-        band = root.find(f"./VRTRasterBand[@band='{band_index}']")
-        if band is None:
-            continue
-
-        color_interp = band.find("ColorInterp")
-        if color_interp is None:
-            color_interp = ET.Element("ColorInterp")
-            band.insert(0, color_interp)
-        color_interp.text = color_name
-
-    tree.write(vrt_path, encoding="UTF-8", xml_declaration=True)
-
-
-def make_step_vrt_path(step: int, label: str, unique_id: str) -> str:
-    """Return a temporary VRT path with an explicit pipeline step prefix."""
-    return f".temp/step{step}_{label}_{unique_id}.vrt"
-
-
-def make_preview_source_vrt_path(output_vrt: str) -> str:
-    """Return the companion tone-mapped VRT path backing a preview VRT."""
-    directory, filename = os.path.split(output_vrt)
-    stem, extension = os.path.splitext(filename)
-    if "_color_corrected_" in stem:
-        stem = stem.replace("_color_corrected_", "_tone_mapped_")
-    else:
-        stem = f"{stem}_tone"
-    return os.path.join(directory, f"{stem}{extension}")
-
-
-def make_materialized_byte_raster_path(output_vrt: str) -> str:
-    """Return the Byte GeoTIFF path backing a step-7 Byte VRT."""
-    return f"{os.path.splitext(output_vrt)[0]}.tif"
 
 
 def get_web_mercator_bounds(z: int, x: int, y: int) -> Tuple[float, float, float, float]:
@@ -174,12 +119,14 @@ def get_web_mercator_bounds(z: int, x: int, y: int) -> Tuple[float, float, float
     # Return (min_x, max_y, max_x, min_y) which is projWin format: [ulx, uly, lrx, lry]
     return min(x1, x2), max(y1, y2), max(x1, x2), min(y1, y2)
 
+
 def meters_to_tile(x_meters: float, y_meters: float, z: int) -> Tuple[int, int]:
     """Convert Web Mercator meters to tile coordinates at zoom z."""
     res = WEB_MERCATOR_LIMIT * 2 / (2**z)
     tx = math.floor((x_meters + WEB_MERCATOR_LIMIT) / res)
     ty = math.floor((WEB_MERCATOR_LIMIT - y_meters) / res)
     return tx, ty
+
 
 def get_dataset_bounds(dataset: gdal.Dataset) -> ProjWin:
     """Return dataset bounds as a projWin-style tuple."""
@@ -188,6 +135,7 @@ def get_dataset_bounds(dataset: gdal.Dataset) -> ProjWin:
     maxx = minx + gt[1] * dataset.RasterXSize
     miny = maxy + gt[5] * dataset.RasterYSize
     return minx, maxy, maxx, miny
+
 
 def get_chunk_tile_range(bounds: ProjWin, zoom: int) -> Tuple[int, int, int, int]:
     """Return inclusive XYZ tile indices covering raster bounds at the chunk zoom."""
@@ -207,6 +155,7 @@ def get_chunk_tile_range(bounds: ProjWin, zoom: int) -> Tuple[int, int, int, int
         max(0, min(tx_max, max_t)),
         max(0, min(ty_max, max_t)),
     )
+
 
 def intersect_proj_win(proj_win: ProjWin, dataset_bounds: ProjWin) -> Optional[ProjWin]:
     """Clamp a projWin to the dataset extent, returning None for empty intersections."""
@@ -234,232 +183,6 @@ def proj_win_to_src_win(dataset: gdal.Dataset, proj_win: ProjWin) -> Tuple[int, 
 
     return xoff, yoff, max(0, xend - xoff), max(0, yend - yoff)
 
-def preview_luminance_expr(channel_exprs: List[str]) -> str:
-    """Return a luminance expression for lightly desaturating the preview."""
-    weights = (LUMA_RED, LUMA_GREEN, LUMA_BLUE)
-    weighted_terms = [
-        f"(({channel_expr}) * {expression_literal(weight)})"
-        for channel_expr, weight in zip(channel_exprs, weights)
-    ]
-    return f"({' + '.join(weighted_terms)})"
-
-
-def preview_channel_expr(channel_expr: str, luminance_expr: str) -> str:
-    """Apply mild desaturation and a compact darker preview curve to a normalized channel."""
-    saturation = expression_literal(PREVIEW_SATURATION)
-    darken_break = expression_literal(PREVIEW_DARKEN_BREAK)
-    low_slope = expression_literal(PREVIEW_DARKEN_LOW_SLOPE)
-    high_slope = expression_literal(PREVIEW_DARKEN_HIGH_SLOPE)
-    break_output = expression_literal(PREVIEW_DARKEN_BREAK * PREVIEW_DARKEN_LOW_SLOPE)
-    desaturated = f"(({luminance_expr}) + (({channel_expr} - {luminance_expr}) * {saturation}))"
-    return ternary_expr(
-        f"({desaturated}) < {darken_break}",
-        f"(({desaturated}) * {low_slope})",
-        f"({break_output} + (({desaturated}) - {darken_break}) * {high_slope})",
-    )
-
-
-def create_tone_mapped_vrt(
-    input_vrt: str,
-    output_vrt: str,
-    scale_params: List[List[float]],
-) -> None:
-    """Create a Float32 VRT that normalizes source data and applies the base soft-knee curve."""
-    ds = gdal.Open(input_vrt)
-    if ds is None:
-        raise RuntimeError(f"Could not open input VRT {input_vrt}")
-    width, height = ds.RasterXSize, ds.RasterYSize
-    nodata_expr = explicit_nodata_expr(ds)
-    
-    vrt_content = vrt_dataset_preamble(ds)
-    
-    def norm_expr(idx: int) -> str:
-        sm, sx = scale_params[idx-1][0], scale_params[idx-1][1]
-        band_range = sx - sm
-        if band_range <= 0:
-            band_range = 1.0
-        sm_value = expression_literal(sm)
-        band_range_value = expression_literal(band_range)
-        raw = f"((B{idx} - {sm_value}) / {band_range_value})"
-        return clamp_expr(raw, "0.0", "1.0")
-
-    for b_idx in range(1, 4):
-        toned_expr = soft_knee_tone_curve_expr(norm_expr(b_idx))
-        scaled_expr = f"({toned_expr} * 255.0)"
-        clamped_expr = clamp_expr(scaled_expr, "0.0", "255.0")
-        final_expr = clamped_expr if nodata_expr is None else ternary_expr(nodata_expr, "0.0", clamped_expr)
-        escaped_expr = escape(final_expr, {'"': '&quot;'})
-
-        vrt_content.extend([
-            f'  <VRTRasterBand dataType="Float32" band="{b_idx}" subClass="VRTDerivedRasterBand">',
-            f'    <ColorInterp>{RGB_COLOR_INTERPRETATIONS[b_idx - 1]}</ColorInterp>',
-            '    <PixelFunctionType>expression</PixelFunctionType>',
-            f'    <PixelFunctionArguments expression="{escaped_expr}" />',
-            '    <NoDataValue>0</NoDataValue>'
-        ])
-
-        # Add all 3 bands as sources to this band so B1, B2, B3 are available
-        for src_idx in range(1, 4):
-            source_band = ds.GetRasterBand(src_idx)
-            block_x, block_y = source_band.GetBlockSize()
-            source_type = gdal.GetDataTypeName(source_band.DataType)
-            vrt_content.extend([
-                '    <SimpleSource>',
-                f'      <SourceFilename relativeToVRT="0">{os.path.abspath(input_vrt)}</SourceFilename>',
-                f'      <SourceBand>{src_idx}</SourceBand>',
-                (
-                    f'      <SourceProperties RasterXSize="{width}" RasterYSize="{height}" '
-                    f'DataType="{source_type}" BlockXSize="{block_x}" BlockYSize="{block_y}" />'
-                ),
-                f'      <SrcRect xOff="0" yOff="0" xSize="{width}" ySize="{height}" />',
-                f'      <DstRect xOff="0" yOff="0" xSize="{width}" ySize="{height}" />',
-                '    </SimpleSource>'
-            ])
-        vrt_content.append('  </VRTRasterBand>')
-
-    vrt_content.append('</VRTDataset>')
-
-    with open(output_vrt, 'w') as f:
-        f.write("\n".join(vrt_content))
-
-
-def create_color_corrected_vrt(
-    input_vrt: str,
-    output_vrt: str,
-    scale_params: List[List[float]],
-) -> None:
-    """Create a Float32 preview VRT with mild desaturation and a darker gamma."""
-    preview_source_vrt = make_preview_source_vrt_path(output_vrt)
-    create_tone_mapped_vrt(input_vrt, preview_source_vrt, scale_params)
-
-    ds = gdal.Open(preview_source_vrt)
-    if ds is None:
-        raise RuntimeError(f"Could not open tone-mapped VRT {preview_source_vrt}")
-    width, height = ds.RasterXSize, ds.RasterYSize
-    nodata_expr = explicit_nodata_expr(ds)
-
-    channel_exprs = [f"(B{band_index} / 255.0)" for band_index in range(1, 4)]
-    luminance_expr = preview_luminance_expr(channel_exprs)
-    vrt_content = vrt_dataset_preamble(ds)
-
-    for band_index in range(1, 4):
-        preview_expr = preview_channel_expr(channel_exprs[band_index - 1], luminance_expr)
-        scaled_expr = f"({preview_expr} * 255.0)"
-        final_expr = scaled_expr if nodata_expr is None else ternary_expr(nodata_expr, "0.0", scaled_expr)
-        escaped_expr = escape(final_expr, {'"': '&quot;'})
-
-        vrt_content.extend([
-            f'  <VRTRasterBand dataType="Float32" band="{band_index}" subClass="VRTDerivedRasterBand">',
-            f'    <ColorInterp>{RGB_COLOR_INTERPRETATIONS[band_index - 1]}</ColorInterp>',
-            '    <PixelFunctionType>expression</PixelFunctionType>',
-            f'    <PixelFunctionArguments expression="{escaped_expr}" />',
-            '    <NoDataValue>0</NoDataValue>',
-        ])
-
-        for source_band_index in range(1, 4):
-            source_band = ds.GetRasterBand(source_band_index)
-            block_x, block_y = source_band.GetBlockSize()
-            source_type = gdal.GetDataTypeName(source_band.DataType)
-            vrt_content.extend([
-                '    <SimpleSource>',
-                f'      <SourceFilename relativeToVRT="0">{os.path.abspath(preview_source_vrt)}</SourceFilename>',
-                f'      <SourceBand>{source_band_index}</SourceBand>',
-                (
-                    f'      <SourceProperties RasterXSize="{width}" RasterYSize="{height}" '
-                    f'DataType="{source_type}" BlockXSize="{block_x}" BlockYSize="{block_y}" />'
-                ),
-                f'      <SrcRect xOff="0" yOff="0" xSize="{width}" ySize="{height}" />',
-                f'      <DstRect xOff="0" yOff="0" xSize="{width}" ySize="{height}" />',
-                '    </SimpleSource>',
-            ])
-        vrt_content.append('  </VRTRasterBand>')
-
-    vrt_content.append('</VRTDataset>')
-
-    with open(output_vrt, 'w') as f:
-        f.write("\n".join(vrt_content))
-
-
-def create_byte_conversion_vrt(input_vrt: str, output_vrt: str) -> None:
-    """Create a Byte VRT backed by a materialized Byte GeoTIFF for packaging."""
-    byte_raster_path = make_materialized_byte_raster_path(output_vrt)
-    materialize_byte_geotiff(input_vrt, byte_raster_path)
-    ds = gdal.Open(byte_raster_path)
-    if ds is None:
-        raise RuntimeError(f"Could not open Byte raster {byte_raster_path}")
-    width, height = ds.RasterXSize, ds.RasterYSize
-
-    vrt_content = vrt_dataset_preamble(ds)
-
-    for band_index in range(1, ds.RasterCount + 1):
-        vrt_content.extend([
-            f'  <VRTRasterBand dataType="Byte" band="{band_index}">',
-            f'    <ColorInterp>{RGB_COLOR_INTERPRETATIONS[band_index - 1]}</ColorInterp>',
-            '    <NoDataValue>0</NoDataValue>',
-            '    <SimpleSource>',
-            f'      <SourceFilename relativeToVRT="0">{os.path.abspath(byte_raster_path)}</SourceFilename>',
-            f'      <SourceBand>{band_index}</SourceBand>',
-            f'      <SrcRect xOff="0" yOff="0" xSize="{width}" ySize="{height}" />',
-            f'      <DstRect xOff="0" yOff="0" xSize="{width}" ySize="{height}" />',
-            '    </SimpleSource>',
-            '  </VRTRasterBand>',
-        ])
-
-    vrt_content.append('</VRTDataset>')
-
-    with open(output_vrt, 'w') as f:
-        f.write("\n".join(vrt_content))
-
-
-def materialize_byte_geotiff(input_vrt: str, output_tif: str, block_size: int = 512) -> None:
-    """Materialize a Float32 RGB VRT into a Byte GeoTIFF without loading the full raster at once."""
-    ds = gdal.Open(input_vrt)
-    if ds is None:
-        raise RuntimeError(f"Could not open input VRT {input_vrt}")
-
-    driver = gdal.GetDriverByName("GTiff")
-    byte_ds = driver.Create(
-        output_tif,
-        ds.RasterXSize,
-        ds.RasterYSize,
-        ds.RasterCount,
-        gdal.GDT_Byte,
-        options=["TILED=YES", "COMPRESS=ZSTD", "ZSTD_LEVEL=1"],
-    )
-    if byte_ds is None:
-        raise RuntimeError(f"Could not create Byte GeoTIFF {output_tif}")
-
-    byte_ds.SetProjection(ds.GetProjection())
-    byte_ds.SetGeoTransform(ds.GetGeoTransform())
-
-    try:
-        for band_index in range(1, ds.RasterCount + 1):
-            src_band = ds.GetRasterBand(band_index)
-            dst_band = byte_ds.GetRasterBand(band_index)
-            dst_band.SetColorInterpretation(src_band.GetColorInterpretation())
-            dst_band.SetNoDataValue(0)
-
-            for yoff in range(0, ds.RasterYSize, block_size):
-                ysize = min(block_size, ds.RasterYSize - yoff)
-                for xoff in range(0, ds.RasterXSize, block_size):
-                    xsize = min(block_size, ds.RasterXSize - xoff)
-                    float_bytes = src_band.ReadRaster(xoff, yoff, xsize, ysize, buf_type=gdal.GDT_Float32)
-                    if float_bytes is None:
-                        raise RuntimeError(
-                            f"Could not read Float32 block x={xoff} y={yoff} size={xsize}x{ysize} from {input_vrt}"
-                        )
-
-                    float_values = array("f")
-                    float_values.frombytes(float_bytes)
-                    byte_values = bytes(
-                        0 if value <= 0.0 else 255 if value >= 255.0 else int(value + 0.5)
-                        for value in float_values
-                    )
-                    dst_band.WriteRaster(xoff, yoff, xsize, ysize, byte_values, buf_type=gdal.GDT_Byte)
-        byte_ds.FlushCache()
-    finally:
-        byte_ds = None
-        ds = None
 
 def process_chunk(args: ChunkTask) -> str:
     """Worker function for parallel gdal.Translate."""
@@ -535,7 +258,7 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     
     print(f"Merging {len(input_mbtiles)} chunks into {output_mbtiles}...")
     
-    # Sort chunks to ensure consistent merging if needed
+    # Sort chunks to ensure consistent merging
     input_mbtiles = sorted([f for f in input_mbtiles if f and os.path.exists(f)])
     if not input_mbtiles:
         return
@@ -590,29 +313,14 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     conn.commit()
     conn.close()
 
-def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str,
-               scale_params: List[List[float]], options: Dict[str, Any]) -> TilingArtifacts:
-    """Main entry point for tiling. Handles staging, chunking, and merging."""
+def run_tiling_simplified(input_vrt: str, output_mbtiles: str, options: Dict[str, Any]) -> TilingArtifacts:
+    """Simplified tiling from a pre-processed Byte VRT."""
     unique_id = options.get('unique_id', 'tiles')
     chunk_zoom = options.get('chunk_zoom', 4)
-    vrt_only = options.get('vrt', False)
+    tile_format = options.get('format', 'webp')
 
-    # 6. Create the quick-inspection Float32 VRT used for QGIS debugging.
-    color_vrt = make_step_vrt_path(6, "color_corrected", unique_id)
-    tone_vrt = make_step_vrt_path(6, "tone_mapped", unique_id)
-    print("Applying step 6 soft-knee tone mapping...")
-    create_color_corrected_vrt(input_vrt, color_vrt, scale_params)
-
-    if vrt_only:
-        return TilingArtifacts(final_vrt=color_vrt, cleanup_paths=[tone_vrt])
-
-    # 7. Materialize the final byte VRT used for packaging.
-    byte_vrt = make_step_vrt_path(7, "byte_conversion", unique_id)
-    byte_tif = make_materialized_byte_raster_path(byte_vrt)
-    create_byte_conversion_vrt(color_vrt, byte_vrt)
-
-    # 8. Determine chunks from the final Byte VRT.
-    ds = gdal.Open(byte_vrt)
+    # Determine chunks from the Byte VRT.
+    ds = gdal.Open(input_vrt)
     bounds = get_dataset_bounds(ds)
     ds = None
 
@@ -629,9 +337,9 @@ def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str,
                 continue
 
             ulx, uly, lrx, lry = get_web_mercator_bounds(chunk_zoom, tx, ty)
-            tasks.append((byte_vrt, chunk_file, tile_format, options, (ulx, uly, lrx, lry)))
+            tasks.append((input_vrt, chunk_file, tile_format, options, (ulx, uly, lrx, lry)))
 
-    # 9. Parallel execution.
+    # Parallel execution.
     if tasks:
         num_workers = options.get('processes', 1)
         print(f"Processing {len(tasks)} chunk(s) at zoom {chunk_zoom} with {num_workers} worker(s)...")
@@ -642,10 +350,10 @@ def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str,
             for task in tasks:
                 process_chunk(task)
 
-    # 10. Merge chunks.
+    # Merge chunks.
     merge_mbtiles(output_mbtiles, chunk_files)
 
-    # 11. Build overviews.
+    # Build overviews.
     print("Building overviews...")
     gdaladdo_cmd = [
         "gdaladdo", "-r", options['resample_alg'], 
@@ -654,4 +362,4 @@ def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str,
     ]
     subprocess.run(gdaladdo_cmd, check=True)
 
-    return TilingArtifacts(final_vrt=byte_vrt, cleanup_paths=[tone_vrt, color_vrt, byte_tif, byte_vrt, *chunk_files])
+    return TilingArtifacts(final_vrt=input_vrt, cleanup_paths=chunk_files)

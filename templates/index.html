@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Tone Mapping Tuner</title>
+    <style>
+        body { font-family: sans-serif; background: #1a1a1a; color: #eee; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; }
+        h1 { margin-bottom: 30px; color: #fb0; }
+        .container { display: flex; gap: 40px; padding: 20px; max-width: 1200px; width: 100%; justify-content: center; }
+        .controls { display: flex; flex-direction: column; gap: 15px; width: 350px; background: #2a2a2a; padding: 20px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        .slider-group { display: flex; flex-direction: column; }
+        .slider-group label { font-size: 13px; margin-bottom: 6px; color: #ccc; display: flex; justify-content: space-between; }
+        .image-container { position: relative; flex-grow: 1; display: flex; flex-direction: column; align-items: center; }
+        img { max-width: 100%; border: 2px solid #333; border-radius: 4px; box-shadow: 0 0 20px rgba(0,0,0,0.4); }
+        span.val { font-weight: bold; color: #fb0; min-width: 40px; text-align: right; }
+        
+        .viz-container { margin-top: 10px; margin-bottom: 20px; background: #000; border: 1px solid #444; position: relative; height: 120px; }
+        .viz-container svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        .viz-label { position: absolute; top: 2px; left: 5px; font-size: 10px; color: #666; pointer-events: none; }
+        
+        h3 { border-bottom: 1px solid #444; padding-bottom: 5px; margin-top: 20px; margin-bottom: 10px; font-size: 16px; color: #fb0; }
+        h3:first-child { margin-top: 0; }
+
+        input[type=range] { cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Tone Mapping Tuner</h1>
+    <div class="container">
+        <div class="controls">
+            <h3>Soft Knee (Tone Mapping)</h3>
+            
+            <div class="viz-container" id="soft_knee_viz">
+                <div class="viz-label">INPUT → TONE MAPPED</div>
+                <svg id="sk_svg" viewBox="0 0 256 128" preserveAspectRatio="none">
+                    <path id="sk_hist" fill="#333" d=""></path>
+                    <path id="sk_curve" stroke="#fb0" stroke-width="2" fill="none" d=""></path>
+                    <line x1="0" y1="0" x2="256" y2="128" stroke="#222" stroke-dasharray="4"></line>
+                </svg>
+            </div>
+
+            <div class="slider-group">
+                <label>Exposure: <span class="val" id="exp_val"></span></label>
+                <input type="range" id="exp" min="0.1" max="4" step="0.1" value="{{params.exposure}}">
+            </div>
+            <div class="slider-group">
+                <label>Shadow Break: <span class="val" id="sb_val"></span></label>
+                <input type="range" id="sb" min="0" max="1" step="0.01" value="{{params.shadow_break}}">
+            </div>
+            <div class="slider-group">
+                <label>Highlight Break: <span class="val" id="hb_val"></span></label>
+                <input type="range" id="hb" min="0" max="1" step="0.01" value="{{params.highlight_break}}">
+            </div>
+            <div class="slider-group">
+                <label>Shadow Slope: <span class="val" id="ss_val"></span></label>
+                <input type="range" id="ss" min="0" max="4" step="0.1" value="{{params.shadow_slope}}">
+            </div>
+            <div class="slider-group">
+                <label>Mid Slope: <span class="val" id="ms_val"></span></label>
+                <input type="range" id="ms" min="0" max="3" step="0.05" value="{{params.mid_slope}}">
+            </div>
+            <div class="slider-group">
+                <label>Highlight Slope: <span class="val" id="hs_val"></span></label>
+                <input type="range" id="hs" min="0" max="2" step="0.05" value="{{params.highlight_slope}}">
+            </div>
+            
+            <h3>Final Grade (Color & Contrast)</h3>
+
+            <div class="viz-container" id="final_grade_viz">
+                <div class="viz-label">TONE MAPPED → FINAL</div>
+                <svg id="fg_svg" viewBox="0 0 256 128" preserveAspectRatio="none">
+                    <path id="fg_curve" stroke="#0af" stroke-width="2" fill="none" d=""></path>
+                    <line x1="0" y1="0" x2="256" y2="128" stroke="#222" stroke-dasharray="4"></line>
+                </svg>
+            </div>
+
+            <div class="slider-group">
+                <label>Gamma: <span class="val" id="gamma_val"></span></label>
+                <input type="range" id="gamma" min="0.2" max="3" step="0.1" value="{{params.gamma}}">
+            </div>
+            <div class="slider-group">
+                <label>Saturation: <span class="val" id="sat_val"></span></label>
+                <input type="range" id="sat" min="0" max="2" step="0.1" value="{{params.saturation}}">
+            </div>
+            <div class="slider-group">
+                <label>Black Level Break: <span class="val" id="db_val"></span></label>
+                <input type="range" id="db" min="0" max="1" step="0.05" value="{{params.darken_break}}">
+            </div>
+            <div class="slider-group">
+                <label>Black Level Slope: <span class="val" id="ls_val"></span></label>
+                <input type="range" id="ls" min="0" max="1" step="0.05" value="{{params.low_slope}}">
+            </div>
+
+            <div style="display: flex; gap: 10px; margin-top: 20px;">
+                <button onclick="copyCLI()" style="flex: 1; padding: 10px; cursor: pointer; background: #fb0; border: none; font-weight: bold; border-radius: 4px;">Copy CLI Args</button>
+                <button onclick="resetDefaults()" style="padding: 10px; cursor: pointer; background: #444; border: none; color: white; border-radius: 4px;">Reset</button>
+            </div>
+        </div>
+        <div class="image-container">
+            <img id="preview" src="/render">
+            <p style="font-size: 12px; color: #666; margin-top: 10px;">Sample: Barcelona Downtown (HLS L30 31TDF)</p>
+        </div>
+    </div>
+
+    <script>
+        const sliders = ['exp', 'sb', 'hb', 'ss', 'ms', 'hs', 'gamma', 'sat', 'db', 'ls'];
+        const img = document.getElementById('preview');
+        const rawHist = {{ raw_hist | tojson }};
+
+        function drawHist() {
+            const path = document.getElementById('sk_hist');
+            if (!rawHist || rawHist.length === 0) return;
+            
+            let d = "M 0 128 ";
+            for (let i = 0; i < rawHist.length; i++) {
+                const x = (i / (rawHist.length - 1)) * 256;
+                const y = 128 - (rawHist[i] * 120);
+                d += `L ${x} ${y} `;
+            }
+            d += "L 256 128 Z";
+            path.setAttribute('d', d);
+        }
+
+        function drawSoftKneeCurve() {
+            const exp = parseFloat(document.getElementById('exp').value);
+            const sb = parseFloat(document.getElementById('sb').value);
+            const hb = parseFloat(document.getElementById('hb').value);
+            const ss = parseFloat(document.getElementById('ss').value);
+            const ms = parseFloat(document.getElementById('ms').value);
+            const hs = parseFloat(document.getElementById('hs').value);
+
+            const path = document.getElementById('sk_curve');
+            
+            function transform(x) {
+                let val = Math.min(1.0, x * exp);
+                let out;
+                const shadow_output = sb * ss;
+                const highlight_output = shadow_output + (hb - sb) * ms;
+                
+                if (val < sb) {
+                    out = val * ss;
+                } else if (val < hb) {
+                    out = shadow_output + (val - sb) * ms;
+                } else {
+                    out = highlight_output + (val - hb) * hs;
+                }
+                return Math.min(1.0, Math.max(0.0, out));
+            }
+
+            let d = "";
+            for (let i = 0; i <= 256; i += 2) {
+                const x = i / 256;
+                const y = 1.0 - transform(x);
+                d += (i === 0 ? "M" : "L") + ` ${i} ${y * 128} `;
+            }
+            path.setAttribute('d', d);
+        }
+
+        function drawFinalGradeCurve() {
+            const gamma = parseFloat(document.getElementById('gamma').value);
+            const db = parseFloat(document.getElementById('db').value);
+            const ls = parseFloat(document.getElementById('ls').value);
+
+            const path = document.getElementById('fg_curve');
+            
+            function transform(x) {
+                // 1. Gamma
+                let val = Math.pow(x, 1.0 / gamma);
+                
+                // 2. Darken curve
+                const high_slope = (1.0 - (db * ls)) / (1.0 - db);
+                const break_output = db * ls;
+                
+                let out;
+                if (val < db) {
+                    out = val * ls;
+                } else {
+                    out = break_output + (val - db) * high_slope;
+                }
+                return Math.min(1.0, Math.max(0.0, out));
+            }
+
+            let d = "";
+            for (let i = 0; i <= 256; i += 2) {
+                const x = i / 256;
+                const y = 1.0 - transform(x);
+                d += (i === 0 ? "M" : "L") + ` ${i} ${y * 128} `;
+            }
+            path.setAttribute('d', d);
+        }
+
+        let updateTimeout;
+        function update() {
+            clearTimeout(updateTimeout);
+            
+            // Update UI immediately
+            sliders.forEach(s => {
+                document.getElementById(`${s}_val`).innerText = document.getElementById(s).value;
+            });
+            drawSoftKneeCurve();
+            drawFinalGradeCurve();
+
+            // Throttle image update
+            updateTimeout = setTimeout(() => {
+                const params = sliders.map(s => {
+                    const el = document.getElementById(s);
+                    // Map back to the short names used in /render
+                    const map = {
+                        'exp': 'exp', 'sb': 'sb', 'hb': 'hb', 'ss': 'ss', 'ms': 'ms', 'hs': 'hs',
+                        'gamma': 'gamma', 'sat': 'sat', 'db': 'db', 'ls': 'ls'
+                    };
+                    return `${map[s]}=${el.value}`;
+                }).join('&');
+                img.src = `/render?${params}&t=${Date.now()}`;
+            }, 100);
+        }
+
+        function resetDefaults() {
+            const defaults = {{ params | tojson }};
+            const map = {
+                'exposure': 'exp', 'shadow_break': 'sb', 'highlight_break': 'hb', 
+                'shadow_slope': 'ss', 'mid_slope': 'ms', 'highlight_slope': 'hs',
+                'gamma': 'gamma', 'saturation': 'sat', 'darken_break': 'db', 'low_slope': 'ls'
+            };
+            for (let [key, val] of Object.entries(defaults)) {
+                const id = map[key];
+                if (document.getElementById(id)) {
+                    document.getElementById(id).value = val;
+                }
+            }
+            update();
+        }
+
+        function copyCLI() {
+            const args = sliders.map(s => {
+                const val = document.getElementById(s).value;
+                const argMap = {
+                    'exp': '--exposure', 'sb': '--sb', 'hb': '--hb', 'ss': '--ss', 
+                    'ms': '--ms', 'hs': '--hs', 'gamma': '--gamma', 
+                    'sat': '--sat', 'db': '--db', 'ls': '--ls'
+                };
+                return `${argMap[s]} ${val}`;
+            }).join(' ');
+            
+            navigator.clipboard.writeText(args).then(() => {
+                const btn = event.target;
+                const oldText = btn.innerText;
+                btn.innerText = "Copied!";
+                setTimeout(() => btn.innerText = oldText, 2000);
+            });
+        }
+
+        sliders.forEach(s => {
+            document.getElementById(s).addEventListener('input', update);
+        });
+
+        drawHist();
+        update();
+    </script>
+</body>
+</html>
