@@ -233,6 +233,12 @@ def calculate_estimates(args: argparse.Namespace) -> None:
     date_paths = [d.strip() for d in args.date.split(",")]
     num_dates = len(date_paths)
 
+    land_only_file = "HLS.land.tiles.txt"
+    land_set = None
+    if os.path.exists(land_only_file):
+        with open(land_only_file, 'r') as f:
+            land_set = {line.strip() for line in f if line.strip()}
+
     if args.bbox:
         try:
             min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
@@ -255,18 +261,15 @@ def calculate_estimates(args: argparse.Namespace) -> None:
                 except Exception:
                     continue
         
-        if args.land_only:
-            with open(args.land_only, 'r') as f:
-                land_set = {line.strip() for line in f if line.strip()}
+        if land_set is not None:
             mgrs_bases = [m for m in discovered_mgrs if m in land_set]
         else:
             mgrs_bases = list(discovered_mgrs)
-    elif args.all_tiles and args.land_only:
-        try:
-            with open(args.land_only, 'r') as f:
-                mgrs_bases = [line.strip() for line in f if line.strip()]
-        except FileNotFoundError:
-            print(f"Error: Land-only file not found: {args.land_only}")
+    elif args.all_tiles:
+        if land_set is not None:
+            mgrs_bases = list(land_set)
+        else:
+            print("Error: --global requires HLS.land.tiles.txt to be present.")
             sys.exit(1)
     else:
         mgrs_bases = [m.strip() for m in args.mgrs.split(",") if m.strip()]
@@ -342,11 +345,11 @@ def main() -> None:
 
     parser.add_argument("--tonemap", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable tone mapping (soft-knee)")
     parser.add_argument("--grade", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable final grading")
+    parser.add_argument("--land", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable land tile processing")
 
     parser.add_argument("--blocksize", type=int, default=512)
     parser.add_argument("--cache", default=".cache", help="Cache directory")
     parser.add_argument("--download", action="store_true", help="Download S3 tiles to local cache and exit")
-    parser.add_argument("--land-only", help="Path to land tile list txt")
     parser.add_argument("--bbox", help="WGS84 bounding box as min_lon,min_lat,max_lon,max_lat")
     parser.add_argument("--vrt", action="store_true", help="Write final VRT and skip MBTiles")
     parser.add_argument("--estimate", action="store_true", help="Print estimated time, RAM, disk space, and network size then exit")
@@ -373,6 +376,12 @@ def main() -> None:
                 print(f"Warning: Could not list folders for {dp}")
 
     # 2. Sub-tile Expansion
+    land_only_file = "HLS.land.tiles.txt"
+    land_set = None
+    if os.path.exists(land_only_file):
+        with open(land_only_file, 'r') as f:
+            land_set = {line.strip() for line in f if line.strip()}
+
     if args.bbox:
         try:
             min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
@@ -400,18 +409,19 @@ def main() -> None:
         discovered_mgrs = list(discovered_mgrs)
         
         # Cross-reference with land-only if provided
-        if args.land_only:
-            with open(args.land_only, 'r') as f:
-                land_set = {line.strip() for line in f if line.strip()}
+        if land_set is not None:
             mgrs_bases = [m for m in discovered_mgrs if m in land_set]
+            print(f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} are land tiles (filtered by {land_only_file}).")
         else:
             mgrs_bases = list(discovered_mgrs)
-            
-        print(f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} are land tiles.")
+            print(f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox.")
 
-    elif args.all_tiles and args.land_only:
-        with open(args.land_only, 'r') as f:
-            mgrs_bases = [line.strip() for line in f if line.strip()]
+    elif args.all_tiles:
+        if land_set is not None:
+            mgrs_bases = list(land_set)
+        else:
+            print("Error: --global requires HLS.land.tiles.txt to be present.")
+            sys.exit(1)
     else:
         mgrs_bases = [m.strip() for m in args.mgrs.split(",") if m.strip()]
         
@@ -419,20 +429,22 @@ def main() -> None:
 
     # 2. Parallel Tile Processing
     processed_tifs = []
-    print(f"Starting processing for {len(subtiles)} sub-tiles...")
-    
-    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-        futures = [executor.submit(process_single_tile, st, date_paths, args, unique_id) for st in subtiles]
-        for future in futures:
-            res = future.result()
-            if res: processed_tifs.append(res)
+    if args.land:
+        print(f"Starting processing for {len(subtiles)} sub-tiles...")
+        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+            futures = [executor.submit(process_single_tile, st, date_paths, args, unique_id) for st in subtiles]
+            for future in futures:
+                res = future.result()
+                if res: processed_tifs.append(res)
+    else:
+        print("Skipping land tile processing (--no-land).")
 
     if args.download:
         print("Download complete.")
         return
 
     if not processed_tifs and not args.bbox:
-        print("Error: No data processed.")
+        print("Error: No data processed (no land tiles found and no bbox provided).")
         sys.exit(1)
 
     # 3. Bathymetry Background (Ocean)
