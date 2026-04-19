@@ -431,8 +431,28 @@ def main() -> None:
     parser.add_argument("--db", "--black-break", type=float, default=tiler.PREVIEW_DARKEN_BREAK)
     parser.add_argument("--ls", "--black-slope", type=float, default=tiler.PREVIEW_DARKEN_LOW_SLOPE)
 
-    parser.add_argument("--tonemap", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable tone mapping (soft-knee)")
-    parser.add_argument("--grade", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable final grading")
+    # Ocean-specific Tone Mapping
+    parser.add_argument("--ocean-exposure", type=float, default=tiler.DEFAULT_EXPOSURE)
+    parser.add_argument("--osb", "--ocean-shadow-break", type=float, default=tiler.SOFT_KNEE_SHADOW_BREAK)
+    parser.add_argument("--ohb", "--ocean-highlight-break", type=float, default=tiler.SOFT_KNEE_HIGHLIGHT_BREAK)
+    parser.add_argument("--oss", "--ocean-shadow-slope", type=float, default=tiler.SOFT_KNEE_SHADOW_SLOPE)
+    parser.add_argument("--oms", "--ocean-mid-slope", type=float, default=tiler.SOFT_KNEE_MID_SLOPE)
+    parser.add_argument("--ohs", "--ocean-highlight-slope", type=float, default=tiler.SOFT_KNEE_HIGHLIGHT_SLOPE)
+
+    # Ocean-specific Grading
+    parser.add_argument("--ocean-gamma", type=float, default=tiler.DEFAULT_GAMMA)
+    parser.add_argument("--osat", "--ocean-saturation", type=float, default=tiler.PREVIEW_SATURATION)
+    parser.add_argument("--odb", "--ocean-black-break", type=float, default=tiler.PREVIEW_DARKEN_BREAK)
+    parser.add_argument("--ols", "--ocean-black-slope", type=float, default=tiler.PREVIEW_DARKEN_LOW_SLOPE)
+
+    # Ocean-specific Depth Range
+    parser.add_argument("--ocean-depth-min", type=float, default=-11000, help="Depth value for 0.0 in the color ramp")
+    parser.add_argument("--ocean-depth-max", type=float, default=0, help="Depth value for 1.0 in the color ramp")
+
+    parser.add_argument("--tonemap", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable land tone mapping")
+    parser.add_argument("--grade", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable land final grading")
+    parser.add_argument("--ocean-tonemap", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable ocean tone mapping")
+    parser.add_argument("--ocean-grade", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable ocean final grading")
     parser.add_argument("--land", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable land tile processing")
 
     parser.add_argument("--blocksize", type=int, default=512)
@@ -591,53 +611,53 @@ def main() -> None:
             (1.00, 222, 245, 229)
         ]
         
-        if args.tonemap:
-            # Apply same tone mapping (soft-knee) as land to ocean ramp
+        if args.ocean_tonemap:
+            # Apply ocean tone mapping (soft-knee)
             # Extract RGB colors (0-255) and normalize to 0-1
             mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
             mako_arr = mako_colors.T.reshape(3, -1, 1)
             toned_mako = tiler.apply_soft_knee_numpy(
                 mako_arr,
-                shadow_break=args.sb,
-                highlight_break=args.hb,
-                shadow_slope=args.ss,
-                mid_slope=args.ms,
-                highlight_slope=args.hs,
-                exposure=args.exposure
+                shadow_break=args.osb,
+                highlight_break=args.ohb,
+                shadow_slope=args.oss,
+                mid_slope=args.oms,
+                highlight_slope=args.ohs,
+                exposure=args.ocean_exposure
             )
             # Convert back for potential grading or final use
             mako_colors = toned_mako.reshape(3, -1).T
+        else:
+            # Just apply exposure if tonemap is off
+            mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
+            mako_colors = np.clip(mako_colors * args.ocean_exposure, 0.0, 1.0)
 
-        if args.grade:
-            # Apply same grading as land to ocean ramp to maximize contrast and consistency
-            if not args.tonemap:
-                mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
-            
+        if args.ocean_grade:
+            # Apply ocean grading
             mako_arr = mako_colors.T.reshape(3, -1, 1)
             graded_mako = tiler.apply_preview_correction_numpy(
                 mako_arr,
-                saturation=args.sat,
-                darken_break=args.db,
-                low_slope=args.ls,
-                gamma=args.gamma
+                saturation=args.osat,
+                darken_break=args.odb,
+                low_slope=args.ols,
+                gamma=args.ocean_gamma
             )
             mako_colors = graded_mako.reshape(3, -1).T
-
-        if args.tonemap or args.grade:
+        if args.ocean_tonemap or args.ocean_grade:
             # Convert back to uint8 and rebuild the ramp
             graded_uint8 = (mako_colors * 255).astype(np.uint8)
             mako_ramp = [(mako_ramp[i][0], *graded_uint8[i]) for i in range(len(mako_ramp))]
 
-        # Map -11000m to 0.0 and 0m to 1.0
-        depth_min = -11000
-        depth_max = 0
+        # Map depth range to 0.0-1.0
+        depth_min = args.ocean_depth_min
+        depth_max = args.ocean_depth_max
         
         with open(color_file, "w") as f:
             for frac, r, g, b in mako_ramp:
                 val = depth_min + frac * (depth_max - depth_min)
                 f.write(f"{val} {r} {g} {b} 255\n")
-            # Explicitly make land transparent (0m and above)
-            f.write("0.0001 0 0 0 0\n")
+            # Explicitly make land transparent (above max depth)
+            f.write(f"{depth_max + 0.0001} 0 0 0 0\n")
             f.write("nv 0 0 0 0\n")
 
         # Colorize using DEMProcessing (format=VRT to avoid intermediate write)

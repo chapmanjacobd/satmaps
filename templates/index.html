@@ -21,12 +21,39 @@
         h3:first-child { margin-top: 0; }
 
         input[type=range] { cursor: pointer; }
+
+        .mode-switcher { display: flex; gap: 10px; margin-bottom: 20px; }
+        .mode-btn { padding: 8px 16px; cursor: pointer; background: #444; border: none; color: white; border-radius: 4px; font-weight: bold; }
+        .mode-btn.active { background: #fb0; color: #1a1a1a; }
+
+        #ramp_viz { height: 30px; width: 100%; background: linear-gradient(to right, #000, #fff); margin-bottom: 10px; border: 1px solid #444; border-radius: 4px; }
     </style>
 </head>
 <body>
     <h1>Tone Mapping Tuner</h1>
+
+    <div class="mode-switcher">
+        <button class="mode-btn {{ 'active' if mode == 'land' else '' }}" onclick="window.location.href='/?mode=land'">Land Mode</button>
+        <button class="mode-btn {{ 'active' if mode == 'ocean' else '' }}" onclick="window.location.href='/?mode=ocean'">Ocean Mode</button>
+    </div>
+
     <div class="container">
         <div class="controls">
+            {% if mode == 'ocean' %}
+            <h3>Depth Range (Vertical Scale)</h3>
+            <div class="slider-group">
+                <label>Depth Min: <span class="val" id="dmin_val"></span></label>
+                <input type="range" id="dmin" min="-11000" max="0" step="100" value="{{params.depth_min}}">
+            </div>
+            <div class="slider-group">
+                <label>Depth Max: <span class="val" id="dmax_val"></span></label>
+                <input type="range" id="dmax" min="-11000" max="0" step="100" value="{{params.depth_max}}">
+            </div>
+            
+            <h3>Mako Color Ramp</h3>
+            <div id="ramp_viz"></div>
+            {% endif %}
+
             <div style="display: flex; justify-content: space-between; align-items: center;">
                 <h3 style="margin: 0; border: none;">Tone Mapping</h3>
                 <input type="checkbox" id="tm_on" checked>
@@ -102,15 +129,32 @@
             </div>
         </div>
         <div class="image-container">
-            <img id="preview" src="/render">
-            <p style="font-size: 12px; color: #666; margin-top: 10px;">Sample: Barcelona Downtown (HLS L30 31TDF)</p>
+            <img id="preview" src="/render?mode={{ mode }}">
+            <p style="font-size: 12px; color: #666; margin-top: 10px;">
+                {% if mode == 'land' %}
+                Sample: Barcelona Downtown (HLS L30 31TDF)
+                {% else %}
+                Sample: Hawaii Bathymetry (GEBCO 2025)
+                {% endif %}
+            </p>
         </div>
     </div>
 
     <script>
-        const sliders = ['exp', 'sb', 'hb', 'ss', 'ms', 'hs', 'gamma', 'sat', 'db', 'ls'];
+        const baseSliders = ['exp', 'sb', 'hb', 'ss', 'ms', 'hs', 'gamma', 'sat', 'db', 'ls'];
+        const currentMode = "{{ mode }}";
+        const sliders = currentMode === 'land' ? baseSliders : [...baseSliders, 'dmin', 'dmax'];
+        
         const img = document.getElementById('preview');
         const rawHist = {{ raw_hist | tojson }};
+        const makoRamp = [
+            [0.00, 11, 4, 5], [0.05, 25, 14, 24], [0.10, 38, 23, 43], [0.15, 49, 33, 64],
+            [0.20, 56, 42, 84], [0.25, 62, 53, 107], [0.30, 65, 64, 130], [0.35, 62, 79, 148],
+            [0.40, 57, 93, 156], [0.45, 54, 108, 160], [0.50, 53, 122, 162], [0.55, 52, 137, 166],
+            [0.60, 52, 153, 170], [0.65, 55, 166, 172], [0.70, 63, 181, 173], [0.75, 75, 194, 173],
+            [0.80, 101, 208, 173], [0.85, 136, 217, 177], [0.90, 171, 226, 190], [0.95, 198, 235, 209],
+            [1.00, 222, 245, 229]
+        ];
 
         function drawHist() {
             const path = document.getElementById('tm_hist');
@@ -126,100 +170,135 @@
             path.setAttribute('d', d);
         }
 
-        function drawToneMapCurve() {
-            const exp = parseFloat(document.getElementById('exp').value);
-            const sb = parseFloat(document.getElementById('sb').value);
-            const hb = parseFloat(document.getElementById('hb').value);
-            const ss = parseFloat(document.getElementById('ss').value);
-            const ms = parseFloat(document.getElementById('ms').value);
-            const hs = parseFloat(document.getElementById('hs').value);
-
-            const path = document.getElementById('tm_curve');
+        function applyToneMap(x, p) {
+            let val = Math.min(1.0, x * p.exp);
+            let out;
+            const shadow_output = p.sb * p.ss;
+            const highlight_output = shadow_output + (p.hb - p.sb) * p.ms;
             
-            function transform(x) {
-                let val = Math.min(1.0, x * exp);
-                let out;
-                const shadow_output = sb * ss;
-                const highlight_output = shadow_output + (hb - sb) * ms;
-                
-                if (val < sb) {
-                    out = val * ss;
-                } else if (val < hb) {
-                    out = shadow_output + (val - sb) * ms;
-                } else {
-                    out = highlight_output + (val - hb) * hs;
-                }
-                return Math.min(1.0, Math.max(0.0, out));
+            if (val < p.sb) {
+                out = val * p.ss;
+            } else if (val < p.hb) {
+                out = shadow_output + (val - p.sb) * p.ms;
+            } else {
+                out = highlight_output + (val - p.hb) * p.hs;
             }
+            return Math.min(1.0, Math.max(0.0, out));
+        }
 
+        function applyGrading(x, p) {
+            // 1. Gamma
+            let val = Math.pow(x, 1.0 / p.gamma);
+            // 2. Darken curve
+            const high_slope = (1.0 - (p.db * p.ls)) / (1.0 - p.db);
+            const break_output = p.db * p.ls;
+            let out;
+            if (val < p.db) {
+                out = val * p.ls;
+            } else {
+                out = break_output + (val - p.db) * high_slope;
+            }
+            return Math.min(1.0, Math.max(0.0, out));
+        }
+
+        function drawToneMapCurve() {
+            const p = {
+                exp: parseFloat(document.getElementById('exp').value),
+                sb: parseFloat(document.getElementById('sb').value),
+                hb: parseFloat(document.getElementById('hb').value),
+                ss: parseFloat(document.getElementById('ss').value),
+                ms: parseFloat(document.getElementById('ms').value),
+                hs: parseFloat(document.getElementById('hs').value)
+            };
+            const path = document.getElementById('tm_curve');
             let d = "";
             for (let i = 0; i <= 256; i += 2) {
                 const x = i / 256;
-                const y = 1.0 - transform(x);
+                const y = 1.0 - applyToneMap(x, p);
                 d += (i === 0 ? "M" : "L") + ` ${i} ${y * 128} `;
             }
             path.setAttribute('d', d);
         }
 
         function drawFinalGradeCurve() {
-            const gamma = parseFloat(document.getElementById('gamma').value);
-            const db = parseFloat(document.getElementById('db').value);
-            const ls = parseFloat(document.getElementById('ls').value);
-
+            const p = {
+                gamma: parseFloat(document.getElementById('gamma').value),
+                db: parseFloat(document.getElementById('db').value),
+                ls: parseFloat(document.getElementById('ls').value)
+            };
             const path = document.getElementById('fg_curve');
-            
-            function transform(x) {
-                // 1. Gamma
-                let val = Math.pow(x, 1.0 / gamma);
-                
-                // 2. Darken curve
-                const high_slope = (1.0 - (db * ls)) / (1.0 - db);
-                const break_output = db * ls;
-                
-                let out;
-                if (val < db) {
-                    out = val * ls;
-                } else {
-                    out = break_output + (val - db) * high_slope;
-                }
-                return Math.min(1.0, Math.max(0.0, out));
-            }
-
             let d = "";
             for (let i = 0; i <= 256; i += 2) {
                 const x = i / 256;
-                const y = 1.0 - transform(x);
+                const y = 1.0 - applyGrading(x, p);
                 d += (i === 0 ? "M" : "L") + ` ${i} ${y * 128} `;
             }
             path.setAttribute('d', d);
         }
 
+        function drawRamp() {
+            if (currentMode !== 'ocean') return;
+            const rampEl = document.getElementById('ramp_viz');
+            const tmOn = document.getElementById('tm_on').checked;
+            const fgOn = document.getElementById('fg_on').checked;
+
+            const p_tm = {
+                exp: parseFloat(document.getElementById('exp').value),
+                sb: parseFloat(document.getElementById('sb').value),
+                hb: parseFloat(document.getElementById('hb').value),
+                ss: parseFloat(document.getElementById('ss').value),
+                ms: parseFloat(document.getElementById('ms').value),
+                hs: parseFloat(document.getElementById('hs').value)
+            };
+            const p_fg = {
+                gamma: parseFloat(document.getElementById('gamma').value),
+                db: parseFloat(document.getElementById('db').value),
+                ls: parseFloat(document.getElementById('ls').value),
+                sat: parseFloat(document.getElementById('sat').value)
+            };
+
+            const stops = makoRamp.map(stop => {
+                const frac = stop[0];
+                let r = stop[1] / 255;
+                let g = stop[2] / 255;
+                let b = stop[3] / 255;
+
+                if (tmOn) {
+                    r = applyToneMap(r, p_tm);
+                    g = applyToneMap(g, p_tm);
+                    b = applyToneMap(b, p_tm);
+                }
+                if (fgOn) {
+                    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    r = luma + (r - luma) * p_fg.sat;
+                    g = luma + (g - luma) * p_fg.sat;
+                    b = luma + (b - luma) * p_fg.sat;
+                    r = applyGrading(r, p_fg);
+                    g = applyGrading(g, p_fg);
+                    b = applyGrading(b, p_fg);
+                }
+
+                return `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)}) ${frac * 100}%`;
+            }).join(', ');
+
+            rampEl.style.background = `linear-gradient(to right, ${stops})`;
+        }
+
         let updateTimeout;
         function update() {
             clearTimeout(updateTimeout);
-            
-            // Update UI immediately
             sliders.forEach(s => {
                 document.getElementById(`${s}_val`).innerText = document.getElementById(s).value;
             });
             drawToneMapCurve();
             drawFinalGradeCurve();
+            drawRamp();
 
-            // Throttle image update
             updateTimeout = setTimeout(() => {
                 const tmOn = document.getElementById('tm_on').checked ? '1' : '0';
                 const fgOn = document.getElementById('fg_on').checked ? '1' : '0';
-                
-                const params = sliders.map(s => {
-                    const el = document.getElementById(s);
-                    // Map back to the short names used in /render
-                    const map = {
-                        'exp': 'exp', 'sb': 'sb', 'hb': 'hb', 'ss': 'ss', 'ms': 'ms', 'hs': 'hs',
-                        'gamma': 'gamma', 'sat': 'sat', 'db': 'db', 'ls': 'ls'
-                    };
-                    return `${map[s]}=${el.value}`;
-                }).join('&');
-                img.src = `/render?${params}&tm=${tmOn}&fg=${fgOn}&t=${Date.now()}`;
+                const params = sliders.map(s => `${s}=${document.getElementById(s).value}`).join('&');
+                img.src = `/render?mode=${currentMode}&${params}&tm=${tmOn}&fg=${fgOn}&t=${Date.now()}`;
             }, 100);
         }
 
@@ -228,13 +307,12 @@
             const map = {
                 'exposure': 'exp', 'shadow_break': 'sb', 'highlight_break': 'hb', 
                 'shadow_slope': 'ss', 'mid_slope': 'ms', 'highlight_slope': 'hs',
-                'gamma': 'gamma', 'saturation': 'sat', 'darken_break': 'db', 'low_slope': 'ls'
+                'gamma': 'gamma', 'saturation': 'sat', 'darken_break': 'db', 'low_slope': 'ls',
+                'depth_min': 'dmin', 'depth_max': 'dmax'
             };
             for (let [key, val] of Object.entries(defaults)) {
                 const id = map[key];
-                if (document.getElementById(id)) {
-                    document.getElementById(id).value = val;
-                }
+                if (document.getElementById(id)) document.getElementById(id).value = val;
             }
             update();
         }
@@ -242,13 +320,24 @@
         function copyCLI() {
             const args = sliders.map(s => {
                 const val = document.getElementById(s).value;
-                const argMap = {
-                    'exp': '--exposure', 'sb': '--sb', 'hb': '--hb', 'ss': '--ss', 
-                    'ms': '--ms', 'hs': '--hs', 'gamma': '--gamma', 
-                    'sat': '--sat', 'db': '--db', 'ls': '--ls'
-                };
+                let argMap;
+                if (currentMode === 'land') {
+                    argMap = {
+                        'exp': '--exposure', 'sb': '--sb', 'hb': '--hb', 'ss': '--ss', 
+                        'ms': '--ms', 'hs': '--hs', 'gamma': '--gamma', 
+                        'sat': '--sat', 'db': '--db', 'ls': '--ls'
+                    };
+                    if (!argMap[s]) return ""; 
+                } else {
+                    argMap = {
+                        'exp': '--ocean-exposure', 'sb': '--osb', 'hb': '--ohb', 'ss': '--oss', 
+                        'ms': '--oms', 'hs': '--ohs', 'gamma': '--ocean-gamma', 
+                        'sat': '--osat', 'db': '--odb', 'ls': '--ols',
+                        'dmin': '--ocean-depth-min', 'dmax': '--ocean-depth-max'
+                    };
+                }
                 return `${argMap[s]} ${val}`;
-            }).join(' ');
+            }).filter(a => a !== "").join(' ');
             
             navigator.clipboard.writeText(args).then(() => {
                 const btn = event.target;
@@ -258,9 +347,7 @@
             });
         }
 
-        sliders.forEach(s => {
-            document.getElementById(s).addEventListener('input', update);
-        });
+        sliders.forEach(s => document.getElementById(s).addEventListener('input', update));
         document.getElementById('tm_on').addEventListener('change', update);
         document.getElementById('fg_on').addEventListener('change', update);
 
