@@ -44,9 +44,9 @@ def load_and_average_sample(paths):
         data.append(arr)
     
     rgb = np.stack(data) # (3, 1024, 1024)
-    # Simple normalization for the tuner
+    # Standardize normalization for the tuner baseline
     v_min = 0.0
-    v_max = np.nanpercentile(rgb, 99.6)
+    v_max = 9000.0 # Match satmaps.py universal baseline
     rgb = np.clip((rgb - v_min) / (v_max - v_min), 0, 1)
     rgb[np.isnan(rgb)] = 0
     return rgb

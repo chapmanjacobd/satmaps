@@ -30,14 +30,16 @@ def setup_gdal_cdse() -> None:
     gdal.SetConfigOption('GDAL_HTTP_MERGE_CONSECUTIVE_RANGES', 'YES')
     gdal.SetConfigOption('GDAL_HTTP_MAX_RETRY', '5')
 
+# Global cache for S3 folder listings to avoid per-tile discovery overhead
+S3_FOLDER_CACHE: Dict[str, set] = {}
+
 def list_mosaic_folders_for_tile(mgrs_tile: str, date_paths: List[str], cache_dir: str) -> List[Tuple[str, str]]:
-    """Find all S3 folders for a specific MGRS sub-tile across multiple dates."""
-    # sub-tile suffix e.g. 0_0
+    """Find all S3 folders for a specific MGRS sub-tile across multiple dates using the pre-populated cache."""
     mgrs_id, x, y = mgrs_tile.split('_')
     found = []
     
     for date_path in date_paths:
-        quarter = "Q3" # Default logic from original script
+        quarter = "Q3" 
         if "07/01" in date_path: quarter = "Q3"
         elif "10/01" in date_path: quarter = "Q4"
         elif "04/01" in date_path: quarter = "Q2"
@@ -46,15 +48,14 @@ def list_mosaic_folders_for_tile(mgrs_tile: str, date_paths: List[str], cache_di
         year = date_path.split('/')[0]
         folder = f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs_id}_{x}_{y}"
         
-        # Check cache first
+        # 1. Check local cache first
         local_b04 = os.path.join(cache_dir, date_path.replace("/", "-"), f"{mgrs_id}_{x}_{y}_B04.tif")
         if os.path.exists(local_b04):
             found.append((folder, date_path))
             continue
 
-        s3_path = f"s3://eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder}/B04.tif"
-        cmd = ["aws", "--endpoint-url", "https://eodata.dataspace.copernicus.eu", "--profile", "cdse", "s3", "ls", s3_path]
-        if subprocess.run(cmd, capture_output=True).returncode == 0:
+        # 2. Check pre-populated S3 cache
+        if date_path in S3_FOLDER_CACHE and folder in S3_FOLDER_CACHE[date_path]:
             found.append((folder, date_path))
             
     return found
@@ -140,14 +141,17 @@ def process_single_tile(
     
     # 3. Tone Mapping
     # Determine scaling (either hardcoded or via percentile)
-    if args.stats_min is not None and args.stats_max is not None:
-        s_min, s_max = args.stats_min, args.stats_max
+    if args.stats_min is not None:
+        s_min = args.stats_min
     else:
         s_min = 0.0
-        # Use a global-ish percentile from the first tile as a heuristic if not provided
-        # Or better: we should calculate global stats first? 
-        # For now, let's use 4000 as a sane default for Sentinel-2 MCQ mosaics if not provided.
-        s_max = np.nanpercentile(averaged, AUTO_SCALE_MAX_PERCENTILE)
+
+    if args.stats_max is not None:
+        s_max = args.stats_max
+    else:
+        # 9000 is a "safe" universal default for Sentinel-2 (90% reflectance).
+        # It prevents clipping in bright regions like sand, snow, or clouds.
+        s_max = 9000.0
     
     normalized = np.clip((averaged - s_min) / (s_max - s_min), 0.0, 1.0)
     normalized[np.isnan(normalized)] = 0.0
@@ -248,9 +252,17 @@ def main() -> None:
     unique_id = uuid.uuid4().hex[:8]
     date_paths = [d.strip() for d in args.date.split(",")]
 
-    # 1. Tile Discovery
-    # For simplicity in this refactor, we just use the provided MGRS filter or a list of tiles.
-    # We need a list of ALL sub-tiles (MGRS_x_y) to process.
+    # 1. Tile Discovery - Pre-populate S3 cache with a single listing per date
+    print("Populating S3 folder cache...")
+    for dp in date_paths:
+        s3_base = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{dp}"
+        dirs = gdal.ReadDir(s3_base)
+        if dirs:
+            S3_FOLDER_CACHE[dp] = set(dirs)
+        else:
+            print(f"Warning: Could not list folders for {dp}")
+
+    # 2. Sub-tile Expansion
     if args.all_tiles and args.land_only:
         with open(args.land_only, 'r') as f:
             mgrs_bases = [line.strip() for line in f if line.strip()]
