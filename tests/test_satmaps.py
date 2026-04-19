@@ -4,11 +4,12 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 from osgeo import gdal, osr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from satmaps import create_rgb_vrt, main, merge_date_vrts, prepare_group_sources, process_date
+from satmaps import calculate_scaling_params, create_rgb_vrt, main, merge_date_vrts, prepare_group_sources, process_date
 from tiler import (
     TilingArtifacts,
     create_byte_conversion_vrt,
@@ -238,8 +239,11 @@ def test_run_tiling_returns_final_byte_vrt_for_vrt_mode(tmp_path: Path, monkeypa
         },
     )
 
-    assert artifacts.final_vrt == ".temp/step7_byte_conversion_abc123.vrt"
-    assert artifacts.cleanup_paths == [".temp/step6_color_corrected_abc123.vrt"]
+    assert artifacts.final_vrt == ".temp/step6_color_corrected_abc123.vrt"
+    assert artifacts.cleanup_paths == [
+        ".temp/step6_color_corrected_abc123_float.vrt",
+        ".temp/step6_color_corrected_abc123_byte.tif",
+    ]
     assert not (tmp_path / "ignored.mbtiles").exists()
 
     final_dataset = gdal.Open(str(tmp_path / artifacts.final_vrt))
@@ -324,16 +328,16 @@ def test_main_vrt_mode_skips_pmtiles_and_preserves_final_vrt(monkeypatch: object
         lambda input_vrt, output_vrt, materialize_geotiff=False: Path(output_vrt).write_text(input_vrt),
     )
     monkeypatch.setattr("satmaps.gdal.Open", lambda path: SimpleNamespace(RasterCount=3))
+    monkeypatch.setattr("satmaps.calculate_scaling_params", lambda dataset: [[0, 4000, 0, 255]] * 3)
 
     pmtiles_calls: list[list[str]] = []
     monkeypatch.setattr("satmaps.subprocess.run", lambda cmd, check=True: pmtiles_calls.append(cmd))
 
     def fake_run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str, scale_params: list[list[float]], options: dict[str, object]) -> TilingArtifacts:
         Path(".temp/step6_color_corrected_abc12345.vrt").write_text("color")
-        Path(".temp/step7_byte_conversion_abc12345.vrt").write_text("byte")
         return TilingArtifacts(
-            final_vrt=".temp/step7_byte_conversion_abc12345.vrt",
-            cleanup_paths=[".temp/step6_color_corrected_abc12345.vrt"],
+            final_vrt=".temp/step6_color_corrected_abc12345.vrt",
+            cleanup_paths=[],
         )
 
     monkeypatch.setattr("satmaps.tiler.run_tiling", fake_run_tiling)
@@ -347,7 +351,7 @@ def test_main_vrt_mode_skips_pmtiles_and_preserves_final_vrt(monkeypatch: object
     assert Path(".temp/step4_master_abc12345.vrt").exists()
     assert Path(".temp/step5_warped_3857_abc12345.vrt").exists()
     assert Path(".temp/step6_color_corrected_abc12345.vrt").exists()
-    assert Path(".temp/step7_byte_conversion_abc12345.vrt").exists()
+    assert not Path(".temp/step7_byte_conversion_abc12345.vrt").exists()
 
 
 def test_main_step5_mode_materializes_geotiff_and_preserves_it_for_vrt(monkeypatch: object, tmp_path: Path) -> None:
@@ -372,6 +376,7 @@ def test_main_step5_mode_materializes_geotiff_and_preserves_it_for_vrt(monkeypat
         lambda output, sources, srcNodata=None, VRTNodata=None: Path(output).write_text("|".join(sources)),
     )
     monkeypatch.setattr("satmaps.gdal.Open", lambda path: SimpleNamespace(RasterCount=3))
+    monkeypatch.setattr("satmaps.calculate_scaling_params", lambda dataset: [[0, 4000, 0, 255]] * 3)
 
     warp_calls: list[tuple[str, str, bool]] = []
 
@@ -385,10 +390,9 @@ def test_main_step5_mode_materializes_geotiff_and_preserves_it_for_vrt(monkeypat
     def fake_run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str, scale_params: list[list[float]], options: dict[str, object]) -> TilingArtifacts:
         assert input_vrt == ".temp/step5_warped_3857_abc12345.tif"
         Path(".temp/step6_color_corrected_abc12345.vrt").write_text(input_vrt)
-        Path(".temp/step7_byte_conversion_abc12345.vrt").write_text("byte")
         return TilingArtifacts(
-            final_vrt=".temp/step7_byte_conversion_abc12345.vrt",
-            cleanup_paths=[".temp/step6_color_corrected_abc12345.vrt"],
+            final_vrt=".temp/step6_color_corrected_abc12345.vrt",
+            cleanup_paths=[],
         )
 
     monkeypatch.setattr("satmaps.tiler.run_tiling", fake_run_tiling)
@@ -404,4 +408,29 @@ def test_main_step5_mode_materializes_geotiff_and_preserves_it_for_vrt(monkeypat
     ]
     assert Path(".temp/step5_warped_3857_abc12345.tif").exists()
     assert Path(".temp/step6_color_corrected_abc12345.vrt").exists()
-    assert Path(".temp/step7_byte_conversion_abc12345.vrt").exists()
+    assert not Path(".temp/step7_byte_conversion_abc12345.vrt").exists()
+
+
+def test_calculate_scaling_params_uses_996_percent_upper_bound(tmp_path: Path) -> None:
+    input_path = tmp_path / "percentile_input.tif"
+
+    driver = gdal.GetDriverByName("GTiff")
+    dataset = driver.Create(str(input_path), 1000, 1, 3, gdal.GDT_Int16)
+    dataset.SetGeoTransform((0.0, 10.0, 0.0, 20.0, 0.0, -10.0))
+
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset.SetProjection(srs.ExportToWkt())
+
+    values = np.full((1, 1000), 2000, dtype=np.int16)
+    values[0, -4:] = 9000
+    for band_index in range(1, 4):
+        band = dataset.GetRasterBand(band_index)
+        band.WriteArray(values)
+        band.SetNoDataValue(0)
+    dataset = None
+
+    opened = gdal.Open(str(input_path))
+    scale_params = calculate_scaling_params(opened)
+
+    assert scale_params == [[0.0, 2000.0, 0, 255]] * 3

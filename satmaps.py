@@ -31,6 +31,12 @@ class ProcessingOptions:
     stats_min: Optional[float] = None
     stats_max: Optional[float] = None
 
+
+AUTO_SCALE_MAX_PERCENTILE = 99.6
+HISTOGRAM_MIN = 0.0
+HISTOGRAM_MAX = 40000.0
+HISTOGRAM_BUCKETS = 4000
+
 # --- Discovery Layer (S3/CDSE Utils) ---
 
 def setup_gdal_cdse() -> None:
@@ -231,30 +237,54 @@ def merge_date_vrts(output_vrt: str, input_vrts: List[str]) -> None:
 
     tree.write(output_vrt, encoding="UTF-8", xml_declaration=True)
 
-def calculate_scaling_params(dataset: gdal.Dataset, shared: bool = True) -> List[List[float]]:
-    """Determine min/max values for 8-bit scaling using percentiles (2% and 98%)."""
+def histogram_bucket_index(value: float, histogram_min: float, histogram_max: float, buckets: int) -> Optional[int]:
+    """Map a histogram value to its bucket index."""
+    if value < histogram_min or value > histogram_max:
+        return None
+    if value == histogram_max:
+        return buckets - 1
+    bucket_width = (histogram_max - histogram_min) / buckets
+    return int((value - histogram_min) / bucket_width)
+
+
+def calculate_scaling_params(
+    dataset: gdal.Dataset,
+    shared: bool = True,
+    max_percentile: float = AUTO_SCALE_MAX_PERCENTILE,
+) -> List[List[float]]:
+    """Determine min/max values for 8-bit scaling using a 0..max_percentile stretch."""
     band_stats = []
+    bucket_width = (HISTOGRAM_MAX - HISTOGRAM_MIN) / HISTOGRAM_BUCKETS
     for i in range(1, dataset.RasterCount + 1):
         band = dataset.GetRasterBand(i)
-        hist = band.GetHistogram(min=0.0, max=40000.0, buckets=4000, approx_ok=True)
+        hist = list(
+            band.GetHistogram(
+                min=HISTOGRAM_MIN,
+                max=HISTOGRAM_MAX,
+                buckets=HISTOGRAM_BUCKETS,
+                approx_ok=True,
+            )
+        )
+        nodata_value = band.GetNoDataValue()
+        if nodata_value is not None:
+            nodata_bucket = histogram_bucket_index(nodata_value, HISTOGRAM_MIN, HISTOGRAM_MAX, HISTOGRAM_BUCKETS)
+            if nodata_bucket is not None:
+                hist[nodata_bucket] = 0
         total_pixels = sum(hist)
 
         if total_pixels == 0:
             band_stats.append((0.0, 4000.0))
             continue
 
-        low_thresh = total_pixels * 0.02
-        high_thresh = total_pixels * 0.98
-        
-        accum, low_val, high_val = 0, 0.0, 4000.0
+        high_thresh = total_pixels * (max_percentile / 100.0)
+
+        accum, high_val = 0, 4000.0
         for idx, count in enumerate(hist):
             accum += count
-            if low_val == 0.0 and accum >= low_thresh:
-                low_val = idx * 10.0
             if accum >= high_thresh:
-                high_val = idx * 10.0
+                high_val = HISTOGRAM_MIN + (idx * bucket_width)
                 break
-        band_stats.append((low_val, high_val))
+        band_stats.append((0.0, high_val))
 
     if shared:
         global_min = min(s[0] for s in band_stats)
@@ -353,8 +383,8 @@ def main() -> None:
     parser.add_argument("--resample-alg", default="lanczos", choices=["bilinear", "average", "gauss", "lanczos"])
     parser.add_argument("--chunk-zoom", type=int, default=4, help="Zoom level to chunk the processing at (for resumability)")
     parser.add_argument("--processes", type=int, default=4, help="Number of parallel processes for tiling")
-    parser.add_argument("--stats-min", type=float, default=0, help="Hardcoded source min")
-    parser.add_argument("--stats-max", type=float, default=9000, help="Hardcoded source max")
+    parser.add_argument("--stats-min", type=float, help="Hardcoded source min for step 6; provide with --stats-max")
+    parser.add_argument("--stats-max", type=float, help="Hardcoded source max for step 6; provide with --stats-min")
     parser.add_argument("--blocksize", type=int, default=512)
     parser.add_argument("--cache", default=".cache", help="Cache directory")
     parser.add_argument("--download-only", action="store_true", help="Download only")
@@ -362,6 +392,9 @@ def main() -> None:
     parser.add_argument("--vrt", action="store_true", help="Write the final inspection VRT in .temp and skip MBTiles/PMTiles output")
     parser.add_argument("--step5", action="store_true", help="Materialize step 5 as a compressed tiled GeoTIFF instead of a VRT")
     args = parser.parse_args()
+
+    if (args.stats_min is None) != (args.stats_max is None):
+        parser.error("--stats-min and --stats-max must be provided together")
 
     opts = ProcessingOptions(
         format=args.format, quality=args.quality, resample_alg=args.resample_alg,
@@ -424,7 +457,7 @@ def main() -> None:
             scale_params = calculate_scaling_params(ds)
         ds = None
 
-        stage_label = "final VRT" if args.vrt else f"MBTiles ({args.format}) via chunking"
+        stage_label = "step 6 inspection VRT" if args.vrt else f"MBTiles ({args.format}) via chunking"
         print(f"Generating {stage_label}...")
         tiling_artifacts = tiler.run_tiling(
             temp_warped_vrt,

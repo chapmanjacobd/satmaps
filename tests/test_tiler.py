@@ -114,6 +114,7 @@ def test_create_color_corrected_vrt_emits_nonzero_pixels(tmp_path: Path) -> None
 
     output = gdal.Open(str(output_path))
     assert output is not None
+    assert output.GetRasterBand(1).DataType == gdal.GDT_Byte
 
     pixel_values = output.ReadAsArray()
     assert pixel_values.max() > 0
@@ -155,11 +156,12 @@ def test_create_color_corrected_vrt_preserves_zero_channel_dark_pixels(tmp_path:
     assert pixel_values[:, 0, 0].max() > 0
     assert pixel_values[:, 0, 1].max() == 0
 
+    float_vrt_text = output_path.with_name(f"{output_path.stem}_float.vrt").read_text()
     vrt_text = output_path.read_text()
     assert "B1 &lt;= 0" not in vrt_text
-    assert "B1 == 0.0" in vrt_text
-    assert "B2 == 0.0" in vrt_text
-    assert "B3 == 0.0" in vrt_text
+    assert "B1 == 0.0" in float_vrt_text
+    assert "B2 == 0.0" in float_vrt_text
+    assert "B3 == 0.0" in float_vrt_text
 
 
 def test_create_color_corrected_vrt_keeps_low_valid_values_above_zero(tmp_path: Path) -> None:
@@ -219,10 +221,11 @@ def test_create_color_corrected_vrt_applies_soft_knee_tone_curve(tmp_path: Path)
 
     output = gdal.Open(str(output_path))
     assert output is not None
+    assert output.GetRasterBand(1).DataType == gdal.GDT_Byte
 
     pixel_values = output.ReadAsArray()
     expected = np.array([11.9, 153.0, 242.25], dtype=np.float32)
-    np.testing.assert_allclose(pixel_values[0, 0, :], expected, atol=0.6)
+    np.testing.assert_allclose(pixel_values[0, 0, :], expected, atol=1.0)
 
 
 def test_proj_win_to_src_win_converts_bounds_to_pixel_window(tmp_path: Path) -> None:

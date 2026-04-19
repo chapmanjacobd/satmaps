@@ -1,3 +1,4 @@
+from array import array
 import os
 import subprocess
 import sqlite3
@@ -130,6 +131,16 @@ def make_step_vrt_path(step: int, label: str, unique_id: str) -> str:
     """Return a temporary VRT path with an explicit pipeline step prefix."""
     return f".temp/step{step}_{label}_{unique_id}.vrt"
 
+
+def make_color_corrected_float_vrt_path(output_vrt: str) -> str:
+    """Return the companion Float32 VRT path backing a Byte step-6 VRT."""
+    return f"{os.path.splitext(output_vrt)[0]}_float.vrt"
+
+
+def make_color_corrected_byte_tif_path(output_vrt: str) -> str:
+    """Return the companion Byte GeoTIFF path backing a step-6 inspection VRT."""
+    return f"{os.path.splitext(output_vrt)[0]}_byte.tif"
+
 def get_web_mercator_bounds(z: int, x: int, y: int) -> Tuple[float, float, float, float]:
     """Calculate Web Mercator (EPSG:3857) bounds for a given XYZ tile."""
     n = 2.0 ** z
@@ -209,12 +220,12 @@ def proj_win_to_src_win(dataset: gdal.Dataset, proj_win: ProjWin) -> Tuple[int, 
 
     return xoff, yoff, max(0, xend - xoff), max(0, yend - yoff)
 
-def create_color_corrected_vrt(
+def write_color_corrected_float_vrt(
     input_vrt: str,
     output_vrt: str,
     scale_params: List[List[float]],
 ) -> None:
-    """Create a VRT that normalizes source data and applies a soft-knee tone curve."""
+    """Create a Float32 VRT that normalizes source data and applies a soft-knee tone curve."""
     ds = gdal.Open(input_vrt)
     if ds is None:
         raise RuntimeError(f"Could not open input VRT {input_vrt}")
@@ -250,10 +261,17 @@ def create_color_corrected_vrt(
         
         # Add all 3 bands as sources to this band so B1, B2, B3 are available
         for src_idx in range(1, 4):
+            source_band = ds.GetRasterBand(src_idx)
+            block_x, block_y = source_band.GetBlockSize()
+            source_type = gdal.GetDataTypeName(source_band.DataType)
             vrt_content.extend([
                 '    <SimpleSource>',
                 f'      <SourceFilename relativeToVRT="0">{os.path.abspath(input_vrt)}</SourceFilename>',
                 f'      <SourceBand>{src_idx}</SourceBand>',
+                (
+                    f'      <SourceProperties RasterXSize="{width}" RasterYSize="{height}" '
+                    f'DataType="{source_type}" BlockXSize="{block_x}" BlockYSize="{block_y}" />'
+                ),
                 f'      <SrcRect xOff="0" yOff="0" xSize="{width}" ySize="{height}" />',
                 f'      <DstRect xOff="0" yOff="0" xSize="{width}" ySize="{height}" />',
                 '    </SimpleSource>'
@@ -266,20 +284,82 @@ def create_color_corrected_vrt(
         f.write("\n".join(vrt_content))
 
 
+def create_color_corrected_vrt(
+    input_vrt: str,
+    output_vrt: str,
+    scale_params: List[List[float]],
+) -> None:
+    """Create the display-ready Byte step-6 VRT from Float32 and Byte companions."""
+    float_output_vrt = make_color_corrected_float_vrt_path(output_vrt)
+    byte_output_tif = make_color_corrected_byte_tif_path(output_vrt)
+    write_color_corrected_float_vrt(input_vrt, float_output_vrt, scale_params)
+    materialize_byte_geotiff(float_output_vrt, byte_output_tif)
+    gdal.Translate(output_vrt, byte_output_tif, options=gdal.TranslateOptions(format="VRT"))
+    apply_rgb_color_interpretation_to_vrt(output_vrt)
+
+
+def materialize_byte_geotiff(input_vrt: str, output_tif: str, block_size: int = 512) -> None:
+    """Materialize a Float32 RGB VRT into a Byte GeoTIFF without loading the full raster at once."""
+    ds = gdal.Open(input_vrt)
+    if ds is None:
+        raise RuntimeError(f"Could not open input VRT {input_vrt}")
+
+    driver = gdal.GetDriverByName("GTiff")
+    byte_ds = driver.Create(
+        output_tif,
+        ds.RasterXSize,
+        ds.RasterYSize,
+        ds.RasterCount,
+        gdal.GDT_Byte,
+        options=["TILED=YES", "COMPRESS=ZSTD", "ZSTD_LEVEL=1"],
+    )
+    if byte_ds is None:
+        raise RuntimeError(f"Could not create Byte GeoTIFF {output_tif}")
+
+    byte_ds.SetProjection(ds.GetProjection())
+    byte_ds.SetGeoTransform(ds.GetGeoTransform())
+
+    try:
+        for band_index in range(1, ds.RasterCount + 1):
+            src_band = ds.GetRasterBand(band_index)
+            dst_band = byte_ds.GetRasterBand(band_index)
+            dst_band.SetColorInterpretation(src_band.GetColorInterpretation())
+            dst_band.SetNoDataValue(0)
+
+            for yoff in range(0, ds.RasterYSize, block_size):
+                ysize = min(block_size, ds.RasterYSize - yoff)
+                for xoff in range(0, ds.RasterXSize, block_size):
+                    xsize = min(block_size, ds.RasterXSize - xoff)
+                    float_bytes = src_band.ReadRaster(xoff, yoff, xsize, ysize, buf_type=gdal.GDT_Float32)
+                    if float_bytes is None:
+                        raise RuntimeError(
+                            f"Could not read Float32 block x={xoff} y={yoff} size={xsize}x{ysize} from {input_vrt}"
+                        )
+
+                    float_values = array("f")
+                    float_values.frombytes(float_bytes)
+                    byte_values = bytes(
+                        0 if value <= 0.0 else 255 if value >= 255.0 else int(value + 0.5)
+                        for value in float_values
+                    )
+                    dst_band.WriteRaster(xoff, yoff, xsize, ysize, byte_values, buf_type=gdal.GDT_Byte)
+        byte_ds.FlushCache()
+    finally:
+        byte_ds = None
+        ds = None
+
+
 def create_byte_conversion_vrt(input_vrt: str, output_vrt: str) -> None:
-    """Create a Byte VRT that clamps a Float32 RGB VRT into MBTiles-safe 8-bit bands."""
+    """Create a Byte VRT that casts an already-clamped RGB source into 8-bit bands."""
     ds = gdal.Open(input_vrt)
     width, height = ds.RasterXSize, ds.RasterYSize
 
     vrt_content = vrt_dataset_preamble(ds)
 
     for band_index in range(1, ds.RasterCount + 1):
-        escaped_expr = escape(clamp_expr("B1", "0.0", "255.0"), {'"': '&quot;'})
         vrt_content.extend([
-            f'  <VRTRasterBand dataType="Byte" band="{band_index}" subClass="VRTDerivedRasterBand">',
+            f'  <VRTRasterBand dataType="Byte" band="{band_index}">',
             f'    <ColorInterp>{RGB_COLOR_INTERPRETATIONS[band_index - 1]}</ColorInterp>',
-            '    <PixelFunctionType>expression</PixelFunctionType>',
-            f'    <PixelFunctionArguments expression="{escaped_expr}" />',
             '    <NoDataValue>0</NoDataValue>',
             '    <SimpleSource>',
             f'      <SourceFilename relativeToVRT="0">{os.path.abspath(input_vrt)}</SourceFilename>',
@@ -431,17 +511,19 @@ def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str,
     chunk_zoom = options.get('chunk_zoom', 4)
     vrt_only = options.get('vrt', False)
 
-    # 6. Create color-corrected and scaled VRT
+    # 6. Create the display-ready Byte VRT used for QGIS inspection.
     color_vrt = make_step_vrt_path(6, "color_corrected", unique_id)
+    color_float_vrt = make_color_corrected_float_vrt_path(color_vrt)
+    color_byte_tif = make_color_corrected_byte_tif_path(color_vrt)
     print("Applying step 6 soft-knee tone mapping...")
     create_color_corrected_vrt(input_vrt, color_vrt, scale_params)
 
-    # 7. Materialize the final byte VRT used for packaging or QGIS inspection.
+    if vrt_only:
+        return TilingArtifacts(final_vrt=color_vrt, cleanup_paths=[color_float_vrt, color_byte_tif])
+
+    # 7. Materialize the final byte VRT used for packaging.
     byte_vrt = make_step_vrt_path(7, "byte_conversion", unique_id)
     create_byte_conversion_vrt(color_vrt, byte_vrt)
-
-    if vrt_only:
-        return TilingArtifacts(final_vrt=byte_vrt, cleanup_paths=[color_vrt])
 
     # 8. Determine chunks from the final Byte VRT.
     ds = gdal.Open(byte_vrt)
@@ -486,4 +568,4 @@ def run_tiling(input_vrt: str, output_mbtiles: str, tile_format: str,
     ]
     subprocess.run(gdaladdo_cmd, check=True)
 
-    return TilingArtifacts(final_vrt=byte_vrt, cleanup_paths=[color_vrt, byte_vrt, *chunk_files])
+    return TilingArtifacts(final_vrt=byte_vrt, cleanup_paths=[color_float_vrt, color_byte_tif, color_vrt, byte_vrt, *chunk_files])

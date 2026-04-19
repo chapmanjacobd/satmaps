@@ -54,9 +54,9 @@ python3 satmaps.py --global --land-only HLS.land.tiles.txt -o global.pmtiles
 ### Advanced Options
 
 - `--date`: Comma-separated list of mosaic dates (e.g., `2025/07/01,2025/01/01`). Multiple dates are averaged to handle overlaps and reduce cloud artifacts.
-- `--stats-min`/`--stats-max`: Hardcoded source min/max values for consistent scaling across different runs. These now feed step 6's built-in soft-knee tone curve, so they are the main controls for balancing shadow lift against highlight preservation.
+- `--stats-min`/`--stats-max`: Optional hardcoded source min/max values for consistent scaling across different runs. If omitted, step 6 auto-scales from 0 to the source histogram's 99.6th percentile before applying its soft-knee tone curve.
 - `--cache`: Local directory to store downloaded `.tif` files.
-- `--vrt`: Stop after generating the final Byte VRT in `.temp/` for inspection in QGIS, skipping MBTiles/PMTiles packaging.
+- `--vrt`: Stop after generating the step 6 inspection VRT in `.temp/` for QGIS review, skipping MBTiles/PMTiles packaging.
 - `--step5`: Materialize step 5 as a tiled ZSTD-compressed GeoTIFF so downstream VRT stages reference a real raster file instead of a warped VRT.
 
 ### Batch Comparison
@@ -89,6 +89,6 @@ Then visit `http://localhost:8000/viewer.html`. The viewer dynamically reads the
     4. Step 3: Build per-date mosaic VRTs and average overlaps with a derived-band expression.
     5. Step 4: Merge the requested date mosaics into a master VRT.
     6. Step 5: Reproject the master VRT to Web Mercator (EPSG:3857), optionally materialized as a tiled ZSTD GeoTIFF with `--step5`.
-    7. Step 6: Create a tone-mapped Float32 VRT with a built-in soft-knee curve that lifts shadows and rolls off highlights.
-    8. Step 7: Create the final Byte-conversion VRT used either for QGIS inspection (`--vrt`) or chunked packaging.
+    7. Step 6: Create a tone-mapped Byte VRT with a built-in soft-knee curve that lifts shadows, rolls off highlights, and is suitable for direct QGIS inspection.
+    8. Step 7: Create the final Byte-conversion VRT used for chunked packaging.
     9. Packaging: Translate chunk MBTiles, merge them, build overviews, and optionally run `pmtiles convert` for distribution.
