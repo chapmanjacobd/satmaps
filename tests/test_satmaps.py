@@ -240,15 +240,12 @@ def test_run_tiling_returns_final_byte_vrt_for_vrt_mode(tmp_path: Path, monkeypa
     )
 
     assert artifacts.final_vrt == ".temp/step6_color_corrected_abc123.vrt"
-    assert artifacts.cleanup_paths == [
-        ".temp/step6_color_corrected_abc123_float.vrt",
-        ".temp/step6_color_corrected_abc123_byte.tif",
-    ]
+    assert artifacts.cleanup_paths == [".temp/step6_tone_mapped_abc123.vrt"]
     assert not (tmp_path / "ignored.mbtiles").exists()
 
     final_dataset = gdal.Open(str(tmp_path / artifacts.final_vrt))
     assert final_dataset is not None
-    assert final_dataset.GetRasterBand(1).DataType == gdal.GDT_Byte
+    assert final_dataset.GetRasterBand(1).DataType == gdal.GDT_Float32
 
 
 def test_create_rgb_vrt_sets_rgb_color_interpretation(tmp_path: Path) -> None:
