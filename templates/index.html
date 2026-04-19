@@ -27,7 +27,10 @@
     <h1>Tone Mapping Tuner</h1>
     <div class="container">
         <div class="controls">
-            <h3>Soft Knee (Tone Mapping)</h3>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3 style="margin: 0; border: none;">Soft Knee (Tone Mapping)</h3>
+                <input type="checkbox" id="sk_on" checked>
+            </div>
             
             <div class="viz-container" id="soft_knee_viz">
                 <div class="viz-label">INPUT → TONE MAPPED</div>
@@ -63,7 +66,10 @@
                 <input type="range" id="hs" min="0" max="2" step="0.05" value="{{params.highlight_slope}}">
             </div>
             
-            <h3>Final Grade (Color & Contrast)</h3>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 20px;">
+                <h3 style="margin: 0; border: none;">Final Grade (Color & Contrast)</h3>
+                <input type="checkbox" id="fg_on" checked>
+            </div>
 
             <div class="viz-container" id="final_grade_viz">
                 <div class="viz-label">TONE MAPPED → FINAL</div>
@@ -201,6 +207,9 @@
 
             // Throttle image update
             updateTimeout = setTimeout(() => {
+                const skOn = document.getElementById('sk_on').checked ? '1' : '0';
+                const fgOn = document.getElementById('fg_on').checked ? '1' : '0';
+                
                 const params = sliders.map(s => {
                     const el = document.getElementById(s);
                     // Map back to the short names used in /render
@@ -210,7 +219,7 @@
                     };
                     return `${map[s]}=${el.value}`;
                 }).join('&');
-                img.src = `/render?${params}&t=${Date.now()}`;
+                img.src = `/render?${params}&sk=${skOn}&fg=${fgOn}&t=${Date.now()}`;
             }, 100);
         }
 
@@ -252,6 +261,8 @@
         sliders.forEach(s => {
             document.getElementById(s).addEventListener('input', update);
         });
+        document.getElementById('sk_on').addEventListener('change', update);
+        document.getElementById('fg_on').addEventListener('change', update);
 
         drawHist();
         update();

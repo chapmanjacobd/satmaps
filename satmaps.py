@@ -153,20 +153,24 @@ def process_single_tile(
     normalized[np.isnan(normalized)] = 0.0
     
     # Apply soft-knee tone mapping
-    toned = tiler.apply_soft_knee_numpy(normalized, 
-                                       shadow_break=args.sb, 
-                                       highlight_break=args.hb,
-                                       shadow_slope=args.ss,
-                                       mid_slope=args.ms,
-                                       highlight_slope=args.hs,
-                                       exposure=args.exposure)
+    if not args.no_soft_knee:
+        toned = tiler.apply_soft_knee_numpy(normalized, 
+                                           shadow_break=args.sb, 
+                                           highlight_break=args.hb,
+                                           shadow_slope=args.ss,
+                                           mid_slope=args.ms,
+                                           highlight_slope=args.hs,
+                                           exposure=args.exposure)
+    else:
+        toned = np.clip(normalized * args.exposure, 0.0, 1.0)
     
     # Apply final grading (preview correction)
-    toned = tiler.apply_preview_correction_numpy(toned,
-                                                saturation=args.sat,
-                                                darken_break=args.db,
-                                                low_slope=args.ls,
-                                                gamma=args.gamma)
+    if not args.no_grading:
+        toned = tiler.apply_preview_correction_numpy(toned,
+                                                    saturation=args.sat,
+                                                    darken_break=args.db,
+                                                    low_slope=args.ls,
+                                                    gamma=args.gamma)
     
     # 4. Save to temporary Byte GeoTIFF
     temp_utm_path = f".temp/processed_{mgrs_subtile}_{unique_id}_utm.tif"
@@ -228,6 +232,9 @@ def main() -> None:
     parser.add_argument("--sat", "--saturation", type=float, default=tiler.PREVIEW_SATURATION)
     parser.add_argument("--db", "--black-break", type=float, default=tiler.PREVIEW_DARKEN_BREAK)
     parser.add_argument("--ls", "--black-slope", type=float, default=tiler.PREVIEW_DARKEN_LOW_SLOPE)
+
+    parser.add_argument("--no-soft-knee", action="store_true", help="Disable soft-knee tone mapping")
+    parser.add_argument("--no-grading", action="store_true", help="Disable final grading")
 
     parser.add_argument("--blocksize", type=int, default=512)
     parser.add_argument("--cache", default=".cache", help="Cache directory")

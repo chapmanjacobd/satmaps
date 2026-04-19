@@ -102,10 +102,19 @@ def render():
     }
     
     # 1. Apply Soft Knee
-    toned = tiler.apply_soft_knee_numpy(RAW_RGB, p["sb"], p["hb"], p["ss"], p["ms"], p["hs"], p["exp"])
+    sk_on = request.args.get('sk', '1') == '1'
+    if sk_on:
+        toned = tiler.apply_soft_knee_numpy(RAW_RGB, p["sb"], p["hb"], p["ss"], p["ms"], p["hs"], p["exp"])
+    else:
+        # Just apply exposure if SK is off
+        toned = np.clip(RAW_RGB * p["exp"], 0.0, 1.0)
     
     # 2. Apply Preview Correction
-    corrected = tiler.apply_preview_correction_numpy(toned, p["sat"], p["db"], p["ls"], p["gamma"])
+    fg_on = request.args.get('fg', '1') == '1'
+    if fg_on:
+        corrected = tiler.apply_preview_correction_numpy(toned, p["sat"], p["db"], p["ls"], p["gamma"])
+    else:
+        corrected = toned
     
     # 3. Convert to Byte and JPEG
     byte_arr = (corrected * 255).astype(np.uint8)
