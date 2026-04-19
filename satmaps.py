@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import uuid
+import warnings
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
@@ -146,7 +147,9 @@ def process_single_tile(
 
     # 2. Average dates (ignoring NaNs)
     full_stack = np.stack(date_stacks) # (D, 3, H, W)
-    averaged = np.nanmean(full_stack, axis=0)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', r'Mean of empty slice')
+        averaged = np.nanmean(full_stack, axis=0)
     
     # 3. Tone Mapping
     # Determine scaling (either hardcoded or via percentile)
