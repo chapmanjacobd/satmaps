@@ -15,7 +15,6 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt
 from osgeo import gdal
 
-import ocean_background
 import tiler
 
 # Setup GDAL exceptions
@@ -202,13 +201,6 @@ def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
         if has_land:
             break
     return has_land
-
-
-def create_gebco_ocean_vrt(source_vrt: str, output_vrt: str) -> str:
-    """Backward-compatible wrapper around the dedicated ocean background module."""
-    return ocean_background.create_gebco_ocean_vrt(source_vrt, output_vrt)
-
-
 def fill_nan_nearest(
     arr: np.ndarray, valid_mask: Optional[np.ndarray] = None
 ) -> np.ndarray:
@@ -702,18 +694,6 @@ def main() -> None:
         default=0,
         help="Depth value for 1.0 in the color ramp",
     )
-    parser.add_argument(
-        "--ocean-resample-alg",
-        choices=["cubicspline", "lanczos"],
-        default="cubicspline",
-        help="Resampling algorithm for the GEBCO upscale and ocean hillshade warp",
-    )
-    parser.add_argument(
-        "--ocean-hillshade-z",
-        type=float,
-        default=5.0,
-        help="Vertical exaggeration passed to gdaldem hillshade for the ocean layer",
-    )
 
     parser.add_argument(
         "--tonemap",
@@ -748,6 +728,11 @@ def main() -> None:
 
     parser.add_argument("--blocksize", type=int, default=512)
     parser.add_argument("--cache", default=".cache", help="Cache directory")
+    parser.add_argument(
+        "--ocean-background",
+        default="ocean.tif",
+        help="Standalone ocean background GeoTIFF to use under bbox renders",
+    )
     parser.add_argument(
         "--download",
         action="store_true",
@@ -816,7 +801,7 @@ def main() -> None:
 
     date_paths = [d.strip() for d in args.date.split(",")]
 
-    # 0. GEBCO Discovery (for both filtering and background)
+    # 0. GEBCO Discovery (for filtering and coastal blending)
     gebco_zip = "gebco_2025_sub_ice_topo_geotiff.zip"
     gebco_vrt_source = None
     if os.path.exists(gebco_zip):
@@ -943,26 +928,16 @@ def main() -> None:
         print("Download complete.")
         return
 
-    if not processed_tifs and not args.bbox:
-        print("Error: No data processed (no land tiles found and no bbox provided).")
+    # 3. Optional standalone ocean background
+    if os.path.exists(args.ocean_background):
+        if args.ocean_background not in processed_tifs:
+            processed_tifs.insert(0, args.ocean_background)
+    elif args.bbox:
+        print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
+
+    if not processed_tifs:
+        print("Error: No data processed.")
         sys.exit(1)
-
-    # 3. Bathymetry Background (Ocean)
-    # If --bbox is provided, we fill non-land with GEBCO bathymetry
-    if args.bbox and gebco_vrt_source:
-        print("Generating bathymetry background...")
-        min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
-        ocean_outputs = ocean_background.generate_ocean_background(
-            gebco_vrt_source,
-            (min_lon, min_lat, max_lon, max_lat),
-            unique_id=unique_id,
-            resample_alg=args.ocean_resample_alg,
-            hillshade_z=args.ocean_hillshade_z,
-        )
-
-        # Prepend to the processed list to make it the bottom layer if not already there
-        if ocean_outputs.rgba_vrt not in processed_tifs:
-            processed_tifs.insert(0, ocean_outputs.rgba_vrt)
 
     # 4. Build Master VRT (Flat, over Web Mercator Byte TIFFs)
     master_vrt = f".temp/master_{unique_id}.vrt"

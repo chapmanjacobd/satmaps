@@ -3,14 +3,19 @@ import argparse
 import os
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from shutil import which
 from typing import Sequence
 from xml.sax.saxutils import escape
 
 from osgeo import gdal, osr
 
+gdal.UseExceptions()
+
+DEFAULT_GEBCO_ZIP = "gebco_2025_sub_ice_topo_geotiff.zip"
+DEFAULT_OUTPUT = "ocean.tif"
 GEBCO_OCEAN_NODATA = -32767.0
-HILLSHADE_CREATION_OPTIONS = (
+GTIFF_CREATION_OPTIONS = (
     "BIGTIFF=YES",
     "TILED=YES",
     "COMPRESS=ZSTD",
@@ -20,14 +25,33 @@ HILLSHADE_CREATION_OPTIONS = (
 
 
 @dataclass(frozen=True)
-class OceanBackgroundOutputs:
-    ocean_vrt: str
+class OceanBackgroundArtifacts:
+    source_vrt: str
+    masked_vrt: str
+    warped_vrt: str
+    alpha_vrt: str
     hillshade_tif: str
     rgba_vrt: str
+    output_tif: str
+
+
+def build_gebco_source_vrt(gebco_zip: str, output_vrt: str) -> str:
+    """Build a source VRT from the GEBCO zip archive."""
+    if not os.path.exists(gebco_zip):
+        raise FileNotFoundError(f"GEBCO zip not found: {gebco_zip}")
+
+    gebco_vsi = f"/vsizip/{gebco_zip}"
+    files_in_zip = gdal.ReadDir(gebco_vsi) or []
+    tif_paths = [f"{gebco_vsi}/{name}" for name in files_in_zip if name.lower().endswith(".tif")]
+    if not tif_paths:
+        raise RuntimeError(f"No GeoTIFF files found in GEBCO zip: {gebco_zip}")
+
+    gdal.BuildVRT(output_vrt, tif_paths)
+    return output_vrt
 
 
 def create_gebco_ocean_vrt(source_vrt: str, output_vrt: str) -> str:
-    """Create a VRT that masks positive GEBCO elevations for ocean rendering."""
+    """Mask positive GEBCO values so only ocean elevations remain."""
     ds = gdal.Open(source_vrt)
     if ds is None:
         raise RuntimeError(f"Could not open GEBCO source VRT: {source_vrt}")
@@ -65,13 +89,50 @@ def create_gebco_ocean_vrt(source_vrt: str, output_vrt: str) -> str:
     return output_vrt
 
 
+def create_alpha_vrt(source_vrt: str, output_vrt: str) -> str:
+    """Create an explicit alpha mask VRT from a nodata comparison."""
+    ds = gdal.Open(source_vrt)
+    if ds is None:
+        raise RuntimeError(f"Could not open source VRT for alpha generation: {source_vrt}")
+
+    band = ds.GetRasterBand(1)
+    nodata_value = band.GetNoDataValue()
+    if nodata_value is None:
+        nodata_value = GEBCO_OCEAN_NODATA
+
+    geotransform = ",".join(str(value) for value in ds.GetGeoTransform())
+    projection = escape(ds.GetProjection())
+    source_filename = escape(os.path.abspath(source_vrt))
+    xsize = ds.RasterXSize
+    ysize = ds.RasterYSize
+    ds = None
+
+    with open(output_vrt, "w") as f:
+        f.write(
+            f"""<VRTDataset rasterXSize="{xsize}" rasterYSize="{ysize}">
+  <SRS>{projection}</SRS>
+  <GeoTransform>{geotransform}</GeoTransform>
+  <VRTRasterBand dataType="Float32" band="1" subClass="VRTDerivedRasterBand">
+    <PixelFunctionType>expression</PixelFunctionType>
+    <PixelFunctionArguments dialect="muparser" expression="B1 == {nodata_value} ? 0 : 255"/>
+    <SimpleSource>
+      <SourceFilename relativeToVRT="0">{source_filename}</SourceFilename>
+      <SourceBand>1</SourceBand>
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>
+"""
+        )
+
+    return output_vrt
+
+
 def resolution_for_utm_10m_3857(
     min_lon: float, min_lat: float, max_lon: float, max_lat: float
 ) -> tuple[float, float]:
-    """Approximate the EPSG:3857 resolution of a 10m UTM grid at the bbox center."""
+    """Approximate the EPSG:3857 pixel size of a 10m UTM grid at the bbox center."""
     center_lon = (min_lon + max_lon) / 2.0
     center_lat = (min_lat + max_lat) / 2.0
-
     zone = int((center_lon + 180.0) / 6.0) + 1
     epsg = (32600 if center_lat >= 0.0 else 32700) + zone
 
@@ -95,32 +156,48 @@ def resolution_for_utm_10m_3857(
 
     x_res = abs(east_merc_x - center_merc_x)
     y_res = abs(north_merc_y - center_merc_y)
-
     if x_res <= 0.0 or y_res <= 0.0:
         raise RuntimeError("Could not derive a positive EPSG:3857 resolution from the bbox center")
-
     return x_res, y_res
 
 
-def create_hillshade_rgba_vrt(
-    hillshade_tif: str, alpha_source_vrt: str, output_vrt: str
-) -> str:
-    """Wrap a grayscale hillshade in an RGBA VRT so it can mosaic with land tiles."""
+def build_hillshade_command(
+    input_vrt: str,
+    output_tif: str,
+    z_factor: float,
+    creation_options: Sequence[str] = GTIFF_CREATION_OPTIONS,
+) -> list[str]:
+    """Build the gdaldem hillshade command line."""
+    command = [
+        "gdaldem",
+        "hillshade",
+        input_vrt,
+        output_tif,
+        "-multidirectional",
+        "-z",
+        str(z_factor),
+    ]
+    for option in creation_options:
+        command.extend(["-co", option])
+    return command
+
+
+def create_hillshade_rgba_vrt(hillshade_tif: str, alpha_vrt: str, output_vrt: str) -> str:
+    """Repeat a grayscale hillshade into RGB and attach an explicit alpha band."""
     hillshade_ds = gdal.Open(hillshade_tif)
     if hillshade_ds is None:
         raise RuntimeError(f"Could not open hillshade TIFF: {hillshade_tif}")
 
-    alpha_ds = gdal.Open(alpha_source_vrt)
+    alpha_ds = gdal.Open(alpha_vrt)
     if alpha_ds is None:
-        raise RuntimeError(f"Could not open alpha source VRT: {alpha_source_vrt}")
+        raise RuntimeError(f"Could not open alpha VRT: {alpha_vrt}")
 
     xsize = hillshade_ds.RasterXSize
     ysize = hillshade_ds.RasterYSize
     geotransform = ",".join(str(value) for value in hillshade_ds.GetGeoTransform())
     projection = escape(hillshade_ds.GetProjection())
     hillshade_filename = escape(os.path.abspath(hillshade_tif))
-    alpha_filename = escape(os.path.abspath(alpha_source_vrt))
-
+    alpha_filename = escape(os.path.abspath(alpha_vrt))
     hillshade_ds = None
     alpha_ds = None
 
@@ -154,7 +231,7 @@ def create_hillshade_rgba_vrt(
     <ColorInterp>Alpha</ColorInterp>
     <SimpleSource>
       <SourceFilename relativeToVRT="0">{alpha_filename}</SourceFilename>
-      <SourceBand>mask,1</SourceBand>
+      <SourceBand>1</SourceBand>
     </SimpleSource>
   </VRTRasterBand>
 </VRTDataset>
@@ -164,51 +241,47 @@ def create_hillshade_rgba_vrt(
     return output_vrt
 
 
-def build_hillshade_command(
-    input_vrt: str,
-    output_tif: str,
-    z_factor: float,
-    creation_options: Sequence[str] = HILLSHADE_CREATION_OPTIONS,
-) -> list[str]:
-    """Build the gdaldem hillshade command line."""
-    command = [
-        "gdaldem",
-        "hillshade",
-        input_vrt,
-        output_tif,
-        "-multidirectional",
-        "-z",
-        str(z_factor),
-    ]
-    for option in creation_options:
-        command.extend(["-co", option])
-    return command
+def translate_rgba_vrt(rgba_vrt: str, destination: str) -> str:
+    """Materialize the RGBA VRT as a tiled GeoTIFF."""
+    destination_dir = os.path.dirname(destination)
+    if destination_dir:
+        os.makedirs(destination_dir, exist_ok=True)
+
+    options = gdal.TranslateOptions(
+        format="GTiff",
+        creationOptions=list(GTIFF_CREATION_OPTIONS),
+    )
+    gdal.Translate(destination, rgba_vrt, options=options)
+    return destination
 
 
 def generate_ocean_background(
-    gebco_source_vrt: str,
+    gebco_zip: str,
+    destination: str,
     bbox: tuple[float, float, float, float],
-    unique_id: str,
-    output_dir: str = ".temp",
+    temp_dir: str = ".temp",
     resample_alg: str = "cubicspline",
     hillshade_z: float = 5.0,
-) -> OceanBackgroundOutputs:
-    """Create a cropped, resampled GEBCO ocean hillshade for bbox rendering."""
+) -> OceanBackgroundArtifacts:
+    """Generate a standalone RGBA ocean background GeoTIFF."""
     if which("gdaldem") is None:
         raise RuntimeError("gdaldem is required to generate the ocean background")
 
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
+    stem = Path(destination).stem or "ocean"
+
+    source_vrt = os.path.join(temp_dir, f"{stem}_source.vrt")
+    masked_vrt = os.path.join(temp_dir, f"{stem}_masked.vrt")
+    warped_vrt = os.path.join(temp_dir, f"{stem}_3857.vrt")
+    alpha_vrt = os.path.join(temp_dir, f"{stem}_alpha.vrt")
+    hillshade_tif = os.path.join(temp_dir, f"{stem}_hillshade.tif")
+    rgba_vrt = os.path.join(temp_dir, f"{stem}_rgba.vrt")
+
+    build_gebco_source_vrt(gebco_zip, source_vrt)
+    create_gebco_ocean_vrt(source_vrt, masked_vrt)
 
     min_lon, min_lat, max_lon, max_lat = bbox
     x_res, y_res = resolution_for_utm_10m_3857(min_lon, min_lat, max_lon, max_lat)
-
-    masked_vrt = os.path.join(output_dir, f"gebco_ocean_source_{unique_id}.vrt")
-    ocean_vrt = os.path.join(output_dir, f"gebco_ocean_{unique_id}.vrt")
-    hillshade_tif = os.path.join(output_dir, f"ocean_{unique_id}.tif")
-    rgba_vrt = os.path.join(output_dir, f"ocean_rgba_{unique_id}.vrt")
-
-    create_gebco_ocean_vrt(gebco_source_vrt, masked_vrt)
-
     warp_options = gdal.WarpOptions(
         format="VRT",
         dstSRS="EPSG:3857",
@@ -218,34 +291,44 @@ def generate_ocean_background(
         yRes=y_res,
         resampleAlg=resample_alg,
     )
-    gdal.Warp(ocean_vrt, masked_vrt, options=warp_options)
+    gdal.Warp(warped_vrt, masked_vrt, options=warp_options)
 
-    subprocess.run(
-        build_hillshade_command(ocean_vrt, hillshade_tif, hillshade_z),
-        check=True,
-    )
-    create_hillshade_rgba_vrt(hillshade_tif, ocean_vrt, rgba_vrt)
+    create_alpha_vrt(warped_vrt, alpha_vrt)
+    subprocess.run(build_hillshade_command(warped_vrt, hillshade_tif, hillshade_z), check=True)
+    create_hillshade_rgba_vrt(hillshade_tif, alpha_vrt, rgba_vrt)
+    translate_rgba_vrt(rgba_vrt, destination)
 
-    return OceanBackgroundOutputs(
-        ocean_vrt=ocean_vrt,
+    return OceanBackgroundArtifacts(
+        source_vrt=source_vrt,
+        masked_vrt=masked_vrt,
+        warped_vrt=warped_vrt,
+        alpha_vrt=alpha_vrt,
         hillshade_tif=hillshade_tif,
         rgba_vrt=rgba_vrt,
+        output_tif=destination,
     )
+
+
+def parse_bbox(bbox: str) -> tuple[float, float, float, float]:
+    values = tuple(float(value) for value in bbox.split(","))
+    if len(values) != 4:
+        raise ValueError("bbox must contain four comma-separated values")
+    return (values[0], values[1], values[2], values[3])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate a GEBCO ocean hillshade background in EPSG:3857 for a WGS84 bbox."
+        description="Generate a standalone GEBCO ocean hillshade GeoTIFF in EPSG:3857."
     )
-    parser.add_argument("gebco_source_vrt", help="Input GEBCO source VRT")
-    parser.add_argument("bbox", help="WGS84 bbox as min_lon,min_lat,max_lon,max_lat")
-    parser.add_argument("--output-dir", default=".temp", help="Directory for temp outputs")
-    parser.add_argument("--unique-id", default="manual", help="Suffix for generated files")
+    parser.add_argument("gebco_zip", nargs="?", default=DEFAULT_GEBCO_ZIP, help="GEBCO zip archive")
+    parser.add_argument("destination", nargs="?", default=DEFAULT_OUTPUT, help="Output GeoTIFF path")
+    parser.add_argument("--bbox", required=True, help="WGS84 bbox as min_lon,min_lat,max_lon,max_lat")
+    parser.add_argument("--temp-dir", default=".temp", help="Directory for intermediary files")
     parser.add_argument(
         "--resample-alg",
-        choices=["cubicspline", "lanczos", "bilinear", "average", "gauss"],
+        choices=["cubicspline", "lanczos"],
         default="cubicspline",
-        help="Resampling algorithm for the GEBCO upscale step into EPSG:3857",
+        help="Resampling algorithm for the GEBCO upscale into EPSG:3857",
     )
     parser.add_argument(
         "--hillshade-z",
@@ -255,25 +338,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    bbox_values = tuple(float(value) for value in args.bbox.split(","))
-    if len(bbox_values) != 4:
-        raise ValueError("bbox must contain four comma-separated values")
-    bbox = (
-        bbox_values[0],
-        bbox_values[1],
-        bbox_values[2],
-        bbox_values[3],
-    )
-
-    outputs = generate_ocean_background(
-        args.gebco_source_vrt,
-        bbox,
-        unique_id=args.unique_id,
-        output_dir=args.output_dir,
+    artifacts = generate_ocean_background(
+        gebco_zip=args.gebco_zip,
+        destination=args.destination,
+        bbox=parse_bbox(args.bbox),
+        temp_dir=args.temp_dir,
         resample_alg=args.resample_alg,
         hillshade_z=args.hillshade_z,
     )
-    print(outputs.hillshade_tif)
+    print(artifacts.output_tif)
 
 
 if __name__ == "__main__":

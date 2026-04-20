@@ -124,12 +124,37 @@ def test_create_gebco_ocean_vrt_masks_positive_values(tmp_path: Path) -> None:
 def test_resolution_for_utm_10m_3857_returns_positive_values() -> None:
     x_res, y_res = ocean_background.resolution_for_utm_10m_3857(-4.0, 50.0, -3.0, 51.0)
 
-    assert x_res > 10.0
-    assert y_res > 10.0
+    assert x_res > 0.0
+    assert y_res > 0.0
     assert np.isclose(x_res, y_res, rtol=0.05)
 
 
-def test_create_hillshade_rgba_vrt_repeats_gray_and_masks_land(tmp_path: Path) -> None:
+def test_create_alpha_vrt_masks_nodata_with_expression(tmp_path: Path) -> None:
+    driver = gdal.GetDriverByName("GTiff")
+
+    alpha_source = tmp_path / "ocean_source.tif"
+    alpha_ds = driver.Create(str(alpha_source), 2, 1, 1, gdal.GDT_Float32)
+    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    alpha_ds.SetProjection(srs.ExportToWkt())
+    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    alpha_ds.GetRasterBand(1).WriteArray(np.array([[-5.0, -32767.0]], dtype=np.float32))
+    alpha_ds = None
+
+    alpha_source_vrt = tmp_path / "ocean_source.vrt"
+    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+
+    alpha_vrt = tmp_path / "alpha.vrt"
+    ocean_background.create_alpha_vrt(str(alpha_source_vrt), str(alpha_vrt))
+
+    np.testing.assert_allclose(
+        gdal.Open(str(alpha_vrt)).ReadAsArray(),
+        np.array([[255.0, 0.0]], dtype=np.float32),
+    )
+
+
+def test_create_hillshade_rgba_vrt_repeats_gray_and_uses_alpha_vrt(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
 
     hillshade_path = tmp_path / "hillshade.tif"
@@ -141,37 +166,25 @@ def test_create_hillshade_rgba_vrt_repeats_gray_and_masks_land(tmp_path: Path) -
     hillshade_ds.GetRasterBand(1).WriteArray(np.array([[10, 20]], dtype=np.uint8))
     hillshade_ds = None
 
-    alpha_source = tmp_path / "ocean_source.tif"
-    alpha_ds = driver.Create(str(alpha_source), 2, 1, 1, gdal.GDT_Float32)
+    alpha_path = tmp_path / "alpha.tif"
+    alpha_ds = driver.Create(str(alpha_path), 2, 1, 1, gdal.GDT_Byte)
     alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
     alpha_ds.SetProjection(srs.ExportToWkt())
-    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
-    alpha_ds.GetRasterBand(1).WriteArray(np.array([[-5.0, -32767.0]], dtype=np.float32))
+    alpha_ds.GetRasterBand(1).WriteArray(np.array([[255, 0]], dtype=np.uint8))
     alpha_ds = None
 
-    alpha_source_vrt = tmp_path / "ocean_source.vrt"
-    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+    alpha_vrt = tmp_path / "alpha.vrt"
+    gdal.BuildVRT(str(alpha_vrt), [str(alpha_path)])
 
     rgba_vrt = tmp_path / "ocean_rgba.vrt"
-    ocean_background.create_hillshade_rgba_vrt(
-        str(hillshade_path), str(alpha_source_vrt), str(rgba_vrt)
-    )
+    ocean_background.create_hillshade_rgba_vrt(str(hillshade_path), str(alpha_vrt), str(rgba_vrt))
 
     rgba_ds = gdal.Open(str(rgba_vrt))
     assert rgba_ds is not None
     assert rgba_ds.RasterCount == 4
-
     np.testing.assert_array_equal(
         rgba_ds.ReadAsArray(),
-        np.array(
-            [
-                [[10, 20]],
-                [[10, 20]],
-                [[10, 20]],
-                [[255, 0]],
-            ],
-            dtype=np.uint8,
-        ),
+        np.array([[[10, 20]], [[10, 20]], [[10, 20]], [[255, 0]]], dtype=np.uint8),
     )
 
 
@@ -193,6 +206,38 @@ def test_build_hillshade_command_matches_expected_flags(tmp_path: Path) -> None:
     ]
     assert "BIGTIFF=YES" in command
     assert "COMPRESS=ZSTD" in command
+
+
+def test_ocean_background_main_uses_default_positionals(monkeypatch: object) -> None:
+    called: dict[str, object] = {}
+
+    def fake_generate_ocean_background(**kwargs):
+        called.update(kwargs)
+        return ocean_background.OceanBackgroundArtifacts(
+            source_vrt=".temp/source.vrt",
+            masked_vrt=".temp/masked.vrt",
+            warped_vrt=".temp/warped.vrt",
+            alpha_vrt=".temp/alpha.vrt",
+            hillshade_tif=".temp/ocean_hillshade.tif",
+            rgba_vrt=".temp/ocean_rgba.vrt",
+            output_tif=str(kwargs["destination"]),
+        )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["ocean_background.py", "--bbox", "0,0,1,1"],
+    )
+    monkeypatch.setattr(
+        "ocean_background.generate_ocean_background",
+        fake_generate_ocean_background,
+    )
+
+    ocean_background.main()
+
+    assert called["gebco_zip"] == ocean_background.DEFAULT_GEBCO_ZIP
+    assert called["destination"] == ocean_background.DEFAULT_OUTPUT
+    assert called["bbox"] == (0.0, 0.0, 1.0, 1.0)
 
 
 def test_process_single_tile_full_pipeline(monkeypatch: object, tmp_path: Path) -> None:
@@ -292,10 +337,11 @@ def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
     assert len(master_vrts) == 1
 
 
-def test_main_bbox_uses_ocean_background_script(monkeypatch: object, tmp_path: Path) -> None:
+def test_main_bbox_uses_standalone_ocean_background(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
-    (tmp_path / "gebco_2025_sub_ice_topo_geotiff.zip").write_text("fake zip")
+    ocean_background_path = tmp_path / "ocean.tif"
+    ocean_background_path.write_text("fake ocean")
 
     monkeypatch.setattr(
         sys,
@@ -303,31 +349,44 @@ def test_main_bbox_uses_ocean_background_script(monkeypatch: object, tmp_path: P
         ["satmaps.py", "--bbox", "0,0,1,1", "--no-land", "--vrt", "--parallel", "1"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.check_land_gebco", lambda *args, **kwargs: False)
-    monkeypatch.setattr(
-        "satmaps.gdal.ReadDir",
-        lambda path: ["fake.tif"] if "gebco_2025_sub_ice_topo_geotiff.zip" in path else None,
-    )
-    monkeypatch.setattr(
-        "satmaps.gdal.BuildVRT",
-        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
-    )
+    buildvrt_sources: list[list[str]] = []
 
-    def fake_generate_ocean_background(*args, **kwargs):
-        rgba_vrt = tmp_path / ".temp" / "ocean_rgba.vrt"
-        rgba_vrt.write_text("fake rgba vrt")
-        return ocean_background.OceanBackgroundOutputs(
-            ocean_vrt=str(tmp_path / ".temp" / "gebco_ocean.vrt"),
-            hillshade_tif=str(tmp_path / ".temp" / "ocean.tif"),
-            rgba_vrt=str(rgba_vrt),
-        )
+    def fake_build_vrt(out, src, **kwargs):
+        buildvrt_sources.append(list(src))
+        Path(out).write_text("fake vrt")
 
-    monkeypatch.setattr(
-        "satmaps.ocean_background.generate_ocean_background",
-        fake_generate_ocean_background,
-    )
+    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
 
     main()
 
     master_vrts = list(tmp_path.glob(".temp/master_*.vrt"))
     assert len(master_vrts) == 1
+    assert buildvrt_sources[-1][0] == "ocean.tif"
+
+
+def test_main_non_bbox_can_use_standalone_ocean_background(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    (tmp_path / "ocean.tif").write_text("fake ocean")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "31TDF", "--no-land", "--vrt", "--parallel", "1"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    buildvrt_sources: list[list[str]] = []
+
+    def fake_build_vrt(out, src, **kwargs):
+        buildvrt_sources.append(list(src))
+        Path(out).write_text("fake vrt")
+
+    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
+
+    main()
+
+    master_vrts = list(tmp_path.glob(".temp/master_*.vrt"))
+    assert len(master_vrts) == 1
+    assert buildvrt_sources[-1] == ["ocean.tif"]

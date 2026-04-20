@@ -9,7 +9,7 @@ This repository provides tools to fetch, process, and package Sentinel-2 mosaic 
 ## Core Components
 
 - `satmaps.py`: The primary engine. Handles GDAL S3 configuration, multi-date mosaicking, reprojection to Web Mercator (EPSG:3857), and PMTiles generation. Uses a NumPy-based pipeline for tone mapping and grading.
-- `ocean_background.py`: Builds the GEBCO ocean background as a standalone 3857 hillshade workflow, matching the effective resolution of a 10m UTM source projected into Web Mercator.
+- `ocean_background.py`: Builds a standalone `ocean.tif` GEBCO hillshade background in EPSG:3857, matching the effective resolution of a 10m UTM source projected into Web Mercator.
 - `tuner_ui.py`: A Flask-based interactive web interface to fine-tune tone mapping parameters (exposure, contrast, saturation) in real-time on sample data.
 - `tiler.py`: Core logic for tile processing, tone mapping algorithms, and parallelized chunk execution.
 
@@ -39,7 +39,17 @@ python3 tuner_ui.py
 ```
 Visit `http://localhost:5001` to adjust exposure, soft-knee curves, and saturation. Note: Requires some data in `.cache/2025-07-01` (e.g., from a small `satmaps.py` run).
 
-### 2. Generate PMTiles
+### 2. Generate the Ocean Background
+
+Prebuild the standalone ocean hillshade once and reuse it anywhere you want an ocean base layer:
+
+```bash
+python3 ocean_background.py --bbox -161,18,-154,23
+```
+
+The first positional argument is the GEBCO zip path if you need something other than `gebco_2025_sub_ice_topo_geotiff.zip`, and the optional second positional argument is the output path (default: `ocean.tif`).
+
+### 3. Generate PMTiles
 
 Generate PMTiles for specific MGRS tiles or a global run:
 
@@ -50,11 +60,14 @@ python3 satmaps.py 31TDF -o barcelona.pmtiles
 # Multiple tiles with custom quality and format
 python3 satmaps.py 31TCF,31TDF,31TCE,31TDE --format webp --quality 80 -o region.pmtiles
 
+# BBox render using the prebuilt standalone ocean background
+python3 satmaps.py --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii.pmtiles
+
 # Global run using a land-only filter
-python3 satmaps.py --global --land-only HLS.land.tiles.txt -o global.pmtiles
+python3 satmaps.py --global --land-only HLS.land.tiles.txt --ocean-background ocean.tif -o global.pmtiles
 ```
 
-### 3. Estimate Resources
+### 4. Estimate Resources
 
 Before a global run, estimate the time and storage required:
 
@@ -66,7 +79,7 @@ python3 satmaps.py --global --land-only HLS.land.tiles.txt --estimate
 
 - `--date`: Comma-separated list of mosaic dates (default: `2025/07/01,2025/01/01`). Overlapping areas are averaged.
 - `--resample-alg`: Resampling algorithm (`lanczos`, `bilinear`, `average`, `gauss`).
-- `--ocean-resample-alg`: Ocean-only GEBCO upscale algorithm (`cubicspline` or `lanczos`).
+- `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`).
 - `--no-soft-knee`: Disable the multi-segment tone mapping curve.
 - `--no-grading`: Disable final saturation and gamma adjustments.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
