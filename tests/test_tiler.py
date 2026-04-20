@@ -1,8 +1,10 @@
 import sqlite3
+import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 from osgeo import gdal, osr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -176,16 +178,202 @@ def test_run_tiling_simplified_creates_mbtiles(
         "description": "Test",
     }
 
-    # Mock gdaladdo as it might not be in the environment or could be slow
-    monkeypatch.setattr("subprocess.run", lambda cmd, check: None)
+    gdaladdo_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], check: bool) -> None:
+        gdaladdo_calls.append(cmd)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
 
     artifacts = run_tiling_simplified(str(input_path), str(output_mbtiles), options)
 
     assert output_mbtiles.exists()
     assert artifacts.final_vrt == str(input_path)
+    assert gdaladdo_calls == [
+        [
+            "gdaladdo",
+            "-r",
+            "bilinear",
+            "--config",
+            "GDAL_NUM_THREADS",
+            "ALL_CPUS",
+            str(output_mbtiles),
+        ]
+    ]
 
     # Check if MBTiles has data
     conn = sqlite3.connect(output_mbtiles)
     count = conn.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
     conn.close()
     assert count > 0
+
+
+@pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")
+def test_run_tiling_simplified_builds_lower_zoom_levels(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    input_path = tmp_path / "input.tif"
+    driver = gdal.GetDriverByName("GTiff")
+    dataset = driver.Create(str(input_path), 256, 256, 3, gdal.GDT_Byte)
+    dataset.SetGeoTransform((0.0, 1000.0, 0.0, 256000.0, 0.0, -1000.0))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset.SetProjection(srs.ExportToWkt())
+    for i in range(1, 4):
+        dataset.GetRasterBand(i).Fill(128)
+    dataset = None
+
+    output_mbtiles = tmp_path / "output.mbtiles"
+    run_tiling_simplified(
+        str(input_path),
+        str(output_mbtiles),
+        {
+            "format": "png",
+            "quality": 75,
+            "resample_alg": "bilinear",
+            "chunk_zoom": 4,
+            "processes": 1,
+            "unique_id": "test-overviews",
+            "name": "Test",
+            "description": "Test",
+        },
+    )
+
+    conn = sqlite3.connect(output_mbtiles)
+    zooms = [
+        row[0]
+        for row in conn.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level")
+    ]
+    metadata = dict(conn.execute("SELECT name, value FROM metadata"))
+    conn.close()
+
+    assert len(zooms) > 1
+    assert min(zooms) < max(zooms)
+    assert metadata["minzoom"] == str(min(zooms))
+    assert metadata["maxzoom"] == str(max(zooms))
+
+
+@pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")
+def test_run_tiling_simplified_preserves_land_in_multi_chunk_overviews(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    width, height = 4096, 1024
+    input_path = tmp_path / "input.tif"
+    driver = gdal.GetDriverByName("GTiff")
+    dataset = driver.Create(str(input_path), width, height, 3, gdal.GDT_Byte)
+    dataset.SetGeoTransform((0.0, 1000.0, 0.0, height * 1000.0, 0.0, -1000.0))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset.SetProjection(srs.ExportToWkt())
+
+    ocean_r = np.full((height, width), 20, dtype=np.uint8)
+    ocean_g = np.full((height, width), 50, dtype=np.uint8)
+    ocean_b = np.full((height, width), 180, dtype=np.uint8)
+
+    ocean_r[:, width // 2 :] = 70
+    ocean_g[:, width // 2 :] = 180
+    ocean_b[:, width // 2 :] = 50
+
+    dataset.GetRasterBand(1).WriteArray(ocean_r)
+    dataset.GetRasterBand(2).WriteArray(ocean_g)
+    dataset.GetRasterBand(3).WriteArray(ocean_b)
+    dataset = None
+
+    output_mbtiles = tmp_path / "output.mbtiles"
+    run_tiling_simplified(
+        str(input_path),
+        str(output_mbtiles),
+        {
+            "format": "png",
+            "quality": 75,
+            "resample_alg": "bilinear",
+            "chunk_zoom": 4,
+            "processes": 1,
+            "unique_id": "test-multichunk-overviews",
+            "name": "Test",
+            "description": "Test",
+        },
+    )
+
+    conn = sqlite3.connect(output_mbtiles)
+    minzoom = int(
+        conn.execute("SELECT value FROM metadata WHERE name = 'minzoom'").fetchone()[0]
+    )
+    conn.close()
+
+    overview_ds = gdal.OpenEx(str(output_mbtiles), open_options=[f"ZOOM_LEVEL={minzoom}"])
+    assert overview_ds is not None
+    arr = overview_ds.ReadAsArray()
+    overview_ds = None
+
+    left_center = arr[:3, arr.shape[1] // 2, arr.shape[2] // 4]
+    right_center = arr[:3, arr.shape[1] // 2, (3 * arr.shape[2]) // 4]
+
+    np.testing.assert_array_equal(left_center, np.array([20, 50, 180], dtype=np.uint8))
+    np.testing.assert_array_equal(right_center, np.array([70, 180, 50], dtype=np.uint8))
+
+
+@pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")
+def test_run_tiling_simplified_respects_alpha_masked_sources(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+
+    def write_masked_tile(name: str, valid_slice: slice, color: tuple[int, int, int]) -> Path:
+        path = tmp_path / f"{name}.tif"
+        ds = gdal.GetDriverByName("GTiff").Create(str(path), 512, 256, 4, gdal.GDT_Byte)
+        ds.SetGeoTransform((0.0, 1000.0, 0.0, 256000.0, 0.0, -1000.0))
+        ds.SetProjection(srs.ExportToWkt())
+
+        alpha = np.zeros((256, 512), dtype=np.uint8)
+        alpha[:, valid_slice] = 255
+        for i, value in enumerate(color, start=1):
+            arr = np.zeros((256, 512), dtype=np.uint8)
+            arr[:, valid_slice] = value
+            ds.GetRasterBand(i).WriteArray(arr)
+        ds.GetRasterBand(4).WriteArray(alpha)
+        ds = None
+        return path
+
+    left = write_masked_tile("left", slice(0, 256), (70, 180, 50))
+    right = write_masked_tile("right", slice(256, 512), (20, 50, 180))
+
+    master_vrt = tmp_path / "master.vrt"
+    gdal.BuildVRT(str(master_vrt), [str(left), str(right)], resolution="highest")
+
+    output_mbtiles = tmp_path / "output.mbtiles"
+    run_tiling_simplified(
+        str(master_vrt),
+        str(output_mbtiles),
+        {
+            "format": "png",
+            "quality": 75,
+            "resample_alg": "bilinear",
+            "chunk_zoom": 4,
+            "processes": 1,
+            "unique_id": "test-alpha-mask",
+            "name": "Test",
+            "description": "Test",
+        },
+    )
+
+    ds = gdal.OpenEx(str(output_mbtiles), open_options=["ZOOM_LEVEL=7"])
+    assert ds is not None
+    arr = ds.ReadAsArray()
+    ds = None
+
+    left_center = arr[:3, arr.shape[1] // 2, arr.shape[2] // 4]
+    right_center = arr[:3, arr.shape[1] // 2, (3 * arr.shape[2]) // 4]
+
+    np.testing.assert_array_equal(left_center, np.array([70, 180, 50], dtype=np.uint8))
+    np.testing.assert_array_equal(right_center, np.array([20, 50, 180], dtype=np.uint8))

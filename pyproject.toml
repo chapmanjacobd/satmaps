@@ -7,13 +7,14 @@ requires-python = ">=3.11"
 dependencies = [
     "gdal>=3.4.0",
     "numpy>=1.20.0",
+    "scipy>=1.11.0",
     "flask>=3.0.0",
     "pillow>=10.0.0",
     "mgrs",
 ]
 
 [tool.setuptools]
-py-modules = ["satmaps", "tiler"]
+py-modules = ["ocean_background", "satmaps", "tiler"]
 
 [project.optional-dependencies]
 dev = [

@@ -9,6 +9,7 @@ This repository provides tools to fetch, process, and package Sentinel-2 mosaic 
 ## Core Components
 
 - `satmaps.py`: The primary engine. Handles GDAL S3 configuration, multi-date mosaicking, reprojection to Web Mercator (EPSG:3857), and PMTiles generation. Uses a NumPy-based pipeline for tone mapping and grading.
+- `ocean_background.py`: Builds the GEBCO ocean background as a standalone 3857 hillshade workflow, matching the effective resolution of a 10m UTM source projected into Web Mercator.
 - `tuner_ui.py`: A Flask-based interactive web interface to fine-tune tone mapping parameters (exposure, contrast, saturation) in real-time on sample data.
 - `tiler.py`: Core logic for tile processing, tone mapping algorithms, and parallelized chunk execution.
 
@@ -65,6 +66,7 @@ python3 satmaps.py --global --land-only HLS.land.tiles.txt --estimate
 
 - `--date`: Comma-separated list of mosaic dates (default: `2025/07/01,2025/01/01`). Overlapping areas are averaged.
 - `--resample-alg`: Resampling algorithm (`lanczos`, `bilinear`, `average`, `gauss`).
+- `--ocean-resample-alg`: Ocean-only GEBCO upscale algorithm (`cubicspline` or `lanczos`).
 - `--no-soft-knee`: Disable the multi-segment tone mapping curve.
 - `--no-grading`: Disable final saturation and gamma adjustments.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).

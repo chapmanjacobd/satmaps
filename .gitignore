@@ -8,3 +8,4 @@
 /cache
 __pycache__
 /.temp
+/*.egg-info

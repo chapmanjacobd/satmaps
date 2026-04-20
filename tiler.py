@@ -389,28 +389,61 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
             if attached:
                 try:
                     cursor.execute(f"DETACH DATABASE {alias}")
-                except sqlite3.OperationalError as e:
+                except sqlite3.OperationalError:
                     pass
                 try:
                     os.remove(db_path)
                 except OSError:
                     pass
 
-    # Update metadata with actual min/max zoom
-    try:
-        cursor.execute("SELECT min(zoom_level), max(zoom_level) FROM tiles")
-        minz, maxz = cursor.fetchone()
-        if minz is not None:
-            cursor.execute(
-                "INSERT OR REPLACE INTO metadata (name, value) VALUES ('minzoom', ?)",
-                (str(minz),),
+    conn.commit()
+    conn.close()
+
+
+def set_metadata_value(cursor: sqlite3.Cursor, name: str, value: str) -> None:
+    """Replace a metadata entry in MBTiles, which does not enforce unique keys."""
+    cursor.execute("DELETE FROM metadata WHERE name = ?", (name,))
+    cursor.execute(
+        "INSERT INTO metadata (name, value) VALUES (?, ?)",
+        (name, value),
+    )
+
+
+def finalize_mbtiles_metadata(mbtiles_path: str) -> None:
+    """Update MBTiles metadata with actual zoom levels and bounds."""
+    conn = sqlite3.connect(mbtiles_path)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT min(zoom_level), max(zoom_level) FROM tiles")
+    minz, maxz = cursor.fetchone()
+    if minz is not None:
+        set_metadata_value(cursor, "minzoom", str(minz))
+        set_metadata_value(cursor, "maxzoom", str(maxz))
+
+        cursor.execute(
+            "SELECT min(tile_column), max(tile_column), min(tile_row), max(tile_row) FROM tiles WHERE zoom_level = ?",
+            (maxz,),
+        )
+        min_c, max_c, min_r, max_r = cursor.fetchone()
+
+        if min_c is not None:
+            def tms_to_lonlat(z: int, x: int, y_tms: int) -> Tuple[float, float]:
+                n = 2.0**z
+                y_xyz = int(n - 1 - y_tms)
+                lon = x / n * 360.0 - 180.0
+                lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * y_xyz / n)))
+                lat = math.degrees(lat_rad)
+                return lon, lat
+
+            w, n_lat = tms_to_lonlat(maxz, min_c, max_r)
+            e, s_lat = tms_to_lonlat(maxz, max_c + 1, min_r - 1)
+            bounds_str = f"{w},{s_lat},{e},{n_lat}"
+            set_metadata_value(cursor, "bounds", bounds_str)
+            set_metadata_value(
+                cursor,
+                "center",
+                f"{(w + e) / 2},{(s_lat + n_lat) / 2},{maxz}",
             )
-            cursor.execute(
-                "INSERT OR REPLACE INTO metadata (name, value) VALUES ('maxzoom', ?)",
-                (str(maxz),),
-            )
-    except sqlite3.OperationalError:
-        pass
 
     conn.commit()
     conn.close()
@@ -462,17 +495,24 @@ def run_tiling_simplified(
     # Merge chunks.
     merge_mbtiles(output_mbtiles, chunk_files)
 
-    # Build overviews.
+    # Refresh metadata before building overviews so GDAL sees the merged extent,
+    # not just the bounds from the first copied chunk.
+    finalize_mbtiles_metadata(output_mbtiles)
+
+    # Build overviews (all levels from maxzoom down to 0)
     print("Building overviews...")
     gdaladdo_cmd = [
         "gdaladdo",
         "-r",
-        options["resample_alg"],
+        options["resample_alg"] if options["resample_alg"] != "gauss" else "bilinear",
         "--config",
         "GDAL_NUM_THREADS",
         "ALL_CPUS",
         output_mbtiles,
     ]
     subprocess.run(gdaladdo_cmd, check=True)
+
+    # Finalize metadata again after gdaladdo adds lower zoom tiles.
+    finalize_mbtiles_metadata(output_mbtiles)
 
     return TilingArtifacts(final_vrt=input_vrt, cleanup_paths=chunk_files)

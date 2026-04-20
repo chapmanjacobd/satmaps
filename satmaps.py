@@ -12,8 +12,10 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import mgrs
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 from osgeo import gdal
 
+import ocean_background
 import tiler
 
 # Setup GDAL exceptions
@@ -117,7 +119,7 @@ def list_mosaic_folders_for_tile(
             try:
                 if gdal.ReadDir(s3_path):
                     found.append((folder, date_path))
-            except:
+            except Exception:
                 pass
 
     return found
@@ -178,7 +180,7 @@ def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
     m = mgrs.MGRS()
     try:
         clat, clon = m.toLatLon(mgrs_tile)
-    except:
+    except Exception:
         return True
 
     # 100km is roughly 1 degree. We'll sample a grid around the center.
@@ -200,6 +202,37 @@ def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
         if has_land:
             break
     return has_land
+
+
+def create_gebco_ocean_vrt(source_vrt: str, output_vrt: str) -> str:
+    """Backward-compatible wrapper around the dedicated ocean background module."""
+    return ocean_background.create_gebco_ocean_vrt(source_vrt, output_vrt)
+
+
+def fill_nan_nearest(
+    arr: np.ndarray, valid_mask: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """Fill invalid pixels in a (C, H, W) array with the nearest valid pixel."""
+    if valid_mask is None:
+        valid_mask = np.all(np.isfinite(arr), axis=0)
+
+    if valid_mask.shape != arr.shape[1:]:
+        raise ValueError("valid_mask must match the spatial shape of arr")
+
+    if np.all(valid_mask) or not np.any(valid_mask):
+        return arr
+
+    indices = distance_transform_edt(
+        ~valid_mask, return_distances=False, return_indices=True
+    )
+
+    filled = np.array(arr, copy=True)
+    invalid_mask = ~valid_mask
+    for i in range(arr.shape[0]):
+        nearest_band = arr[i][tuple(indices)]
+        filled[i][invalid_mask] = nearest_band[invalid_mask]
+
+    return filled
 
 
 def process_single_tile(
@@ -228,7 +261,6 @@ def process_single_tile(
     width, height = ds_init.RasterXSize, ds_init.RasterYSize
     ds_init = None
 
-    ocean_mask = None
     alpha_weight = None
     # Transition constants
     LAND_STAY = -42.0  # 100% Sentinel-2 above this depth
@@ -295,9 +327,6 @@ def process_single_tile(
                     block_arr[block_arr == -32768] = np.nan
                     bands_data[i][yoff : yoff + bh, xoff : xoff + bw] = block_arr
 
-        # Close datasets for this date
-        for ds in dss:
-            ds = None
         date_stacks.append(np.stack(bands_data))  # (3, H, W)
 
     if not date_stacks:
@@ -308,15 +337,9 @@ def process_single_tile(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         averaged = np.nanmean(full_stack, axis=0)
+    source_valid_mask = np.isfinite(averaged[0])
 
-    # 4. Final Masking (clean up ocean pixels within land blocks)
-    if alpha_weight is not None:
-        # Hard cut only at the very end of the fade to prevent NaN pollution in blend
-        deep_ocean_mask = gebco_data <= OCEAN_FADE
-        for i in range(3):
-            averaged[i][deep_ocean_mask] = np.nan
-
-    # 3. Tone Mapping
+    # 4. Tone Mapping
     # Determine scaling (either hardcoded or via percentile)
     if args.stats_min is not None:
         s_min = args.stats_min
@@ -357,7 +380,7 @@ def process_single_tile(
             gamma=args.gamma,
         )
 
-    # 4. Pixel-level Blending (actually blend the colors, not just transparency)
+    # 5. Pixel-level Blending
     if alpha_weight is not None:
         # Generate the same ocean color ramp used for the background
         mako_colors = (
@@ -397,23 +420,29 @@ def process_single_tile(
         # Note: alpha_weight is (H,W), toned is (3,H,W), ocean_rgb is (3,H,W)
         toned = toned * alpha_weight + ocean_rgb * (1.0 - alpha_weight)
 
-    # 5. Save to temporary Byte GeoTIFF
+    # 6. Fill land/coastal gaps from the nearest valid source pixel without
+    # overriding pure deep-ocean pixels that should remain ocean-colored.
+    fill_mask = ~source_valid_mask
+    if alpha_weight is not None:
+        fill_mask &= gebco_data > OCEAN_FADE
+    if np.any(fill_mask):
+        toned = fill_nan_nearest(toned, valid_mask=~fill_mask)
+
+    # 7. Save to temporary Byte GeoTIFF
     temp_utm_path = f".temp/processed_{mgrs_subtile}_{unique_id}_utm.tif"
     temp_3857_path = f".temp/processed_{mgrs_subtile}_{unique_id}_3857.tif"
 
     driver = gdal.GetDriverByName("GTiff")
 
-    # Calculate alpha mask from finite values (non-NaN)
-    # Since we blended with the ocean, the land tile is now opaque where we have depth data
-    finite_mask = np.isfinite(averaged[0]).astype(np.float32)
-    combined_alpha = (finite_mask * 255).astype(np.uint8)
-
+    # Keep an alpha mask for valid land-source pixels so warping and mosaicking
+    # preserve the true tile footprint even though the RGB is blended/filled.
+    combined_alpha = (source_valid_mask.astype(np.uint8) * 255)
     byte_arr = np.nan_to_num(toned * 255, nan=0).astype(np.uint8)
 
     ds_out = driver.Create(
         temp_utm_path,
-        byte_arr.shape[2],
-        byte_arr.shape[1],
+        width,
+        height,
         4,
         gdal.GDT_Byte,
         options=["COMPRESS=ZSTD", "TILED=YES"],
@@ -434,12 +463,12 @@ def process_single_tile(
     ds_out.FlushCache()
     ds_out = None
 
-    # 5. Warp to Web Mercator
+    # 8. Warp to Web Mercator
     warp_options = gdal.WarpOptions(
         format="GTiff",
         dstSRS="EPSG:3857",
         resampleAlg=args.resample_alg,
-        # Using 4th band as alpha for transparency, no need for srcNodata/dstNodata
+        # Standard RGB GeoTIFF creation options
         creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "PREDICTOR=2", "TILED=YES"],
     )
     gdal.Warp(temp_3857_path, temp_utm_path, options=warp_options)
@@ -528,18 +557,18 @@ def calculate_estimates(args: argparse.Namespace) -> None:
     # Final PMTiles: ~40MB * num_subtiles (very rough)
     disk_end_gb = (num_subtiles * 40) / 1024
 
-    print(f"--- Processing Estimates ---")
+    print("--- Processing Estimates ---")
     print(f"MGRS Tiles (100km): {num_mgrs}")
     print(f"MGRS Sub-tiles (4x): {num_subtiles}")
     print(f"Date(s):            {num_dates} ({', '.join(date_paths)})")
     print(f"Total tile-dates:    {total_tile_dates} (3 bands each)")
-    print(f"---------------------------")
+    print("---------------------------")
     print(f"Estimated Time:       {hours}h {minutes}m")
     print(f"Estimated RAM Usage:  {ram_gb:.1f} GB (peak)")
     print(f"Estimated Disk Peak:  {disk_peak_gb:.2f} GB")
     print(f"Estimated Disk End:   {disk_end_gb:.2f} GB")
     print(f"Estimated Network:    {network_gb:.2f} GB")
-    print(f"---------------------------")
+    print("---------------------------")
 
 
 def main() -> None:
@@ -672,6 +701,18 @@ def main() -> None:
         type=float,
         default=0,
         help="Depth value for 1.0 in the color ramp",
+    )
+    parser.add_argument(
+        "--ocean-resample-alg",
+        choices=["cubicspline", "lanczos"],
+        default="cubicspline",
+        help="Resampling algorithm for the GEBCO upscale and ocean hillshade warp",
+    )
+    parser.add_argument(
+        "--ocean-hillshade-z",
+        type=float,
+        default=5.0,
+        help="Vertical exaggeration passed to gdaldem hillshade for the ocean layer",
     )
 
     parser.add_argument(
@@ -909,93 +950,19 @@ def main() -> None:
     # 3. Bathymetry Background (Ocean)
     # If --bbox is provided, we fill non-land with GEBCO bathymetry
     if args.bbox and gebco_vrt_source:
-        gebco_3857 = f".temp/gebco_3857_{unique_id}.vrt"
         print("Generating bathymetry background...")
-        gebco_src = gebco_vrt_source
-
-        # Create color file based on 'Mako' color ramp
-        color_file = f".temp/gebco_colors_{unique_id}.txt"
-
-        # Mako-inspired stops (fraction 0.0 to 1.0)
-        mako_ramp = tiler.MAKO_RAMP
-
-        if args.ocean_tonemap:
-            # Apply ocean tone mapping (soft-knee)
-            # Extract RGB colors (0-255) and normalize to 0-1
-            mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
-            mako_arr = mako_colors.T.reshape(3, -1, 1)
-            toned_mako = tiler.apply_soft_knee_numpy(
-                mako_arr,
-                shadow_break=args.osb,
-                highlight_break=args.ohb,
-                shadow_slope=args.oss,
-                mid_slope=args.oms,
-                highlight_slope=args.ohs,
-                exposure=args.ocean_exposure,
-            )
-            # Convert back for potential grading or final use
-            mako_colors = toned_mako.reshape(3, -1).T
-        else:
-            # Just apply exposure if tonemap is off
-            mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
-            mako_colors = np.clip(mako_colors * args.ocean_exposure, 0.0, 1.0)
-
-        if args.ocean_grade:
-            # Apply ocean grading
-            mako_arr = mako_colors.T.reshape(3, -1, 1)
-            graded_mako = tiler.apply_preview_correction_numpy(
-                mako_arr,
-                saturation=args.osat,
-                darken_break=args.odb,
-                low_slope=args.ols,
-                gamma=args.ocean_gamma,
-            )
-            mako_colors = graded_mako.reshape(3, -1).T
-        if args.ocean_tonemap or args.ocean_grade:
-            # Convert back to uint8 and rebuild the ramp
-            graded_uint8 = (mako_colors * 255).astype(np.uint8)
-            mako_ramp = [
-                (mako_ramp[i][0], *graded_uint8[i]) for i in range(len(mako_ramp))
-            ]
-
-        # Map depth range to 0.0-1.0
-        depth_min = args.ocean_depth_min
-        depth_max = args.ocean_depth_max
-
-        with open(color_file, "w") as f:
-            for frac, r, g, b in mako_ramp:
-                val = depth_min + frac * (depth_max - depth_min)
-                f.write(f"{val} {r} {g} {b} 255\n")
-            # Explicitly make land transparent (above max depth)
-            f.write(f"{depth_max + 0.01} 0 0 0 0\n")
-            f.write("10000 0 0 0 0\n")
-            f.write("nv 0 0 0 0\n")
-
-        # Colorize using DEMProcessing (format=VRT to avoid intermediate write)
-        colored_vrt = f".temp/gebco_colored_{unique_id}.vrt"
-        gdal.DEMProcessing(
-            colored_vrt,
-            gebco_src,
-            "color-relief",
-            colorFilename=color_file,
-            format="VRT",
-            addAlpha=True,
-        )
-
-        # Warp to EPSG:3857 and crop to bbox
         min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
-        # Using -te minx miny maxx maxy in dstSRS
-        warp_opts = gdal.WarpOptions(
-            format="VRT",
-            dstSRS="EPSG:3857",
-            outputBounds=(min_lon, min_lat, max_lon, max_lat),
-            outputBoundsSRS="EPSG:4326",
+        ocean_outputs = ocean_background.generate_ocean_background(
+            gebco_vrt_source,
+            (min_lon, min_lat, max_lon, max_lat),
+            unique_id=unique_id,
+            resample_alg=args.ocean_resample_alg,
+            hillshade_z=args.ocean_hillshade_z,
         )
-        gdal.Warp(gebco_3857, colored_vrt, options=warp_opts)
 
         # Prepend to the processed list to make it the bottom layer if not already there
-        if gebco_3857 not in processed_tifs:
-            processed_tifs.insert(0, gebco_3857)
+        if ocean_outputs.rgba_vrt not in processed_tifs:
+            processed_tifs.insert(0, ocean_outputs.rgba_vrt)
 
     # 4. Build Master VRT (Flat, over Web Mercator Byte TIFFs)
     master_vrt = f".temp/master_{unique_id}.vrt"
