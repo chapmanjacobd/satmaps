@@ -18,11 +18,9 @@ import tiler
 gdal.UseExceptions()
 
 AUTO_SCALE_MAX_PERCENTILE = 99.6
-STATE_FILE = ".temp/satmaps_state.json"
-
 # --- State Management ---
 
-def save_state(unique_id: str, completed_subtiles: Set[str], processed_tifs: List[str], args: argparse.Namespace) -> None:
+def save_state(state_file: str, unique_id: str, completed_subtiles: Set[str], processed_tifs: List[str], args: argparse.Namespace) -> None:
     """Save the current processing state to a JSON file."""
     state = {
         "unique_id": unique_id,
@@ -30,23 +28,23 @@ def save_state(unique_id: str, completed_subtiles: Set[str], processed_tifs: Lis
         "processed_tifs": processed_tifs,
         "args": vars(args)
     }
-    with open(STATE_FILE, "w") as f:
+    with open(state_file, "w") as f:
         json.dump(state, f, indent=2)
 
-def load_state() -> Optional[Dict]:
+def load_state(state_file: str) -> Optional[Dict]:
     """Load the processing state from the JSON file if it exists."""
-    if os.path.exists(STATE_FILE):
+    if os.path.exists(state_file):
         try:
-            with open(STATE_FILE, "r") as f:
+            with open(state_file, "r") as f:
                 return json.load(f)
         except Exception as e:
             print(f"Warning: Could not load state file: {e}")
     return None
 
-def delete_state() -> None:
+def delete_state(state_file: str) -> None:
     """Delete the state file upon successful completion."""
-    if os.path.exists(STATE_FILE):
-        os.remove(STATE_FILE)
+    if os.path.exists(state_file):
+        os.remove(state_file)
 
 # --- Discovery Layer (S3/CDSE Utils) ---
 
@@ -520,7 +518,7 @@ def main() -> None:
     parser.add_argument("--bbox", help="WGS84 bounding box as min_lon,min_lat,max_lon,max_lat")
     parser.add_argument("--vrt", action="store_true", help="Write final VRT and skip MBTiles")
     parser.add_argument("--estimate", action="store_true", help="Print estimated time, RAM, disk space, and network size then exit")
-    parser.add_argument("--resume", action="store_true", help="Resume from a previous run if a state file exists")
+    parser.add_argument("--resume", nargs="?", const=True, help="Resume from a previous run if a state file exists")
     args = parser.parse_args()
 
     if args.estimate:
@@ -531,23 +529,29 @@ def main() -> None:
     os.makedirs(".temp", exist_ok=True)
     
     unique_id = uuid.uuid4().hex[:8]
+    state_file = f".temp/state_{unique_id}.json"
     completed_subtiles = set()
     processed_tifs = []
     
-    state = load_state()
-    if args.resume and state:
-        # Check if basic args match (e.g., date, bbox)
-        if state["args"]["date"] == args.date and state["args"].get("bbox") == args.bbox:
-            unique_id = state["unique_id"]
-            completed_subtiles = set(state["completed_subtiles"])
-            # Filter processed_tifs to only those that still exist
-            processed_tifs = [f for f in state["processed_tifs"] if os.path.exists(f)]
-            print(f"Resuming from state file (unique_id: {unique_id})...")
-            print(f"Already completed {len(completed_subtiles)} sub-tiles, {len(processed_tifs)} TIFs found.")
-        else:
-            print("Warning: State file found but arguments (date/bbox) do not match. Starting fresh.")
-    elif state:
-        print("Note: A state file from a previous run exists. Use --resume to continue.")
+    if args.resume:
+        # If resume is a string, it's a specific state file
+        resume_path = args.resume if isinstance(args.resume, str) and os.path.exists(args.resume) else None
+        
+        # If not, look for the most recent state file in .temp
+        if not resume_path:
+            states = glob.glob(".temp/state_*.json")
+            if states:
+                resume_path = max(states, key=os.path.getmtime)
+        
+        if resume_path:
+            state = load_state(resume_path)
+            if state:
+                state_file = resume_path
+                unique_id = state["unique_id"]
+                completed_subtiles = set(state["completed_subtiles"])
+                processed_tifs = [f for f in state["processed_tifs"] if os.path.exists(f)]
+                print(f"Resuming from state file: {resume_path} (unique_id: {unique_id})")
+                print(f"Already completed {len(completed_subtiles)} sub-tiles, {len(processed_tifs)} TIFs found.")
 
     date_paths = [d.strip() for d in args.date.split(",")]
 
@@ -651,7 +655,7 @@ def main() -> None:
                     completed_subtiles.add(st)
                     if res:
                         processed_tifs.append(res)
-                    save_state(unique_id, completed_subtiles, processed_tifs, args)
+                    save_state(state_file, unique_id, completed_subtiles, processed_tifs, args)
         else:
             print("All sub-tiles already processed.")
     else:
@@ -788,7 +792,7 @@ def main() -> None:
             except OSError:
                 pass
     
-    delete_state()
+    delete_state(state_file)
 
 if __name__ == "__main__":
     main()
