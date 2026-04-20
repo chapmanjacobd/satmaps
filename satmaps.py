@@ -191,8 +191,8 @@ def process_single_tile(
     ocean_mask = None
     alpha_weight = None
     # Transition constants
-    LAND_STAY = -30.0    # 100% Sentinel-2 above this depth
-    OCEAN_FADE = -100.0  # 0% Sentinel-2 below this depth
+    LAND_STAY = -42.0    # 100% Sentinel-2 above this depth
+    OCEAN_FADE = -50.0   # 0% Sentinel-2 below this depth
 
     if gebco_src:
         try:
@@ -302,19 +302,47 @@ def process_single_tile(
                                                     low_slope=args.ls,
                                                     gamma=args.gamma)
     
-    # 4. Save to temporary Byte GeoTIFF
+    # 4. Pixel-level Blending (actually blend the colors, not just transparency)
+    if alpha_weight is not None:
+        # Generate the same ocean color ramp used for the background
+        mako_colors = np.array([c[1:] for c in tiler.MAKO_RAMP], dtype=np.float32) / 255.0
+        if args.ocean_tonemap:
+            mako_arr = mako_colors.T.reshape(3, -1, 1)
+            toned_mako = tiler.apply_soft_knee_numpy(
+                mako_arr,
+                shadow_break=args.osb, highlight_break=args.ohb,
+                shadow_slope=args.oss, mid_slope=args.oms, highlight_slope=args.ohs,
+                exposure=args.ocean_exposure
+            )
+            mako_colors = toned_mako.reshape(3, -1).T
+        else:
+            mako_colors = np.clip(mako_colors * args.ocean_exposure, 0.0, 1.0)
+            
+        if args.ocean_grade:
+            mako_arr = mako_colors.T.reshape(3, -1, 1)
+            graded_mako = tiler.apply_preview_correction_numpy(
+                mako_arr,
+                saturation=args.osat, darken_break=args.odb, low_slope=args.ols,
+                gamma=args.ocean_gamma
+            )
+            mako_colors = graded_mako.reshape(3, -1).T
+        
+        ocean_rgb = tiler.colorize_depth_numpy(gebco_data, mako_colors, args.ocean_depth_min, args.ocean_depth_max)
+        
+        # Blend: Toned * alpha + Ocean * (1 - alpha)
+        # Note: alpha_weight is (H,W), toned is (3,H,W), ocean_rgb is (3,H,W)
+        toned = toned * alpha_weight + ocean_rgb * (1.0 - alpha_weight)
+
+    # 5. Save to temporary Byte GeoTIFF
     temp_utm_path = f".temp/processed_{mgrs_subtile}_{unique_id}_utm.tif"
     temp_3857_path = f".temp/processed_{mgrs_subtile}_{unique_id}_3857.tif"
     
     driver = gdal.GetDriverByName("GTiff")
     
-    # Calculate alpha mask from finite values (non-NaN) AND the GEBCO alpha weight
-    # We check 'averaged' because NaNs are filled with 0 in 'toned'
+    # Calculate alpha mask from finite values (non-NaN)
+    # Since we blended with the ocean, the land tile is now opaque where we have depth data
     finite_mask = np.isfinite(averaged[0]).astype(np.float32)
-    if alpha_weight is not None:
-        combined_alpha = (finite_mask * alpha_weight * 255).astype(np.uint8)
-    else:
-        combined_alpha = (finite_mask * 255).astype(np.uint8)
+    combined_alpha = (finite_mask * 255).astype(np.uint8)
     
     byte_arr = np.nan_to_num(toned * 255, nan=0).astype(np.uint8)
     
@@ -651,29 +679,7 @@ def main() -> None:
             color_file = f".temp/gebco_colors_{unique_id}.txt"
             
             # Mako-inspired stops (fraction 0.0 to 1.0)
-            mako_ramp = [
-                (0.00, 11, 4, 5),
-                (0.05, 25, 14, 24),
-                (0.10, 38, 23, 43),
-                (0.15, 49, 33, 64),
-                (0.20, 56, 42, 84),
-                (0.25, 62, 53, 107),
-                (0.30, 65, 64, 130),
-                (0.35, 62, 79, 148),
-                (0.40, 57, 93, 156),
-                (0.45, 54, 108, 160),
-                (0.50, 53, 122, 162),
-                (0.55, 52, 137, 166),
-                (0.60, 52, 153, 170),
-                (0.65, 55, 166, 172),
-                (0.70, 63, 181, 173),
-                (0.75, 75, 194, 173),
-                (0.80, 101, 208, 173),
-                (0.85, 136, 217, 177),
-                (0.90, 171, 226, 190),
-                (0.95, 198, 235, 209),
-                (1.00, 222, 245, 229)
-            ]
+            mako_ramp = tiler.MAKO_RAMP
             
             if args.ocean_tonemap:
                 # Apply ocean tone mapping (soft-knee)

@@ -33,9 +33,56 @@ PREVIEW_DARKEN_LOW_SLOPE = 0.7
 DEFAULT_EXPOSURE = 1.0
 DEFAULT_GAMMA = 1.0
 
+MAKO_RAMP = [
+    (0.00, 11, 4, 5),
+    (0.05, 25, 14, 24),
+    (0.10, 38, 23, 43),
+    (0.15, 49, 33, 64),
+    (0.20, 56, 42, 84),
+    (0.25, 62, 53, 107),
+    (0.30, 65, 64, 130),
+    (0.35, 62, 79, 148),
+    (0.40, 57, 93, 156),
+    (0.45, 54, 108, 160),
+    (0.50, 53, 122, 162),
+    (0.55, 52, 137, 166),
+    (0.60, 52, 153, 170),
+    (0.65, 55, 166, 172),
+    (0.70, 63, 181, 173),
+    (0.75, 75, 194, 173),
+    (0.80, 101, 208, 173),
+    (0.85, 136, 217, 177),
+    (0.90, 171, 226, 190),
+    (0.95, 198, 235, 209),
+    (1.00, 222, 245, 229)
+]
+
 LUMA_RED = 0.2126
 LUMA_GREEN = 0.7152
 LUMA_BLUE = 0.0722
+
+def colorize_depth_numpy(depths: np.ndarray, 
+                         ramp_colors: np.ndarray, 
+                         depth_min: float, 
+                         depth_max: float) -> np.ndarray:
+    """
+    Colorize a depth map using a provided color ramp.
+    depths: (H, W) or (1, H, W) float32
+    ramp_colors: (N, 3) float32 [0, 1]
+    depth_min/max: range for the ramp
+    Returns: (3, H, W) float32 [0, 1]
+    """
+    if depths.ndim == 3:
+        depths = depths[0]
+        
+    frac = np.clip((depths - depth_min) / (depth_max - depth_min), 0.0, 1.0)
+    ramp_fracs = np.linspace(0.0, 1.0, len(ramp_colors))
+    
+    r = np.interp(frac, ramp_fracs, ramp_colors[:, 0])
+    g = np.interp(frac, ramp_fracs, ramp_colors[:, 1])
+    b = np.interp(frac, ramp_fracs, ramp_colors[:, 2])
+    
+    return np.stack([r, g, b])
 
 def apply_soft_knee_numpy(arr: np.ndarray, 
                           shadow_break: float = SOFT_KNEE_SHADOW_BREAK,
