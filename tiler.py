@@ -1,14 +1,15 @@
-import numpy as np
-import os
-import subprocess
-import sqlite3
-import shutil
 import math
+import os
+import shutil
+import sqlite3
+import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from osgeo import gdal
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+from osgeo import gdal
 
 gdal.UseExceptions()
 
@@ -54,17 +55,17 @@ MAKO_RAMP = [
     (0.85, 104, 130, 172),
     (0.90, 109, 137, 182),
     (0.95, 115, 145, 192),
-    (1.00, 120, 152, 202)  # Ocean Blue #7898ca
+    (1.00, 120, 152, 202),  # Ocean Blue #7898ca
 ]
 
 LUMA_RED = 0.2126
 LUMA_GREEN = 0.7152
 LUMA_BLUE = 0.0722
 
-def colorize_depth_numpy(depths: np.ndarray, 
-                         ramp_colors: np.ndarray, 
-                         depth_min: float, 
-                         depth_max: float) -> np.ndarray:
+
+def colorize_depth_numpy(
+    depths: np.ndarray, ramp_colors: np.ndarray, depth_min: float, depth_max: float
+) -> np.ndarray:
     """
     Colorize a depth map using a provided color ramp.
     depths: (H, W) or (1, H, W) float32
@@ -74,50 +75,58 @@ def colorize_depth_numpy(depths: np.ndarray,
     """
     if depths.ndim == 3:
         depths = depths[0]
-        
+
     frac = np.clip((depths - depth_min) / (depth_max - depth_min), 0.0, 1.0)
     ramp_fracs = np.linspace(0.0, 1.0, len(ramp_colors))
-    
+
     r = np.interp(frac, ramp_fracs, ramp_colors[:, 0])
     g = np.interp(frac, ramp_fracs, ramp_colors[:, 1])
     b = np.interp(frac, ramp_fracs, ramp_colors[:, 2])
-    
+
     return np.stack([r, g, b])
 
-def apply_soft_knee_numpy(arr: np.ndarray, 
-                          shadow_break: float = SOFT_KNEE_SHADOW_BREAK,
-                          highlight_break: float = SOFT_KNEE_HIGHLIGHT_BREAK,
-                          shadow_slope: float = SOFT_KNEE_SHADOW_SLOPE,
-                          mid_slope: float = SOFT_KNEE_MID_SLOPE,
-                          highlight_slope: float = SOFT_KNEE_HIGHLIGHT_SLOPE,
-                          exposure: float = DEFAULT_EXPOSURE) -> np.ndarray:
+
+def apply_soft_knee_numpy(
+    arr: np.ndarray,
+    shadow_break: float = SOFT_KNEE_SHADOW_BREAK,
+    highlight_break: float = SOFT_KNEE_HIGHLIGHT_BREAK,
+    shadow_slope: float = SOFT_KNEE_SHADOW_SLOPE,
+    mid_slope: float = SOFT_KNEE_MID_SLOPE,
+    highlight_slope: float = SOFT_KNEE_HIGHLIGHT_SLOPE,
+    exposure: float = DEFAULT_EXPOSURE,
+) -> np.ndarray:
     """Apply soft-knee tone mapping using NumPy."""
     arr = np.clip(arr * exposure, 0.0, 1.0)
-    
+
     shadow_output = shadow_break * shadow_slope
     highlight_output = shadow_output + (highlight_break - shadow_break) * mid_slope
-    
+
     out = np.zeros_like(arr)
-    
+
     # Shadow region
     mask_shadow = arr < shadow_break
     out[mask_shadow] = arr[mask_shadow] * shadow_slope
-    
+
     # Mid region
     mask_mid = (arr >= shadow_break) & (arr < highlight_break)
     out[mask_mid] = shadow_output + (arr[mask_mid] - shadow_break) * mid_slope
-    
+
     # Highlight region
     mask_highlight = arr >= highlight_break
-    out[mask_highlight] = highlight_output + (arr[mask_highlight] - highlight_break) * highlight_slope
-    
+    out[mask_highlight] = (
+        highlight_output + (arr[mask_highlight] - highlight_break) * highlight_slope
+    )
+
     return np.clip(out, 0.0, 1.0)
 
-def apply_preview_correction_numpy(rgb_arr: np.ndarray,
-                                   saturation: float = PREVIEW_SATURATION,
-                                   darken_break: float = PREVIEW_DARKEN_BREAK,
-                                   low_slope: float = PREVIEW_DARKEN_LOW_SLOPE,
-                                   gamma: float = DEFAULT_GAMMA) -> np.ndarray:
+
+def apply_preview_correction_numpy(
+    rgb_arr: np.ndarray,
+    saturation: float = PREVIEW_SATURATION,
+    darken_break: float = PREVIEW_DARKEN_BREAK,
+    low_slope: float = PREVIEW_DARKEN_LOW_SLOPE,
+    gamma: float = DEFAULT_GAMMA,
+) -> np.ndarray:
     """Apply mild desaturation and preview darkening using NumPy. Expects (C, H, W) float32 [0,1]."""
     # 1. Gamma
     if gamma != 1.0:
@@ -125,42 +134,50 @@ def apply_preview_correction_numpy(rgb_arr: np.ndarray,
 
     # 2. Calculate luminance
     luma = LUMA_RED * rgb_arr[0] + LUMA_GREEN * rgb_arr[1] + LUMA_BLUE * rgb_arr[2]
-    
+
     # 3. Desaturate
     out = luma + (rgb_arr - luma) * saturation
-    
+
     # 4. Darken curve
     high_slope = (1.0 - (darken_break * low_slope)) / (1.0 - darken_break)
     break_output = darken_break * low_slope
-    
+
     mask_low = out < darken_break
     out[mask_low] = out[mask_low] * low_slope
     out[~mask_low] = break_output + (out[~mask_low] - darken_break) * high_slope
-    
+
     return np.clip(out, 0.0, 1.0)
 
 
 @dataclass(frozen=True)
 class TilingArtifacts:
     """Paths created during tiling so the caller can preserve or clean them up."""
+
     final_vrt: str
     cleanup_paths: List[str]
 
 
-def get_web_mercator_bounds(z: int, x: int, y: int) -> Tuple[float, float, float, float]:
+def get_web_mercator_bounds(
+    z: int, x: int, y: int
+) -> Tuple[float, float, float, float]:
     """Calculate Web Mercator (EPSG:3857) bounds for a given XYZ tile."""
-    n = 2.0 ** z
+    n = 2.0**z
     lon1 = x / n * 360.0 - 180.0
     lon2 = (x + 1) / n * 360.0 - 180.0
     # Latitude calculation (Slippy map tilenames)
     lat1 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
     lat2 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
-    
+
     def lonlat_to_3857(lon: float, lat: float) -> Tuple[float, float]:
         x_meters = lon * WEB_MERCATOR_LIMIT / 180
-        y_meters = math.log(math.tan((90 + lat) * math.pi / 360)) / (math.pi / 180) * WEB_MERCATOR_LIMIT / 180
+        y_meters = (
+            math.log(math.tan((90 + lat) * math.pi / 360))
+            / (math.pi / 180)
+            * WEB_MERCATOR_LIMIT
+            / 180
+        )
         return x_meters, y_meters
-        
+
     x1, y1 = lonlat_to_3857(lon1, lat1)
     x2, y2 = lonlat_to_3857(lon2, lat2)
     # Return (min_x, max_y, max_x, min_y) which is projWin format: [ulx, uly, lrx, lry]
@@ -187,9 +204,9 @@ def get_dataset_bounds(dataset: gdal.Dataset) -> ProjWin:
 def get_chunk_tile_range(bounds: ProjWin, zoom: int) -> Tuple[int, int, int, int]:
     """Return inclusive XYZ tile indices covering raster bounds at the chunk zoom."""
     minx, maxy, maxx, miny = bounds
-    max_t = (2 ** zoom) - 1
+    max_t = (2**zoom) - 1
 
-    # We use a small epsilon to avoid including the next tile if the boundary 
+    # We use a small epsilon to avoid including the next tile if the boundary
     # just barely touches it due to floating point precision.
     eps = 1e-8
     tx_min, ty_min = meters_to_tile(minx + eps, maxy - eps, zoom)
@@ -216,7 +233,9 @@ def intersect_proj_win(proj_win: ProjWin, dataset_bounds: ProjWin) -> Optional[P
     return ulx, uly, lrx, lry
 
 
-def proj_win_to_src_win(dataset: gdal.Dataset, proj_win: ProjWin) -> Tuple[int, int, int, int]:
+def proj_win_to_src_win(
+    dataset: gdal.Dataset, proj_win: ProjWin
+) -> Tuple[int, int, int, int]:
     """Convert a georeferenced projWin into a clipped pixel srcWin for a north-up raster."""
     inv_gt = gdal.InvGeoTransform(dataset.GetGeoTransform())
     px_ul, py_ul = gdal.ApplyGeoTransform(inv_gt, proj_win[0], proj_win[1])
@@ -237,7 +256,7 @@ def process_chunk(args: ChunkTask) -> str:
     temp_chunk_raster = chunk_file.replace(".mbtiles", ".tif")
     try:
         gdal.UseExceptions()
-        
+
         # Open VRT to check intersection
         ds = gdal.Open(input_vrt)
         if ds is None:
@@ -268,7 +287,7 @@ def process_chunk(args: ChunkTask) -> str:
             metadataOptions=[
                 f"format={format.lower()}",
                 f"name={options['name']}",
-                f"description={options['description']}"
+                f"description={options['description']}",
             ],
             creationOptions=[
                 f"NAME={options['name']}",
@@ -278,12 +297,12 @@ def process_chunk(args: ChunkTask) -> str:
                 f"QUALITY={options['quality']}",
                 f"RESAMPLING={options['resample_alg'] if options['resample_alg'] != 'gauss' else 'bilinear'}",
                 f"BLOCKSIZE={options.get('blocksize', 512)}",
-                "ZOOM_LEVEL_STRATEGY=UPPER"
-            ]
+                "ZOOM_LEVEL_STRATEGY=UPPER",
+            ],
         )
-        
+
         if format.lower() == "webp":
-            gdal.SetConfigOption('WEBP_LEVEL', str(options['quality']))
+            gdal.SetConfigOption("WEBP_LEVEL", str(options["quality"]))
 
         gdal.Translate(chunk_file, temp_chunk_raster, options=translate_options)
         return chunk_file
@@ -297,26 +316,27 @@ def process_chunk(args: ChunkTask) -> str:
         if os.path.exists(temp_chunk_raster):
             os.remove(temp_chunk_raster)
 
+
 def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     """Merge multiple MBTiles chunks into a single file."""
     if not input_mbtiles:
         return
-    
+
     print(f"Merging {len(input_mbtiles)} chunks into {output_mbtiles}...")
-    
+
     # Sort chunks to ensure consistent merging
     input_mbtiles = sorted([f for f in input_mbtiles if f and os.path.exists(f)])
     if not input_mbtiles:
         return
 
     shutil.copyfile(input_mbtiles[0], output_mbtiles)
-    
+
     conn = sqlite3.connect(output_mbtiles)
-    conn.execute("PRAGMA busy_timeout = 30000") # 30 seconds
+    conn.execute("PRAGMA busy_timeout = 30000")  # 30 seconds
     cursor = conn.cursor()
     cursor.execute("PRAGMA synchronous = OFF")
     cursor.execute("PRAGMA journal_mode = MEMORY")
-    
+
     # Check if the output database has the 'map' table
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='map'")
     output_has_map = cursor.fetchone() is not None
@@ -336,23 +356,31 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
                     time.sleep(0.5)
                 else:
                     raise RuntimeError(f"Failed to attach {db_path}: {e}") from e
-        
+
         if not attached:
-            raise RuntimeError(f"Failed to attach {db_path} after retries due to database locks")
+            raise RuntimeError(
+                f"Failed to attach {db_path} after retries due to database locks"
+            )
 
         try:
             # Check which tables exist in the source chunk
-            cursor.execute(f"SELECT name FROM {alias}.sqlite_master WHERE type='table' AND name='map'")
+            cursor.execute(
+                f"SELECT name FROM {alias}.sqlite_master WHERE type='table' AND name='map'"
+            )
             source_has_map = cursor.fetchone() is not None
-            
+
             if output_has_map and source_has_map:
                 cursor.execute(f"INSERT OR IGNORE INTO map SELECT * FROM {alias}.map")
-                cursor.execute(f"INSERT OR IGNORE INTO images SELECT * FROM {alias}.images")
+                cursor.execute(
+                    f"INSERT OR IGNORE INTO images SELECT * FROM {alias}.images"
+                )
             else:
                 # Fallback to inserting into the 'tiles' view/table
                 # Note: This might not work if 'tiles' is a view without an INSTEAD OF trigger,
                 # but most chunks should have the same schema.
-                cursor.execute(f"INSERT OR IGNORE INTO tiles SELECT * FROM {alias}.tiles")
+                cursor.execute(
+                    f"INSERT OR IGNORE INTO tiles SELECT * FROM {alias}.tiles"
+                )
             conn.commit()
         except sqlite3.OperationalError as e:
             # If inserting into tiles failed and we have no map table, it's a real error
@@ -367,25 +395,34 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
                     os.remove(db_path)
                 except OSError:
                     pass
-    
+
     # Update metadata with actual min/max zoom
     try:
         cursor.execute("SELECT min(zoom_level), max(zoom_level) FROM tiles")
         minz, maxz = cursor.fetchone()
         if minz is not None:
-            cursor.execute("INSERT OR REPLACE INTO metadata (name, value) VALUES ('minzoom', ?)", (str(minz),))
-            cursor.execute("INSERT OR REPLACE INTO metadata (name, value) VALUES ('maxzoom', ?)", (str(maxz),))
+            cursor.execute(
+                "INSERT OR REPLACE INTO metadata (name, value) VALUES ('minzoom', ?)",
+                (str(minz),),
+            )
+            cursor.execute(
+                "INSERT OR REPLACE INTO metadata (name, value) VALUES ('maxzoom', ?)",
+                (str(maxz),),
+            )
     except sqlite3.OperationalError:
         pass
 
     conn.commit()
     conn.close()
 
-def run_tiling_simplified(input_vrt: str, output_mbtiles: str, options: Dict[str, Any]) -> TilingArtifacts:
+
+def run_tiling_simplified(
+    input_vrt: str, output_mbtiles: str, options: Dict[str, Any]
+) -> TilingArtifacts:
     """Simplified tiling from a pre-processed Byte VRT."""
-    unique_id = options.get('unique_id', 'tiles')
-    chunk_zoom = options.get('chunk_zoom', 4)
-    tile_format = options.get('format', 'webp')
+    unique_id = options.get("unique_id", "tiles")
+    chunk_zoom = options.get("chunk_zoom", 4)
+    tile_format = options.get("format", "webp")
 
     # Determine chunks from the Byte VRT.
     ds = gdal.Open(input_vrt)
@@ -405,12 +442,16 @@ def run_tiling_simplified(input_vrt: str, output_mbtiles: str, options: Dict[str
                 continue
 
             ulx, uly, lrx, lry = get_web_mercator_bounds(chunk_zoom, tx, ty)
-            tasks.append((input_vrt, chunk_file, tile_format, options, (ulx, uly, lrx, lry)))
+            tasks.append(
+                (input_vrt, chunk_file, tile_format, options, (ulx, uly, lrx, lry))
+            )
 
     # Parallel execution.
     if tasks:
-        num_workers = options.get('processes', 1)
-        print(f"Processing {len(tasks)} chunk(s) at zoom {chunk_zoom} with {num_workers} worker(s)...")
+        num_workers = options.get("processes", 1)
+        print(
+            f"Processing {len(tasks)} chunk(s) at zoom {chunk_zoom} with {num_workers} worker(s)..."
+        )
         if num_workers > 1:
             with ProcessPoolExecutor(max_workers=num_workers) as executor:
                 list(executor.map(process_chunk, tasks))
@@ -424,9 +465,13 @@ def run_tiling_simplified(input_vrt: str, output_mbtiles: str, options: Dict[str
     # Build overviews.
     print("Building overviews...")
     gdaladdo_cmd = [
-        "gdaladdo", "-r", options['resample_alg'], 
-        "--config", "GDAL_NUM_THREADS", "ALL_CPUS", 
-        output_mbtiles
+        "gdaladdo",
+        "-r",
+        options["resample_alg"],
+        "--config",
+        "GDAL_NUM_THREADS",
+        "ALL_CPUS",
+        output_mbtiles,
     ]
     subprocess.run(gdaladdo_cmd, check=True)
 
