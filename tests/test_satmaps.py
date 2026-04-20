@@ -14,6 +14,7 @@ from satmaps import (
     get_tile_paths,
     list_mosaic_folders_for_tile,
     main,
+    mosaic_date_stacks,
     process_single_tile,
 )
 
@@ -90,6 +91,39 @@ def test_fill_nan_nearest_uses_explicit_valid_mask() -> None:
         dtype=np.float32,
     )
     assert np.array_equal(filled, expected)
+
+
+def test_mosaic_date_stacks_prefers_any_complete_date_over_neighbor_fill() -> None:
+    date1 = np.array(
+        [
+            [[10.0, np.nan, np.nan]],
+            [[20.0, np.nan, np.nan]],
+            [[30.0, np.nan, np.nan]],
+        ],
+        dtype=np.float32,
+    )
+    date2 = np.array(
+        [
+            [[np.nan, 40.0, np.nan]],
+            [[50.0, 50.0, np.nan]],
+            [[60.0, 60.0, np.nan]],
+        ],
+        dtype=np.float32,
+    )
+
+    averaged, valid_mask = mosaic_date_stacks([date1, date2])
+
+    expected = np.array(
+        [
+            [[10.0, 40.0, np.nan]],
+            [[20.0, 50.0, np.nan]],
+            [[30.0, 60.0, np.nan]],
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(averaged[:, :, :2], expected[:, :, :2])
+    assert np.isnan(averaged[:, :, 2]).all()
+    np.testing.assert_array_equal(valid_mask, np.array([[True, True, False]]))
 
 
 def test_create_gebco_ocean_vrt_masks_positive_values(tmp_path: Path) -> None:

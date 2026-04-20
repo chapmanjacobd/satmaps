@@ -227,6 +227,23 @@ def fill_nan_nearest(
     return filled
 
 
+def mosaic_date_stacks(date_stacks: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    """Average only complete RGB observations and track where any date was valid."""
+    if not date_stacks:
+        raise ValueError("date_stacks must not be empty")
+
+    full_stack = np.stack(date_stacks)  # (D, 3, H, W)
+    complete_rgb_mask = np.all(np.isfinite(full_stack), axis=1)  # (D, H, W)
+    valid_source_mask = np.any(complete_rgb_mask, axis=0)
+    mosaic_stack = np.where(complete_rgb_mask[:, np.newaxis, :, :], full_stack, np.nan)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        averaged = np.nanmean(mosaic_stack, axis=0)
+
+    return averaged, valid_source_mask
+
+
 def process_single_tile(
     mgrs_subtile: str,
     date_paths: List[str],
@@ -324,12 +341,9 @@ def process_single_tile(
     if not date_stacks:
         return None
 
-    # 3. Average dates (ignoring NaNs)
-    full_stack = np.stack(date_stacks)  # (D, 3, H, W)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        averaged = np.nanmean(full_stack, axis=0)
-    source_valid_mask = np.isfinite(averaged[0])
+    # 3. Mosaic dates before any nodata fill so a real source pixel from any date
+    # always wins over a later nearest-neighbor interpolation.
+    averaged, source_valid_mask = mosaic_date_stacks(date_stacks)
 
     # 4. Tone Mapping
     # Determine scaling (either hardcoded or via percentile)
