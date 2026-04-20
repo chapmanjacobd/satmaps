@@ -785,10 +785,9 @@ def main() -> None:
         tif_files = [f for f in files_in_zip if f.lower().endswith(".tif")]
         if tif_files:
             gebco_vrt_source = f".temp/gebco_source_{unique_id}.vrt"
-            # Recreate GEBCO VRT if it doesn't exist (it has unique_id in name)
-            if not os.path.exists(gebco_vrt_source):
-                tif_paths = [f"{gebco_vsi}/{f}" for f in tif_files]
-                gdal.BuildVRT(gebco_vrt_source, tif_paths)
+            # Always recreate GEBCO VRT (it's fast and ensures consistency)
+            tif_paths = [f"{gebco_vsi}/{f}" for f in tif_files]
+            gdal.BuildVRT(gebco_vrt_source, tif_paths)
 
     # 1. Tile Discovery - Pre-populate S3 cache only for global runs
     if args.all_tiles:
@@ -911,95 +910,88 @@ def main() -> None:
     # If --bbox is provided, we fill non-land with GEBCO bathymetry
     if args.bbox and gebco_vrt_source:
         gebco_3857 = f".temp/gebco_3857_{unique_id}.vrt"
-        if os.path.exists(gebco_3857):
-            print("Bathymetry background already exists.")
+        print("Generating bathymetry background...")
+        gebco_src = gebco_vrt_source
+
+        # Create color file based on 'Mako' color ramp
+        color_file = f".temp/gebco_colors_{unique_id}.txt"
+
+        # Mako-inspired stops (fraction 0.0 to 1.0)
+        mako_ramp = tiler.MAKO_RAMP
+
+        if args.ocean_tonemap:
+            # Apply ocean tone mapping (soft-knee)
+            # Extract RGB colors (0-255) and normalize to 0-1
+            mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
+            mako_arr = mako_colors.T.reshape(3, -1, 1)
+            toned_mako = tiler.apply_soft_knee_numpy(
+                mako_arr,
+                shadow_break=args.osb,
+                highlight_break=args.ohb,
+                shadow_slope=args.oss,
+                mid_slope=args.oms,
+                highlight_slope=args.ohs,
+                exposure=args.ocean_exposure,
+            )
+            # Convert back for potential grading or final use
+            mako_colors = toned_mako.reshape(3, -1).T
         else:
-            print("Generating bathymetry background...")
-            gebco_src = gebco_vrt_source
+            # Just apply exposure if tonemap is off
+            mako_colors = np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
+            mako_colors = np.clip(mako_colors * args.ocean_exposure, 0.0, 1.0)
 
-            # Create color file based on 'Mako' color ramp
-            color_file = f".temp/gebco_colors_{unique_id}.txt"
-
-            # Mako-inspired stops (fraction 0.0 to 1.0)
-            mako_ramp = tiler.MAKO_RAMP
-
-            if args.ocean_tonemap:
-                # Apply ocean tone mapping (soft-knee)
-                # Extract RGB colors (0-255) and normalize to 0-1
-                mako_colors = (
-                    np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
-                )
-                mako_arr = mako_colors.T.reshape(3, -1, 1)
-                toned_mako = tiler.apply_soft_knee_numpy(
-                    mako_arr,
-                    shadow_break=args.osb,
-                    highlight_break=args.ohb,
-                    shadow_slope=args.oss,
-                    mid_slope=args.oms,
-                    highlight_slope=args.ohs,
-                    exposure=args.ocean_exposure,
-                )
-                # Convert back for potential grading or final use
-                mako_colors = toned_mako.reshape(3, -1).T
-            else:
-                # Just apply exposure if tonemap is off
-                mako_colors = (
-                    np.array([c[1:] for c in mako_ramp], dtype=np.float32) / 255.0
-                )
-                mako_colors = np.clip(mako_colors * args.ocean_exposure, 0.0, 1.0)
-
-            if args.ocean_grade:
-                # Apply ocean grading
-                mako_arr = mako_colors.T.reshape(3, -1, 1)
-                graded_mako = tiler.apply_preview_correction_numpy(
-                    mako_arr,
-                    saturation=args.osat,
-                    darken_break=args.odb,
-                    low_slope=args.ols,
-                    gamma=args.ocean_gamma,
-                )
-                mako_colors = graded_mako.reshape(3, -1).T
-            if args.ocean_tonemap or args.ocean_grade:
-                # Convert back to uint8 and rebuild the ramp
-                graded_uint8 = (mako_colors * 255).astype(np.uint8)
-                mako_ramp = [
-                    (mako_ramp[i][0], *graded_uint8[i]) for i in range(len(mako_ramp))
-                ]
-
-            # Map depth range to 0.0-1.0
-            depth_min = args.ocean_depth_min
-            depth_max = args.ocean_depth_max
-
-            with open(color_file, "w") as f:
-                for frac, r, g, b in mako_ramp:
-                    val = depth_min + frac * (depth_max - depth_min)
-                    f.write(f"{val} {r} {g} {b} 255\n")
-                # Explicitly make land transparent (above max depth)
-                f.write(f"{depth_max + 0.01} 0 0 0 0\n")
-                f.write("10000 0 0 0 0\n")
-                f.write("nv 0 0 0 0\n")
-
-            # Colorize using DEMProcessing (format=VRT to avoid intermediate write)
-            colored_vrt = f".temp/gebco_colored_{unique_id}.vrt"
-            gdal.DEMProcessing(
-                colored_vrt,
-                gebco_src,
-                "color-relief",
-                colorFilename=color_file,
-                format="VRT",
-                addAlpha=True,
+        if args.ocean_grade:
+            # Apply ocean grading
+            mako_arr = mako_colors.T.reshape(3, -1, 1)
+            graded_mako = tiler.apply_preview_correction_numpy(
+                mako_arr,
+                saturation=args.osat,
+                darken_break=args.odb,
+                low_slope=args.ols,
+                gamma=args.ocean_gamma,
             )
+            mako_colors = graded_mako.reshape(3, -1).T
+        if args.ocean_tonemap or args.ocean_grade:
+            # Convert back to uint8 and rebuild the ramp
+            graded_uint8 = (mako_colors * 255).astype(np.uint8)
+            mako_ramp = [
+                (mako_ramp[i][0], *graded_uint8[i]) for i in range(len(mako_ramp))
+            ]
 
-            # Warp to EPSG:3857 and crop to bbox
-            min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
-            # Using -te minx miny maxx maxy in dstSRS
-            warp_opts = gdal.WarpOptions(
-                format="VRT",
-                dstSRS="EPSG:3857",
-                outputBounds=(min_lon, min_lat, max_lon, max_lat),
-                outputBoundsSRS="EPSG:4326",
-            )
-            gdal.Warp(gebco_3857, colored_vrt, options=warp_opts)
+        # Map depth range to 0.0-1.0
+        depth_min = args.ocean_depth_min
+        depth_max = args.ocean_depth_max
+
+        with open(color_file, "w") as f:
+            for frac, r, g, b in mako_ramp:
+                val = depth_min + frac * (depth_max - depth_min)
+                f.write(f"{val} {r} {g} {b} 255\n")
+            # Explicitly make land transparent (above max depth)
+            f.write(f"{depth_max + 0.01} 0 0 0 0\n")
+            f.write("10000 0 0 0 0\n")
+            f.write("nv 0 0 0 0\n")
+
+        # Colorize using DEMProcessing (format=VRT to avoid intermediate write)
+        colored_vrt = f".temp/gebco_colored_{unique_id}.vrt"
+        gdal.DEMProcessing(
+            colored_vrt,
+            gebco_src,
+            "color-relief",
+            colorFilename=color_file,
+            format="VRT",
+            addAlpha=True,
+        )
+
+        # Warp to EPSG:3857 and crop to bbox
+        min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
+        # Using -te minx miny maxx maxy in dstSRS
+        warp_opts = gdal.WarpOptions(
+            format="VRT",
+            dstSRS="EPSG:3857",
+            outputBounds=(min_lon, min_lat, max_lon, max_lat),
+            outputBoundsSRS="EPSG:4326",
+        )
+        gdal.Warp(gebco_3857, colored_vrt, options=warp_opts)
 
         # Prepend to the processed list to make it the bottom layer if not already there
         if gebco_3857 not in processed_tifs:

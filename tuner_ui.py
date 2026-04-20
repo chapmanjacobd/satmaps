@@ -108,31 +108,6 @@ def get_histogram_data(arr, mode="land", depth_min=-11000, depth_max=0):
     return hist.tolist()
 
 
-MAKO_RAMP = [
-    (0.00, 11, 4, 5),
-    (0.05, 25, 14, 24),
-    (0.10, 38, 23, 43),
-    (0.15, 49, 33, 64),
-    (0.20, 56, 42, 84),
-    (0.25, 62, 53, 107),
-    (0.30, 65, 64, 130),
-    (0.35, 62, 79, 148),
-    (0.40, 57, 93, 156),
-    (0.45, 54, 108, 160),
-    (0.50, 53, 122, 162),
-    (0.55, 52, 137, 166),
-    (0.60, 52, 153, 170),
-    (0.65, 55, 166, 172),
-    (0.70, 63, 181, 173),
-    (0.75, 75, 194, 173),
-    (0.80, 101, 208, 173),
-    (0.85, 136, 217, 177),
-    (0.90, 171, 226, 190),
-    (0.95, 198, 235, 209),
-    (1.00, 222, 245, 229),
-]
-
-
 @app.route("/")
 def index():
     mode = request.args.get("mode", "land")
@@ -209,41 +184,32 @@ def render():
             return "No GEBCO zip found", 404
 
         # Colorize Mako ramp based on depth
-        mako_colors = np.array([c[1:] for c in MAKO_RAMP], dtype=np.float32) / 255.0
+        mako_colors = (
+            np.array([c[1:] for c in tiler.MAKO_RAMP], dtype=np.float32) / 255.0
+        )
         mako_arr = mako_colors.T.reshape(3, -1, 1)
 
         if tm_on:
             toned_mako = tiler.apply_soft_knee_numpy(
                 mako_arr, p["sb"], p["hb"], p["ss"], p["ms"], p["hs"], p["exp"]
             )
+            mako_colors = toned_mako.reshape(3, -1).T
         else:
-            toned_mako = np.clip(mako_arr * p["exp"], 0.0, 1.0)
+            mako_colors = np.clip(mako_colors * p["exp"], 0.0, 1.0)
 
         if fg_on:
             graded_mako = tiler.apply_preview_correction_numpy(
-                toned_mako, p["sat"], p["db"], p["ls"], p["gamma"]
+                mako_arr if not tm_on else toned_mako,
+                p["sat"],
+                p["db"],
+                p["ls"],
+                p["gamma"],
             )
-        else:
-            graded_mako = toned_mako
+            mako_colors = graded_mako.reshape(3, -1).T
 
-        mako_lut = graded_mako.reshape(3, -1).T  # (21, 3)
-
-        # Apply LUT to RAW_GEBCO
-        normalized_gebco = np.clip(
-            (RAW_GEBCO - p["dmin"]) / (p["dmax"] - p["dmin"]), 0.0, 1.0
+        corrected = tiler.colorize_depth_numpy(
+            RAW_GEBCO, mako_colors, p["dmin"], p["dmax"]
         )
-
-        # Interp depth (0-1) to LUT indices
-        fracs = np.array([c[0] for c in MAKO_RAMP])
-        indices = np.arange(len(MAKO_RAMP))
-
-        # Map pixels to continuous index
-        pixel_indices = np.interp(normalized_gebco, fracs, indices)
-
-        # Interpolate RGB values from the LUT
-        corrected = np.zeros((3, 1024, 1024), dtype=np.float32)
-        for i in range(3):
-            corrected[i] = np.interp(pixel_indices, indices, mako_lut[:, i])
 
     # 3. Convert to Byte and JPEG
     byte_arr = (np.clip(corrected, 0, 1) * 255).astype(np.uint8)
