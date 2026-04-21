@@ -16,6 +16,10 @@ from tiler import (
     apply_preview_correction_numpy,
     apply_soft_knee_numpy,
     colorize_depth_numpy,
+    lonlat_bbox_to_mercator_bounds,
+    snap_bounds_to_pixel_grid,
+    web_mercator_pixel_size,
+    zoom_for_pixel_size,
 )
 
 gdal.UseExceptions()
@@ -23,6 +27,7 @@ gdal.UseExceptions()
 DEFAULT_GEBCO_ZIP = "gebco_2025_sub_ice_topo_geotiff.zip"
 DEFAULT_OUTPUT = "ocean.tif"
 GEBCO_OCEAN_NODATA = -32767.0
+EQUATORIAL_REFERENCE_BBOX = (-0.5, -0.5, 0.5, 0.5)
 WEB_MERCATOR_WORLD_BOUNDS = (
     -20037508.342789244,
     -20037508.342789244,
@@ -252,6 +257,26 @@ def resolution_for_utm_10m_3857(
             "Could not derive a positive EPSG:3857 resolution from the bbox center"
         )
     return x_res, y_res
+
+
+def target_resolution_for_utm_10m_3857(
+    bbox: tuple[float, float, float, float] | None = None,
+) -> tuple[float, float]:
+    """Return the explicit 3857 pixel size used for styled ocean outputs."""
+    reference_bbox = bbox if bbox is not None else EQUATORIAL_REFERENCE_BBOX
+    return resolution_for_utm_10m_3857(*reference_bbox)
+
+
+def snapped_tile_grid_for_bbox(
+    bbox: tuple[float, float, float, float],
+) -> tuple[tuple[float, float, float, float], float, int]:
+    """Snap a bbox outward to the target Web Mercator tile pixel grid."""
+    x_res, y_res = target_resolution_for_utm_10m_3857(bbox)
+    zoom = zoom_for_pixel_size(min(x_res, y_res))
+    pixel_size = web_mercator_pixel_size(zoom)
+    mercator_bounds = lonlat_bbox_to_mercator_bounds(*bbox)
+    snapped_bounds = snap_bounds_to_pixel_grid(mercator_bounds, pixel_size)
+    return snapped_bounds, pixel_size, zoom
 
 
 def build_hillshade_command(
@@ -517,25 +542,22 @@ def generate_ocean_background(
     if style is None:
         style = OceanStyleOptions()
 
+    warp_kwargs: dict[str, object] = {
+        "format": "VRT",
+        "dstSRS": "EPSG:3857",
+        "resampleAlg": resample_alg,
+    }
     if bbox is None:
-        warp_options = gdal.WarpOptions(
-            format="VRT",
-            dstSRS="EPSG:3857",
-            outputBounds=WEB_MERCATOR_WORLD_BOUNDS,
-            resampleAlg=resample_alg,
-        )
+        x_res, y_res = target_resolution_for_utm_10m_3857()
+        warp_kwargs["outputBounds"] = WEB_MERCATOR_WORLD_BOUNDS
+        warp_kwargs["xRes"] = x_res
+        warp_kwargs["yRes"] = y_res
     else:
-        min_lon, min_lat, max_lon, max_lat = bbox
-        x_res, y_res = resolution_for_utm_10m_3857(min_lon, min_lat, max_lon, max_lat)
-        warp_options = gdal.WarpOptions(
-            format="VRT",
-            dstSRS="EPSG:3857",
-            outputBounds=(min_lon, min_lat, max_lon, max_lat),
-            outputBoundsSRS="EPSG:4326",
-            xRes=x_res,
-            yRes=y_res,
-            resampleAlg=resample_alg,
-        )
+        snapped_bounds, pixel_size, _zoom = snapped_tile_grid_for_bbox(bbox)
+        warp_kwargs["outputBounds"] = snapped_bounds
+        warp_kwargs["xRes"] = pixel_size
+        warp_kwargs["yRes"] = pixel_size
+    warp_options = gdal.WarpOptions(**warp_kwargs)
     gdal.Warp(warped_vrt, masked_vrt, options=warp_options)
 
     create_alpha_vrt(warped_vrt, alpha_vrt)

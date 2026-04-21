@@ -182,6 +182,39 @@ def lonlat_bbox_to_mercator_bounds(
     )
 
 
+def web_mercator_pixel_size(zoom: int) -> float:
+    """Return the meters-per-pixel value for a Web Mercator XYZ zoom level."""
+    return float((WEB_MERCATOR_LIMIT * 2) / (256 * (2**zoom)))
+
+
+def zoom_for_pixel_size(pixel_size: float) -> int:
+    """Return the finest XYZ zoom whose pixel size is not coarser than the target."""
+    if pixel_size <= 0.0:
+        raise ValueError("pixel_size must be positive")
+    return max(0, math.ceil(math.log2((WEB_MERCATOR_LIMIT * 2) / (256 * pixel_size))))
+
+
+def snap_bounds_to_pixel_grid(bounds: ProjWin, pixel_size: float) -> ProjWin:
+    """Expand bounds outward to the global Web Mercator pixel grid."""
+    if pixel_size <= 0.0:
+        raise ValueError("pixel_size must be positive")
+
+    minx, maxy, maxx, miny = bounds
+    snapped_minx = -WEB_MERCATOR_LIMIT + math.floor(
+        (minx + WEB_MERCATOR_LIMIT) / pixel_size
+    ) * pixel_size
+    snapped_maxx = -WEB_MERCATOR_LIMIT + math.ceil(
+        (maxx + WEB_MERCATOR_LIMIT) / pixel_size
+    ) * pixel_size
+    snapped_maxy = WEB_MERCATOR_LIMIT - math.floor(
+        (WEB_MERCATOR_LIMIT - maxy) / pixel_size
+    ) * pixel_size
+    snapped_miny = WEB_MERCATOR_LIMIT - math.ceil(
+        (WEB_MERCATOR_LIMIT - miny) / pixel_size
+    ) * pixel_size
+    return snapped_minx, snapped_maxy, snapped_maxx, snapped_miny
+
+
 def get_web_mercator_bounds(
     z: int, x: int, y: int
 ) -> Tuple[float, float, float, float]:

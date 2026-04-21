@@ -41,13 +41,13 @@ Visit `http://localhost:5001` to adjust exposure, soft-knee curves, and saturati
 
 ### 2. Generate the Ocean Background
 
-Prebuild the standalone styled ocean background once and reuse it anywhere you want an ocean base layer:
+Build the standalone styled ocean background and reuse it as an ocean base layer:
 
 ```bash
 # Global export from the full masked GEBCO source raster
 python3 ocean_background.py
 
-# Crop and reproject to match a bbox render
+# Crop and reproject to the same snapped tile-grid resolution used by bbox renders
 python3 ocean_background.py --bbox -161,18,-154,23
 
 # Inspect the final styled RGBA VRT without translating to GeoTIFF
@@ -93,13 +93,13 @@ python3 satmaps.py --global --estimate
 - `--chunk-zoom`: Chunking zoom used during MBTiles generation (default: `4`).
 - `--parallel`: Number of worker processes/threads used for tile processing and chunk generation (default: `2`).
 - `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
-- `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs clip chunk generation to the requested bbox even when this raster is global.
+- `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before chunk generation.
 - `--land` / `--no-land`: Enable or skip Sentinel-2 land tile processing entirely.
 - `--tonemap` / `--no-tonemap`: Enable or disable the land tone-mapping stage.
 - `--grade` / `--no-grade`: Enable or disable final land grading.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
 - `--download`: Download source tiles into the cache and exit without building output tiles.
-- `--resume [STATE_FILE]`: Resume a previous run from a saved `.temp/state_*.json`; without a path, the newest state file is used.
+- `--resume [STATE_FILE]`: Resume a previous run from a saved `.temp/state_*.json`; without a path, the most recent state file is used.
 - `--estimate`: Print estimated time, RAM, disk, and network usage, then exit.
 - `--vrt`: Generate the final VRT and exit (useful for inspection in QGIS).
 
@@ -107,7 +107,7 @@ python3 satmaps.py --global --estimate
 
 `ocean_background.py` supports the same tone-mapping controls as `satmaps.py`, plus:
 
-- `--bbox`: Export a Web Mercator ocean background cropped to a WGS84 bbox.
+- `--bbox`: Export a Web Mercator ocean background cropped to a WGS84 bbox and snapped outward to the target Web Mercator tile pixel grid used for bbox renders in `satmaps.py`.
 - `--hillshade-z`: Vertical exaggeration passed to `gdaldem hillshade`.
 - `--depth-min` / `--depth-max`: Depth range mapped onto the ocean color ramp.
 - `--resample-alg`: GEBCO upscale kernel (`cubicspline` or `lanczos`).
@@ -127,12 +127,12 @@ You can override the defaults (tuned via `tuner_ui.py`):
 
 1.  Discovery: Lists S3 folders for requested MGRS tiles and dates, or discovers touched MGRS tiles from `--bbox`.
 2.  Mosaicking: Opens RGB bands (B04, B03, B02) for each date and averages complete observations to reduce cloud artifacts.
-3.  Masking: Optionally warps the configured ocean background onto each tile grid so coastal alpha and fill decisions can be made block-by-block.
+3.  Masking: Optionally warps the configured ocean background onto each tile grid so coastal alpha and fill decisions happen block-by-block.
 4.  Reprojection: Warps processed land tiles to Web Mercator (EPSG:3857) and composites them with the standalone ocean background.
 5.  Processing (NumPy):
     - Soft-Knee Tone Mapping: A 3-segment linear curve to compress high dynamic range while preserving local contrast.
     - Color Grading: Saturation adjustment and gamma correction for a "natural" look.
-6.  Packaging: The merged Web Mercator VRT is split into XYZ-aligned chunks at `--chunk-zoom`, each chunk is translated into MBTiles, those MBTiles are merged, and the result is converted to PMTiles. For `--bbox` runs, chunk selection is clipped to the requested bbox instead of the full background extent.
+6.  Packaging: The merged Web Mercator VRT is split into XYZ-aligned chunks at `--chunk-zoom`, each chunk is translated into MBTiles, those MBTiles are merged, and the result is converted to PMTiles. For `--bbox` runs, chunk selection stays clipped to the requested bbox rather than the full background extent.
 
 ## Datasets
 

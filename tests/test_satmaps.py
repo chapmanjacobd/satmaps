@@ -176,6 +176,31 @@ def test_resolution_for_utm_10m_3857_rejects_polar_centers() -> None:
         ocean_background.resolution_for_utm_10m_3857(-10.0, 84.5, 10.0, 85.5)
 
 
+def test_target_resolution_for_utm_10m_3857_without_bbox_uses_equatorial_reference() -> None:
+    assert ocean_background.target_resolution_for_utm_10m_3857() == (
+        ocean_background.resolution_for_utm_10m_3857(
+            *ocean_background.EQUATORIAL_REFERENCE_BBOX
+        )
+    )
+
+
+def test_snapped_tile_grid_for_bbox_expands_to_tile_pixel_grid() -> None:
+    bbox = (-4.0, 50.0, -3.0, 51.0)
+
+    snapped_bounds, pixel_size, zoom = ocean_background.snapped_tile_grid_for_bbox(bbox)
+
+    assert zoom == satmaps.tiler.zoom_for_pixel_size(
+        min(ocean_background.target_resolution_for_utm_10m_3857(bbox))
+    )
+    assert pixel_size == pytest.approx(satmaps.tiler.web_mercator_pixel_size(zoom))
+
+    mercator_bounds = satmaps.tiler.lonlat_bbox_to_mercator_bounds(*bbox)
+    assert snapped_bounds[0] <= mercator_bounds[0]
+    assert snapped_bounds[1] >= mercator_bounds[1]
+    assert snapped_bounds[2] >= mercator_bounds[2]
+    assert snapped_bounds[3] <= mercator_bounds[3]
+
+
 def test_create_alpha_vrt_masks_nodata_with_expression(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
 
@@ -471,8 +496,70 @@ def test_generate_ocean_background_without_bbox_warps_global_raster(
     assert warp_calls[0][0] == artifacts.warped_vrt
     assert warp_calls[0][1] == artifacts.masked_vrt
     assert warp_options_calls[0]["outputBounds"] == ocean_background.WEB_MERCATOR_WORLD_BOUNDS
+    assert warp_options_calls[0]["xRes"] == pytest.approx(
+        ocean_background.target_resolution_for_utm_10m_3857()[0]
+    )
+    assert warp_options_calls[0]["yRes"] == pytest.approx(
+        ocean_background.target_resolution_for_utm_10m_3857()[1]
+    )
     assert commands == [[artifacts.warped_vrt, artifacts.hillshade_tif, "5.0"]]
     assert translated == [(artifacts.rgba_vrt, "ocean.tif")]
+
+
+def test_generate_ocean_background_with_bbox_sets_explicit_target_resolution(
+    monkeypatch: object,
+) -> None:
+    warp_options_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr("ocean_background.which", lambda cmd: "/usr/bin/gdaldem")
+    monkeypatch.setattr("ocean_background.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "ocean_background.build_gebco_source_vrt",
+        lambda gebco_zip, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_gebco_ocean_vrt",
+        lambda source_vrt, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_alpha_vrt",
+        lambda source_vrt, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_ocean_rgb_tif",
+        lambda depth_vrt, hillshade_tif, output_tif, style: output_tif,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_rgb_with_alpha_vrt",
+        lambda rgb_tif, alpha_vrt, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr("ocean_background.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
+    monkeypatch.setattr(
+        "ocean_background.build_hillshade_command",
+        lambda input_vrt, output_tif, z_factor: [input_vrt, output_tif, str(z_factor)],
+    )
+    monkeypatch.setattr("ocean_background.subprocess.run", lambda cmd, check: None)
+    monkeypatch.setattr(
+        "ocean_background.gdal.WarpOptions",
+        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        "ocean_background.gdal.Warp",
+        lambda destination, source, options=None: None,
+    )
+
+    bbox = (-4.0, 50.0, -3.0, 51.0)
+    snapped_bounds, pixel_size, _zoom = ocean_background.snapped_tile_grid_for_bbox(bbox)
+    ocean_background.generate_ocean_background(
+        gebco_zip="gebco.zip",
+        destination="ocean.tif",
+        bbox=bbox,
+    )
+
+    assert warp_options_calls[0]["outputBounds"] == pytest.approx(snapped_bounds)
+    assert "outputBoundsSRS" not in warp_options_calls[0]
+    assert warp_options_calls[0]["xRes"] == pytest.approx(pixel_size)
+    assert warp_options_calls[0]["yRes"] == pytest.approx(pixel_size)
 
 
 def test_generate_ocean_background_vrt_mode_skips_translate(monkeypatch: object) -> None:
@@ -903,18 +990,35 @@ def test_main_bbox_uses_standalone_ocean_background(monkeypatch: object, tmp_pat
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     buildvrt_sources: list[list[str]] = []
+    warp_options_calls: list[dict[str, object]] = []
 
     def fake_build_vrt(out, src, **kwargs):
         buildvrt_sources.append(list(src))
         Path(out).write_text("fake vrt")
 
+    monkeypatch.setattr(
+        "satmaps.gdal.WarpOptions",
+        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        "satmaps.gdal.Warp",
+        lambda destination, source, options=None: Path(destination).write_text("fake ocean"),
+    )
     monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
 
     main()
 
     master_vrts = list(tmp_path.glob(".temp/master_*.vrt"))
     assert len(master_vrts) == 1
-    assert buildvrt_sources[-1][0] == "ocean.tif"
+    assert buildvrt_sources[-1][0] != "ocean.tif"
+    assert Path(buildvrt_sources[-1][0]).name.startswith("ocean_")
+    assert Path(buildvrt_sources[-1][0]).name.endswith("_bbox.tif")
+    snapped_bounds, pixel_size, _zoom = ocean_background.snapped_tile_grid_for_bbox(
+        (0.0, 0.0, 1.0, 1.0)
+    )
+    assert warp_options_calls[0]["outputBounds"] == pytest.approx(snapped_bounds)
+    assert warp_options_calls[0]["xRes"] == pytest.approx(pixel_size)
+    assert warp_options_calls[0]["yRes"] == pytest.approx(pixel_size)
 
 
 def test_main_bbox_passes_chunk_bounds_to_tiler(
@@ -939,6 +1043,11 @@ def test_main_bbox_passes_chunk_bounds_to_tiler(
     monkeypatch.setattr(
         "satmaps.gdal.BuildVRT",
         lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+    )
+    monkeypatch.setattr("satmaps.gdal.WarpOptions", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        "satmaps.gdal.Warp",
+        lambda destination, source, options=None: Path(destination).write_text("fake ocean"),
     )
     captured_options: dict[str, object] = {}
 
@@ -982,3 +1091,34 @@ def test_main_non_bbox_can_use_standalone_ocean_background(
     master_vrts = list(tmp_path.glob(".temp/master_*.vrt"))
     assert len(master_vrts) == 1
     assert buildvrt_sources[-1] == ["ocean.tif"]
+
+
+def test_main_keeps_ocean_background_after_processing(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    ocean_background_path = tmp_path / "ocean.tif"
+    ocean_background_path.write_text("fake ocean")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "31TDF", "--no-land", "--parallel", "1"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr(
+        "satmaps.gdal.BuildVRT",
+        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+    )
+
+    def fake_run_tiling_simplified(input_vrt: str, output_mbtiles: str, options: dict[str, object]):
+        Path(output_mbtiles).write_text("fake mbtiles")
+        return satmaps.tiler.TilingArtifacts(final_vrt=input_vrt, cleanup_paths=[])
+
+    monkeypatch.setattr("satmaps.tiler.run_tiling_simplified", fake_run_tiling_simplified)
+    monkeypatch.setattr("satmaps.subprocess.run", lambda cmd, check: None)
+
+    main()
+
+    assert ocean_background_path.exists()

@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, cast
 
 import mgrs
 import numpy as np
+import ocean_background
 from scipy.ndimage import distance_transform_edt
 from osgeo import gdal
 
@@ -304,6 +305,40 @@ def resolve_ocean_mask_source(ocean_background: str) -> Optional[str]:
 
     dataset = None
     return ocean_background
+
+
+def prepare_ocean_background_for_output(
+    ocean_background_path: str,
+    requested_bbox: Optional[Tuple[float, float, float, float]],
+    unique_id: str,
+    resample_alg: str,
+) -> Optional[str]:
+    """Prepare the ocean background used in the final 3857 composite."""
+    if not os.path.exists(ocean_background_path):
+        return None
+    if requested_bbox is None:
+        return ocean_background_path
+
+    snapped_bounds, pixel_size, _zoom = ocean_background.snapped_tile_grid_for_bbox(
+        requested_bbox
+    )
+    prepared_ocean_path = f".temp/ocean_{unique_id}_bbox.tif"
+    warp_options = gdal.WarpOptions(
+        format="GTiff",
+        dstSRS="EPSG:3857",
+        outputBounds=snapped_bounds,
+        xRes=pixel_size,
+        yRes=pixel_size,
+        resampleAlg=resample_alg,
+        creationOptions=list(ocean_background.GTIFF_CREATION_OPTIONS),
+    )
+    prepared_ds = gdal.Warp(prepared_ocean_path, ocean_background_path, options=warp_options)
+    if prepared_ds is None:
+        raise RuntimeError(
+            f"Could not prepare bbox ocean background from {ocean_background_path}"
+        )
+    prepared_ds = None
+    return prepared_ocean_path
 
 
 def get_ocean_mask_band_details(dataset: gdal.Dataset) -> Optional[Tuple[int, bool]]:
@@ -1062,9 +1097,15 @@ def main() -> None:
         return
 
     # 3. Optional standalone ocean background
-    if os.path.exists(args.ocean_background):
-        if args.ocean_background not in processed_tifs:
-            processed_tifs.insert(0, args.ocean_background)
+    prepared_ocean_background = prepare_ocean_background_for_output(
+        args.ocean_background,
+        requested_bbox,
+        unique_id,
+        args.resample_alg,
+    )
+    if prepared_ocean_background:
+        if prepared_ocean_background not in processed_tifs:
+            processed_tifs.insert(0, prepared_ocean_background)
     elif args.bbox:
         print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
 
@@ -1103,7 +1144,14 @@ def main() -> None:
     subprocess.run(["pmtiles", "convert", temp_mbtiles, args.output], check=True)
     print(f"Success! {args.output}")
 
-    for path in processed_tifs + [master_vrt, temp_mbtiles] + artifacts.cleanup_paths:
+    persistent_paths = {os.path.abspath(args.ocean_background)}
+    cleanup_paths = [
+        path
+        for path in processed_tifs
+        if os.path.abspath(path) not in persistent_paths
+    ]
+
+    for path in cleanup_paths + [master_vrt, temp_mbtiles] + artifacts.cleanup_paths:
         if os.path.exists(path):
             try:
                 os.remove(path)
