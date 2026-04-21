@@ -51,6 +51,7 @@ OCEAN_DEFAULT_GAMMA = 1.2
 OCEAN_DEFAULT_SATURATION = 1.0
 OCEAN_DEFAULT_BLACK_BREAK = 0.35
 OCEAN_DEFAULT_BLACK_SLOPE = 0.35
+OCEAN_FADE_DEPTH = -50.0
 
 
 @dataclass(frozen=True)
@@ -140,7 +141,7 @@ def create_gebco_ocean_vrt(source_vrt: str, output_vrt: str) -> str:
 
 
 def create_alpha_vrt(source_vrt: str, output_vrt: str) -> str:
-    """Create an explicit alpha mask VRT from a nodata comparison."""
+    """Create an explicit alpha mask VRT from nodata and shallow-water thresholds."""
     ds = gdal.Open(source_vrt)
     if ds is None:
         raise RuntimeError(f"Could not open source VRT for alpha generation: {source_vrt}")
@@ -164,7 +165,7 @@ def create_alpha_vrt(source_vrt: str, output_vrt: str) -> str:
   <GeoTransform>{geotransform}</GeoTransform>
   <VRTRasterBand dataType="Float32" band="1" subClass="VRTDerivedRasterBand">
     <PixelFunctionType>expression</PixelFunctionType>
-    <PixelFunctionArguments dialect="muparser" expression="B1 == {nodata_value} ? 0 : 255"/>
+    <PixelFunctionArguments dialect="muparser" expression="B1 &lt;= {nodata_value + 0.1} || B1 &gt;= {OCEAN_FADE_DEPTH} ? 0 : 255"/>
     <SimpleSource>
       <SourceFilename relativeToVRT="0">{source_filename}</SourceFilename>
       <SourceBand>1</SourceBand>
@@ -335,12 +336,25 @@ def create_rgb_with_alpha_vrt(rgb_tif: str, alpha_vrt: str, output_vrt: str) -> 
     if alpha_ds is None:
         raise RuntimeError(f"Could not open alpha VRT: {alpha_vrt}")
 
+    alpha_tif = str(Path(output_vrt).with_suffix(".alpha.tif"))
+    translated_alpha = gdal.Translate(
+        alpha_tif,
+        alpha_vrt,
+        options=gdal.TranslateOptions(
+            format="GTiff",
+            creationOptions=list(GTIFF_CREATION_OPTIONS),
+        ),
+    )
+    if translated_alpha is None:
+        raise RuntimeError(f"Could not materialize alpha TIFF: {alpha_tif}")
+    translated_alpha = None
+
     xsize = rgb_ds.RasterXSize
     ysize = rgb_ds.RasterYSize
     geotransform = ",".join(str(value) for value in rgb_ds.GetGeoTransform())
     projection = escape(rgb_ds.GetProjection())
     rgb_filename = escape(os.path.abspath(rgb_tif))
-    alpha_filename = escape(os.path.abspath(alpha_vrt))
+    alpha_filename = escape(os.path.abspath(alpha_tif))
     rgb_ds = None
     alpha_ds = None
 

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import satmaps
 from satmaps import (
     build_alpha_block,
+    build_fill_allowed_mask,
     expand_subtiles,
     filter_mgrs_tiles,
     find_resume_path,
@@ -165,6 +166,29 @@ def test_build_alpha_block_applies_gebco_fade_curve() -> None:
             False,
         ),
         np.array([[0, 0, 127, 255, 255]], dtype=np.uint8),
+    )
+
+
+def test_build_fill_allowed_mask_uses_alpha_and_coverage() -> None:
+    np.testing.assert_array_equal(
+        build_fill_allowed_mask(
+            np.array([[0.0, 255.0, 0.0]], dtype=np.float32),
+            True,
+            np.array([[True, True, False]], dtype=bool),
+        ),
+        np.array([[True, False, False]], dtype=bool),
+    )
+
+
+def test_build_alpha_block_masks_out_pixels_outside_ocean_render() -> None:
+    np.testing.assert_array_equal(
+        build_alpha_block(
+            np.array([[0.0, 255.0, 0.0]], dtype=np.float32),
+            np.array([[True, True, True]], dtype=bool),
+            True,
+            np.array([[True, True, False]], dtype=bool),
+        ),
+        np.array([[255, 0, 0]], dtype=np.uint8),
     )
 
 

@@ -138,22 +138,165 @@ def test_snapped_tile_grid_for_bbox_expands_to_tile_pixel_grid() -> None:
 
     mercator_bounds = satmaps.tiler.lonlat_bbox_to_mercator_bounds(*bbox)
     assert snapped_bounds[0] <= mercator_bounds[0]
-    assert snapped_bounds[1] >= mercator_bounds[1]
+    assert snapped_bounds[1] <= mercator_bounds[1]
     assert snapped_bounds[2] >= mercator_bounds[2]
-    assert snapped_bounds[3] <= mercator_bounds[3]
+    assert snapped_bounds[3] >= mercator_bounds[3]
 
 
-def test_create_alpha_vrt_masks_nodata_with_expression(tmp_path: Path) -> None:
+def test_create_alpha_vrt_handles_near_nodata_and_shallow_values(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
 
-    alpha_source = tmp_path / "ocean_source.tif"
-    alpha_ds = driver.Create(str(alpha_source), 2, 1, 1, gdal.GDT_Float32)
+    alpha_source = tmp_path / "ocean_near_nodata.tif"
+    alpha_ds = driver.Create(str(alpha_source), 4, 1, 1, gdal.GDT_Float32)
     alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(3857)
     alpha_ds.SetProjection(srs.ExportToWkt())
     alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
-    alpha_ds.GetRasterBand(1).WriteArray(np.array([[-5.0, -32767.0]], dtype=np.float32))
+    # -32766.95 is near nodata, and -49.0 is shallower than the fade threshold.
+    alpha_ds.GetRasterBand(1).WriteArray(
+        np.array([[-32767.0, -32766.95, -60.0, -49.0]], dtype=np.float32)
+    )
+    alpha_ds = None
+
+    alpha_source_vrt = tmp_path / "ocean_near_nodata.vrt"
+    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+
+    alpha_vrt = tmp_path / "alpha_robust.vrt"
+    ocean_background.create_alpha_vrt(str(alpha_source_vrt), str(alpha_vrt))
+
+    np.testing.assert_allclose(
+        gdal.Open(str(alpha_vrt)).ReadAsArray(),
+        np.array([[0.0, 0.0, 255.0, 0.0]], dtype=np.float32),
+    )
+
+
+def test_average_tile_blocks_skips_horizontal_ocean(monkeypatch: object) -> None:
+    from satmaps import TileGrid, average_tile_blocks
+
+    tile_grid = TileGrid(
+        projection="EPSG:3857",
+        geotransform=(0, 1, 0, 0, 0, -1),
+        width=10,
+        height=4,
+    )
+
+    # Land is only in columns 3 to 6
+    fill_allowed_mask = np.zeros((4, 10), dtype=bool)
+    fill_allowed_mask[:, 3:7] = True
+
+    calls = []
+
+    def mock_average_block(date_band_sets, xoff, yoff, width, height):
+        calls.append((xoff, yoff, width, height))
+        return np.zeros((3, height, width), dtype=np.float32), np.ones(
+            (height, width), dtype=bool
+        )
+
+    monkeypatch.setattr("satmaps.average_block", mock_average_block)
+
+    date_band_sets = []  # Empty for this test
+
+    average_tile_blocks(date_band_sets, tile_grid, fill_allowed_mask)
+
+    # It should have called mock_average_block with xoff=3 and width=4
+    # Note: PROCESS_SLAB_HEIGHT is 24, so it should be one call for 4 rows
+    assert len(calls) == 1
+    assert calls[0] == (3, 0, 4, 4)
+
+
+def test_average_tile_blocks_skips_empty_slabs(monkeypatch: object) -> None:
+    from satmaps import TileGrid, average_tile_blocks
+
+    tile_grid = TileGrid(
+        projection="EPSG:3857",
+        geotransform=(0, 1, 0, 0, 0, -1),
+        width=10,
+        height=100,
+    )
+
+    # Land is only in rows 30 to 40
+    fill_allowed_mask = np.zeros((100, 10), dtype=bool)
+    fill_allowed_mask[30:41, :] = True
+
+    calls = []
+
+    def mock_average_block(date_band_sets, xoff, yoff, width, height):
+        calls.append((xoff, yoff, width, height))
+        return np.zeros((3, height, width), dtype=np.float32), np.ones(
+            (height, width), dtype=bool
+        )
+
+    monkeypatch.setattr("satmaps.average_block", mock_average_block)
+
+    date_band_sets = []
+    average_tile_blocks(date_band_sets, tile_grid, fill_allowed_mask)
+
+    # SLAB_HEIGHT is 24.
+    # Slab 0: 0-24 (Skip)
+    # Slab 1: 24-48 (Contains 30-40) -> Processed
+    # Slab 2: 48-72 (Skip)
+    # Slab 3: 72-96 (Skip)
+    # Slab 4: 96-100 (Skip)
+    assert len(calls) == 1
+    assert calls[0][1] == 24
+    assert calls[0][3] == 24
+
+
+def test_average_tile_blocks_masks_out_ocean_holes_inside_processed_slab(
+    monkeypatch: object,
+) -> None:
+    from satmaps import TileGrid, average_tile_blocks
+
+    tile_grid = TileGrid(
+        projection="EPSG:3857",
+        geotransform=(0, 1, 0, 0, 0, -1),
+        width=6,
+        height=2,
+    )
+    fill_allowed_mask = np.array(
+        [
+            [False, True, False, True, False, False],
+            [False, True, False, True, False, False],
+        ],
+        dtype=bool,
+    )
+
+    def mock_average_block(date_band_sets, xoff, yoff, width, height):
+        assert (xoff, yoff, width, height) == (1, 0, 3, 2)
+        averaged_block = np.ones((3, height, width), dtype=np.float32)
+        source_valid = np.ones((height, width), dtype=bool)
+        return averaged_block, source_valid
+
+    monkeypatch.setattr("satmaps.average_block", mock_average_block)
+
+    averaged, source_valid_mask, found_non_ocean_pixels = average_tile_blocks(
+        [], tile_grid, fill_allowed_mask
+    )
+
+    assert found_non_ocean_pixels is True
+    np.testing.assert_array_equal(source_valid_mask, fill_allowed_mask)
+    assert np.isnan(averaged[:, :, 0]).all()
+    assert np.isnan(averaged[:, :, 2]).all()
+    assert np.isnan(averaged[:, :, 4]).all()
+    assert np.isnan(averaged[:, :, 5]).all()
+    np.testing.assert_array_equal(averaged[:, :, 1], np.ones((3, 2), dtype=np.float32))
+    np.testing.assert_array_equal(averaged[:, :, 3], np.ones((3, 2), dtype=np.float32))
+
+
+def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None:
+    driver = gdal.GetDriverByName("GTiff")
+
+    alpha_source = tmp_path / "ocean_source.tif"
+    alpha_ds = driver.Create(str(alpha_source), 4, 1, 1, gdal.GDT_Float32)
+    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    alpha_ds.SetProjection(srs.ExportToWkt())
+    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    alpha_ds.GetRasterBand(1).WriteArray(
+        np.array([[-60.0, -50.0, -5.0, -32767.0]], dtype=np.float32)
+    )
     alpha_ds = None
 
     alpha_source_vrt = tmp_path / "ocean_source.vrt"
@@ -164,7 +307,7 @@ def test_create_alpha_vrt_masks_nodata_with_expression(tmp_path: Path) -> None:
 
     np.testing.assert_allclose(
         gdal.Open(str(alpha_vrt)).ReadAsArray(),
-        np.array([[255.0, 0.0]], dtype=np.float32),
+        np.array([[255.0, 0.0, 0.0, 0.0]], dtype=np.float32),
     )
 
 
@@ -219,6 +362,82 @@ def test_create_ocean_rgb_tif_colorizes_in_blocks(tmp_path: Path) -> None:
         np.uint8
     )
     np.testing.assert_array_equal(arr, expected)
+
+
+def test_create_rgb_with_alpha_vrt_preserves_alpha_values(tmp_path: Path) -> None:
+    driver = gdal.GetDriverByName("GTiff")
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+
+    rgb_path = tmp_path / "rgb.tif"
+    rgb_ds = driver.Create(str(rgb_path), 2, 1, 3, gdal.GDT_Byte)
+    rgb_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    rgb_ds.SetProjection(srs.ExportToWkt())
+    for band_index, value in enumerate((10, 20, 30), start=1):
+        rgb_ds.GetRasterBand(band_index).WriteArray(np.array([[value, value]], dtype=np.uint8))
+    rgb_ds = None
+
+    alpha_source = tmp_path / "alpha_source.tif"
+    alpha_ds = driver.Create(str(alpha_source), 2, 1, 1, gdal.GDT_Float32)
+    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    alpha_ds.SetProjection(srs.ExportToWkt())
+    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    alpha_ds.GetRasterBand(1).WriteArray(np.array([[-60.0, -32767.0]], dtype=np.float32))
+    alpha_ds = None
+
+    alpha_source_vrt = tmp_path / "alpha_source.vrt"
+    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+    alpha_vrt = tmp_path / "alpha.vrt"
+    ocean_background.create_alpha_vrt(str(alpha_source_vrt), str(alpha_vrt))
+
+    rgba_vrt = tmp_path / "rgba.vrt"
+    ocean_background.create_rgb_with_alpha_vrt(str(rgb_path), str(alpha_vrt), str(rgba_vrt))
+
+    rgba_ds = gdal.Open(str(rgba_vrt))
+    assert rgba_ds is not None
+    np.testing.assert_array_equal(
+        rgba_ds.GetRasterBand(4).ReadAsArray(),
+        np.array([[255, 0]], dtype=np.uint8),
+    )
+
+
+def test_translate_rgba_vrt_preserves_alpha_values(tmp_path: Path) -> None:
+    driver = gdal.GetDriverByName("GTiff")
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+
+    rgb_path = tmp_path / "rgb.tif"
+    rgb_ds = driver.Create(str(rgb_path), 2, 1, 3, gdal.GDT_Byte)
+    rgb_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    rgb_ds.SetProjection(srs.ExportToWkt())
+    for band_index, value in enumerate((10, 20, 30), start=1):
+        rgb_ds.GetRasterBand(band_index).WriteArray(np.array([[value, value]], dtype=np.uint8))
+    rgb_ds = None
+
+    alpha_source = tmp_path / "alpha_source.tif"
+    alpha_ds = driver.Create(str(alpha_source), 2, 1, 1, gdal.GDT_Float32)
+    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    alpha_ds.SetProjection(srs.ExportToWkt())
+    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    alpha_ds.GetRasterBand(1).WriteArray(np.array([[-60.0, -32767.0]], dtype=np.float32))
+    alpha_ds = None
+
+    alpha_source_vrt = tmp_path / "alpha_source.vrt"
+    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+    alpha_vrt = tmp_path / "alpha.vrt"
+    ocean_background.create_alpha_vrt(str(alpha_source_vrt), str(alpha_vrt))
+
+    rgba_vrt = tmp_path / "rgba.vrt"
+    ocean_background.create_rgb_with_alpha_vrt(str(rgb_path), str(alpha_vrt), str(rgba_vrt))
+    output_tif = tmp_path / "out.tif"
+    ocean_background.translate_rgba_vrt(str(rgba_vrt), str(output_tif))
+
+    out_ds = gdal.Open(str(output_tif))
+    assert out_ds is not None
+    np.testing.assert_array_equal(
+        out_ds.GetRasterBand(4).ReadAsArray(),
+        np.array([[255, 0]], dtype=np.uint8),
+    )
 
 
 def test_build_hillshade_command_matches_expected_flags(tmp_path: Path) -> None:

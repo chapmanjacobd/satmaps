@@ -44,6 +44,15 @@ class TileGrid:
     height: int
 
 
+@dataclass
+class OceanMaskWarp:
+    band: gdal.Band
+    dataset: gdal.Dataset
+    uses_alpha: bool
+    coverage_band: gdal.Band
+    coverage_dataset: gdal.Dataset
+
+
 # --- Discovery Layer (S3/CDSE Utils) ---
 
 
@@ -465,10 +474,10 @@ def open_gebco_mask(
     gebco_src: Optional[str],
     tile_grid: TileGrid,
     mgrs_subtile: str,
-) -> Tuple[Optional[gdal.Band], Optional[gdal.Dataset], bool]:
+) -> Optional[OceanMaskWarp]:
     """Warp GEBCO onto the tile grid so land/ocean blending can reuse it block-by-block."""
     if not gebco_src:
-        return None, None, False
+        return None
 
     try:
         gebco_ds = gdal.Open(gebco_src)
@@ -483,15 +492,17 @@ def open_gebco_mask(
             mem_driver = gdal.GetDriverByName("MEM")
             if mem_driver is None:
                 raise RuntimeError("Could not load GDAL MEM driver")
-            gebco_mem_ds = mem_driver.Create(
-                "", tile_grid.width, tile_grid.height, 1, gdal.GDT_Float32
+            mask_data_type = gebco_ds.GetRasterBand(band_index).DataType
+
+            warped_mask_ds = mem_driver.Create(
+                "", tile_grid.width, tile_grid.height, 1, mask_data_type
             )
-            if gebco_mem_ds is None:
+            if warped_mask_ds is None:
                 raise RuntimeError("Could not create in-memory GEBCO mask dataset")
-            gebco_mem_ds.SetProjection(tile_grid.projection)
-            gebco_mem_ds.SetGeoTransform(tile_grid.geotransform)
+            warped_mask_ds.SetProjection(tile_grid.projection)
+            warped_mask_ds.SetGeoTransform(tile_grid.geotransform)
             warped = gdal.Warp(
-                gebco_mem_ds,
+                warped_mask_ds,
                 gebco_ds,
                 options=gdal.WarpOptions(
                     resampleAlg="bilinear",
@@ -501,17 +512,68 @@ def open_gebco_mask(
             )
             if warped is None:
                 raise RuntimeError(f"Could not warp GEBCO mask for {mgrs_subtile}")
+
+            coverage_source_ds = mem_driver.Create(
+                "", gebco_ds.RasterXSize, gebco_ds.RasterYSize, 1, gdal.GDT_Byte
+            )
+            if coverage_source_ds is None:
+                raise RuntimeError("Could not create source coverage dataset")
+            coverage_source_ds.SetProjection(gebco_ds.GetProjection())
+            coverage_source_ds.SetGeoTransform(gebco_ds.GetGeoTransform())
+            coverage_source_ds.GetRasterBand(1).Fill(255)
+
+            coverage_mem_ds = mem_driver.Create(
+                "", tile_grid.width, tile_grid.height, 1, gdal.GDT_Byte
+            )
+            if coverage_mem_ds is None:
+                raise RuntimeError("Could not create in-memory GEBCO coverage dataset")
+            coverage_mem_ds.SetProjection(tile_grid.projection)
+            coverage_mem_ds.SetGeoTransform(tile_grid.geotransform)
+            coverage_mem_ds.GetRasterBand(1).Fill(0)
+            warped_coverage = gdal.Warp(
+                coverage_mem_ds,
+                coverage_source_ds,
+                options=gdal.WarpOptions(
+                    resampleAlg="near",
+                    srcBands=[1],
+                    dstBands=[1],
+                ),
+            )
+            coverage_source_ds = None
+            if warped_coverage is None:
+                raise RuntimeError(f"Could not warp GEBCO coverage for {mgrs_subtile}")
         finally:
             gebco_ds = None
 
-        return (
-            gebco_mem_ds.GetRasterBand(1),
-            gebco_mem_ds,
-            uses_alpha,
+        return OceanMaskWarp(
+            band=warped_mask_ds.GetRasterBand(1),
+            dataset=warped_mask_ds,
+            uses_alpha=uses_alpha,
+            coverage_band=coverage_mem_ds.GetRasterBand(1),
+            coverage_dataset=coverage_mem_ds,
         )
     except RuntimeError as e:
         print(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
-        return None, None, False
+        return None
+
+
+def build_fill_allowed_mask(
+    ocean_mask: np.ndarray,
+    mask_uses_alpha: bool,
+    coverage_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Return the pixels where Sentinel land rendering is allowed."""
+    if mask_uses_alpha:
+        fill_allowed_mask = ocean_mask < 254.5
+    else:
+        fill_allowed_mask = ocean_mask > OCEAN_FADE_DEPTH
+
+    if coverage_mask is not None:
+        if coverage_mask.shape != fill_allowed_mask.shape:
+            raise ValueError("coverage_mask must match the spatial shape of ocean_mask")
+        fill_allowed_mask &= coverage_mask
+
+    return fill_allowed_mask
 
 
 def open_date_band_sets(
@@ -648,25 +710,43 @@ def average_tile_blocks(
         if yoff + block_height <= y_min or yoff >= y_max:
             continue
 
+        # Default to full slab width if no mask is provided
+        actual_xoff = xoff
+        actual_width = block_width
+
         if fill_allowed_mask is not None:
-            fill_allowed_block = fill_allowed_mask[
-                yoff : yoff + block_height, xoff : xoff + block_width
+            # Refine the horizontal bounds for this specific row slab
+            fill_allowed_slab = fill_allowed_mask[
+                yoff : yoff + block_height, :
             ]
-            if not np.any(fill_allowed_block):
+            cols_with_land = np.any(fill_allowed_slab, axis=0)
+            if not np.any(cols_with_land):
                 continue
+
+            x_start = int(np.argmax(cols_with_land))
+            x_end = int(len(cols_with_land) - np.argmax(cols_with_land[::-1]))
+
+            actual_xoff = x_start
+            actual_width = x_end - x_start
             found_non_ocean_pixels = True
 
         averaged_block, block_valid_sources = average_block(
-            date_band_sets, xoff, yoff, block_width, block_height
+            date_band_sets, actual_xoff, yoff, actual_width, block_height
         )
+        if fill_allowed_mask is not None:
+            allowed_block = fill_allowed_mask[
+                yoff : yoff + block_height, actual_xoff : actual_xoff + actual_width
+            ]
+            averaged_block = np.where(allowed_block[np.newaxis, :, :], averaged_block, np.nan)
+            block_valid_sources &= allowed_block
         if not np.any(block_valid_sources):
             continue
 
-        averaged[:, yoff : yoff + block_height, xoff : xoff + block_width] = (
+        averaged[:, yoff : yoff + block_height, actual_xoff : actual_xoff + actual_width] = (
             averaged_block
         )
         source_valid_mask[
-            yoff : yoff + block_height, xoff : xoff + block_width
+            yoff : yoff + block_height, actual_xoff : actual_xoff + actual_width
         ] = block_valid_sources
 
     return averaged, source_valid_mask, found_non_ocean_pixels
@@ -712,25 +792,37 @@ def create_output_dataset(
 
 
 def build_alpha_block(
-    gebco_block: Optional[np.ndarray], source_valid_block: np.ndarray, mask_uses_alpha: bool
+    gebco_block: Optional[np.ndarray],
+    source_valid_block: np.ndarray,
+    mask_uses_alpha: bool,
+    coverage_block: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Build the output alpha band for one block."""
     if gebco_block is None:
-        return source_valid_block.astype(np.uint8) * 255
+        alpha_block = source_valid_block.astype(np.uint8) * 255
+    elif mask_uses_alpha:
+        alpha_block = np.clip(255.0 - gebco_block, 0.0, 255.0).astype(np.uint8)
+    else:
+        alpha_block = np.clip(
+            (gebco_block - OCEAN_FADE_DEPTH) / (LAND_STAY_DEPTH - OCEAN_FADE_DEPTH),
+            0.0,
+            1.0,
+        )
+        alpha_block = np.clip(alpha_block * 255.0, 0.0, 255.0).astype(np.uint8)
 
-    if mask_uses_alpha:
-        return np.clip(255.0 - gebco_block, 0.0, 255.0).astype(np.uint8)
+    if coverage_block is not None:
+        if coverage_block.shape != source_valid_block.shape:
+            raise ValueError("coverage_block must match the spatial shape of source_valid_block")
+        alpha_block = np.where(coverage_block, alpha_block, 0)
 
-    alpha_block = np.clip(
-        (gebco_block - OCEAN_FADE_DEPTH) / (LAND_STAY_DEPTH - OCEAN_FADE_DEPTH), 0.0, 1.0
-    )
-    return np.clip(alpha_block * 255.0, 0.0, 255.0).astype(np.uint8)
+    return alpha_block.astype(np.uint8)
 
 
 def write_processed_blocks(
     averaged: np.ndarray,
     source_valid_mask: np.ndarray,
     gebco_band: Optional[gdal.Band],
+    coverage_band: Optional[gdal.Band],
     mask_uses_alpha: bool,
     tile_grid: TileGrid,
     args: argparse.Namespace,
@@ -783,10 +875,16 @@ def write_processed_blocks(
             gebco_block = gebco_band.ReadAsArray(
                 xoff, yoff, block_width, block_height
             ).astype(np.float32)
+        coverage_block = None
+        if coverage_band is not None:
+            coverage_block = coverage_band.ReadAsArray(
+                xoff, yoff, block_width, block_height
+            ) >= 254.5
         alpha_block = build_alpha_block(
             gebco_block,
             source_valid_block,
             mask_uses_alpha,
+            coverage_block,
         )
         alpha_band.WriteArray(alpha_block, xoff=xoff, yoff=yoff)
 
@@ -828,18 +926,20 @@ def process_single_tile(
     paths = get_tile_paths(first_folder, first_date, args.cache, download=False)
     tile_grid = load_tile_grid(paths["red"])
 
-    gebco_band, _gebco_mem_ds, mask_uses_alpha = open_gebco_mask(
-        gebco_src, tile_grid, mgrs_subtile
-    )
+    ocean_mask = open_gebco_mask(gebco_src, tile_grid, mgrs_subtile)
 
     # 1. Compute land mask early and check if any land exists in this subtile
     fill_allowed_mask = None
-    if gebco_band is not None:
-        gebco_full = gebco_band.ReadAsArray().astype(np.float32)
-        if mask_uses_alpha:
-            fill_allowed_mask = gebco_full < 254.5
-        else:
-            fill_allowed_mask = gebco_full > OCEAN_FADE_DEPTH
+    if ocean_mask is not None:
+        gebco_full = ocean_mask.band.ReadAsArray()
+        coverage_full = ocean_mask.coverage_band.ReadAsArray() >= 254.5
+        fill_allowed_mask = build_fill_allowed_mask(
+            gebco_full,
+            ocean_mask.uses_alpha,
+            coverage_full,
+        )
+        gebco_full = None
+        coverage_full = None
 
         if not np.any(fill_allowed_mask):
             return None
@@ -862,8 +962,9 @@ def process_single_tile(
         write_processed_blocks(
             averaged,
             source_valid_mask,
-            gebco_band,
-            mask_uses_alpha,
+            ocean_mask.band if ocean_mask is not None else None,
+            ocean_mask.coverage_band if ocean_mask is not None else None,
+            ocean_mask.uses_alpha if ocean_mask is not None else False,
             tile_grid,
             args,
             color_bands,
@@ -880,7 +981,7 @@ def process_single_tile(
             bands.clear()
             datasets.clear()
         date_band_sets.clear()
-        gebco_band = None
+        ocean_mask = None
         fill_allowed_mask = None
 
 
