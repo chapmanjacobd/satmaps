@@ -18,6 +18,7 @@ from satmaps import (
     find_resume_path,
     get_source_scale,
     infer_quarter,
+    iter_processing_windows,
     load_land_tiles,
     load_state,
     parse_bbox,
@@ -143,6 +144,21 @@ def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: objec
 def test_get_source_scale_uses_defaults_and_overrides() -> None:
     assert get_source_scale(argparse.Namespace(stats_min=None, stats_max=None)) == (0.0, 9000.0)
     assert get_source_scale(argparse.Namespace(stats_min=12.5, stats_max=345.0)) == (12.5, 345.0)
+
+
+def test_iter_processing_windows_uses_full_width_row_slabs() -> None:
+    tile_grid = satmaps.TileGrid(
+        projection="EPSG:32631",
+        geotransform=(0.0, 10.0, 0.0, 0.0, 0.0, -10.0),
+        width=10008,
+        height=50,
+    )
+
+    assert list(iter_processing_windows(tile_grid)) == [
+        (0, 0, 10008, 24),
+        (0, 24, 10008, 24),
+        (0, 48, 10008, 2),
+    ]
 
 
 def test_build_alpha_block_uses_source_mask_without_gebco() -> None:

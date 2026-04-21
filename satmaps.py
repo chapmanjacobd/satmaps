@@ -8,7 +8,7 @@ import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, cast
 
 import mgrs
 import numpy as np
@@ -30,7 +30,7 @@ DATE_PATH_QUARTERS = (
 RGB_BANDS = (("B04", "red"), ("B03", "green"), ("B02", "blue"))
 SUBTILE_OFFSETS = ((0, 0), (0, 1), (1, 0), (1, 1))
 SENTINEL_NODATA = -32768
-PROCESS_BLOCK_SIZE = 1024
+PROCESS_SLAB_HEIGHT = 24
 LAND_STAY_DEPTH = -42.0
 OCEAN_FADE_DEPTH = -50.0
 
@@ -542,6 +542,12 @@ def read_rgb_block(
     return rgb_block
 
 
+def iter_processing_windows(tile_grid: TileGrid) -> Iterator[Tuple[int, int, int, int]]:
+    """Yield full-width row slabs that match the striped source TIFF layout."""
+    for yoff in range(0, tile_grid.height, PROCESS_SLAB_HEIGHT):
+        yield 0, yoff, tile_grid.width, min(PROCESS_SLAB_HEIGHT, tile_grid.height - yoff)
+
+
 def average_block(
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]],
     xoff: int,
@@ -593,36 +599,32 @@ def average_tile_blocks(
     source_valid_mask = np.zeros((tile_grid.height, tile_grid.width), dtype=bool)
     found_non_ocean_pixels = gebco_band is None
 
-    for yoff in range(0, tile_grid.height, PROCESS_BLOCK_SIZE):
-        block_height = min(PROCESS_BLOCK_SIZE, tile_grid.height - yoff)
-        for xoff in range(0, tile_grid.width, PROCESS_BLOCK_SIZE):
-            block_width = min(PROCESS_BLOCK_SIZE, tile_grid.width - xoff)
-
-            if gebco_band is not None:
-                gebco_block = gebco_band.ReadAsArray(
-                    xoff, yoff, block_width, block_height
-                ).astype(np.float32)
-                assert fill_allowed_mask is not None
-                fill_allowed_block = gebco_block > OCEAN_FADE_DEPTH
-                fill_allowed_mask[
-                    yoff : yoff + block_height, xoff : xoff + block_width
-                ] = fill_allowed_block
-                if not np.any(fill_allowed_block):
-                    continue
-                found_non_ocean_pixels = True
-
-            averaged_block, block_valid_sources = average_block(
-                date_band_sets, xoff, yoff, block_width, block_height
-            )
-            if not np.any(block_valid_sources):
-                continue
-
-            averaged[:, yoff : yoff + block_height, xoff : xoff + block_width] = (
-                averaged_block
-            )
-            source_valid_mask[
+    for xoff, yoff, block_width, block_height in iter_processing_windows(tile_grid):
+        if gebco_band is not None:
+            gebco_block = gebco_band.ReadAsArray(
+                xoff, yoff, block_width, block_height
+            ).astype(np.float32)
+            assert fill_allowed_mask is not None
+            fill_allowed_block = gebco_block > OCEAN_FADE_DEPTH
+            fill_allowed_mask[
                 yoff : yoff + block_height, xoff : xoff + block_width
-            ] = block_valid_sources
+            ] = fill_allowed_block
+            if not np.any(fill_allowed_block):
+                continue
+            found_non_ocean_pixels = True
+
+        averaged_block, block_valid_sources = average_block(
+            date_band_sets, xoff, yoff, block_width, block_height
+        )
+        if not np.any(block_valid_sources):
+            continue
+
+        averaged[:, yoff : yoff + block_height, xoff : xoff + block_width] = (
+            averaged_block
+        )
+        source_valid_mask[
+            yoff : yoff + block_height, xoff : xoff + block_width
+        ] = block_valid_sources
 
     return averaged, source_valid_mask, found_non_ocean_pixels
 
@@ -710,44 +712,41 @@ def write_processed_blocks(
     if scale <= 0.0:
         raise ValueError("stats_max must be greater than stats_min")
 
-    for yoff in range(0, tile_grid.height, PROCESS_BLOCK_SIZE):
-        block_height = min(PROCESS_BLOCK_SIZE, tile_grid.height - yoff)
-        for xoff in range(0, tile_grid.width, PROCESS_BLOCK_SIZE):
-            block_width = min(PROCESS_BLOCK_SIZE, tile_grid.width - xoff)
-            averaged_block = averaged[:, yoff : yoff + block_height, xoff : xoff + block_width]
-            normalized = np.clip((averaged_block - source_min) / scale, 0.0, 1.0)
-            normalized[np.isnan(normalized)] = 0.0
+    for xoff, yoff, block_width, block_height in iter_processing_windows(tile_grid):
+        averaged_block = averaged[:, yoff : yoff + block_height, xoff : xoff + block_width]
+        normalized = np.clip((averaged_block - source_min) / scale, 0.0, 1.0)
+        normalized[np.isnan(normalized)] = 0.0
 
-            if args.tonemap:
-                toned_block = tiler.apply_soft_knee_numpy(
-                    normalized,
-                    shadow_break=args.sb,
-                    highlight_break=args.hb,
-                    shadow_slope=args.ss,
-                    mid_slope=args.ms,
-                    highlight_slope=args.hs,
-                    exposure=args.exposure,
-                )
-            else:
-                toned_block = np.clip(normalized * args.exposure, 0.0, 1.0)
-
-            if args.grade:
-                toned_block = tiler.apply_preview_correction_numpy(
-                    toned_block,
-                    saturation=args.sat,
-                    darken_break=args.db,
-                    low_slope=args.ls,
-                    gamma=args.gamma,
-                )
-
-            byte_block = np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
-            for band_index, out_band in enumerate(color_bands):
-                out_band.WriteArray(byte_block[band_index], xoff=xoff, yoff=yoff)
-
-            alpha_block = build_alpha_block(
-                gebco_band, source_valid_mask, xoff, yoff, block_width, block_height
+        if args.tonemap:
+            toned_block = tiler.apply_soft_knee_numpy(
+                normalized,
+                shadow_break=args.sb,
+                highlight_break=args.hb,
+                shadow_slope=args.ss,
+                mid_slope=args.ms,
+                highlight_slope=args.hs,
+                exposure=args.exposure,
             )
-            alpha_band.WriteArray(alpha_block, xoff=xoff, yoff=yoff)
+        else:
+            toned_block = np.clip(normalized * args.exposure, 0.0, 1.0)
+
+        if args.grade:
+            toned_block = tiler.apply_preview_correction_numpy(
+                toned_block,
+                saturation=args.sat,
+                darken_break=args.db,
+                low_slope=args.ls,
+                gamma=args.gamma,
+            )
+
+        byte_block = np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
+        for band_index, out_band in enumerate(color_bands):
+            out_band.WriteArray(byte_block[band_index], xoff=xoff, yoff=yoff)
+
+        alpha_block = build_alpha_block(
+            gebco_band, source_valid_mask, xoff, yoff, block_width, block_height
+        )
+        alpha_band.WriteArray(alpha_block, xoff=xoff, yoff=yoff)
 
 
 def warp_to_web_mercator(
