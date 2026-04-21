@@ -43,65 +43,6 @@ class TileGrid:
     height: int
 
 
-@dataclass(frozen=True)
-class ResumeState:
-    state_file: str
-    unique_id: str
-    completed_subtiles: Set[str]
-    processed_tifs: List[str]
-
-
-def infer_quarter(date_path: str) -> str:
-    """Infer the quarterly mosaic label from a date path."""
-    for marker, quarter in DATE_PATH_QUARTERS:
-        if marker in date_path:
-            return quarter
-    return "Q3"
-
-
-def parse_date_paths(date_arg: str) -> List[str]:
-    """Split the comma-separated --date argument into individual paths."""
-    return [date_path.strip() for date_path in date_arg.split(",")]
-
-
-# --- State Management ---
-
-
-def save_state(
-    state_file: str,
-    unique_id: str,
-    completed_subtiles: Set[str],
-    processed_tifs: List[str],
-    args: argparse.Namespace,
-) -> None:
-    """Save the current processing state to a JSON file."""
-    state = {
-        "unique_id": unique_id,
-        "completed_subtiles": list(completed_subtiles),
-        "processed_tifs": processed_tifs,
-        "args": vars(args),
-    }
-    with open(state_file, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-def load_state(state_file: str) -> Optional[Dict[str, Any]]:
-    """Load the processing state from the JSON file if it exists."""
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, "r") as f:
-                return cast(Dict[str, Any], json.load(f))
-        except Exception as e:
-            print(f"Warning: Could not load state file: {e}")
-    return None
-
-
-def delete_state(state_file: str) -> None:
-    """Delete the state file upon successful completion."""
-    if os.path.exists(state_file):
-        os.remove(state_file)
-
-
 # --- Discovery Layer (S3/CDSE Utils) ---
 
 
@@ -130,7 +71,11 @@ def list_mosaic_folders_for_tile(
     found = []
 
     for date_path in date_paths:
-        quarter = infer_quarter(date_path)
+        quarter = "Q3"
+        for marker, candidate_quarter in DATE_PATH_QUARTERS:
+            if marker in date_path:
+                quarter = candidate_quarter
+                break
         year = date_path.split("/")[0]
         folder = f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs_id}_{x}_{y}"
 
@@ -281,7 +226,7 @@ def discover_mgrs_bases(
         discovered_mgrs = discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat)
         mgrs_bases = filter_mgrs_tiles(discovered_mgrs, land_set, gebco_vrt_source)
         print(
-            f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} kept after GEBCO/land filtering."
+            f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} kept after ocean-mask/land filtering."
         )
         return mgrs_bases
 
@@ -314,10 +259,13 @@ def find_resume_path(resume_arg: object) -> Optional[str]:
     return max(states, key=os.path.getmtime)
 
 
-def restore_resume_state(resume_path: str) -> Optional[ResumeState]:
+def restore_resume_state(resume_path: str) -> Optional[Dict[str, Any]]:
     """Load a previous run state and keep only surviving intermediate files."""
-    state = load_state(resume_path)
-    if not state:
+    try:
+        with open(resume_path, "r") as f:
+            state = cast(Dict[str, Any], json.load(f))
+    except Exception as e:
+        print(f"Warning: Could not load state file: {e}")
         return None
 
     unique_id = state["unique_id"]
@@ -327,29 +275,47 @@ def restore_resume_state(resume_path: str) -> Optional[ResumeState]:
     print(
         f"Already completed {len(completed_subtiles)} sub-tiles, {len(processed_tifs)} TIFs found."
     )
-    return ResumeState(resume_path, unique_id, completed_subtiles, processed_tifs)
+    return {
+        "state_file": resume_path,
+        "unique_id": unique_id,
+        "completed_subtiles": completed_subtiles,
+        "processed_tifs": processed_tifs,
+    }
 
 
-def build_gebco_vrt(
-    unique_id: str, gebco_zip: str = "gebco_2025_sub_ice_topo_geotiff.zip"
-) -> Optional[str]:
-    """Build a temporary GEBCO source VRT when the zip archive is available."""
-    if not os.path.exists(gebco_zip):
+def resolve_ocean_mask_source(ocean_background: str) -> Optional[str]:
+    """Reuse the configured ocean background as the optional mask source when it has a usable mask band."""
+    if not os.path.exists(ocean_background):
         return None
 
-    print("Opening GEBCO bathymetry zip...")
-    gebco_vsi = f"/vsizip/{gebco_zip}"
-    files_in_zip = gdal.ReadDir(gebco_vsi)
-    tif_files = [
-        filename for filename in files_in_zip if filename.lower().endswith(".tif")
-    ]
-    if not tif_files:
+    try:
+        dataset = gdal.Open(ocean_background)
+    except RuntimeError as exc:
+        print(f"Warning: Could not open ocean mask source {ocean_background}: {exc}")
         return None
 
-    gebco_vrt_source = f".temp/gebco_source_{unique_id}.vrt"
-    tif_paths = [f"{gebco_vsi}/{filename}" for filename in tif_files]
-    gdal.BuildVRT(gebco_vrt_source, tif_paths)
-    return gebco_vrt_source
+    if dataset is None:
+        print(f"Warning: Could not open ocean mask source {ocean_background}")
+        return None
+
+    if get_ocean_mask_band_details(dataset) is None:
+        dataset = None
+        return None
+
+    dataset = None
+    return ocean_background
+
+
+def get_ocean_mask_band_details(dataset: gdal.Dataset) -> Optional[Tuple[int, bool]]:
+    """Return the mask band index and whether it should be treated as an alpha mask."""
+    if dataset.RasterCount == 1:
+        return 1, False
+
+    for band_index in range(1, dataset.RasterCount + 1):
+        if dataset.GetRasterBand(band_index).GetColorInterpretation() == gdal.GCI_AlphaBand:
+            return band_index, True
+
+    return None
 
 
 def populate_s3_cache(date_paths: List[str]) -> None:
@@ -377,6 +343,11 @@ def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
 
     # 100km is roughly 1 degree. We'll sample a grid around the center.
     ds = gdal.Open(gebco_src)
+    band_details = get_ocean_mask_band_details(ds)
+    if band_details is None:
+        return True
+    band_index, uses_alpha = band_details
+    band = ds.GetRasterBand(band_index)
     gt = ds.GetGeoTransform()
     inv_gt = gdal.InvGeoTransform(gt)
 
@@ -387,8 +358,8 @@ def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
             px, py = gdal.ApplyGeoTransform(inv_gt, clon + dlon, clat + dlat)
             px, py = int(px), int(py)
             if 0 <= px < ds.RasterXSize and 0 <= py < ds.RasterYSize:
-                val = ds.GetRasterBand(1).ReadAsArray(px, py, 1, 1)[0, 0]
-                if val > 0.001:
+                val = band.ReadAsArray(px, py, 1, 1)[0, 0]
+                if (uses_alpha and val < 254.5) or (not uses_alpha and val > 0.001):
                     has_land = True
                     break
         if has_land:
@@ -459,14 +430,6 @@ def mosaic_date_stacks(date_stacks: List[np.ndarray]) -> Tuple[np.ndarray, np.nd
     return averaged, valid_source_mask
 
 
-def download_tile_folders(
-    folders: List[Tuple[str, str]], cache_dir: str
-) -> None:
-    """Download every band for each folder and exit before raster processing."""
-    for folder_name, date_path in folders:
-        get_tile_paths(folder_name, date_path, cache_dir, download=True)
-
-
 def load_tile_grid(red_path: str) -> TileGrid:
     """Read the common raster grid metadata from the red band."""
     dataset = gdal.Open(red_path)
@@ -484,15 +447,19 @@ def open_gebco_mask(
     gebco_src: Optional[str],
     tile_grid: TileGrid,
     mgrs_subtile: str,
-) -> Tuple[Optional[gdal.Band], Optional[gdal.Dataset], Optional[np.ndarray]]:
+) -> Tuple[Optional[gdal.Band], Optional[gdal.Dataset], Optional[np.ndarray], bool]:
     """Warp GEBCO onto the tile grid so land/ocean blending can reuse it block-by-block."""
     if not gebco_src:
-        return None, None, None
+        return None, None, None, False
 
     try:
         gebco_ds = gdal.Open(gebco_src)
         if gebco_ds is None:
             raise RuntimeError(f"Could not open GEBCO source: {gebco_src}")
+        band_details = get_ocean_mask_band_details(gebco_ds)
+        if band_details is None:
+            raise RuntimeError(f"Could not find a usable mask band in: {gebco_src}")
+        band_index, uses_alpha = band_details
 
         try:
             mem_driver = gdal.GetDriverByName("MEM")
@@ -502,7 +469,13 @@ def open_gebco_mask(
             gebco_mem_ds.SetProjection(tile_grid.projection)
             gebco_mem_ds.SetGeoTransform(tile_grid.geotransform)
             gdal.Warp(
-                gebco_mem_ds, gebco_ds, options=gdal.WarpOptions(resampleAlg="bilinear")
+                gebco_mem_ds,
+                gebco_ds,
+                options=gdal.WarpOptions(
+                    resampleAlg="bilinear",
+                    srcBands=[band_index],
+                    dstBands=[1],
+                ),
             )
         finally:
             gebco_ds = None
@@ -511,10 +484,11 @@ def open_gebco_mask(
             gebco_mem_ds.GetRasterBand(1),
             gebco_mem_ds,
             np.zeros((tile_grid.height, tile_grid.width), dtype=bool),
+            uses_alpha,
         )
     except Exception as e:
         print(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
-        return None, None, None
+        return None, None, None, False
 
 
 def open_date_band_sets(
@@ -528,18 +502,6 @@ def open_date_band_sets(
         bands = [dataset.GetRasterBand(1) for dataset in datasets]
         date_band_sets.append((bands, datasets))
     return date_band_sets
-
-
-def read_rgb_block(
-    bands: List[gdal.Band], xoff: int, yoff: int, width: int, height: int
-) -> np.ndarray:
-    """Read a window of RGB data and convert Sentinel nodata to NaN."""
-    rgb_block = np.empty((3, height, width), dtype=np.float32)
-    for band_index, band in enumerate(bands):
-        block = band.ReadAsArray(xoff, yoff, width, height).astype(np.float32)
-        block[block == SENTINEL_NODATA] = np.nan
-        rgb_block[band_index] = block
-    return rgb_block
 
 
 def iter_processing_windows(tile_grid: TileGrid) -> Iterator[Tuple[int, int, int, int]]:
@@ -561,7 +523,11 @@ def average_block(
     valid_source_mask = np.zeros((height, width), dtype=bool)
 
     for bands, _ in date_band_sets:
-        rgb_block = read_rgb_block(bands, xoff, yoff, width, height)
+        rgb_block = np.empty((3, height, width), dtype=np.float32)
+        for band_index, band in enumerate(bands):
+            block = band.ReadAsArray(xoff, yoff, width, height).astype(np.float32)
+            block[block == SENTINEL_NODATA] = np.nan
+            rgb_block[band_index] = block
         complete_rgb_mask = np.all(np.isfinite(rgb_block), axis=0)
         if not np.any(complete_rgb_mask):
             continue
@@ -593,6 +559,7 @@ def average_tile_blocks(
     tile_grid: TileGrid,
     gebco_band: Optional[gdal.Band],
     fill_allowed_mask: Optional[np.ndarray],
+    mask_uses_alpha: bool,
 ) -> Tuple[np.ndarray, np.ndarray, bool]:
     """Average all tile windows while skipping pure-ocean blocks when GEBCO is available."""
     averaged = np.full((3, tile_grid.height, tile_grid.width), np.nan, dtype=np.float32)
@@ -605,7 +572,10 @@ def average_tile_blocks(
                 xoff, yoff, block_width, block_height
             ).astype(np.float32)
             assert fill_allowed_mask is not None
-            fill_allowed_block = gebco_block > OCEAN_FADE_DEPTH
+            if mask_uses_alpha:
+                fill_allowed_block = gebco_block < 254.5
+            else:
+                fill_allowed_block = gebco_block > OCEAN_FADE_DEPTH
             fill_allowed_mask[
                 yoff : yoff + block_height, xoff : xoff + block_width
             ] = fill_allowed_block
@@ -643,13 +613,6 @@ def fill_missing_pixels(
     return averaged
 
 
-def get_source_scale(args: argparse.Namespace) -> Tuple[float, float]:
-    """Resolve the source scaling range with the existing defaults."""
-    source_min = args.stats_min if args.stats_min is not None else 0.0
-    source_max = args.stats_max if args.stats_max is not None else 9000.0
-    return source_min, source_max
-
-
 def create_output_dataset(
     output_path: str, tile_grid: TileGrid
 ) -> Tuple[gdal.Dataset, List[gdal.Band], gdal.Band]:
@@ -676,38 +639,34 @@ def create_output_dataset(
 
 
 def build_alpha_block(
-    gebco_band: Optional[gdal.Band],
-    source_valid_mask: np.ndarray,
-    xoff: int,
-    yoff: int,
-    width: int,
-    height: int,
+    gebco_block: Optional[np.ndarray], source_valid_block: np.ndarray, mask_uses_alpha: bool
 ) -> np.ndarray:
     """Build the output alpha band for one block."""
-    if gebco_band is None:
-        return (
-            source_valid_mask[yoff : yoff + height, xoff : xoff + width].astype(np.uint8)
-            * 255
-        )
+    if gebco_block is None:
+        return source_valid_block.astype(np.uint8) * 255
 
-    gebco_block = gebco_band.ReadAsArray(xoff, yoff, width, height).astype(np.float32)
+    if mask_uses_alpha:
+        return np.clip(255.0 - gebco_block, 0.0, 255.0).astype(np.uint8)
+
     alpha_block = np.clip(
         (gebco_block - OCEAN_FADE_DEPTH) / (LAND_STAY_DEPTH - OCEAN_FADE_DEPTH), 0.0, 1.0
     )
-    return cast(np.ndarray, np.clip(alpha_block * 255.0, 0.0, 255.0).astype(np.uint8))
+    return np.clip(alpha_block * 255.0, 0.0, 255.0).astype(np.uint8)
 
 
 def write_processed_blocks(
     averaged: np.ndarray,
     source_valid_mask: np.ndarray,
     gebco_band: Optional[gdal.Band],
+    mask_uses_alpha: bool,
     tile_grid: TileGrid,
     args: argparse.Namespace,
     color_bands: List[gdal.Band],
     alpha_band: gdal.Band,
 ) -> None:
     """Convert averaged float data to byte RGB(A) output one block at a time."""
-    source_min, source_max = get_source_scale(args)
+    source_min = args.stats_min if args.stats_min is not None else 0.0
+    source_max = args.stats_max if args.stats_max is not None else 9000.0
     scale = source_max - source_min
     if scale <= 0.0:
         raise ValueError("stats_max must be greater than stats_min")
@@ -743,8 +702,18 @@ def write_processed_blocks(
         for band_index, out_band in enumerate(color_bands):
             out_band.WriteArray(byte_block[band_index], xoff=xoff, yoff=yoff)
 
+        source_valid_block = source_valid_mask[
+            yoff : yoff + block_height, xoff : xoff + block_width
+        ]
+        gebco_block = None
+        if gebco_band is not None:
+            gebco_block = gebco_band.ReadAsArray(
+                xoff, yoff, block_width, block_height
+            ).astype(np.float32)
         alpha_block = build_alpha_block(
-            gebco_band, source_valid_mask, xoff, yoff, block_width, block_height
+            gebco_block,
+            source_valid_block,
+            mask_uses_alpha,
         )
         alpha_band.WriteArray(alpha_block, xoff=xoff, yoff=yoff)
 
@@ -762,16 +731,6 @@ def warp_to_web_mercator(
     gdal.Warp(destination_path, source_path, options=warp_options)
 
 
-def close_date_band_sets(
-    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]]
-) -> None:
-    """Drop GDAL band and dataset handles opened for per-date reads."""
-    for bands, datasets in date_band_sets:
-        bands.clear()
-        datasets.clear()
-    date_band_sets.clear()
-
-
 def process_single_tile(
     mgrs_subtile: str,
     date_paths: List[str],
@@ -785,14 +744,15 @@ def process_single_tile(
         return None
 
     if args.download:
-        download_tile_folders(folders, args.cache)
+        for folder_name, date_path in folders:
+            get_tile_paths(folder_name, date_path, args.cache, download=True)
         return None
 
     first_folder, first_date = folders[0]
     paths = get_tile_paths(first_folder, first_date, args.cache, download=False)
     tile_grid = load_tile_grid(paths["red"])
 
-    gebco_band, _gebco_mem_ds, fill_allowed_mask = open_gebco_mask(
+    gebco_band, _gebco_mem_ds, fill_allowed_mask, mask_uses_alpha = open_gebco_mask(
         gebco_src, tile_grid, mgrs_subtile
     )
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
@@ -800,7 +760,7 @@ def process_single_tile(
         print(f"Processing tile {mgrs_subtile} across {len(folders)} date(s)...")
         date_band_sets = open_date_band_sets(folders, args.cache)
         averaged, source_valid_mask, found_non_ocean_pixels = average_tile_blocks(
-            date_band_sets, tile_grid, gebco_band, fill_allowed_mask
+            date_band_sets, tile_grid, gebco_band, fill_allowed_mask, mask_uses_alpha
         )
 
         if not found_non_ocean_pixels:
@@ -814,6 +774,7 @@ def process_single_tile(
             averaged,
             source_valid_mask,
             gebco_band,
+            mask_uses_alpha,
             tile_grid,
             args,
             color_bands,
@@ -826,14 +787,17 @@ def process_single_tile(
         os.remove(temp_utm_path)
         return temp_3857_path
     finally:
-        close_date_band_sets(date_band_sets)
+        for bands, datasets in date_band_sets:
+            bands.clear()
+            datasets.clear()
+        date_band_sets.clear()
         gebco_band = None
         fill_allowed_mask = None
 
 
 def calculate_estimates(args: argparse.Namespace) -> None:
     """Calculate and print estimations for the given command."""
-    date_paths = parse_date_paths(args.date)
+    date_paths = [date_path.strip() for date_path in args.date.split(",")]
     num_dates = len(date_paths)
 
     land_set = load_land_tiles("HLS.land.tiles.txt")
@@ -961,15 +925,15 @@ def main() -> None:
     )
 
     # Grading
-    parser.add_argument("--gamma", type=float, default=tiler.DEFAULT_GAMMA)
+    parser.add_argument("--gamma", type=float, default=2.6)
     parser.add_argument(
-        "--sat", "--saturation", type=float, default=tiler.PREVIEW_SATURATION
+        "--sat", "--saturation", type=float, default=0.9
     )
     parser.add_argument(
-        "--db", "--black-break", type=float, default=tiler.PREVIEW_DARKEN_BREAK
+        "--db", "--black-break", type=float, default=0.15
     )
     parser.add_argument(
-        "--ls", "--black-slope", type=float, default=tiler.PREVIEW_DARKEN_LOW_SLOPE
+        "--ls", "--black-slope", type=float, default=0.2
     )
 
     parser.add_argument(
@@ -1039,13 +1003,14 @@ def main() -> None:
         if resume_path:
             resume_state = restore_resume_state(resume_path)
             if resume_state:
-                state_file = resume_state.state_file
-                unique_id = resume_state.unique_id
-                completed_subtiles = resume_state.completed_subtiles
-                processed_tifs = resume_state.processed_tifs
+                state_file = cast(str, resume_state["state_file"])
+                unique_id = cast(str, resume_state["unique_id"])
+                completed_subtiles = cast(Set[str], resume_state["completed_subtiles"])
+                processed_tifs = cast(List[str], resume_state["processed_tifs"])
 
-    date_paths = parse_date_paths(args.date)
-    gebco_vrt_source = build_gebco_vrt(unique_id)
+    requested_bbox = parse_bbox(args.bbox) if args.bbox else None
+    date_paths = [date_path.strip() for date_path in args.date.split(",")]
+    gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
 
     if args.all_tiles:
         populate_s3_cache(date_paths)
@@ -1076,9 +1041,17 @@ def main() -> None:
                     completed_subtiles.add(st)
                     if res:
                         processed_tifs.append(res)
-                    save_state(
-                        state_file, unique_id, completed_subtiles, processed_tifs, args
-                    )
+                    with open(state_file, "w") as f:
+                        json.dump(
+                            {
+                                "unique_id": unique_id,
+                                "completed_subtiles": list(completed_subtiles),
+                                "processed_tifs": processed_tifs,
+                                "args": vars(args),
+                            },
+                            f,
+                            indent=2,
+                        )
         else:
             print("All sub-tiles already processed.")
     else:
@@ -1118,6 +1091,10 @@ def main() -> None:
         "description": "Copernicus Sentinel data",
         "unique_id": unique_id,
     }
+    if requested_bbox is not None:
+        tiling_opts["chunk_bounds"] = tiler.lonlat_bbox_to_mercator_bounds(
+            *requested_bbox
+        )
 
     print("Generating MBTiles...")
     artifacts = tiler.run_tiling_simplified(master_vrt, temp_mbtiles, tiling_opts)
@@ -1133,7 +1110,8 @@ def main() -> None:
             except OSError:
                 pass
 
-    delete_state(state_file)
+    if os.path.exists(state_file):
+        os.remove(state_file)
 
 
 if __name__ == "__main__":

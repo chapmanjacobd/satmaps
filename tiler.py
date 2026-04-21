@@ -14,6 +14,7 @@ from osgeo import gdal
 gdal.UseExceptions()
 
 WEB_MERCATOR_LIMIT = 20037508.342789244
+WEB_MERCATOR_MAX_LAT = 85.0511287798066
 ProjWin = Tuple[float, float, float, float]
 ChunkTask = Tuple[str, str, str, Dict[str, Any], ProjWin]
 RGB_COLOR_INTERPRETATIONS = ("Red", "Green", "Blue")
@@ -157,6 +158,30 @@ class TilingArtifacts:
     cleanup_paths: List[str]
 
 
+def lonlat_to_3857(lon: float, lat: float) -> Tuple[float, float]:
+    """Convert lon/lat degrees to Web Mercator meters."""
+    clamped_lat = min(max(lat, -WEB_MERCATOR_MAX_LAT), WEB_MERCATOR_MAX_LAT)
+    x_meters = lon * WEB_MERCATOR_LIMIT / 180
+    y_meters = (
+        math.log(math.tan((90 + clamped_lat) * math.pi / 360))
+        / (math.pi / 180)
+        * WEB_MERCATOR_LIMIT
+        / 180
+    )
+    return x_meters, y_meters
+
+
+def lonlat_bbox_to_mercator_bounds(
+    min_lon: float, min_lat: float, max_lon: float, max_lat: float
+) -> ProjWin:
+    """Convert a WGS84 bbox into projWin-style Web Mercator bounds."""
+    west_x, south_y = lonlat_to_3857(min_lon, min_lat)
+    east_x, north_y = lonlat_to_3857(max_lon, max_lat)
+    return min(west_x, east_x), max(north_y, south_y), max(west_x, east_x), min(
+        north_y, south_y
+    )
+
+
 def get_web_mercator_bounds(
     z: int, x: int, y: int
 ) -> Tuple[float, float, float, float]:
@@ -167,16 +192,6 @@ def get_web_mercator_bounds(
     # Latitude calculation (Slippy map tilenames)
     lat1 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
     lat2 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
-
-    def lonlat_to_3857(lon: float, lat: float) -> Tuple[float, float]:
-        x_meters = lon * WEB_MERCATOR_LIMIT / 180
-        y_meters = (
-            math.log(math.tan((90 + lat) * math.pi / 360))
-            / (math.pi / 180)
-            * WEB_MERCATOR_LIMIT
-            / 180
-        )
-        return x_meters, y_meters
 
     x1, y1 = lonlat_to_3857(lon1, lat1)
     x2, y2 = lonlat_to_3857(lon2, lat2)
@@ -459,8 +474,13 @@ def run_tiling_simplified(
 
     # Determine chunks from the Byte VRT.
     ds = gdal.Open(input_vrt)
-    bounds = get_dataset_bounds(ds)
+    dataset_bounds = get_dataset_bounds(ds)
     ds = None
+
+    requested_bounds = cast(ProjWin, options.get("chunk_bounds", dataset_bounds))
+    bounds = intersect_proj_win(requested_bounds, dataset_bounds)
+    if bounds is None:
+        raise RuntimeError("Requested chunk bounds do not intersect the input raster")
 
     tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, chunk_zoom)
 

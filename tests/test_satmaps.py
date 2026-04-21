@@ -683,6 +683,81 @@ def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path
     assert np.any((alpha > 0) & (alpha < 255))
 
 
+def test_process_single_tile_with_rgba_ocean_alpha_mask(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    monkeypatch.setattr(
+        "satmaps.list_mosaic_folders_for_tile",
+        lambda tile, dates, cache: [
+            ("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")
+        ],
+    )
+
+    def fake_get_tile_paths(folder, date, cache, download=False):
+        p = {}
+        for b in ["red", "green", "blue"]:
+            path = tmp_path / f"{b}.tif"
+            if not path.exists():
+                driver = gdal.GetDriverByName("GTiff")
+                ds = driver.Create(str(path), 10, 10, 1, gdal.GDT_Int16)
+                ds.SetGeoTransform((0, 1, 0, 10, 0, -1))
+                srs = osr.SpatialReference()
+                srs.ImportFromEPSG(32631)
+                ds.SetProjection(srs.ExportToWkt())
+                ds.GetRasterBand(1).Fill(1000)
+                ds = None
+            p[b] = str(path)
+        return p
+
+    monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
+
+    ocean_path = tmp_path / "ocean_rgba.tif"
+    ocean_ds = gdal.GetDriverByName("GTiff").Create(str(ocean_path), 10, 10, 4, gdal.GDT_Byte)
+    ocean_ds.SetGeoTransform((0, 1, 0, 10, 0, -1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32631)
+    ocean_ds.SetProjection(srs.ExportToWkt())
+    for band_index in range(1, 4):
+        ocean_ds.GetRasterBand(band_index).Fill(0)
+    alpha_values = np.full((10, 10), 255, dtype=np.uint8)
+    alpha_values[:, :5] = 0
+    ocean_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    ocean_ds.GetRasterBand(4).WriteArray(alpha_values)
+    ocean_ds = None
+
+    args = argparse.Namespace(
+        cache=".cache",
+        download=False,
+        stats_min=0,
+        stats_max=10000,
+        tonemap=True,
+        grade=True,
+        sb=0.3,
+        hb=0.75,
+        ss=1.4,
+        ms=0.9,
+        hs=0.5,
+        exposure=1.0,
+        gamma=1.0,
+        sat=0.9,
+        db=0.7,
+        ls=0.7,
+        resample_alg="near",
+    )
+
+    out_path = process_single_tile("31TDF_0_0", ["2025/07/01"], args, "ocean", str(ocean_path))
+
+    assert out_path is not None
+    out_ds = gdal.Open(out_path)
+    assert out_ds is not None
+    alpha = out_ds.GetRasterBand(4).ReadAsArray()
+    assert np.any(alpha == 255)
+    assert np.any(alpha == 0)
+
+
 def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
@@ -715,6 +790,106 @@ def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
     assert len(master_vrts) == 1
 
 
+def test_main_passes_ocean_background_path_to_tile_processing(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    custom_ocean_path = tmp_path / "custom-ocean.tif"
+    custom_ocean_ds = gdal.GetDriverByName("GTiff").Create(
+        str(custom_ocean_path), 1, 1, 1, gdal.GDT_Byte
+    )
+    assert custom_ocean_ds is not None
+    custom_ocean_ds.GetRasterBand(1).Fill(1)
+    custom_ocean_ds = None
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "satmaps.py",
+            "31TDF",
+            "--vrt",
+            "--parallel",
+            "1",
+            "--date",
+            "2025/07/01",
+            "--ocean-background",
+            str(custom_ocean_path),
+        ],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    gebco_sources: list[str | None] = []
+
+    def fake_process_single_tile(st, dates, args, uid, gebco_src=None):
+        gebco_sources.append(gebco_src)
+        path = tmp_path / f"processed_{st}.tif"
+        path.write_text("fake tif")
+        return str(path)
+
+    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
+    monkeypatch.setattr(
+        "satmaps.gdal.BuildVRT",
+        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+    )
+
+    main()
+
+    assert gebco_sources
+    assert set(gebco_sources) == {str(custom_ocean_path)}
+
+
+def test_main_uses_rgba_ocean_background_as_alpha_mask_source(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    custom_ocean_path = tmp_path / "custom-ocean.tif"
+    custom_ocean_ds = gdal.GetDriverByName("GTiff").Create(
+        str(custom_ocean_path), 1, 1, 4, gdal.GDT_Byte
+    )
+    assert custom_ocean_ds is not None
+    for band_index in range(1, 5):
+        custom_ocean_ds.GetRasterBand(band_index).Fill(band_index)
+    custom_ocean_ds = None
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "satmaps.py",
+            "31TDF",
+            "--vrt",
+            "--parallel",
+            "1",
+            "--date",
+            "2025/07/01",
+            "--ocean-background",
+            str(custom_ocean_path),
+        ],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    gebco_sources: list[str | None] = []
+
+    def fake_process_single_tile(st, dates, args, uid, gebco_src=None):
+        gebco_sources.append(gebco_src)
+        path = tmp_path / f"processed_{st}.tif"
+        path.write_text("fake tif")
+        return str(path)
+
+    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
+    monkeypatch.setattr(
+        "satmaps.gdal.BuildVRT",
+        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+    )
+
+    main()
+
+    assert gebco_sources
+    assert gebco_sources
+    assert set(gebco_sources) == {str(custom_ocean_path)}
+
+
 def test_main_bbox_uses_standalone_ocean_background(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
@@ -740,6 +915,45 @@ def test_main_bbox_uses_standalone_ocean_background(monkeypatch: object, tmp_pat
     master_vrts = list(tmp_path.glob(".temp/master_*.vrt"))
     assert len(master_vrts) == 1
     assert buildvrt_sources[-1][0] == "ocean.tif"
+
+
+def test_main_bbox_passes_chunk_bounds_to_tiler(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    ocean_background_path = tmp_path / "ocean.tif"
+    ocean_ds = gdal.GetDriverByName("GTiff").Create(
+        str(ocean_background_path), 1, 1, 1, gdal.GDT_Byte
+    )
+    assert ocean_ds is not None
+    ocean_ds.GetRasterBand(1).Fill(1)
+    ocean_ds = None
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "--bbox", "0,0,1,1", "--no-land", "--parallel", "1"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr(
+        "satmaps.gdal.BuildVRT",
+        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+    )
+    captured_options: dict[str, object] = {}
+
+    def fake_run_tiling_simplified(input_vrt: str, output_mbtiles: str, options: dict[str, object]):
+        captured_options.update(options)
+        return satmaps.tiler.TilingArtifacts(final_vrt=input_vrt, cleanup_paths=[])
+
+    monkeypatch.setattr("satmaps.tiler.run_tiling_simplified", fake_run_tiling_simplified)
+    monkeypatch.setattr("satmaps.subprocess.run", lambda cmd, check: None)
+
+    main()
+
+    assert captured_options["chunk_bounds"] == satmaps.tiler.lonlat_bbox_to_mercator_bounds(
+        0.0, 0.0, 1.0, 1.0
+    )
 
 
 def test_main_non_bbox_can_use_standalone_ocean_background(

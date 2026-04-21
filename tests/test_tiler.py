@@ -9,6 +9,7 @@ from osgeo import gdal, osr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import tiler as tiler_module
 from tiler import (
     WEB_MERCATOR_LIMIT,
     apply_preview_correction_numpy,
@@ -16,6 +17,7 @@ from tiler import (
     get_chunk_tile_range,
     get_web_mercator_bounds,
     intersect_proj_win,
+    lonlat_bbox_to_mercator_bounds,
     merge_mbtiles,
     proj_win_to_src_win,
     run_tiling_simplified,
@@ -49,6 +51,12 @@ def test_intersect_proj_win_clamps_partial_overlap() -> None:
 
 def test_intersect_proj_win_rejects_touching_window() -> None:
     assert intersect_proj_win((10.0, 10.0, 20.0, 0.0), (0.0, 10.0, 10.0, 0.0)) is None
+
+
+def test_lonlat_bbox_to_mercator_bounds_matches_chunk_tile() -> None:
+    tile_bounds = get_web_mercator_bounds(4, 8, 7)
+    bbox_bounds = lonlat_bbox_to_mercator_bounds(0.0, 0.0, 22.5, 21.943045533438177)
+    np.testing.assert_allclose(bbox_bounds, tile_bounds, atol=1e-6)
 
 
 def test_merge_mbtiles_merges_all_attached_tile_tables(tmp_path: Path) -> None:
@@ -206,6 +214,60 @@ def test_run_tiling_simplified_creates_mbtiles(
     count = conn.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
     conn.close()
     assert count > 0
+
+
+def test_run_tiling_simplified_uses_explicit_chunk_bounds(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    input_path = tmp_path / "world.tif"
+    dataset = gdal.GetDriverByName("GTiff").Create(str(input_path), 16, 16, 3, gdal.GDT_Byte)
+    dataset.SetGeoTransform(
+        (
+            -WEB_MERCATOR_LIMIT,
+            (WEB_MERCATOR_LIMIT * 2) / 16,
+            0.0,
+            WEB_MERCATOR_LIMIT,
+            0.0,
+            -(WEB_MERCATOR_LIMIT * 2) / 16,
+        )
+    )
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset.SetProjection(srs.ExportToWkt())
+    dataset = None
+
+    requested_bounds = get_web_mercator_bounds(4, 8, 7)
+    seen_proj_wins: list[tuple[float, float, float, float]] = []
+
+    def fake_process_chunk(task):
+        seen_proj_wins.append(task[-1])
+        return ""
+
+    monkeypatch.setattr(tiler_module, "process_chunk", fake_process_chunk)
+    monkeypatch.setattr(tiler_module, "merge_mbtiles", lambda output, chunks: None)
+    monkeypatch.setattr(tiler_module, "finalize_mbtiles_metadata", lambda path: None)
+    monkeypatch.setattr(tiler_module.subprocess, "run", lambda cmd, check: None)
+
+    run_tiling_simplified(
+        str(input_path),
+        str(tmp_path / "output.mbtiles"),
+        {
+            "format": "png",
+            "quality": 75,
+            "resample_alg": "bilinear",
+            "chunk_zoom": 4,
+            "processes": 1,
+            "unique_id": "test-explicit-bounds",
+            "name": "Test",
+            "description": "Test",
+            "chunk_bounds": requested_bounds,
+        },
+    )
+
+    assert seen_proj_wins == [requested_bounds]
 
 
 @pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")

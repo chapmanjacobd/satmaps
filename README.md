@@ -55,7 +55,6 @@ python3 ocean_background.py --vrt
 ```
 
 The first positional argument is the GEBCO zip path if you need something other than `gebco_2025_sub_ice_topo_geotiff.zip`, and the optional second positional argument is the output path (default: `ocean.tif`, or `ocean.vrt` when `--vrt` is used).
-Ocean-specific tone mapping, grading, and depth-ramp tuning now live in `ocean_background.py`; `satmaps.py` composites land tiles over that prebuilt background.
 
 ### 3. Generate PMTiles
 
@@ -68,11 +67,11 @@ python3 satmaps.py 31TDF -o barcelona.pmtiles
 # Multiple tiles with custom quality and format
 python3 satmaps.py 31TCF,31TDF,31TCE,31TDE --format webp --quality 80 -o region.pmtiles
 
-# BBox render using the prebuilt standalone ocean background
+# BBox render using either a global or bbox-matched standalone ocean background
 python3 satmaps.py --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii.pmtiles
 
-# Global run using a land-only filter
-python3 satmaps.py --global --land-only HLS.land.tiles.txt --ocean-background ocean.tif -o global.pmtiles
+# Global run using the auto-detected HLS.land.tiles.txt land filter
+python3 satmaps.py --global --ocean-background ocean.tif -o global.pmtiles
 ```
 
 ### 4. Estimate Resources
@@ -80,18 +79,40 @@ python3 satmaps.py --global --land-only HLS.land.tiles.txt --ocean-background oc
 Before a global run, estimate the time and storage required:
 
 ```bash
-python3 satmaps.py --global --land-only HLS.land.tiles.txt --estimate
+python3 satmaps.py --global --estimate
 ```
 
 ## Advanced Options
 
+- `--global`: Process all land tiles listed in `HLS.land.tiles.txt`. If that file is missing, global mode exits with an error.
+- `--bbox`: Discover MGRS tiles touched by a WGS84 bbox (`min_lon,min_lat,max_lon,max_lat`).
 - `--date`: Comma-separated list of mosaic dates (default: `2025/07/01,2025/01/01`). Overlapping areas are averaged.
+- `--format`: Output tile format (`webp`, `jpg`, `png`, `png8`).
+- `--quality`: Output tile quality for lossy formats.
 - `--resample-alg`: Resampling algorithm (`lanczos`, `bilinear`, `average`, `gauss`).
-- `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`).
-- `--no-soft-knee`: Disable the multi-segment tone mapping curve.
-- `--no-grading`: Disable final saturation and gamma adjustments.
+- `--chunk-zoom`: Chunking zoom used during MBTiles generation (default: `4`).
+- `--parallel`: Number of worker processes/threads used for tile processing and chunk generation (default: `2`).
+- `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
+- `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs clip chunk generation to the requested bbox even when this raster is global.
+- `--land` / `--no-land`: Enable or skip Sentinel-2 land tile processing entirely.
+- `--tonemap` / `--no-tonemap`: Enable or disable the land tone-mapping stage.
+- `--grade` / `--no-grade`: Enable or disable final land grading.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
+- `--download`: Download source tiles into the cache and exit without building output tiles.
+- `--resume [STATE_FILE]`: Resume a previous run from a saved `.temp/state_*.json`; without a path, the newest state file is used.
+- `--estimate`: Print estimated time, RAM, disk, and network usage, then exit.
 - `--vrt`: Generate the final VRT and exit (useful for inspection in QGIS).
+
+### Ocean Background Options
+
+`ocean_background.py` supports the same tone-mapping controls as `satmaps.py`, plus:
+
+- `--bbox`: Export a Web Mercator ocean background cropped to a WGS84 bbox.
+- `--hillshade-z`: Vertical exaggeration passed to `gdaldem hillshade`.
+- `--depth-min` / `--depth-max`: Depth range mapped onto the ocean color ramp.
+- `--resample-alg`: GEBCO upscale kernel (`cubicspline` or `lanczos`).
+- `--temp-dir`: Directory for intermediate rasters/VRTs.
+- `--vrt`: Write the final styled RGBA VRT instead of translating to GeoTIFF.
 
 ### Tone Mapping Parameters
 
@@ -104,13 +125,14 @@ You can override the defaults (tuned via `tuner_ui.py`):
 
 ## Technical Details
 
-1.  Discovery: Lists S3 folders for requested MGRS tiles and dates.
-2.  Mosaicking: Builds VRTs that combine bands (B04, B03, B02) and average multiple dates to reduce cloud artifacts.
-3.  Reprojection: Warps data to Web Mercator (EPSG:3857).
-4.  Processing (NumPy):
+1.  Discovery: Lists S3 folders for requested MGRS tiles and dates, or discovers touched MGRS tiles from `--bbox`.
+2.  Mosaicking: Opens RGB bands (B04, B03, B02) for each date and averages complete observations to reduce cloud artifacts.
+3.  Masking: Optionally warps the configured ocean background onto each tile grid so coastal alpha and fill decisions can be made block-by-block.
+4.  Reprojection: Warps processed land tiles to Web Mercator (EPSG:3857) and composites them with the standalone ocean background.
+5.  Processing (NumPy):
     - Soft-Knee Tone Mapping: A 3-segment linear curve to compress high dynamic range while preserving local contrast.
     - Color Grading: Saturation adjustment and gamma correction for a "natural" look.
-5.  Packaging: Tiles are generated in chunks, merged into an MBTiles database, and converted to PMTiles.
+6.  Packaging: The merged Web Mercator VRT is split into XYZ-aligned chunks at `--chunk-zoom`, each chunk is translated into MBTiles, those MBTiles are merged, and the result is converted to PMTiles. For `--bbox` runs, chunk selection is clipped to the requested bbox instead of the full background extent.
 
 ## Datasets
 
