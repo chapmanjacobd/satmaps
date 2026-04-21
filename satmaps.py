@@ -7,7 +7,8 @@ import subprocess
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 import mgrs
 import numpy as np
@@ -20,6 +21,49 @@ import tiler
 gdal.UseExceptions()
 
 AUTO_SCALE_MAX_PERCENTILE = 99.6
+DATE_PATH_QUARTERS = (
+    ("07/01", "Q3"),
+    ("10/01", "Q4"),
+    ("04/01", "Q2"),
+    ("01/01", "Q1"),
+)
+RGB_BANDS = (("B04", "red"), ("B03", "green"), ("B02", "blue"))
+SUBTILE_OFFSETS = ((0, 0), (0, 1), (1, 0), (1, 1))
+SENTINEL_NODATA = -32768
+PROCESS_BLOCK_SIZE = 1024
+LAND_STAY_DEPTH = -42.0
+OCEAN_FADE_DEPTH = -50.0
+
+
+@dataclass(frozen=True)
+class TileGrid:
+    projection: str
+    geotransform: Tuple[float, float, float, float, float, float]
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class ResumeState:
+    state_file: str
+    unique_id: str
+    completed_subtiles: Set[str]
+    processed_tifs: List[str]
+
+
+def infer_quarter(date_path: str) -> str:
+    """Infer the quarterly mosaic label from a date path."""
+    for marker, quarter in DATE_PATH_QUARTERS:
+        if marker in date_path:
+            return quarter
+    return "Q3"
+
+
+def parse_date_paths(date_arg: str) -> List[str]:
+    """Split the comma-separated --date argument into individual paths."""
+    return [date_path.strip() for date_path in date_arg.split(",")]
+
+
 # --- State Management ---
 
 
@@ -41,12 +85,12 @@ def save_state(
         json.dump(state, f, indent=2)
 
 
-def load_state(state_file: str) -> Optional[Dict]:
+def load_state(state_file: str) -> Optional[Dict[str, Any]]:
     """Load the processing state from the JSON file if it exists."""
     if os.path.exists(state_file):
         try:
             with open(state_file, "r") as f:
-                return json.load(f)
+                return cast(Dict[str, Any], json.load(f))
         except Exception as e:
             print(f"Warning: Could not load state file: {e}")
     return None
@@ -75,7 +119,7 @@ def setup_gdal_cdse() -> None:
 
 
 # Global cache for S3 folder listings to avoid per-tile discovery overhead
-S3_FOLDER_CACHE: Dict[str, set] = {}
+S3_FOLDER_CACHE: Dict[str, set[str]] = {}
 
 
 def list_mosaic_folders_for_tile(
@@ -86,16 +130,7 @@ def list_mosaic_folders_for_tile(
     found = []
 
     for date_path in date_paths:
-        quarter = "Q3"
-        if "07/01" in date_path:
-            quarter = "Q3"
-        elif "10/01" in date_path:
-            quarter = "Q4"
-        elif "04/01" in date_path:
-            quarter = "Q2"
-        elif "01/01" in date_path:
-            quarter = "Q1"
-
+        quarter = infer_quarter(date_path)
         year = date_path.split("/")[0]
         folder = f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs_id}_{x}_{y}"
 
@@ -132,13 +167,12 @@ def get_tile_paths(
     """Construct local or S3 paths for RGB bands. Only downloads if 'download' is True."""
     cache_prefix = "_".join(folder_name.split("_")[4:])
     base_s3 = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder_name}"
-    bands = {"B04": "red", "B03": "green", "B02": "blue"}
     paths = {}
 
     date_cache_dir = (
         os.path.join(cache_dir, date_path.replace("/", "-")) if cache_dir else None
     )
-    for band_id, color_name in bands.items():
+    for band_id, color_name in RGB_BANDS:
         local_path = (
             os.path.join(date_cache_dir, f"{cache_prefix}_{band_id}.tif")
             if date_cache_dir
@@ -168,6 +202,166 @@ def get_tile_paths(
         paths[color_name] = f"{base_s3}/{band_id}.tif"
 
     return paths
+
+
+def load_land_tiles(land_only_file: str) -> Optional[Set[str]]:
+    """Load the precomputed land tile list if present."""
+    if not os.path.exists(land_only_file):
+        return None
+
+    with open(land_only_file, "r") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def parse_bbox(bbox: str) -> Tuple[float, float, float, float]:
+    """Parse a bbox argument or exit with the existing CLI error message."""
+    try:
+        min_lon, min_lat, max_lon, max_lat = (float(value) for value in bbox.split(","))
+        return min_lon, min_lat, max_lon, max_lat
+    except ValueError:
+        print(f"Error: Invalid bbox format: {bbox}")
+        sys.exit(1)
+
+
+def discover_mgrs_tiles_in_bbox(
+    min_lon: float, min_lat: float, max_lon: float, max_lat: float
+) -> List[str]:
+    """Discover the 100 km MGRS tiles touched by a bbox."""
+    m_converter = mgrs.MGRS()
+    discovered_mgrs: Set[str] = set()
+    lon_steps = int((max_lon - min_lon) / 0.1) + 2
+    lat_steps = int((max_lat - min_lat) / 0.1) + 2
+
+    for i in range(lon_steps):
+        lon = min(min_lon + i * 0.1, max_lon)
+        for j in range(lat_steps):
+            lat = min(min_lat + j * 0.1, max_lat)
+            try:
+                mgrs_res = m_converter.toMGRS(lat, lon, MGRSPrecision=0)
+                mgrs_str = (
+                    mgrs_res.decode("utf-8") if isinstance(mgrs_res, bytes) else mgrs_res
+                )
+                discovered_mgrs.add(mgrs_str)
+            except Exception:
+                continue
+
+    return list(discovered_mgrs)
+
+
+def filter_mgrs_tiles(
+    discovered_mgrs: List[str],
+    land_set: Optional[Set[str]],
+    gebco_vrt_source: Optional[str],
+) -> List[str]:
+    """Keep only tiles that should participate in land rendering."""
+    mgrs_bases = []
+    for mgrs_tile in discovered_mgrs:
+        is_land = False
+        if land_set and mgrs_tile in land_set:
+            is_land = True
+        elif gebco_vrt_source and check_land_gebco(mgrs_tile, gebco_vrt_source):
+            is_land = True
+        elif land_set is None:
+            is_land = True
+
+        if is_land:
+            mgrs_bases.append(mgrs_tile)
+
+    return mgrs_bases
+
+
+def discover_mgrs_bases(
+    args: argparse.Namespace,
+    land_set: Optional[Set[str]],
+    gebco_vrt_source: Optional[str],
+) -> List[str]:
+    """Resolve the requested MGRS tile list from bbox, global, or explicit inputs."""
+    if args.bbox:
+        min_lon, min_lat, max_lon, max_lat = parse_bbox(args.bbox)
+        discovered_mgrs = discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat)
+        mgrs_bases = filter_mgrs_tiles(discovered_mgrs, land_set, gebco_vrt_source)
+        print(
+            f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} kept after GEBCO/land filtering."
+        )
+        return mgrs_bases
+
+    if args.all_tiles:
+        if land_set is not None:
+            return list(land_set)
+        print("Error: --global requires HLS.land.tiles.txt to be present.")
+        sys.exit(1)
+
+    return [mgrs_tile.strip() for mgrs_tile in args.mgrs.split(",") if mgrs_tile.strip()]
+
+
+def expand_subtiles(mgrs_bases: List[str]) -> List[str]:
+    """Expand each 100 km MGRS tile into its four processing subtiles."""
+    return [
+        f"{mgrs_tile}_{x}_{y}"
+        for mgrs_tile in mgrs_bases
+        for x, y in SUBTILE_OFFSETS
+    ]
+
+
+def find_resume_path(resume_arg: object) -> Optional[str]:
+    """Resolve the explicit or latest state file path for --resume."""
+    if isinstance(resume_arg, str) and os.path.exists(resume_arg):
+        return resume_arg
+
+    states = glob.glob(".temp/state_*.json")
+    if not states:
+        return None
+    return max(states, key=os.path.getmtime)
+
+
+def restore_resume_state(resume_path: str) -> Optional[ResumeState]:
+    """Load a previous run state and keep only surviving intermediate files."""
+    state = load_state(resume_path)
+    if not state:
+        return None
+
+    unique_id = state["unique_id"]
+    completed_subtiles = set(state["completed_subtiles"])
+    processed_tifs = [path for path in state["processed_tifs"] if os.path.exists(path)]
+    print(f"Resuming from state file: {resume_path} (unique_id: {unique_id})")
+    print(
+        f"Already completed {len(completed_subtiles)} sub-tiles, {len(processed_tifs)} TIFs found."
+    )
+    return ResumeState(resume_path, unique_id, completed_subtiles, processed_tifs)
+
+
+def build_gebco_vrt(
+    unique_id: str, gebco_zip: str = "gebco_2025_sub_ice_topo_geotiff.zip"
+) -> Optional[str]:
+    """Build a temporary GEBCO source VRT when the zip archive is available."""
+    if not os.path.exists(gebco_zip):
+        return None
+
+    print("Opening GEBCO bathymetry zip...")
+    gebco_vsi = f"/vsizip/{gebco_zip}"
+    files_in_zip = gdal.ReadDir(gebco_vsi)
+    tif_files = [
+        filename for filename in files_in_zip if filename.lower().endswith(".tif")
+    ]
+    if not tif_files:
+        return None
+
+    gebco_vrt_source = f".temp/gebco_source_{unique_id}.vrt"
+    tif_paths = [f"{gebco_vsi}/{filename}" for filename in tif_files]
+    gdal.BuildVRT(gebco_vrt_source, tif_paths)
+    return gebco_vrt_source
+
+
+def populate_s3_cache(date_paths: List[str]) -> None:
+    """Cache remote folder listings for global runs."""
+    print("Populating S3 folder cache...")
+    for date_path in date_paths:
+        s3_base = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}"
+        dirs = gdal.ReadDir(s3_base)
+        if dirs:
+            S3_FOLDER_CACHE[date_path] = set(dirs)
+        else:
+            print(f"Warning: Could not list folders for {date_path}")
 
 
 # --- Processing Layer (NumPy Manipulation) ---
@@ -200,6 +394,8 @@ def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
         if has_land:
             break
     return has_land
+
+
 def fill_nan_nearest(
     arr: np.ndarray, valid_mask: Optional[np.ndarray] = None
 ) -> np.ndarray:
@@ -263,6 +459,320 @@ def mosaic_date_stacks(date_stacks: List[np.ndarray]) -> Tuple[np.ndarray, np.nd
     return averaged, valid_source_mask
 
 
+def download_tile_folders(
+    folders: List[Tuple[str, str]], cache_dir: str
+) -> None:
+    """Download every band for each folder and exit before raster processing."""
+    for folder_name, date_path in folders:
+        get_tile_paths(folder_name, date_path, cache_dir, download=True)
+
+
+def load_tile_grid(red_path: str) -> TileGrid:
+    """Read the common raster grid metadata from the red band."""
+    dataset = gdal.Open(red_path)
+    tile_grid = TileGrid(
+        projection=dataset.GetProjection(),
+        geotransform=dataset.GetGeoTransform(),
+        width=dataset.RasterXSize,
+        height=dataset.RasterYSize,
+    )
+    dataset = None
+    return tile_grid
+
+
+def open_gebco_mask(
+    gebco_src: Optional[str],
+    tile_grid: TileGrid,
+    mgrs_subtile: str,
+) -> Tuple[Optional[gdal.Band], Optional[gdal.Dataset], Optional[np.ndarray]]:
+    """Warp GEBCO onto the tile grid so land/ocean blending can reuse it block-by-block."""
+    if not gebco_src:
+        return None, None, None
+
+    try:
+        gebco_ds = gdal.Open(gebco_src)
+        if gebco_ds is None:
+            raise RuntimeError(f"Could not open GEBCO source: {gebco_src}")
+
+        try:
+            mem_driver = gdal.GetDriverByName("MEM")
+            gebco_mem_ds = mem_driver.Create(
+                "", tile_grid.width, tile_grid.height, 1, gdal.GDT_Float32
+            )
+            gebco_mem_ds.SetProjection(tile_grid.projection)
+            gebco_mem_ds.SetGeoTransform(tile_grid.geotransform)
+            gdal.Warp(
+                gebco_mem_ds, gebco_ds, options=gdal.WarpOptions(resampleAlg="bilinear")
+            )
+        finally:
+            gebco_ds = None
+
+        return (
+            gebco_mem_ds.GetRasterBand(1),
+            gebco_mem_ds,
+            np.zeros((tile_grid.height, tile_grid.width), dtype=bool),
+        )
+    except Exception as e:
+        print(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
+        return None, None, None
+
+
+def open_date_band_sets(
+    folders: List[Tuple[str, str]], cache_dir: str
+) -> List[Tuple[List[gdal.Band], List[gdal.Dataset]]]:
+    """Open RGB band handles for every date so block reads stay sequential."""
+    date_band_sets = []
+    for folder_name, date_path in folders:
+        paths = get_tile_paths(folder_name, date_path, cache_dir, download=False)
+        datasets = [gdal.Open(paths[color_name]) for _, color_name in RGB_BANDS]
+        bands = [dataset.GetRasterBand(1) for dataset in datasets]
+        date_band_sets.append((bands, datasets))
+    return date_band_sets
+
+
+def read_rgb_block(
+    bands: List[gdal.Band], xoff: int, yoff: int, width: int, height: int
+) -> np.ndarray:
+    """Read a window of RGB data and convert Sentinel nodata to NaN."""
+    rgb_block = np.empty((3, height, width), dtype=np.float32)
+    for band_index, band in enumerate(bands):
+        block = band.ReadAsArray(xoff, yoff, width, height).astype(np.float32)
+        block[block == SENTINEL_NODATA] = np.nan
+        rgb_block[band_index] = block
+    return rgb_block
+
+
+def average_block(
+    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]],
+    xoff: int,
+    yoff: int,
+    width: int,
+    height: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Average one block across all dates while requiring complete RGB observations."""
+    summed = np.zeros((3, height, width), dtype=np.float32)
+    valid_counts = np.zeros((height, width), dtype=np.uint16)
+    valid_source_mask = np.zeros((height, width), dtype=bool)
+
+    for bands, _ in date_band_sets:
+        rgb_block = read_rgb_block(bands, xoff, yoff, width, height)
+        complete_rgb_mask = np.all(np.isfinite(rgb_block), axis=0)
+        if not np.any(complete_rgb_mask):
+            continue
+
+        valid_source_mask |= complete_rgb_mask
+        valid_counts[complete_rgb_mask] += 1
+        for band_index in range(rgb_block.shape[0]):
+            np.add(
+                summed[band_index],
+                rgb_block[band_index],
+                out=summed[band_index],
+                where=complete_rgb_mask,
+            )
+
+    averaged_block = np.full((3, height, width), np.nan, dtype=np.float32)
+    for band_index in range(averaged_block.shape[0]):
+        np.divide(
+            summed[band_index],
+            valid_counts,
+            out=averaged_block[band_index],
+            where=valid_source_mask,
+        )
+
+    return averaged_block, valid_source_mask
+
+
+def average_tile_blocks(
+    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]],
+    tile_grid: TileGrid,
+    gebco_band: Optional[gdal.Band],
+    fill_allowed_mask: Optional[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """Average all tile windows while skipping pure-ocean blocks when GEBCO is available."""
+    averaged = np.full((3, tile_grid.height, tile_grid.width), np.nan, dtype=np.float32)
+    source_valid_mask = np.zeros((tile_grid.height, tile_grid.width), dtype=bool)
+    found_non_ocean_pixels = gebco_band is None
+
+    for yoff in range(0, tile_grid.height, PROCESS_BLOCK_SIZE):
+        block_height = min(PROCESS_BLOCK_SIZE, tile_grid.height - yoff)
+        for xoff in range(0, tile_grid.width, PROCESS_BLOCK_SIZE):
+            block_width = min(PROCESS_BLOCK_SIZE, tile_grid.width - xoff)
+
+            if gebco_band is not None:
+                gebco_block = gebco_band.ReadAsArray(
+                    xoff, yoff, block_width, block_height
+                ).astype(np.float32)
+                assert fill_allowed_mask is not None
+                fill_allowed_block = gebco_block > OCEAN_FADE_DEPTH
+                fill_allowed_mask[
+                    yoff : yoff + block_height, xoff : xoff + block_width
+                ] = fill_allowed_block
+                if not np.any(fill_allowed_block):
+                    continue
+                found_non_ocean_pixels = True
+
+            averaged_block, block_valid_sources = average_block(
+                date_band_sets, xoff, yoff, block_width, block_height
+            )
+            if not np.any(block_valid_sources):
+                continue
+
+            averaged[:, yoff : yoff + block_height, xoff : xoff + block_width] = (
+                averaged_block
+            )
+            source_valid_mask[
+                yoff : yoff + block_height, xoff : xoff + block_width
+            ] = block_valid_sources
+
+    return averaged, source_valid_mask, found_non_ocean_pixels
+
+
+def fill_missing_pixels(
+    averaged: np.ndarray,
+    source_valid_mask: np.ndarray,
+    fill_allowed_mask: Optional[np.ndarray],
+) -> np.ndarray:
+    """Fill gaps only when at least one missing pixel is eligible for coastal interpolation."""
+    fill_mask = ~source_valid_mask
+    if fill_allowed_mask is not None:
+        fill_mask &= fill_allowed_mask
+    if np.any(fill_mask):
+        return fill_nan_nearest(averaged, valid_mask=source_valid_mask)
+    return averaged
+
+
+def get_source_scale(args: argparse.Namespace) -> Tuple[float, float]:
+    """Resolve the source scaling range with the existing defaults."""
+    source_min = args.stats_min if args.stats_min is not None else 0.0
+    source_max = args.stats_max if args.stats_max is not None else 9000.0
+    return source_min, source_max
+
+
+def create_output_dataset(
+    output_path: str, tile_grid: TileGrid
+) -> Tuple[gdal.Dataset, List[gdal.Band], gdal.Band]:
+    """Create the temporary UTM RGBA GeoTIFF used before Web Mercator warping."""
+    driver = gdal.GetDriverByName("GTiff")
+    dataset = driver.Create(
+        output_path,
+        tile_grid.width,
+        tile_grid.height,
+        4,
+        gdal.GDT_Byte,
+        options=["COMPRESS=ZSTD", "TILED=YES"],
+    )
+    dataset.SetProjection(tile_grid.projection)
+    dataset.SetGeoTransform(tile_grid.geotransform)
+
+    color_bands = [dataset.GetRasterBand(index + 1) for index in range(3)]
+    for band_index, color_name in enumerate(("RedBand", "GreenBand", "BlueBand")):
+        color_bands[band_index].SetColorInterpretation(getattr(gdal, f"GCI_{color_name}"))
+
+    alpha_band = dataset.GetRasterBand(4)
+    alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
+    return dataset, color_bands, alpha_band
+
+
+def build_alpha_block(
+    gebco_band: Optional[gdal.Band],
+    source_valid_mask: np.ndarray,
+    xoff: int,
+    yoff: int,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Build the output alpha band for one block."""
+    if gebco_band is None:
+        return (
+            source_valid_mask[yoff : yoff + height, xoff : xoff + width].astype(np.uint8)
+            * 255
+        )
+
+    gebco_block = gebco_band.ReadAsArray(xoff, yoff, width, height).astype(np.float32)
+    alpha_block = np.clip(
+        (gebco_block - OCEAN_FADE_DEPTH) / (LAND_STAY_DEPTH - OCEAN_FADE_DEPTH), 0.0, 1.0
+    )
+    return cast(np.ndarray, np.clip(alpha_block * 255.0, 0.0, 255.0).astype(np.uint8))
+
+
+def write_processed_blocks(
+    averaged: np.ndarray,
+    source_valid_mask: np.ndarray,
+    gebco_band: Optional[gdal.Band],
+    tile_grid: TileGrid,
+    args: argparse.Namespace,
+    color_bands: List[gdal.Band],
+    alpha_band: gdal.Band,
+) -> None:
+    """Convert averaged float data to byte RGB(A) output one block at a time."""
+    source_min, source_max = get_source_scale(args)
+    scale = source_max - source_min
+    if scale <= 0.0:
+        raise ValueError("stats_max must be greater than stats_min")
+
+    for yoff in range(0, tile_grid.height, PROCESS_BLOCK_SIZE):
+        block_height = min(PROCESS_BLOCK_SIZE, tile_grid.height - yoff)
+        for xoff in range(0, tile_grid.width, PROCESS_BLOCK_SIZE):
+            block_width = min(PROCESS_BLOCK_SIZE, tile_grid.width - xoff)
+            averaged_block = averaged[:, yoff : yoff + block_height, xoff : xoff + block_width]
+            normalized = np.clip((averaged_block - source_min) / scale, 0.0, 1.0)
+            normalized[np.isnan(normalized)] = 0.0
+
+            if args.tonemap:
+                toned_block = tiler.apply_soft_knee_numpy(
+                    normalized,
+                    shadow_break=args.sb,
+                    highlight_break=args.hb,
+                    shadow_slope=args.ss,
+                    mid_slope=args.ms,
+                    highlight_slope=args.hs,
+                    exposure=args.exposure,
+                )
+            else:
+                toned_block = np.clip(normalized * args.exposure, 0.0, 1.0)
+
+            if args.grade:
+                toned_block = tiler.apply_preview_correction_numpy(
+                    toned_block,
+                    saturation=args.sat,
+                    darken_break=args.db,
+                    low_slope=args.ls,
+                    gamma=args.gamma,
+                )
+
+            byte_block = np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
+            for band_index, out_band in enumerate(color_bands):
+                out_band.WriteArray(byte_block[band_index], xoff=xoff, yoff=yoff)
+
+            alpha_block = build_alpha_block(
+                gebco_band, source_valid_mask, xoff, yoff, block_width, block_height
+            )
+            alpha_band.WriteArray(alpha_block, xoff=xoff, yoff=yoff)
+
+
+def warp_to_web_mercator(
+    source_path: str, destination_path: str, resample_alg: str
+) -> None:
+    """Warp the temporary UTM GeoTIFF into the final EPSG:3857 intermediate."""
+    warp_options = gdal.WarpOptions(
+        format="GTiff",
+        dstSRS="EPSG:3857",
+        resampleAlg=resample_alg,
+        creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "TILED=YES", "BIGTIFF=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512"],
+    )
+    gdal.Warp(destination_path, source_path, options=warp_options)
+
+
+def close_date_band_sets(
+    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]]
+) -> None:
+    """Drop GDAL band and dataset handles opened for per-date reads."""
+    for bands, datasets in date_band_sets:
+        bands.clear()
+        datasets.clear()
+    date_band_sets.clear()
+
+
 def process_single_tile(
     mgrs_subtile: str,
     date_paths: List[str],
@@ -276,276 +786,62 @@ def process_single_tile(
         return None
 
     if args.download:
-        for folder_name, date_path in folders:
-            get_tile_paths(folder_name, date_path, args.cache, download=True)
+        download_tile_folders(folders, args.cache)
         return None
 
-    # 1. Get Metadata and GEBCO Mask
     first_folder, first_date = folders[0]
     paths = get_tile_paths(first_folder, first_date, args.cache, download=False)
-    ds_init = gdal.Open(paths["red"])
-    projection = ds_init.GetProjection()
-    geotransform = ds_init.GetGeoTransform()
-    width, height = ds_init.RasterXSize, ds_init.RasterYSize
-    ds_init = None
+    tile_grid = load_tile_grid(paths["red"])
 
-    gebco_band = None
-    gebco_mem_ds = None
-    fill_allowed_mask = None
-    # Transition constants
-    LAND_STAY = -42.0  # 100% Sentinel-2 above this depth
-    OCEAN_FADE = -50.0  # 0% Sentinel-2 below this depth
-
-    date_band_sets = []
+    gebco_band, _gebco_mem_ds, fill_allowed_mask = open_gebco_mask(
+        gebco_src, tile_grid, mgrs_subtile
+    )
+    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
     try:
-        if gebco_src:
-            try:
-                gebco_ds = gdal.Open(gebco_src)
-                if gebco_ds is None:
-                    raise RuntimeError(f"Could not open GEBCO source: {gebco_src}")
-                try:
-                    # Create in-memory dataset matching the Sentinel-2 grid
-                    mem_driver = gdal.GetDriverByName("MEM")
-                    gebco_mem_ds = mem_driver.Create("", width, height, 1, gdal.GDT_Float32)
-                    gebco_mem_ds.SetProjection(projection)
-                    gebco_mem_ds.SetGeoTransform(geotransform)
-
-                    # Warp GEBCO into the Sentinel-2 grid
-                    gdal.Warp(
-                        gebco_mem_ds, gebco_ds, options=gdal.WarpOptions(resampleAlg="bilinear")
-                    )
-                finally:
-                    gebco_ds = None
-                gebco_band = gebco_mem_ds.GetRasterBand(1)
-                fill_allowed_mask = np.zeros((height, width), dtype=bool)
-            except Exception as e:
-                print(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
-
         print(f"Processing tile {mgrs_subtile} across {len(folders)} date(s)...")
-
-        # 2. Average dates block-by-block so only one working window is resident at a time.
-        averaged = np.full((3, height, width), np.nan, dtype=np.float32)
-        source_valid_mask = np.zeros((height, width), dtype=bool)
-        block_size = 1024
-        found_non_ocean_pixels = gebco_band is None
-        for folder_name, date_path in folders:
-            paths = get_tile_paths(folder_name, date_path, args.cache, download=False)
-            dss = [gdal.Open(paths[color]) for color in ["red", "green", "blue"]]
-            date_band_sets.append(([ds.GetRasterBand(1) for ds in dss], dss))
-
-        for yoff in range(0, height, block_size):
-            bh = min(block_size, height - yoff)
-            for xoff in range(0, width, block_size):
-                bw = min(block_size, width - xoff)
-
-                if gebco_band is not None:
-                    gebco_block = gebco_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
-                    assert fill_allowed_mask is not None
-                    fill_allowed_block = gebco_block > OCEAN_FADE
-                    fill_allowed_mask[yoff : yoff + bh, xoff : xoff + bw] = fill_allowed_block
-                    if not np.any(fill_allowed_block):
-                        continue
-                    found_non_ocean_pixels = True
-
-                summed = np.zeros((3, bh, bw), dtype=np.float32)
-                valid_counts = np.zeros((bh, bw), dtype=np.uint16)
-                block_valid_sources = np.zeros((bh, bw), dtype=bool)
-
-                for bands, _ in date_band_sets:
-                    rgb_block = np.empty((3, bh, bw), dtype=np.float32)
-                    for band_index, band in enumerate(bands):
-                        block_arr = band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
-                        block_arr[block_arr == -32768] = np.nan
-                        rgb_block[band_index] = block_arr
-
-                    complete_rgb_mask = np.all(np.isfinite(rgb_block), axis=0)
-                    if not np.any(complete_rgb_mask):
-                        continue
-
-                    block_valid_sources |= complete_rgb_mask
-                    valid_counts[complete_rgb_mask] += 1
-                    for band_index in range(rgb_block.shape[0]):
-                        np.add(
-                            summed[band_index],
-                            rgb_block[band_index],
-                            out=summed[band_index],
-                            where=complete_rgb_mask,
-                        )
-
-                if not np.any(block_valid_sources):
-                    continue
-
-                averaged_block = np.full((3, bh, bw), np.nan, dtype=np.float32)
-                for band_index in range(averaged_block.shape[0]):
-                    np.divide(
-                        summed[band_index],
-                        valid_counts,
-                        out=averaged_block[band_index],
-                        where=block_valid_sources,
-                    )
-                averaged[:, yoff : yoff + bh, xoff : xoff + bw] = averaged_block
-                source_valid_mask[yoff : yoff + bh, xoff : xoff + bw] = block_valid_sources
+        date_band_sets = open_date_band_sets(folders, args.cache)
+        averaged, source_valid_mask, found_non_ocean_pixels = average_tile_blocks(
+            date_band_sets, tile_grid, gebco_band, fill_allowed_mask
+        )
 
         if not found_non_ocean_pixels:
             return None
 
-        # 3. Fill land/coastal gaps from the nearest valid source pixel while leaving
-        # pure ocean transparent so the prebuilt ocean background can show through.
-        fill_mask = ~source_valid_mask
-        if fill_allowed_mask is not None:
-            fill_mask &= fill_allowed_mask
-        if np.any(fill_mask):
-            averaged = fill_nan_nearest(averaged, valid_mask=source_valid_mask)
-
-        # 4. Tone mapping is windowed to avoid creating more full-size NumPy copies.
-        # Determine scaling (either hardcoded or via percentile)
-        if args.stats_min is not None:
-            s_min = args.stats_min
-        else:
-            s_min = 0.0
-
-        if args.stats_max is not None:
-            s_max = args.stats_max
-        else:
-            # 9000 is a "safe" universal default for Sentinel-2 (90% reflectance).
-            # It prevents clipping in bright regions like sand, snow, or clouds.
-            s_max = 9000.0
-
-        # 5. Save to temporary Byte GeoTIFF while converting each window independently.
+        averaged = fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
         temp_utm_path = f".temp/processed_{mgrs_subtile}_{unique_id}_utm.tif"
         temp_3857_path = f".temp/processed_{mgrs_subtile}_{unique_id}_3857.tif"
-
-        driver = gdal.GetDriverByName("GTiff")
-
-        ds_out = driver.Create(
-            temp_utm_path,
-            width,
-            height,
-            4,
-            gdal.GDT_Byte,
-            options=["COMPRESS=ZSTD", "TILED=YES"],
+        ds_out, color_bands, alpha_band = create_output_dataset(temp_utm_path, tile_grid)
+        write_processed_blocks(
+            averaged,
+            source_valid_mask,
+            gebco_band,
+            tile_grid,
+            args,
+            color_bands,
+            alpha_band,
         )
-        ds_out.SetProjection(projection)
-        ds_out.SetGeoTransform(geotransform)
-        color_bands = [ds_out.GetRasterBand(i + 1) for i in range(3)]
-        for band_index, color_name in enumerate(("RedBand", "GreenBand", "BlueBand")):
-            color_bands[band_index].SetColorInterpretation(getattr(gdal, f"GCI_{color_name}"))
-
-        alpha_band = ds_out.GetRasterBand(4)
-        alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
-
-        scale = s_max - s_min
-        if scale <= 0.0:
-            raise ValueError("stats_max must be greater than stats_min")
-
-        for yoff in range(0, height, block_size):
-            bh = min(block_size, height - yoff)
-            for xoff in range(0, width, block_size):
-                bw = min(block_size, width - xoff)
-                averaged_block = averaged[:, yoff : yoff + bh, xoff : xoff + bw]
-                normalized = np.clip((averaged_block - s_min) / scale, 0.0, 1.0)
-                normalized[np.isnan(normalized)] = 0.0
-
-                if args.tonemap:
-                    toned_block = tiler.apply_soft_knee_numpy(
-                        normalized,
-                        shadow_break=args.sb,
-                        highlight_break=args.hb,
-                        shadow_slope=args.ss,
-                        mid_slope=args.ms,
-                        highlight_slope=args.hs,
-                        exposure=args.exposure,
-                    )
-                else:
-                    toned_block = np.clip(normalized * args.exposure, 0.0, 1.0)
-
-                if args.grade:
-                    toned_block = tiler.apply_preview_correction_numpy(
-                        toned_block,
-                        saturation=args.sat,
-                        darken_break=args.db,
-                        low_slope=args.ls,
-                        gamma=args.gamma,
-                    )
-
-                byte_block = np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
-                for band_index, out_band in enumerate(color_bands):
-                    out_band.WriteArray(byte_block[band_index], xoff=xoff, yoff=yoff)
-
-                if gebco_band is not None:
-                    gebco_block = gebco_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
-                    alpha_block = np.clip(
-                        (gebco_block - OCEAN_FADE) / (LAND_STAY - OCEAN_FADE), 0.0, 1.0
-                    )
-                    combined_alpha = np.clip(alpha_block * 255.0, 0.0, 255.0).astype(np.uint8)
-                else:
-                    combined_alpha = source_valid_mask[yoff : yoff + bh, xoff : xoff + bw].astype(
-                        np.uint8
-                    ) * 255
-
-                alpha_band.WriteArray(combined_alpha, xoff=xoff, yoff=yoff)
-
         ds_out.FlushCache()
         ds_out = None
 
-        # 6. Warp to Web Mercator
-        warp_options = gdal.WarpOptions(
-            format="GTiff",
-            dstSRS="EPSG:3857",
-            resampleAlg=args.resample_alg,
-            # Standard RGB GeoTIFF creation options
-            creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "PREDICTOR=2", "TILED=YES"],
-        )
-        gdal.Warp(temp_3857_path, temp_utm_path, options=warp_options)
+        warp_to_web_mercator(temp_utm_path, temp_3857_path, args.resample_alg)
         os.remove(temp_utm_path)
-
         return temp_3857_path
     finally:
-        for bands, dss in date_band_sets:
-            bands.clear()
-            dss.clear()
-        date_band_sets.clear()
+        close_date_band_sets(date_band_sets)
         gebco_band = None
-        gebco_mem_ds = None
         fill_allowed_mask = None
 
 
 def calculate_estimates(args: argparse.Namespace) -> None:
     """Calculate and print estimations for the given command."""
-    date_paths = [d.strip() for d in args.date.split(",")]
+    date_paths = parse_date_paths(args.date)
     num_dates = len(date_paths)
 
-    land_only_file = "HLS.land.tiles.txt"
-    land_set = None
-    if os.path.exists(land_only_file):
-        with open(land_only_file, "r") as f:
-            land_set = {line.strip() for line in f if line.strip()}
+    land_set = load_land_tiles("HLS.land.tiles.txt")
 
     if args.bbox:
-        try:
-            min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
-        except ValueError:
-            print(f"Error: Invalid bbox format: {args.bbox}")
-            sys.exit(1)
-
-        m_converter = mgrs.MGRS()
-        discovered_mgrs = set()
-        lon_steps = int((max_lon - min_lon) / 0.1) + 2
-        lat_steps = int((max_lat - min_lat) / 0.1) + 2
-        for i in range(lon_steps):
-            lon = min(min_lon + i * 0.1, max_lon)
-            for j in range(lat_steps):
-                lat = min(min_lat + j * 0.1, max_lat)
-                try:
-                    mgrs_res = m_converter.toMGRS(lat, lon, MGRSPrecision=0)
-                    mgrs_str = (
-                        mgrs_res.decode("utf-8")
-                        if isinstance(mgrs_res, bytes)
-                        else mgrs_res
-                    )
-                    discovered_mgrs.add(mgrs_str)
-                except Exception:
-                    continue
+        min_lon, min_lat, max_lon, max_lat = parse_bbox(args.bbox)
+        discovered_mgrs = discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat)
 
         if land_set is not None:
             mgrs_bases = [m for m in discovered_mgrs if m in land_set]
@@ -736,134 +1032,29 @@ def main() -> None:
 
     unique_id = uuid.uuid4().hex[:8]
     state_file = f".temp/state_{unique_id}.json"
-    completed_subtiles = set()
-    processed_tifs = []
+    completed_subtiles: Set[str] = set()
+    processed_tifs: List[str] = []
 
     if args.resume:
-        # If resume is a string, it's a specific state file
-        resume_path = (
-            args.resume
-            if isinstance(args.resume, str) and os.path.exists(args.resume)
-            else None
-        )
-
-        # If not, look for the most recent state file in .temp
-        if not resume_path:
-            states = glob.glob(".temp/state_*.json")
-            if states:
-                resume_path = max(states, key=os.path.getmtime)
-
+        resume_path = find_resume_path(args.resume)
         if resume_path:
-            state = load_state(resume_path)
-            if state:
-                state_file = resume_path
-                unique_id = state["unique_id"]
-                completed_subtiles = set(state["completed_subtiles"])
-                processed_tifs = [
-                    f for f in state["processed_tifs"] if os.path.exists(f)
-                ]
-                print(
-                    f"Resuming from state file: {resume_path} (unique_id: {unique_id})"
-                )
-                print(
-                    f"Already completed {len(completed_subtiles)} sub-tiles, {len(processed_tifs)} TIFs found."
-                )
+            resume_state = restore_resume_state(resume_path)
+            if resume_state:
+                state_file = resume_state.state_file
+                unique_id = resume_state.unique_id
+                completed_subtiles = resume_state.completed_subtiles
+                processed_tifs = resume_state.processed_tifs
 
-    date_paths = [d.strip() for d in args.date.split(",")]
+    date_paths = parse_date_paths(args.date)
+    gebco_vrt_source = build_gebco_vrt(unique_id)
 
-    # 0. GEBCO Discovery (for filtering and coastal blending)
-    gebco_zip = "gebco_2025_sub_ice_topo_geotiff.zip"
-    gebco_vrt_source = None
-    if os.path.exists(gebco_zip):
-        print("Opening GEBCO bathymetry zip...")
-        gebco_vsi = f"/vsizip/{gebco_zip}"
-        files_in_zip = gdal.ReadDir(gebco_vsi)
-        tif_files = [f for f in files_in_zip if f.lower().endswith(".tif")]
-        if tif_files:
-            gebco_vrt_source = f".temp/gebco_source_{unique_id}.vrt"
-            # Always recreate GEBCO VRT (it's fast and ensures consistency)
-            tif_paths = [f"{gebco_vsi}/{f}" for f in tif_files]
-            gdal.BuildVRT(gebco_vrt_source, tif_paths)
-
-    # 1. Tile Discovery - Pre-populate S3 cache only for global runs
     if args.all_tiles:
-        print("Populating S3 folder cache...")
-        for dp in date_paths:
-            s3_base = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{dp}"
-            dirs = gdal.ReadDir(s3_base)
-            if dirs:
-                S3_FOLDER_CACHE[dp] = set(dirs)
-            else:
-                print(f"Warning: Could not list folders for {dp}")
+        populate_s3_cache(date_paths)
 
-    # 2. Sub-tile Expansion
-    land_only_file = "HLS.land.tiles.txt"
-    land_set = None
-    if os.path.exists(land_only_file):
-        with open(land_only_file, "r") as f:
-            land_set = {line.strip() for line in f if line.strip()}
+    land_set = load_land_tiles("HLS.land.tiles.txt")
+    mgrs_bases = discover_mgrs_bases(args, land_set, gebco_vrt_source)
+    subtiles = expand_subtiles(mgrs_bases)
 
-    if args.bbox:
-        try:
-            min_lon, min_lat, max_lon, max_lat = map(float, args.bbox.split(","))
-        except ValueError:
-            print(f"Error: Invalid bbox format: {args.bbox}")
-            sys.exit(1)
-
-        m_converter = mgrs.MGRS()
-        discovered_mgrs = set()
-        # Sample coordinates within bbox every 0.1 degree (robust for 100km MGRS squares)
-        lon_steps = int((max_lon - min_lon) / 0.1) + 2
-        lat_steps = int((max_lat - min_lat) / 0.1) + 2
-        for i in range(lon_steps):
-            lon = min(min_lon + i * 0.1, max_lon)
-            for j in range(lat_steps):
-                lat = min(min_lat + j * 0.1, max_lat)
-                try:
-                    # Convert to MGRS string, e.g., '4QFJ' (precision 0 gives 100km square ID)
-                    mgrs_res = m_converter.toMGRS(lat, lon, MGRSPrecision=0)
-                    mgrs_str = (
-                        mgrs_res.decode("utf-8")
-                        if isinstance(mgrs_res, bytes)
-                        else mgrs_res
-                    )
-                    discovered_mgrs.add(mgrs_str)
-                except Exception:
-                    continue
-
-        discovered_mgrs = list(discovered_mgrs)
-
-        # Filter tiles using land_set AND GEBCO
-        mgrs_bases = []
-        for m in discovered_mgrs:
-            is_land = False
-            if land_set and m in land_set:
-                is_land = True
-            elif gebco_vrt_source:
-                if check_land_gebco(m, gebco_vrt_source):
-                    is_land = True
-            elif land_set is None:
-                is_land = True
-
-            if is_land:
-                mgrs_bases.append(m)
-
-        print(
-            f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} kept after GEBCO/land filtering."
-        )
-
-    elif args.all_tiles:
-        if land_set is not None:
-            mgrs_bases = list(land_set)
-        else:
-            print("Error: --global requires HLS.land.tiles.txt to be present.")
-            sys.exit(1)
-    else:
-        mgrs_bases = [m.strip() for m in args.mgrs.split(",") if m.strip()]
-
-    subtiles = [f"{m}_{x}_{y}" for m in mgrs_bases for x in [0, 1] for y in [0, 1]]
-
-    # 2. Parallel Tile Processing
     if args.land:
         subtiles_to_process = [st for st in subtiles if st not in completed_subtiles]
         if subtiles_to_process:
@@ -909,7 +1100,6 @@ def main() -> None:
         print("Error: No data processed.")
         sys.exit(1)
 
-    # 4. Build Master VRT (Flat, over Web Mercator Byte TIFFs)
     master_vrt = f".temp/master_{unique_id}.vrt"
     gdal.BuildVRT(master_vrt, processed_tifs, resolution="highest")
 
@@ -917,7 +1107,6 @@ def main() -> None:
         print(f"Success! Master VRT: {master_vrt}")
         return
 
-    # 4. Tiling (Directly from the Byte VRT)
     temp_mbtiles = f".temp/tiles_{unique_id}.mbtiles"
     tiling_opts = {
         "format": args.format,
@@ -932,18 +1121,16 @@ def main() -> None:
     }
 
     print("Generating MBTiles...")
-    # Modified run_tiling will be simpler now
     artifacts = tiler.run_tiling_simplified(master_vrt, temp_mbtiles, tiling_opts)
 
     print("Converting to PMTiles...")
     subprocess.run(["pmtiles", "convert", temp_mbtiles, args.output], check=True)
     print(f"Success! {args.output}")
 
-    # Cleanup
-    for f in processed_tifs + [master_vrt, temp_mbtiles] + artifacts.cleanup_paths:
-        if os.path.exists(f):
+    for path in processed_tifs + [master_vrt, temp_mbtiles] + artifacts.cleanup_paths:
+        if os.path.exists(path):
             try:
-                os.remove(f)
+                os.remove(path)
             except OSError:
                 pass
 

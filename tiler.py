@@ -6,7 +6,7 @@ import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 from osgeo import gdal
@@ -53,9 +53,9 @@ MAKO_RAMP = [
     (0.75, 75, 194, 173),
     (0.80, 101, 208, 173),
     (0.85, 136, 217, 177),
-    (0.90, 171, 226, 190),
-    (0.95, 198, 235, 209),
-    (1.00, 222, 245, 229),
+    (0.90, 156, 213, 184),
+    (0.95, 176, 208, 194),
+    (1.00, 168, 195, 182),
 ]
 
 LUMA_RED = 0.2126
@@ -117,7 +117,7 @@ def apply_soft_knee_numpy(
         highlight_output + (arr[mask_highlight] - highlight_break) * highlight_slope
     )
 
-    return np.clip(out, 0.0, 1.0)
+    return cast(np.ndarray, np.clip(out, 0.0, 1.0))
 
 
 def apply_preview_correction_numpy(
@@ -146,7 +146,7 @@ def apply_preview_correction_numpy(
     out[mask_low] = out[mask_low] * low_slope
     out[~mask_low] = break_output + (out[~mask_low] - darken_break) * high_slope
 
-    return np.clip(out, 0.0, 1.0)
+    return cast(np.ndarray, np.clip(out, 0.0, 1.0))
 
 
 @dataclass(frozen=True)

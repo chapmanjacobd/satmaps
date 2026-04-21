@@ -5,13 +5,18 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import copyfile, which
-from typing import Sequence, cast
+from typing import Sequence
 from xml.sax.saxutils import escape
 
 import numpy as np
 from osgeo import gdal, osr
 
-import tiler
+from tiler import (
+    MAKO_RAMP,
+    apply_preview_correction_numpy,
+    apply_soft_knee_numpy,
+    colorize_depth_numpy,
+)
 
 gdal.UseExceptions()
 
@@ -28,9 +33,20 @@ GTIFF_CREATION_OPTIONS = (
     "BIGTIFF=YES",
     "TILED=YES",
     "COMPRESS=ZSTD",
+    "ZSTD_LEVEL=5",
     "BLOCKXSIZE=512",
     "BLOCKYSIZE=512",
 )
+OCEAN_DEFAULT_EXPOSURE = 1.0
+OCEAN_DEFAULT_SHADOW_BREAK = 0.3
+OCEAN_DEFAULT_HIGHLIGHT_BREAK = 0.75
+OCEAN_DEFAULT_SHADOW_SLOPE = 1.4
+OCEAN_DEFAULT_MID_SLOPE = 0.9
+OCEAN_DEFAULT_HIGHLIGHT_SLOPE = 0.5
+OCEAN_DEFAULT_GAMMA = 1.2
+OCEAN_DEFAULT_SATURATION = 1.0
+OCEAN_DEFAULT_BLACK_BREAK = 0.35
+OCEAN_DEFAULT_BLACK_SLOPE = 0.35
 
 
 @dataclass(frozen=True)
@@ -49,16 +65,16 @@ class OceanBackgroundArtifacts:
 class OceanStyleOptions:
     tonemap: bool = True
     grade: bool = True
-    exposure: float = tiler.DEFAULT_EXPOSURE
-    shadow_break: float = tiler.SOFT_KNEE_SHADOW_BREAK
-    highlight_break: float = tiler.SOFT_KNEE_HIGHLIGHT_BREAK
-    shadow_slope: float = tiler.SOFT_KNEE_SHADOW_SLOPE
-    mid_slope: float = tiler.SOFT_KNEE_MID_SLOPE
-    highlight_slope: float = tiler.SOFT_KNEE_HIGHLIGHT_SLOPE
-    gamma: float = tiler.DEFAULT_GAMMA
-    saturation: float = tiler.PREVIEW_SATURATION
-    black_break: float = tiler.PREVIEW_DARKEN_BREAK
-    black_slope: float = tiler.PREVIEW_DARKEN_LOW_SLOPE
+    exposure: float = OCEAN_DEFAULT_EXPOSURE
+    shadow_break: float = OCEAN_DEFAULT_SHADOW_BREAK
+    highlight_break: float = OCEAN_DEFAULT_HIGHLIGHT_BREAK
+    shadow_slope: float = OCEAN_DEFAULT_SHADOW_SLOPE
+    mid_slope: float = OCEAN_DEFAULT_MID_SLOPE
+    highlight_slope: float = OCEAN_DEFAULT_HIGHLIGHT_SLOPE
+    gamma: float = OCEAN_DEFAULT_GAMMA
+    saturation: float = OCEAN_DEFAULT_SATURATION
+    black_break: float = OCEAN_DEFAULT_BLACK_BREAK
+    black_slope: float = OCEAN_DEFAULT_BLACK_SLOPE
     depth_min: float = -11000.0
     depth_max: float = 0.0
 
@@ -159,11 +175,11 @@ def create_alpha_vrt(source_vrt: str, output_vrt: str) -> str:
 
 def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
     """Return the styled MAKO depth ramp as float32 RGB triples in [0, 1]."""
-    mako_colors = np.array([c[1:] for c in tiler.MAKO_RAMP], dtype=np.float32) / 255.0
+    mako_colors = np.array([c[1:] for c in MAKO_RAMP], dtype=np.float32) / 255.0
     mako_arr = mako_colors.T.reshape(3, -1, 1)
 
     if style.tonemap:
-        toned_mako = tiler.apply_soft_knee_numpy(
+        toned_mako = apply_soft_knee_numpy(
             mako_arr,
             shadow_break=style.shadow_break,
             highlight_break=style.highlight_break,
@@ -177,7 +193,7 @@ def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
         mako_colors = np.clip(mako_colors * style.exposure, 0.0, 1.0)
 
     if style.grade:
-        graded_mako = tiler.apply_preview_correction_numpy(
+        graded_mako = apply_preview_correction_numpy(
             mako_colors.T.reshape(3, -1, 1),
             saturation=style.saturation,
             darken_break=style.black_break,
@@ -186,19 +202,16 @@ def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
         )
         mako_colors = graded_mako.reshape(3, -1).T
 
-    return cast(np.ndarray, np.asarray(mako_colors, dtype=np.float32))
+    return np.asarray(mako_colors, dtype=np.float32)
 
 
 def colorize_ocean_depths(depths: np.ndarray, style: OceanStyleOptions) -> np.ndarray:
     """Colorize GEBCO depth values using the shared ocean styling pipeline."""
-    return cast(
-        np.ndarray,
-        tiler.colorize_depth_numpy(
-            depths,
-            build_ocean_ramp_colors(style),
-            style.depth_min,
-            style.depth_max,
-        ),
+    return colorize_depth_numpy(
+        depths,
+        build_ocean_ramp_colors(style),
+        style.depth_min,
+        style.depth_max,
     )
 
 
@@ -312,7 +325,7 @@ def create_ocean_rgb_tif(
             bw = min(block_width, hillshade_ds.RasterXSize - xoff)
             depths = depth_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
             hillshade = hillshade_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
-            rgb = tiler.colorize_depth_numpy(
+            rgb = colorize_depth_numpy(
                 depths,
                 ramp_colors,
                 style.depth_min,
@@ -600,31 +613,31 @@ def main() -> None:
         default=True,
         help="Enable/disable ocean final grading before colorization",
     )
-    parser.add_argument("--exposure", type=float, default=tiler.DEFAULT_EXPOSURE)
+    parser.add_argument("--exposure", type=float, default=OCEAN_DEFAULT_EXPOSURE)
     parser.add_argument(
-        "--sb", "--shadow-break", type=float, default=tiler.SOFT_KNEE_SHADOW_BREAK
+        "--sb", "--shadow-break", type=float, default=OCEAN_DEFAULT_SHADOW_BREAK
     )
     parser.add_argument(
-        "--hb", "--highlight-break", type=float, default=tiler.SOFT_KNEE_HIGHLIGHT_BREAK
+        "--hb", "--highlight-break", type=float, default=OCEAN_DEFAULT_HIGHLIGHT_BREAK
     )
     parser.add_argument(
-        "--ss", "--shadow-slope", type=float, default=tiler.SOFT_KNEE_SHADOW_SLOPE
+        "--ss", "--shadow-slope", type=float, default=OCEAN_DEFAULT_SHADOW_SLOPE
     )
     parser.add_argument(
-        "--ms", "--mid-slope", type=float, default=tiler.SOFT_KNEE_MID_SLOPE
+        "--ms", "--mid-slope", type=float, default=OCEAN_DEFAULT_MID_SLOPE
     )
     parser.add_argument(
-        "--hs", "--highlight-slope", type=float, default=tiler.SOFT_KNEE_HIGHLIGHT_SLOPE
+        "--hs", "--highlight-slope", type=float, default=OCEAN_DEFAULT_HIGHLIGHT_SLOPE
     )
-    parser.add_argument("--gamma", type=float, default=tiler.DEFAULT_GAMMA)
+    parser.add_argument("--gamma", type=float, default=OCEAN_DEFAULT_GAMMA)
     parser.add_argument(
-        "--sat", "--saturation", type=float, default=tiler.PREVIEW_SATURATION
-    )
-    parser.add_argument(
-        "--db", "--black-break", type=float, default=tiler.PREVIEW_DARKEN_BREAK
+        "--sat", "--saturation", type=float, default=OCEAN_DEFAULT_SATURATION
     )
     parser.add_argument(
-        "--ls", "--black-slope", type=float, default=tiler.PREVIEW_DARKEN_LOW_SLOPE
+        "--db", "--black-break", type=float, default=OCEAN_DEFAULT_BLACK_BREAK
+    )
+    parser.add_argument(
+        "--ls", "--black-slope", type=float, default=OCEAN_DEFAULT_BLACK_SLOPE
     )
     parser.add_argument(
         "--depth-min",

@@ -1,8 +1,11 @@
 import io
 import os
+from typing import cast
 
 import numpy as np
 from flask import Flask, render_template, request, send_file
+from flask.typing import ResponseReturnValue
+from numpy.typing import NDArray
 from osgeo import gdal
 from PIL import Image
 
@@ -15,7 +18,10 @@ app = Flask(__name__)
 GEBCO_ZIP = "gebco_2025_sub_ice_topo_geotiff.zip"
 
 
-def find_sample_tile():
+FloatArray = NDArray[np.float32]
+
+
+def find_sample_tile() -> dict[str, str] | None:
     cache_root = ".cache/2025-07-01"
     if not os.path.exists(cache_root):
         return None
@@ -36,30 +42,33 @@ def find_sample_tile():
 SAMPLE_PATHS = find_sample_tile()
 
 
-def load_and_average_sample(paths):
+def load_and_average_sample(paths: dict[str, str]) -> FloatArray:
     """Load sample RGB bands and return as float32 normalized numpy array (cropped for RAM)."""
-    data = []
+    data: list[FloatArray] = []
     # Crop to a 1024x1024 area in Barcelona Downtown (approx center of 31TDF_0_0)
     CROP_SIZE = 1024
     OFF_X, OFF_Y = 2000, 2000
 
     for band in ["red", "green", "blue"]:
         ds = gdal.Open(paths[band])
+        if ds is None:
+            raise RuntimeError(f"Could not open sample band: {paths[band]}")
         # Use ReadAsArray with offsets to load only a small portion
-        arr = (
+        arr = cast(
+            FloatArray,
             ds.GetRasterBand(1)
             .ReadAsArray(OFF_X, OFF_Y, CROP_SIZE, CROP_SIZE)
-            .astype(np.float32)
+            .astype(np.float32),
         )
         # Handle nodata -32768
         arr[arr == -32768] = np.nan
         data.append(arr)
 
-    rgb = np.stack(data)  # (3, 1024, 1024)
+    rgb = cast(FloatArray, np.stack(data))  # (3, 1024, 1024)
     # Standardize normalization for the tuner baseline
     v_min = 0.0
     v_max = 9000.0  # Match satmaps.py universal baseline
-    rgb = np.clip((rgb - v_min) / (v_max - v_min), 0, 1)
+    rgb = cast(FloatArray, np.clip((rgb - v_min) / (v_max - v_min), 0, 1))
     rgb[np.isnan(rgb)] = 0
     return rgb
 
@@ -67,7 +76,7 @@ def load_and_average_sample(paths):
 RAW_RGB = load_and_average_sample(SAMPLE_PATHS) if SAMPLE_PATHS else None
 
 
-def load_gebco_sample():
+def load_gebco_sample() -> FloatArray | None:
     """Load a sample of GEBCO data for ocean mode (Hawaii Area)."""
     if not os.path.exists(GEBCO_ZIP):
         return None
@@ -75,16 +84,19 @@ def load_gebco_sample():
     # Hawaii is in n90.0_s0.0_w-180.0_e-90.0.tif
     gebco_vsi = f"/vsizip/{GEBCO_ZIP}/gebco_2025_sub_ice_n90.0_s0.0_w-180.0_e-90.0.tif"
     ds = gdal.Open(gebco_vsi)
+    if ds is None:
+        raise RuntimeError(f"Could not open GEBCO sample: {gebco_vsi}")
 
     # Hawaii Center approx 19.5N, -159.5W
     # Tile origin: -180, 90. Resolution: 1/240 degree.
     # x_off = (-159.5 - (-180)) * 240 = 20.5 * 240 = 4920
     # y_off = (90 - 19.5) * 240 = 70.5 * 240 = 16920
     CROP_SIZE = 1024
-    data = (
+    data = cast(
+        FloatArray,
         ds.GetRasterBand(1)
         .ReadAsArray(4408, 16408, CROP_SIZE, CROP_SIZE)
-        .astype(np.float32)
+        .astype(np.float32),
     )
     return data
 
@@ -92,7 +104,12 @@ def load_gebco_sample():
 RAW_GEBCO = load_gebco_sample()
 
 
-def get_histogram_data(arr, mode="land", depth_min=-11000, depth_max=0):
+def get_histogram_data(
+    arr: FloatArray | None,
+    mode: str = "land",
+    depth_min: float = -11000,
+    depth_max: float = 0,
+) -> list[float]:
     if arr is None:
         return []
     if mode == "land":
@@ -100,17 +117,20 @@ def get_histogram_data(arr, mode="land", depth_min=-11000, depth_max=0):
         luma = 0.2126 * arr[0] + 0.7152 * arr[1] + 0.0722 * arr[2]
     else:
         # Normalize GEBCO band to 0-1 based on current depth range for histogram
-        luma = np.clip((arr - depth_min) / (depth_max - depth_min), 0.0, 1.0)
+        luma = cast(
+            FloatArray,
+            np.clip((arr - depth_min) / (depth_max - depth_min), 0.0, 1.0),
+        )
 
     hist, _ = np.histogram(luma, bins=128, range=(0, 1))
     # Normalize to 0-1
     if hist.max() > 0:
         hist = hist / hist.max()
-    return hist.tolist()
+    return [float(value) for value in hist.tolist()]
 
 
 @app.route("/")
-def index():
+def index() -> ResponseReturnValue:
     mode = request.args.get("mode", "land")
     depth_min = float(request.args.get("dmin", -11000))
     depth_max = float(request.args.get("dmax", 0))
@@ -140,7 +160,7 @@ def index():
 
 
 @app.route("/render")
-def render():
+def render() -> ResponseReturnValue:
     mode = request.args.get("mode", "land")
 
     p = {

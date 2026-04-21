@@ -340,6 +340,12 @@ def test_ocean_background_main_uses_default_positionals(monkeypatch: object) -> 
     assert called["destination"] == ocean_background.DEFAULT_OUTPUT
     assert called["bbox"] is None
     assert called["vrt"] is False
+    assert called["style"] == ocean_background.OceanStyleOptions(
+        gamma=1.2,
+        saturation=1.0,
+        black_break=0.35,
+        black_slope=0.35,
+    )
 
 
 def test_ocean_background_main_parses_bbox_when_provided(monkeypatch: object) -> None:
@@ -531,10 +537,10 @@ def test_build_ocean_ramp_colors_respects_style_flags() -> None:
         ocean_background.OceanStyleOptions(tonemap=False, grade=False, exposure=0.5)
     )
 
-    assert default_colors.shape == (len(ocean_background.tiler.MAKO_RAMP), 3)
+    assert default_colors.shape == (len(ocean_background.MAKO_RAMP), 3)
     np.testing.assert_allclose(
         ungraded_colors[0],
-        np.array(ocean_background.tiler.MAKO_RAMP[0][1:], dtype=np.float32) / 255.0,
+        np.array(ocean_background.MAKO_RAMP[0][1:], dtype=np.float32) / 255.0,
     )
     assert np.all((default_colors >= 0.0) & (default_colors <= 1.0))
     assert np.all((ungraded_colors >= 0.0) & (ungraded_colors <= 1.0))
