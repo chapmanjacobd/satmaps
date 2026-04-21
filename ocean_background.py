@@ -4,17 +4,26 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from shutil import which
-from typing import Sequence
+from shutil import copyfile, which
+from typing import Sequence, cast
 from xml.sax.saxutils import escape
 
+import numpy as np
 from osgeo import gdal, osr
+
+import tiler
 
 gdal.UseExceptions()
 
 DEFAULT_GEBCO_ZIP = "gebco_2025_sub_ice_topo_geotiff.zip"
 DEFAULT_OUTPUT = "ocean.tif"
 GEBCO_OCEAN_NODATA = -32767.0
+WEB_MERCATOR_WORLD_BOUNDS = (
+    -20037508.342789244,
+    -20037508.342789244,
+    20037508.342789244,
+    20037508.342789244,
+)
 GTIFF_CREATION_OPTIONS = (
     "BIGTIFF=YES",
     "TILED=YES",
@@ -31,8 +40,27 @@ class OceanBackgroundArtifacts:
     warped_vrt: str
     alpha_vrt: str
     hillshade_tif: str
+    color_tif: str
     rgba_vrt: str
     output_tif: str
+
+
+@dataclass(frozen=True)
+class OceanStyleOptions:
+    tonemap: bool = True
+    grade: bool = True
+    exposure: float = tiler.DEFAULT_EXPOSURE
+    shadow_break: float = tiler.SOFT_KNEE_SHADOW_BREAK
+    highlight_break: float = tiler.SOFT_KNEE_HIGHLIGHT_BREAK
+    shadow_slope: float = tiler.SOFT_KNEE_SHADOW_SLOPE
+    mid_slope: float = tiler.SOFT_KNEE_MID_SLOPE
+    highlight_slope: float = tiler.SOFT_KNEE_HIGHLIGHT_SLOPE
+    gamma: float = tiler.DEFAULT_GAMMA
+    saturation: float = tiler.PREVIEW_SATURATION
+    black_break: float = tiler.PREVIEW_DARKEN_BREAK
+    black_slope: float = tiler.PREVIEW_DARKEN_LOW_SLOPE
+    depth_min: float = -11000.0
+    depth_max: float = 0.0
 
 
 def build_gebco_source_vrt(gebco_zip: str, output_vrt: str) -> str:
@@ -42,7 +70,9 @@ def build_gebco_source_vrt(gebco_zip: str, output_vrt: str) -> str:
 
     gebco_vsi = f"/vsizip/{gebco_zip}"
     files_in_zip = gdal.ReadDir(gebco_vsi) or []
-    tif_paths = [f"{gebco_vsi}/{name}" for name in files_in_zip if name.lower().endswith(".tif")]
+    tif_paths = [
+        f"{gebco_vsi}/{name}" for name in files_in_zip if name.lower().endswith(".tif")
+    ]
     if not tif_paths:
         raise RuntimeError(f"No GeoTIFF files found in GEBCO zip: {gebco_zip}")
 
@@ -127,6 +157,51 @@ def create_alpha_vrt(source_vrt: str, output_vrt: str) -> str:
     return output_vrt
 
 
+def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
+    """Return the styled MAKO depth ramp as float32 RGB triples in [0, 1]."""
+    mako_colors = np.array([c[1:] for c in tiler.MAKO_RAMP], dtype=np.float32) / 255.0
+    mako_arr = mako_colors.T.reshape(3, -1, 1)
+
+    if style.tonemap:
+        toned_mako = tiler.apply_soft_knee_numpy(
+            mako_arr,
+            shadow_break=style.shadow_break,
+            highlight_break=style.highlight_break,
+            shadow_slope=style.shadow_slope,
+            mid_slope=style.mid_slope,
+            highlight_slope=style.highlight_slope,
+            exposure=style.exposure,
+        )
+        mako_colors = toned_mako.reshape(3, -1).T
+    else:
+        mako_colors = np.clip(mako_colors * style.exposure, 0.0, 1.0)
+
+    if style.grade:
+        graded_mako = tiler.apply_preview_correction_numpy(
+            mako_colors.T.reshape(3, -1, 1),
+            saturation=style.saturation,
+            darken_break=style.black_break,
+            low_slope=style.black_slope,
+            gamma=style.gamma,
+        )
+        mako_colors = graded_mako.reshape(3, -1).T
+
+    return cast(np.ndarray, np.asarray(mako_colors, dtype=np.float32))
+
+
+def colorize_ocean_depths(depths: np.ndarray, style: OceanStyleOptions) -> np.ndarray:
+    """Colorize GEBCO depth values using the shared ocean styling pipeline."""
+    return cast(
+        np.ndarray,
+        tiler.colorize_depth_numpy(
+            depths,
+            build_ocean_ramp_colors(style),
+            style.depth_min,
+            style.depth_max,
+        ),
+    )
+
+
 def resolution_for_utm_10m_3857(
     min_lon: float, min_lat: float, max_lon: float, max_lat: float
 ) -> tuple[float, float]:
@@ -157,7 +232,9 @@ def resolution_for_utm_10m_3857(
     x_res = abs(east_merc_x - center_merc_x)
     y_res = abs(north_merc_y - center_merc_y)
     if x_res <= 0.0 or y_res <= 0.0:
-        raise RuntimeError("Could not derive a positive EPSG:3857 resolution from the bbox center")
+        raise RuntimeError(
+            "Could not derive a positive EPSG:3857 resolution from the bbox center"
+        )
     return x_res, y_res
 
 
@@ -180,6 +257,114 @@ def build_hillshade_command(
     for option in creation_options:
         command.extend(["-co", option])
     return command
+
+
+def create_ocean_rgb_tif(
+    depth_vrt: str,
+    hillshade_tif: str,
+    output_tif: str,
+    style: OceanStyleOptions,
+) -> str:
+    """Colorize warped GEBCO depths and modulate them with hillshade."""
+    depth_ds = gdal.Open(depth_vrt)
+    if depth_ds is None:
+        raise RuntimeError(f"Could not open ocean depth VRT: {depth_vrt}")
+
+    hillshade_ds = gdal.Open(hillshade_tif)
+    if hillshade_ds is None:
+        raise RuntimeError(f"Could not open hillshade TIFF: {hillshade_tif}")
+
+    depths = depth_ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    hillshade = hillshade_ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    rgb = colorize_ocean_depths(depths, style)
+    shade = 0.35 + 0.65 * np.clip(hillshade / 255.0, 0.0, 1.0)
+    shaded_rgb = np.clip(rgb * shade[np.newaxis, :, :], 0.0, 1.0)
+
+    driver = gdal.GetDriverByName("GTiff")
+    color_ds = driver.Create(
+        output_tif,
+        hillshade_ds.RasterXSize,
+        hillshade_ds.RasterYSize,
+        3,
+        gdal.GDT_Byte,
+        options=list(GTIFF_CREATION_OPTIONS),
+    )
+    if color_ds is None:
+        raise RuntimeError(f"Could not create colorized ocean TIFF: {output_tif}")
+
+    color_ds.SetProjection(hillshade_ds.GetProjection())
+    color_ds.SetGeoTransform(hillshade_ds.GetGeoTransform())
+
+    byte_arr = (shaded_rgb * 255.0).astype(np.uint8)
+    for band_index, color_name in enumerate(("RedBand", "GreenBand", "BlueBand"), start=1):
+        band = color_ds.GetRasterBand(band_index)
+        band.WriteArray(byte_arr[band_index - 1])
+        band.SetColorInterpretation(getattr(gdal, f"GCI_{color_name}"))
+
+    color_ds.FlushCache()
+    color_ds = None
+    depth_ds = None
+    hillshade_ds = None
+    return output_tif
+
+
+def create_rgb_with_alpha_vrt(rgb_tif: str, alpha_vrt: str, output_vrt: str) -> str:
+    """Attach an explicit alpha band to an RGB GeoTIFF via VRT."""
+    rgb_ds = gdal.Open(rgb_tif)
+    if rgb_ds is None:
+        raise RuntimeError(f"Could not open RGB TIFF: {rgb_tif}")
+
+    alpha_ds = gdal.Open(alpha_vrt)
+    if alpha_ds is None:
+        raise RuntimeError(f"Could not open alpha VRT: {alpha_vrt}")
+
+    xsize = rgb_ds.RasterXSize
+    ysize = rgb_ds.RasterYSize
+    geotransform = ",".join(str(value) for value in rgb_ds.GetGeoTransform())
+    projection = escape(rgb_ds.GetProjection())
+    rgb_filename = escape(os.path.abspath(rgb_tif))
+    alpha_filename = escape(os.path.abspath(alpha_vrt))
+    rgb_ds = None
+    alpha_ds = None
+
+    with open(output_vrt, "w") as f:
+        f.write(
+            f"""<VRTDataset rasterXSize="{xsize}" rasterYSize="{ysize}">
+  <SRS>{projection}</SRS>
+  <GeoTransform>{geotransform}</GeoTransform>
+  <VRTRasterBand dataType="Byte" band="1">
+    <ColorInterp>Red</ColorInterp>
+    <SimpleSource>
+      <SourceFilename relativeToVRT="0">{rgb_filename}</SourceFilename>
+      <SourceBand>1</SourceBand>
+    </SimpleSource>
+  </VRTRasterBand>
+  <VRTRasterBand dataType="Byte" band="2">
+    <ColorInterp>Green</ColorInterp>
+    <SimpleSource>
+      <SourceFilename relativeToVRT="0">{rgb_filename}</SourceFilename>
+      <SourceBand>2</SourceBand>
+    </SimpleSource>
+  </VRTRasterBand>
+  <VRTRasterBand dataType="Byte" band="3">
+    <ColorInterp>Blue</ColorInterp>
+    <SimpleSource>
+      <SourceFilename relativeToVRT="0">{rgb_filename}</SourceFilename>
+      <SourceBand>3</SourceBand>
+    </SimpleSource>
+  </VRTRasterBand>
+  <VRTRasterBand dataType="Byte" band="4">
+    <ColorInterp>Alpha</ColorInterp>
+    <SimpleSource>
+      <SourceFilename relativeToVRT="0">{alpha_filename}</SourceFilename>
+      <SourceBand>1</SourceBand>
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>
+"""
+        )
+
+    return output_vrt
 
 
 def create_hillshade_rgba_vrt(hillshade_tif: str, alpha_vrt: str, output_vrt: str) -> str:
@@ -255,15 +440,27 @@ def translate_rgba_vrt(rgba_vrt: str, destination: str) -> str:
     return destination
 
 
+def write_rgba_vrt(rgba_vrt: str, destination: str) -> str:
+    """Persist the final RGBA VRT to a caller-visible output path."""
+    destination_dir = os.path.dirname(destination)
+    if destination_dir:
+        os.makedirs(destination_dir, exist_ok=True)
+
+    copyfile(rgba_vrt, destination)
+    return destination
+
+
 def generate_ocean_background(
     gebco_zip: str,
     destination: str,
-    bbox: tuple[float, float, float, float],
+    bbox: tuple[float, float, float, float] | None = None,
     temp_dir: str = ".temp",
     resample_alg: str = "cubicspline",
     hillshade_z: float = 5.0,
+    style: OceanStyleOptions | None = None,
+    vrt: bool = False,
 ) -> OceanBackgroundArtifacts:
-    """Generate a standalone RGBA ocean background GeoTIFF."""
+    """Generate a standalone RGBA ocean background output."""
     if which("gdaldem") is None:
         raise RuntimeError("gdaldem is required to generate the ocean background")
 
@@ -275,28 +472,46 @@ def generate_ocean_background(
     warped_vrt = os.path.join(temp_dir, f"{stem}_3857.vrt")
     alpha_vrt = os.path.join(temp_dir, f"{stem}_alpha.vrt")
     hillshade_tif = os.path.join(temp_dir, f"{stem}_hillshade.tif")
+    color_tif = os.path.join(temp_dir, f"{stem}_color.tif")
     rgba_vrt = os.path.join(temp_dir, f"{stem}_rgba.vrt")
 
     build_gebco_source_vrt(gebco_zip, source_vrt)
     create_gebco_ocean_vrt(source_vrt, masked_vrt)
 
-    min_lon, min_lat, max_lon, max_lat = bbox
-    x_res, y_res = resolution_for_utm_10m_3857(min_lon, min_lat, max_lon, max_lat)
-    warp_options = gdal.WarpOptions(
-        format="VRT",
-        dstSRS="EPSG:3857",
-        outputBounds=(min_lon, min_lat, max_lon, max_lat),
-        outputBoundsSRS="EPSG:4326",
-        xRes=x_res,
-        yRes=y_res,
-        resampleAlg=resample_alg,
-    )
+    if style is None:
+        style = OceanStyleOptions()
+
+    if bbox is None:
+        warp_options = gdal.WarpOptions(
+            format="VRT",
+            dstSRS="EPSG:3857",
+            outputBounds=WEB_MERCATOR_WORLD_BOUNDS,
+            resampleAlg=resample_alg,
+        )
+    else:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        x_res, y_res = resolution_for_utm_10m_3857(min_lon, min_lat, max_lon, max_lat)
+        warp_options = gdal.WarpOptions(
+            format="VRT",
+            dstSRS="EPSG:3857",
+            outputBounds=(min_lon, min_lat, max_lon, max_lat),
+            outputBoundsSRS="EPSG:4326",
+            xRes=x_res,
+            yRes=y_res,
+            resampleAlg=resample_alg,
+        )
     gdal.Warp(warped_vrt, masked_vrt, options=warp_options)
 
     create_alpha_vrt(warped_vrt, alpha_vrt)
     subprocess.run(build_hillshade_command(warped_vrt, hillshade_tif, hillshade_z), check=True)
-    create_hillshade_rgba_vrt(hillshade_tif, alpha_vrt, rgba_vrt)
-    translate_rgba_vrt(rgba_vrt, destination)
+    create_ocean_rgb_tif(warped_vrt, hillshade_tif, color_tif, style)
+    create_rgb_with_alpha_vrt(color_tif, alpha_vrt, rgba_vrt)
+    if vrt:
+        translate_path = str(Path(destination).with_suffix(".vrt"))
+        write_rgba_vrt(rgba_vrt, translate_path)
+        destination = translate_path
+    else:
+        translate_rgba_vrt(rgba_vrt, destination)
 
     return OceanBackgroundArtifacts(
         source_vrt=source_vrt,
@@ -304,6 +519,7 @@ def generate_ocean_background(
         warped_vrt=warped_vrt,
         alpha_vrt=alpha_vrt,
         hillshade_tif=hillshade_tif,
+        color_tif=color_tif,
         rgba_vrt=rgba_vrt,
         output_tif=destination,
     )
@@ -318,11 +534,24 @@ def parse_bbox(bbox: str) -> tuple[float, float, float, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate a standalone GEBCO ocean hillshade GeoTIFF in EPSG:3857."
+        description=(
+            "Generate a standalone GEBCO ocean hillshade GeoTIFF. "
+            "Without --bbox, export the full masked source raster in EPSG:3857."
+        )
     )
-    parser.add_argument("gebco_zip", nargs="?", default=DEFAULT_GEBCO_ZIP, help="GEBCO zip archive")
-    parser.add_argument("destination", nargs="?", default=DEFAULT_OUTPUT, help="Output GeoTIFF path")
-    parser.add_argument("--bbox", required=True, help="WGS84 bbox as min_lon,min_lat,max_lon,max_lat")
+    parser.add_argument(
+        "gebco_zip", nargs="?", default=DEFAULT_GEBCO_ZIP, help="GEBCO zip archive"
+    )
+    parser.add_argument(
+        "destination", nargs="?", default=DEFAULT_OUTPUT, help="Output GeoTIFF path"
+    )
+    parser.add_argument(
+        "--bbox",
+        help=(
+            "Optional WGS84 bbox as min_lon,min_lat,max_lon,max_lat. "
+            "When omitted, exports the full masked source raster in EPSG:3857."
+        ),
+    )
     parser.add_argument("--temp-dir", default=".temp", help="Directory for intermediary files")
     parser.add_argument(
         "--resample-alg",
@@ -336,15 +565,87 @@ def main() -> None:
         default=5.0,
         help="Vertical exaggeration passed to gdaldem hillshade",
     )
+    parser.add_argument(
+        "--tonemap",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable ocean tone mapping before colorization",
+    )
+    parser.add_argument(
+        "--grade",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable ocean final grading before colorization",
+    )
+    parser.add_argument("--exposure", type=float, default=tiler.DEFAULT_EXPOSURE)
+    parser.add_argument(
+        "--sb", "--shadow-break", type=float, default=tiler.SOFT_KNEE_SHADOW_BREAK
+    )
+    parser.add_argument(
+        "--hb", "--highlight-break", type=float, default=tiler.SOFT_KNEE_HIGHLIGHT_BREAK
+    )
+    parser.add_argument(
+        "--ss", "--shadow-slope", type=float, default=tiler.SOFT_KNEE_SHADOW_SLOPE
+    )
+    parser.add_argument(
+        "--ms", "--mid-slope", type=float, default=tiler.SOFT_KNEE_MID_SLOPE
+    )
+    parser.add_argument(
+        "--hs", "--highlight-slope", type=float, default=tiler.SOFT_KNEE_HIGHLIGHT_SLOPE
+    )
+    parser.add_argument("--gamma", type=float, default=tiler.DEFAULT_GAMMA)
+    parser.add_argument(
+        "--sat", "--saturation", type=float, default=tiler.PREVIEW_SATURATION
+    )
+    parser.add_argument(
+        "--db", "--black-break", type=float, default=tiler.PREVIEW_DARKEN_BREAK
+    )
+    parser.add_argument(
+        "--ls", "--black-slope", type=float, default=tiler.PREVIEW_DARKEN_LOW_SLOPE
+    )
+    parser.add_argument(
+        "--depth-min",
+        type=float,
+        default=-11000.0,
+        help="Depth value mapped to the start of the ocean color ramp",
+    )
+    parser.add_argument(
+        "--depth-max",
+        type=float,
+        default=0.0,
+        help="Depth value mapped to the end of the ocean color ramp",
+    )
+    parser.add_argument(
+        "--vrt",
+        action="store_true",
+        help="Write the final styled RGBA VRT instead of translating it to a GeoTIFF",
+    )
     args = parser.parse_args()
 
     artifacts = generate_ocean_background(
         gebco_zip=args.gebco_zip,
         destination=args.destination,
-        bbox=parse_bbox(args.bbox),
+        bbox=parse_bbox(args.bbox) if args.bbox else None,
         temp_dir=args.temp_dir,
         resample_alg=args.resample_alg,
         hillshade_z=args.hillshade_z,
+        style=OceanStyleOptions(
+            tonemap=args.tonemap,
+            grade=args.grade,
+            exposure=args.exposure,
+            shadow_break=args.sb,
+            highlight_break=args.hb,
+            shadow_slope=args.ss,
+            mid_slope=args.ms,
+            highlight_slope=args.hs,
+            gamma=args.gamma,
+            saturation=args.sat,
+            black_break=args.db,
+            black_slope=args.ls,
+            depth_min=args.depth_min,
+            depth_max=args.depth_max,
+        ),
+        vrt=args.vrt,
     )
     print(artifacts.output_tif)
 

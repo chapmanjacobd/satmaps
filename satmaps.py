@@ -386,63 +386,26 @@ def process_single_tile(
             gamma=args.gamma,
         )
 
-    # 5. Pixel-level Blending
-    if alpha_weight is not None:
-        # Generate the same ocean color ramp used for the background
-        mako_colors = (
-            np.array([c[1:] for c in tiler.MAKO_RAMP], dtype=np.float32) / 255.0
-        )
-        if args.ocean_tonemap:
-            mako_arr = mako_colors.T.reshape(3, -1, 1)
-            toned_mako = tiler.apply_soft_knee_numpy(
-                mako_arr,
-                shadow_break=args.osb,
-                highlight_break=args.ohb,
-                shadow_slope=args.oss,
-                mid_slope=args.oms,
-                highlight_slope=args.ohs,
-                exposure=args.ocean_exposure,
-            )
-            mako_colors = toned_mako.reshape(3, -1).T
-        else:
-            mako_colors = np.clip(mako_colors * args.ocean_exposure, 0.0, 1.0)
-
-        if args.ocean_grade:
-            mako_arr = mako_colors.T.reshape(3, -1, 1)
-            graded_mako = tiler.apply_preview_correction_numpy(
-                mako_arr,
-                saturation=args.osat,
-                darken_break=args.odb,
-                low_slope=args.ols,
-                gamma=args.ocean_gamma,
-            )
-            mako_colors = graded_mako.reshape(3, -1).T
-
-        ocean_rgb = tiler.colorize_depth_numpy(
-            gebco_data, mako_colors, args.ocean_depth_min, args.ocean_depth_max
-        )
-
-        # Blend: Toned * alpha + Ocean * (1 - alpha)
-        # Note: alpha_weight is (H,W), toned is (3,H,W), ocean_rgb is (3,H,W)
-        toned = toned * alpha_weight + ocean_rgb * (1.0 - alpha_weight)
-
-    # 6. Fill land/coastal gaps from the nearest valid source pixel without
-    # overriding pure deep-ocean pixels that should remain ocean-colored.
+    # 5. Fill land/coastal gaps from the nearest valid source pixel while leaving
+    # pure ocean transparent so the prebuilt ocean background can show through.
     fill_mask = ~source_valid_mask
     if alpha_weight is not None:
         fill_mask &= gebco_data > OCEAN_FADE
     if np.any(fill_mask):
         toned = fill_nan_nearest(toned, valid_mask=~fill_mask)
 
-    # 7. Save to temporary Byte GeoTIFF
+    # 6. Save to temporary Byte GeoTIFF
     temp_utm_path = f".temp/processed_{mgrs_subtile}_{unique_id}_utm.tif"
     temp_3857_path = f".temp/processed_{mgrs_subtile}_{unique_id}_3857.tif"
 
     driver = gdal.GetDriverByName("GTiff")
 
-    # Keep an alpha mask for valid land-source pixels so warping and mosaicking
-    # preserve the true tile footprint even though the RGB is blended/filled.
-    combined_alpha = (source_valid_mask.astype(np.uint8) * 255)
+    # Use a smooth coastal alpha when GEBCO is available so the standalone ocean
+    # background shows through beneath ocean pixels instead of being repainted here.
+    if alpha_weight is not None:
+        combined_alpha = np.clip(alpha_weight * 255.0, 0.0, 255.0).astype(np.uint8)
+    else:
+        combined_alpha = source_valid_mask.astype(np.uint8) * 255
     byte_arr = np.nan_to_num(toned * 255, nan=0).astype(np.uint8)
 
     ds_out = driver.Create(
@@ -469,7 +432,7 @@ def process_single_tile(
     ds_out.FlushCache()
     ds_out = None
 
-    # 8. Warp to Web Mercator
+    # 7. Warp to Web Mercator
     warp_options = gdal.WarpOptions(
         format="GTiff",
         dstSRS="EPSG:3857",
@@ -650,65 +613,6 @@ def main() -> None:
         "--ls", "--black-slope", type=float, default=tiler.PREVIEW_DARKEN_LOW_SLOPE
     )
 
-    # Ocean-specific Tone Mapping
-    parser.add_argument("--ocean-exposure", type=float, default=tiler.DEFAULT_EXPOSURE)
-    parser.add_argument(
-        "--osb",
-        "--ocean-shadow-break",
-        type=float,
-        default=tiler.SOFT_KNEE_SHADOW_BREAK,
-    )
-    parser.add_argument(
-        "--ohb",
-        "--ocean-highlight-break",
-        type=float,
-        default=tiler.SOFT_KNEE_HIGHLIGHT_BREAK,
-    )
-    parser.add_argument(
-        "--oss",
-        "--ocean-shadow-slope",
-        type=float,
-        default=tiler.SOFT_KNEE_SHADOW_SLOPE,
-    )
-    parser.add_argument(
-        "--oms", "--ocean-mid-slope", type=float, default=tiler.SOFT_KNEE_MID_SLOPE
-    )
-    parser.add_argument(
-        "--ohs",
-        "--ocean-highlight-slope",
-        type=float,
-        default=tiler.SOFT_KNEE_HIGHLIGHT_SLOPE,
-    )
-
-    # Ocean-specific Grading
-    parser.add_argument("--ocean-gamma", type=float, default=tiler.DEFAULT_GAMMA)
-    parser.add_argument(
-        "--osat", "--ocean-saturation", type=float, default=tiler.PREVIEW_SATURATION
-    )
-    parser.add_argument(
-        "--odb", "--ocean-black-break", type=float, default=tiler.PREVIEW_DARKEN_BREAK
-    )
-    parser.add_argument(
-        "--ols",
-        "--ocean-black-slope",
-        type=float,
-        default=tiler.PREVIEW_DARKEN_LOW_SLOPE,
-    )
-
-    # Ocean-specific Depth Range
-    parser.add_argument(
-        "--ocean-depth-min",
-        type=float,
-        default=-11000,
-        help="Depth value for 0.0 in the color ramp",
-    )
-    parser.add_argument(
-        "--ocean-depth-max",
-        type=float,
-        default=0,
-        help="Depth value for 1.0 in the color ramp",
-    )
-
     parser.add_argument(
         "--tonemap",
         action=argparse.BooleanOptionalAction,
@@ -720,18 +624,6 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable/disable land final grading",
-    )
-    parser.add_argument(
-        "--ocean-tonemap",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable/disable ocean tone mapping",
-    )
-    parser.add_argument(
-        "--ocean-grade",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable/disable ocean final grading",
     )
     parser.add_argument(
         "--land",

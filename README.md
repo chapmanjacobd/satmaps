@@ -9,7 +9,7 @@ This repository provides tools to fetch, process, and package Sentinel-2 mosaic 
 ## Core Components
 
 - `satmaps.py`: The primary engine. Handles GDAL S3 configuration, multi-date mosaicking, reprojection to Web Mercator (EPSG:3857), and PMTiles generation. Uses a NumPy-based pipeline for tone mapping and grading.
-- `ocean_background.py`: Builds a standalone `ocean.tif` GEBCO hillshade background in EPSG:3857, matching the effective resolution of a 10m UTM source projected into Web Mercator.
+- `ocean_background.py`: Builds a standalone styled Web Mercator ocean background from GEBCO, either cropped for a `--bbox` render or exported globally from the full masked source raster when no bbox is provided.
 - `tuner_ui.py`: A Flask-based interactive web interface to fine-tune tone mapping parameters (exposure, contrast, saturation) in real-time on sample data.
 - `tiler.py`: Core logic for tile processing, tone mapping algorithms, and parallelized chunk execution.
 
@@ -41,13 +41,21 @@ Visit `http://localhost:5001` to adjust exposure, soft-knee curves, and saturati
 
 ### 2. Generate the Ocean Background
 
-Prebuild the standalone ocean hillshade once and reuse it anywhere you want an ocean base layer:
+Prebuild the standalone styled ocean background once and reuse it anywhere you want an ocean base layer:
 
 ```bash
+# Global export from the full masked GEBCO source raster
+python3 ocean_background.py
+
+# Crop and reproject to match a bbox render
 python3 ocean_background.py --bbox -161,18,-154,23
+
+# Inspect the final styled RGBA VRT without translating to GeoTIFF
+python3 ocean_background.py --vrt
 ```
 
-The first positional argument is the GEBCO zip path if you need something other than `gebco_2025_sub_ice_topo_geotiff.zip`, and the optional second positional argument is the output path (default: `ocean.tif`).
+The first positional argument is the GEBCO zip path if you need something other than `gebco_2025_sub_ice_topo_geotiff.zip`, and the optional second positional argument is the output path (default: `ocean.tif`, or `ocean.vrt` when `--vrt` is used).
+Ocean-specific tone mapping, grading, and depth-ramp tuning now live in `ocean_background.py`; `satmaps.py` composites land tiles over that prebuilt background.
 
 ### 3. Generate PMTiles
 

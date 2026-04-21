@@ -6,6 +6,7 @@ from flask import Flask, render_template, request, send_file
 from osgeo import gdal
 from PIL import Image
 
+import ocean_background
 import tiler
 
 app = Flask(__name__)
@@ -183,32 +184,24 @@ def render():
         if RAW_GEBCO is None:
             return "No GEBCO zip found", 404
 
-        # Colorize Mako ramp based on depth
-        mako_colors = (
-            np.array([c[1:] for c in tiler.MAKO_RAMP], dtype=np.float32) / 255.0
-        )
-        mako_arr = mako_colors.T.reshape(3, -1, 1)
-
-        if tm_on:
-            toned_mako = tiler.apply_soft_knee_numpy(
-                mako_arr, p["sb"], p["hb"], p["ss"], p["ms"], p["hs"], p["exp"]
-            )
-            mako_colors = toned_mako.reshape(3, -1).T
-        else:
-            mako_colors = np.clip(mako_colors * p["exp"], 0.0, 1.0)
-
-        if fg_on:
-            graded_mako = tiler.apply_preview_correction_numpy(
-                mako_arr if not tm_on else toned_mako,
-                p["sat"],
-                p["db"],
-                p["ls"],
-                p["gamma"],
-            )
-            mako_colors = graded_mako.reshape(3, -1).T
-
-        corrected = tiler.colorize_depth_numpy(
-            RAW_GEBCO, mako_colors, p["dmin"], p["dmax"]
+        corrected = ocean_background.colorize_ocean_depths(
+            RAW_GEBCO,
+            ocean_background.OceanStyleOptions(
+                tonemap=tm_on,
+                grade=fg_on,
+                exposure=p["exp"],
+                shadow_break=p["sb"],
+                highlight_break=p["hb"],
+                shadow_slope=p["ss"],
+                mid_slope=p["ms"],
+                highlight_slope=p["hs"],
+                gamma=p["gamma"],
+                saturation=p["sat"],
+                black_break=p["db"],
+                black_slope=p["ls"],
+                depth_min=p["dmin"],
+                depth_max=p["dmax"],
+            ),
         )
 
     # 3. Convert to Byte and JPEG

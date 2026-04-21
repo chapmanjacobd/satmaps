@@ -253,6 +253,41 @@ def test_ocean_background_main_uses_default_positionals(monkeypatch: object) -> 
             warped_vrt=".temp/warped.vrt",
             alpha_vrt=".temp/alpha.vrt",
             hillshade_tif=".temp/ocean_hillshade.tif",
+            color_tif=".temp/ocean_color.tif",
+            rgba_vrt=".temp/ocean_rgba.vrt",
+            output_tif=str(kwargs["destination"]),
+        )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["ocean_background.py"],
+    )
+    monkeypatch.setattr(
+        "ocean_background.generate_ocean_background",
+        fake_generate_ocean_background,
+    )
+
+    ocean_background.main()
+
+    assert called["gebco_zip"] == ocean_background.DEFAULT_GEBCO_ZIP
+    assert called["destination"] == ocean_background.DEFAULT_OUTPUT
+    assert called["bbox"] is None
+    assert called["vrt"] is False
+
+
+def test_ocean_background_main_parses_bbox_when_provided(monkeypatch: object) -> None:
+    called: dict[str, object] = {}
+
+    def fake_generate_ocean_background(**kwargs):
+        called.update(kwargs)
+        return ocean_background.OceanBackgroundArtifacts(
+            source_vrt=".temp/source.vrt",
+            masked_vrt=".temp/masked.vrt",
+            warped_vrt=".temp/warped.vrt",
+            alpha_vrt=".temp/alpha.vrt",
+            hillshade_tif=".temp/ocean_hillshade.tif",
+            color_tif=".temp/ocean_color.tif",
             rgba_vrt=".temp/ocean_rgba.vrt",
             output_tif=str(kwargs["destination"]),
         )
@@ -269,9 +304,174 @@ def test_ocean_background_main_uses_default_positionals(monkeypatch: object) -> 
 
     ocean_background.main()
 
-    assert called["gebco_zip"] == ocean_background.DEFAULT_GEBCO_ZIP
-    assert called["destination"] == ocean_background.DEFAULT_OUTPUT
     assert called["bbox"] == (0.0, 0.0, 1.0, 1.0)
+
+
+def test_ocean_background_main_enables_vrt_mode(monkeypatch: object) -> None:
+    called: dict[str, object] = {}
+
+    def fake_generate_ocean_background(**kwargs):
+        called.update(kwargs)
+        return ocean_background.OceanBackgroundArtifacts(
+            source_vrt=".temp/source.vrt",
+            masked_vrt=".temp/masked.vrt",
+            warped_vrt=".temp/warped.vrt",
+            alpha_vrt=".temp/alpha.vrt",
+            hillshade_tif=".temp/ocean_hillshade.tif",
+            color_tif=".temp/ocean_color.tif",
+            rgba_vrt=".temp/ocean_rgba.vrt",
+            output_tif="ocean.vrt",
+        )
+
+    monkeypatch.setattr(sys, "argv", ["ocean_background.py", "--vrt"])
+    monkeypatch.setattr(
+        "ocean_background.generate_ocean_background",
+        fake_generate_ocean_background,
+    )
+
+    ocean_background.main()
+
+    assert called["vrt"] is True
+
+
+def test_generate_ocean_background_without_bbox_warps_global_raster(
+    monkeypatch: object,
+) -> None:
+    commands: list[list[str]] = []
+    translated: list[tuple[str, str]] = []
+    warp_calls: list[tuple[str, str, object]] = []
+    warp_options_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr("ocean_background.which", lambda cmd: "/usr/bin/gdaldem")
+    monkeypatch.setattr("ocean_background.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "ocean_background.build_gebco_source_vrt",
+        lambda gebco_zip, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_gebco_ocean_vrt",
+        lambda source_vrt, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_alpha_vrt",
+        lambda source_vrt, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_ocean_rgb_tif",
+        lambda depth_vrt, hillshade_tif, output_tif, style: output_tif,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_rgb_with_alpha_vrt",
+        lambda rgb_tif, alpha_vrt, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.translate_rgba_vrt",
+        lambda rgba_vrt, destination: translated.append((rgba_vrt, destination)) or destination,
+    )
+    monkeypatch.setattr(
+        "ocean_background.build_hillshade_command",
+        lambda input_vrt, output_tif, z_factor: [input_vrt, output_tif, str(z_factor)],
+    )
+    monkeypatch.setattr(
+        "ocean_background.subprocess.run",
+        lambda cmd, check: commands.append(cmd),
+    )
+    monkeypatch.setattr(
+        "ocean_background.gdal.WarpOptions",
+        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        "ocean_background.gdal.Warp",
+        lambda destination, source, options=None: warp_calls.append(
+            (destination, source, options)
+        ),
+    )
+
+    artifacts = ocean_background.generate_ocean_background(
+        gebco_zip="gebco.zip",
+        destination="ocean.tif",
+        bbox=None,
+    )
+
+    assert artifacts.masked_vrt.endswith("ocean_masked.vrt")
+    assert artifacts.warped_vrt.endswith("ocean_3857.vrt")
+    assert len(warp_calls) == 1
+    assert warp_calls[0][0] == artifacts.warped_vrt
+    assert warp_calls[0][1] == artifacts.masked_vrt
+    assert warp_options_calls[0]["outputBounds"] == ocean_background.WEB_MERCATOR_WORLD_BOUNDS
+    assert commands == [[artifacts.warped_vrt, artifacts.hillshade_tif, "5.0"]]
+    assert translated == [(artifacts.rgba_vrt, "ocean.tif")]
+
+
+def test_generate_ocean_background_vrt_mode_skips_translate(monkeypatch: object) -> None:
+    vrt_outputs: list[tuple[str, str]] = []
+
+    monkeypatch.setattr("ocean_background.which", lambda cmd: "/usr/bin/gdaldem")
+    monkeypatch.setattr("ocean_background.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "ocean_background.build_gebco_source_vrt",
+        lambda gebco_zip, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_gebco_ocean_vrt",
+        lambda source_vrt, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_alpha_vrt",
+        lambda source_vrt, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_ocean_rgb_tif",
+        lambda depth_vrt, hillshade_tif, output_tif, style: output_tif,
+    )
+    monkeypatch.setattr(
+        "ocean_background.create_rgb_with_alpha_vrt",
+        lambda rgb_tif, alpha_vrt, output_vrt: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean_background.write_rgba_vrt",
+        lambda rgba_vrt, destination: vrt_outputs.append((rgba_vrt, destination)) or destination,
+    )
+    monkeypatch.setattr(
+        "ocean_background.translate_rgba_vrt",
+        lambda rgba_vrt, destination: (_ for _ in ()).throw(AssertionError("Translate should not be called")),
+    )
+    monkeypatch.setattr(
+        "ocean_background.build_hillshade_command",
+        lambda input_vrt, output_tif, z_factor: [input_vrt, output_tif, str(z_factor)],
+    )
+    monkeypatch.setattr("ocean_background.subprocess.run", lambda cmd, check: None)
+    monkeypatch.setattr("ocean_background.gdal.WarpOptions", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        "ocean_background.gdal.Warp",
+        lambda destination, source, options=None: None,
+    )
+
+    artifacts = ocean_background.generate_ocean_background(
+        gebco_zip="gebco.zip",
+        destination="ocean.tif",
+        vrt=True,
+    )
+
+    assert artifacts.output_tif == "ocean.vrt"
+    assert vrt_outputs == [(artifacts.rgba_vrt, "ocean.vrt")]
+
+
+def test_build_ocean_ramp_colors_respects_style_flags() -> None:
+    default_colors = ocean_background.build_ocean_ramp_colors(
+        ocean_background.OceanStyleOptions()
+    )
+    ungraded_colors = ocean_background.build_ocean_ramp_colors(
+        ocean_background.OceanStyleOptions(tonemap=False, grade=False, exposure=0.5)
+    )
+
+    assert default_colors.shape == (len(ocean_background.tiler.MAKO_RAMP), 3)
+    np.testing.assert_allclose(
+        ungraded_colors[0],
+        np.array(ocean_background.tiler.MAKO_RAMP[0][1:], dtype=np.float32) / 255.0,
+    )
+    assert np.all((default_colors >= 0.0) & (default_colors <= 1.0))
+    assert np.all((ungraded_colors >= 0.0) & (ungraded_colors <= 1.0))
 
 
 def test_process_single_tile_full_pipeline(monkeypatch: object, tmp_path: Path) -> None:
