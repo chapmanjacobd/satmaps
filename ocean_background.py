@@ -274,11 +274,14 @@ def create_ocean_rgb_tif(
     if hillshade_ds is None:
         raise RuntimeError(f"Could not open hillshade TIFF: {hillshade_tif}")
 
-    depths = depth_ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
-    hillshade = hillshade_ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
-    rgb = colorize_ocean_depths(depths, style)
-    shade = 0.35 + 0.65 * np.clip(hillshade / 255.0, 0.0, 1.0)
-    shaded_rgb = np.clip(rgb * shade[np.newaxis, :, :], 0.0, 1.0)
+    depth_band = depth_ds.GetRasterBand(1)
+    hillshade_band = hillshade_ds.GetRasterBand(1)
+    block_width, block_height = hillshade_band.GetBlockSize()
+    if block_width <= 0:
+        block_width = 512
+    if block_height <= 0:
+        block_height = 512
+    ramp_colors = build_ocean_ramp_colors(style)
 
     driver = gdal.GetDriverByName("GTiff")
     color_ds = driver.Create(
@@ -295,11 +298,28 @@ def create_ocean_rgb_tif(
     color_ds.SetProjection(hillshade_ds.GetProjection())
     color_ds.SetGeoTransform(hillshade_ds.GetGeoTransform())
 
-    byte_arr = (shaded_rgb * 255.0).astype(np.uint8)
     for band_index, color_name in enumerate(("RedBand", "GreenBand", "BlueBand"), start=1):
         band = color_ds.GetRasterBand(band_index)
-        band.WriteArray(byte_arr[band_index - 1])
         band.SetColorInterpretation(getattr(gdal, f"GCI_{color_name}"))
+
+    color_bands = [color_ds.GetRasterBand(index) for index in range(1, 4)]
+    for yoff in range(0, hillshade_ds.RasterYSize, block_height):
+        bh = min(block_height, hillshade_ds.RasterYSize - yoff)
+        for xoff in range(0, hillshade_ds.RasterXSize, block_width):
+            bw = min(block_width, hillshade_ds.RasterXSize - xoff)
+            depths = depth_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+            hillshade = hillshade_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+            rgb = tiler.colorize_depth_numpy(
+                depths,
+                ramp_colors,
+                style.depth_min,
+                style.depth_max,
+            )
+            shade = 0.35 + 0.65 * np.clip(hillshade / 255.0, 0.0, 1.0)
+            shaded_rgb = np.clip(rgb * shade[np.newaxis, :, :], 0.0, 1.0)
+            byte_arr = (shaded_rgb * 255.0).astype(np.uint8)
+            for band_index, band in enumerate(color_bands):
+                band.WriteArray(byte_arr[band_index], xoff=xoff, yoff=yoff)
 
     color_ds.FlushCache()
     color_ds = None

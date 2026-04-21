@@ -222,6 +222,59 @@ def test_create_hillshade_rgba_vrt_repeats_gray_and_uses_alpha_vrt(tmp_path: Pat
     )
 
 
+def test_create_ocean_rgb_tif_colorizes_in_blocks(tmp_path: Path) -> None:
+    driver = gdal.GetDriverByName("GTiff")
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+
+    depth_path = tmp_path / "depth.tif"
+    depth_ds = driver.Create(str(depth_path), 2, 2, 1, gdal.GDT_Float32)
+    depth_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    depth_ds.SetProjection(srs.ExportToWkt())
+    depth_ds.GetRasterBand(1).WriteArray(
+        np.array([[-1000.0, -500.0], [-250.0, 0.0]], dtype=np.float32)
+    )
+    depth_ds = None
+
+    hillshade_path = tmp_path / "hillshade.tif"
+    hillshade_ds = driver.Create(str(hillshade_path), 2, 2, 1, gdal.GDT_Byte)
+    hillshade_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    hillshade_ds.SetProjection(srs.ExportToWkt())
+    hillshade_ds.GetRasterBand(1).WriteArray(
+        np.array([[0, 64], [128, 255]], dtype=np.uint8)
+    )
+    hillshade_ds = None
+
+    output_path = tmp_path / "ocean_rgb.tif"
+    ocean_background.create_ocean_rgb_tif(
+        str(depth_path),
+        str(hillshade_path),
+        str(output_path),
+        ocean_background.OceanStyleOptions(tonemap=False, grade=False),
+    )
+
+    rgb_ds = gdal.Open(str(output_path))
+    assert rgb_ds is not None
+    arr = rgb_ds.ReadAsArray()
+    assert arr.shape == (3, 2, 2)
+    assert arr.dtype == np.uint8
+
+    style = ocean_background.OceanStyleOptions(tonemap=False, grade=False)
+    expected_rgb = ocean_background.colorize_ocean_depths(
+        np.array([[-1000.0, -500.0], [-250.0, 0.0]], dtype=np.float32),
+        style,
+    )
+    expected_shade = 0.35 + 0.65 * np.clip(
+        np.array([[0, 64], [128, 255]], dtype=np.float32) / 255.0,
+        0.0,
+        1.0,
+    )
+    expected = (np.clip(expected_rgb * expected_shade[np.newaxis, :, :], 0.0, 1.0) * 255.0).astype(
+        np.uint8
+    )
+    np.testing.assert_array_equal(arr, expected)
+
+
 def test_build_hillshade_command_matches_expected_flags(tmp_path: Path) -> None:
     command = ocean_background.build_hillshade_command(
         str(tmp_path / "in.vrt"),

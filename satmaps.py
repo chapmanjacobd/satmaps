@@ -6,7 +6,6 @@ import os
 import subprocess
 import sys
 import uuid
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -232,14 +231,34 @@ def mosaic_date_stacks(date_stacks: List[np.ndarray]) -> Tuple[np.ndarray, np.nd
     if not date_stacks:
         raise ValueError("date_stacks must not be empty")
 
-    full_stack = np.stack(date_stacks)  # (D, 3, H, W)
-    complete_rgb_mask = np.all(np.isfinite(full_stack), axis=1)  # (D, H, W)
-    valid_source_mask = np.any(complete_rgb_mask, axis=0)
-    mosaic_stack = np.where(complete_rgb_mask[:, np.newaxis, :, :], full_stack, np.nan)
+    first_stack = date_stacks[0]
+    summed = np.zeros_like(first_stack, dtype=np.float32)
+    valid_counts = np.zeros(first_stack.shape[1:], dtype=np.uint16)
+    valid_source_mask = np.zeros(first_stack.shape[1:], dtype=bool)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        averaged = np.nanmean(mosaic_stack, axis=0)
+    for date_stack in date_stacks:
+        complete_rgb_mask = np.all(np.isfinite(date_stack), axis=0)
+        if not np.any(complete_rgb_mask):
+            continue
+
+        valid_source_mask |= complete_rgb_mask
+        valid_counts[complete_rgb_mask] += 1
+        for band_index in range(date_stack.shape[0]):
+            np.add(
+                summed[band_index],
+                date_stack[band_index],
+                out=summed[band_index],
+                where=complete_rgb_mask,
+            )
+
+    averaged = np.full_like(first_stack, np.nan, dtype=np.float32)
+    for band_index in range(first_stack.shape[0]):
+        np.divide(
+            summed[band_index],
+            valid_counts,
+            out=averaged[band_index],
+            where=valid_source_mask,
+        )
 
     return averaged, valid_source_mask
 
@@ -270,7 +289,8 @@ def process_single_tile(
     width, height = ds_init.RasterXSize, ds_init.RasterYSize
     ds_init = None
 
-    alpha_weight = None
+    gebco_band = None
+    fill_allowed_mask = None
     # Transition constants
     LAND_STAY = -42.0  # 100% Sentinel-2 above this depth
     OCEAN_FADE = -50.0  # 0% Sentinel-2 below this depth
@@ -288,64 +308,91 @@ def process_single_tile(
             gdal.Warp(
                 gebco_mem_ds, gebco_ds, options=gdal.WarpOptions(resampleAlg="bilinear")
             )
-            gebco_data = gebco_mem_ds.GetRasterBand(1).ReadAsArray()
-
-            # Create a smooth alpha weight based on depth
-            alpha_weight = np.clip(
-                (gebco_data - OCEAN_FADE) / (LAND_STAY - OCEAN_FADE), 0.0, 1.0
-            )
-
-            # Optimization: If the whole tile is deep ocean (below OCEAN_FADE), skip it
-            if np.all(gebco_data <= OCEAN_FADE):
-                return None
+            gebco_band = gebco_mem_ds.GetRasterBand(1)
+            fill_allowed_mask = np.zeros((height, width), dtype=bool)
         except Exception as e:
             print(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
 
     print(f"Processing tile {mgrs_subtile} across {len(folders)} date(s)...")
 
-    # 2. Load all dates into memory (with block-level skipping to save bandwidth)
-    date_stacks = []
+    # 2. Average dates block-by-block so only one working window is resident at a time.
+    averaged = np.full((3, height, width), np.nan, dtype=np.float32)
+    source_valid_mask = np.zeros((height, width), dtype=bool)
+    block_size = 1024
+    found_non_ocean_pixels = gebco_band is None
+    date_band_sets = []
     for folder_name, date_path in folders:
         paths = get_tile_paths(folder_name, date_path, args.cache, download=False)
-        bands_data = [
-            np.full((height, width), np.nan, dtype=np.float32) for _ in range(3)
-        ]
-
-        # Open datasets once per folder
         dss = [gdal.Open(paths[color]) for color in ["red", "green", "blue"]]
-        bands = [ds.GetRasterBand(1) for ds in dss]
+        date_band_sets.append(([ds.GetRasterBand(1) for ds in dss], dss))
 
-        # Use large blocks to skip ocean regions efficiently while maintaining throughput
-        block_size = 2048
-        for yoff in range(0, height, block_size):
-            bh = min(block_size, height - yoff)
-            for xoff in range(0, width, block_size):
-                bw = min(block_size, width - xoff)
+    for yoff in range(0, height, block_size):
+        bh = min(block_size, height - yoff)
+        for xoff in range(0, width, block_size):
+            bw = min(block_size, width - xoff)
 
-                # If this block is 100% deep ocean according to GEBCO, skip the S3 request
-                if gebco_src and np.all(
-                    gebco_data[yoff : yoff + bh, xoff : xoff + bw] <= OCEAN_FADE
-                ):
+            if gebco_band is not None:
+                gebco_block = gebco_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+                assert fill_allowed_mask is not None
+                fill_allowed_block = gebco_block > OCEAN_FADE
+                fill_allowed_mask[yoff : yoff + bh, xoff : xoff + bw] = fill_allowed_block
+                if not np.any(fill_allowed_block):
+                    continue
+                found_non_ocean_pixels = True
+
+            summed = np.zeros((3, bh, bw), dtype=np.float32)
+            valid_counts = np.zeros((bh, bw), dtype=np.uint16)
+            block_valid_sources = np.zeros((bh, bw), dtype=bool)
+
+            for bands, _ in date_band_sets:
+                rgb_block = np.empty((3, bh, bw), dtype=np.float32)
+                for band_index, band in enumerate(bands):
+                    block_arr = band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+                    block_arr[block_arr == -32768] = np.nan
+                    rgb_block[band_index] = block_arr
+
+                complete_rgb_mask = np.all(np.isfinite(rgb_block), axis=0)
+                if not np.any(complete_rgb_mask):
                     continue
 
-                for i in range(3):
-                    block_arr = (
-                        bands[i].ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+                block_valid_sources |= complete_rgb_mask
+                valid_counts[complete_rgb_mask] += 1
+                for band_index in range(rgb_block.shape[0]):
+                    np.add(
+                        summed[band_index],
+                        rgb_block[band_index],
+                        out=summed[band_index],
+                        where=complete_rgb_mask,
                     )
-                    # Use NaN for nodata -32768
-                    block_arr[block_arr == -32768] = np.nan
-                    bands_data[i][yoff : yoff + bh, xoff : xoff + bw] = block_arr
 
-        date_stacks.append(np.stack(bands_data))  # (3, H, W)
+            if not np.any(block_valid_sources):
+                continue
 
-    if not date_stacks:
+            averaged_block = np.full((3, bh, bw), np.nan, dtype=np.float32)
+            for band_index in range(averaged_block.shape[0]):
+                np.divide(
+                    summed[band_index],
+                    valid_counts,
+                    out=averaged_block[band_index],
+                    where=block_valid_sources,
+                )
+            averaged[:, yoff : yoff + bh, xoff : xoff + bw] = averaged_block
+            source_valid_mask[yoff : yoff + bh, xoff : xoff + bw] = block_valid_sources
+
+    date_band_sets.clear()
+
+    if not found_non_ocean_pixels:
         return None
 
-    # 3. Mosaic dates before any nodata fill so a real source pixel from any date
-    # always wins over a later nearest-neighbor interpolation.
-    averaged, source_valid_mask = mosaic_date_stacks(date_stacks)
+    # 3. Fill land/coastal gaps from the nearest valid source pixel while leaving
+    # pure ocean transparent so the prebuilt ocean background can show through.
+    fill_mask = ~source_valid_mask
+    if fill_allowed_mask is not None:
+        fill_mask &= fill_allowed_mask
+    if np.any(fill_mask):
+        averaged = fill_nan_nearest(averaged, valid_mask=source_valid_mask)
 
-    # 4. Tone Mapping
+    # 4. Tone mapping is windowed to avoid creating more full-size NumPy copies.
     # Determine scaling (either hardcoded or via percentile)
     if args.stats_min is not None:
         s_min = args.stats_min
@@ -359,54 +406,11 @@ def process_single_tile(
         # It prevents clipping in bright regions like sand, snow, or clouds.
         s_max = 9000.0
 
-    normalized = np.clip((averaged - s_min) / (s_max - s_min), 0.0, 1.0)
-    normalized[np.isnan(normalized)] = 0.0
-
-    # Apply tone mapping (soft-knee)
-    if args.tonemap:
-        toned = tiler.apply_soft_knee_numpy(
-            normalized,
-            shadow_break=args.sb,
-            highlight_break=args.hb,
-            shadow_slope=args.ss,
-            mid_slope=args.ms,
-            highlight_slope=args.hs,
-            exposure=args.exposure,
-        )
-    else:
-        toned = np.clip(normalized * args.exposure, 0.0, 1.0)
-
-    # Apply final grading (preview correction)
-    if args.grade:
-        toned = tiler.apply_preview_correction_numpy(
-            toned,
-            saturation=args.sat,
-            darken_break=args.db,
-            low_slope=args.ls,
-            gamma=args.gamma,
-        )
-
-    # 5. Fill land/coastal gaps from the nearest valid source pixel while leaving
-    # pure ocean transparent so the prebuilt ocean background can show through.
-    fill_mask = ~source_valid_mask
-    if alpha_weight is not None:
-        fill_mask &= gebco_data > OCEAN_FADE
-    if np.any(fill_mask):
-        toned = fill_nan_nearest(toned, valid_mask=~fill_mask)
-
-    # 6. Save to temporary Byte GeoTIFF
+    # 5. Save to temporary Byte GeoTIFF while converting each window independently.
     temp_utm_path = f".temp/processed_{mgrs_subtile}_{unique_id}_utm.tif"
     temp_3857_path = f".temp/processed_{mgrs_subtile}_{unique_id}_3857.tif"
 
     driver = gdal.GetDriverByName("GTiff")
-
-    # Use a smooth coastal alpha when GEBCO is available so the standalone ocean
-    # background shows through beneath ocean pixels instead of being repainted here.
-    if alpha_weight is not None:
-        combined_alpha = np.clip(alpha_weight * 255.0, 0.0, 255.0).astype(np.uint8)
-    else:
-        combined_alpha = source_valid_mask.astype(np.uint8) * 255
-    byte_arr = np.nan_to_num(toned * 255, nan=0).astype(np.uint8)
 
     ds_out = driver.Create(
         temp_utm_path,
@@ -418,21 +422,68 @@ def process_single_tile(
     )
     ds_out.SetProjection(projection)
     ds_out.SetGeoTransform(geotransform)
-    for i in range(3):
-        out_band = ds_out.GetRasterBand(i + 1)
-        out_band.WriteArray(byte_arr[i])
-        out_band.SetColorInterpretation(
-            getattr(gdal, f"GCI_{['RedBand', 'GreenBand', 'BlueBand'][i]}")
-        )
+    color_bands = [ds_out.GetRasterBand(i + 1) for i in range(3)]
+    for band_index, color_name in enumerate(("RedBand", "GreenBand", "BlueBand")):
+        color_bands[band_index].SetColorInterpretation(getattr(gdal, f"GCI_{color_name}"))
 
     alpha_band = ds_out.GetRasterBand(4)
-    alpha_band.WriteArray(combined_alpha)
     alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
+
+    scale = s_max - s_min
+    if scale <= 0.0:
+        raise ValueError("stats_max must be greater than stats_min")
+
+    for yoff in range(0, height, block_size):
+        bh = min(block_size, height - yoff)
+        for xoff in range(0, width, block_size):
+            bw = min(block_size, width - xoff)
+            averaged_block = averaged[:, yoff : yoff + bh, xoff : xoff + bw]
+            normalized = np.clip((averaged_block - s_min) / scale, 0.0, 1.0)
+            normalized[np.isnan(normalized)] = 0.0
+
+            if args.tonemap:
+                toned_block = tiler.apply_soft_knee_numpy(
+                    normalized,
+                    shadow_break=args.sb,
+                    highlight_break=args.hb,
+                    shadow_slope=args.ss,
+                    mid_slope=args.ms,
+                    highlight_slope=args.hs,
+                    exposure=args.exposure,
+                )
+            else:
+                toned_block = np.clip(normalized * args.exposure, 0.0, 1.0)
+
+            if args.grade:
+                toned_block = tiler.apply_preview_correction_numpy(
+                    toned_block,
+                    saturation=args.sat,
+                    darken_break=args.db,
+                    low_slope=args.ls,
+                    gamma=args.gamma,
+                )
+
+            byte_block = np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
+            for band_index, out_band in enumerate(color_bands):
+                out_band.WriteArray(byte_block[band_index], xoff=xoff, yoff=yoff)
+
+            if gebco_band is not None:
+                gebco_block = gebco_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+                alpha_block = np.clip(
+                    (gebco_block - OCEAN_FADE) / (LAND_STAY - OCEAN_FADE), 0.0, 1.0
+                )
+                combined_alpha = np.clip(alpha_block * 255.0, 0.0, 255.0).astype(np.uint8)
+            else:
+                combined_alpha = source_valid_mask[yoff : yoff + bh, xoff : xoff + bw].astype(
+                    np.uint8
+                ) * 255
+
+            alpha_band.WriteArray(combined_alpha, xoff=xoff, yoff=yoff)
 
     ds_out.FlushCache()
     ds_out = None
 
-    # 7. Warp to Web Mercator
+    # 6. Warp to Web Mercator
     warp_options = gdal.WarpOptions(
         format="GTiff",
         dstSRS="EPSG:3857",
