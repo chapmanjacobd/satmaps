@@ -208,7 +208,10 @@ def resolution_for_utm_10m_3857(
     """Approximate the EPSG:3857 pixel size of a 10m UTM grid at the bbox center."""
     center_lon = (min_lon + max_lon) / 2.0
     center_lat = (min_lat + max_lat) / 2.0
-    zone = int((center_lon + 180.0) / 6.0) + 1
+    if center_lat < -80.0 or center_lat > 84.0:
+        raise ValueError("UTM projection requires the bbox center to be between 80S and 84N")
+
+    zone = max(1, min(60, int((center_lon + 180.0) / 6.0) + 1))
     epsg = (32600 if center_lat >= 0.0 else 32700) + zone
 
     wgs84 = osr.SpatialReference()

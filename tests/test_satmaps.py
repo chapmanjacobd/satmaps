@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 from osgeo import gdal, osr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -161,6 +162,18 @@ def test_resolution_for_utm_10m_3857_returns_positive_values() -> None:
     assert x_res > 0.0
     assert y_res > 0.0
     assert np.isclose(x_res, y_res, rtol=0.05)
+
+
+def test_resolution_for_utm_10m_3857_clamps_dateline_zone() -> None:
+    x_res, y_res = ocean_background.resolution_for_utm_10m_3857(179.5, 0.0, 180.5, 1.0)
+
+    assert x_res > 0.0
+    assert y_res > 0.0
+
+
+def test_resolution_for_utm_10m_3857_rejects_polar_centers() -> None:
+    with pytest.raises(ValueError, match="UTM projection requires"):
+        ocean_background.resolution_for_utm_10m_3857(-10.0, 84.5, 10.0, 85.5)
 
 
 def test_create_alpha_vrt_masks_nodata_with_expression(tmp_path: Path) -> None:
@@ -590,6 +603,78 @@ def test_process_single_tile_full_pipeline(monkeypatch: object, tmp_path: Path) 
     # Check projection is 3857
     srs = osr.SpatialReference(ds.GetProjection())
     assert srs.GetAttrValue("AUTHORITY", 1) == "3857"
+
+
+def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    monkeypatch.setattr(
+        "satmaps.list_mosaic_folders_for_tile",
+        lambda tile, dates, cache: [
+            ("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")
+        ],
+    )
+
+    def fake_get_tile_paths(folder, date, cache, download=False):
+        p = {}
+        for b in ["red", "green", "blue"]:
+            path = tmp_path / f"{b}.tif"
+            if not path.exists():
+                driver = gdal.GetDriverByName("GTiff")
+                ds = driver.Create(str(path), 10, 10, 1, gdal.GDT_Int16)
+                ds.SetGeoTransform((0, 1, 0, 10, 0, -1))
+                srs = osr.SpatialReference()
+                srs.ImportFromEPSG(32631)
+                ds.SetProjection(srs.ExportToWkt())
+                ds.GetRasterBand(1).Fill(1000)
+                ds = None
+            p[b] = str(path)
+        return p
+
+    monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
+
+    gebco_path = tmp_path / "gebco.tif"
+    gebco_ds = gdal.GetDriverByName("GTiff").Create(str(gebco_path), 10, 10, 1, gdal.GDT_Float32)
+    gebco_ds.SetGeoTransform((0, 1, 0, 10, 0, -1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32631)
+    gebco_ds.SetProjection(srs.ExportToWkt())
+    gebco_values = np.full((10, 10), 0.0, dtype=np.float32)
+    gebco_values[0, 0] = -60.0
+    gebco_values[0, 1] = -45.0
+    gebco_ds.GetRasterBand(1).WriteArray(gebco_values)
+    gebco_ds = None
+
+    args = argparse.Namespace(
+        cache=".cache",
+        download=False,
+        stats_min=0,
+        stats_max=10000,
+        tonemap=True,
+        grade=True,
+        sb=0.3,
+        hb=0.75,
+        ss=1.4,
+        ms=0.9,
+        hs=0.5,
+        exposure=1.0,
+        gamma=1.0,
+        sat=0.9,
+        db=0.7,
+        ls=0.7,
+        resample_alg="near",
+    )
+
+    out_path = process_single_tile("31TDF_0_0", ["2025/07/01"], args, "gebco", str(gebco_path))
+
+    assert out_path is not None
+    out_ds = gdal.Open(out_path)
+    assert out_ds is not None
+    alpha = out_ds.GetRasterBand(4).ReadAsArray()
+    assert np.any(alpha == 0)
+    assert np.any(alpha == 255)
+    assert np.any((alpha > 0) & (alpha < 255))
 
 
 def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
