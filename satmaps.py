@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, cast
 import mgrs
 from mgrs import core as mgrs_core
 import numpy as np
-import ocean_background
+import ocean
 from scipy.ndimage import distance_transform_edt
 from osgeo import gdal
 
@@ -335,6 +335,7 @@ def prepare_ocean_background_for_output(
     requested_bbox: Optional[Tuple[float, float, float, float]],
     unique_id: str,
     resample_alg: str,
+    max_zoom: int,
 ) -> Optional[str]:
     """Prepare the ocean background used in the final 3857 composite."""
     if not os.path.exists(ocean_background_path):
@@ -342,9 +343,7 @@ def prepare_ocean_background_for_output(
     if requested_bbox is None:
         return ocean_background_path
 
-    snapped_bounds, pixel_size, _zoom = ocean_background.snapped_tile_grid_for_bbox(
-        requested_bbox
-    )
+    snapped_bounds, pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(requested_bbox, max_zoom)
     prepared_ocean_path = f".temp/ocean_{unique_id}_bbox.tif"
     warp_options = gdal.WarpOptions(
         format="GTiff",
@@ -353,7 +352,7 @@ def prepare_ocean_background_for_output(
         xRes=pixel_size,
         yRes=pixel_size,
         resampleAlg=resample_alg,
-        creationOptions=list(ocean_background.GTIFF_CREATION_OPTIONS),
+        creationOptions=list(ocean.GTIFF_CREATION_OPTIONS),
     )
     prepared_ds = gdal.Warp(prepared_ocean_path, ocean_background_path, options=warp_options)
     if prepared_ds is None:
@@ -796,6 +795,7 @@ def build_alpha_block(
     source_valid_block: np.ndarray,
     mask_uses_alpha: bool,
     coverage_block: Optional[np.ndarray] = None,
+    fill_allowed_block: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Build the output alpha band for one block."""
     if gebco_block is None:
@@ -810,6 +810,15 @@ def build_alpha_block(
         )
         alpha_block = np.clip(alpha_block * 255.0, 0.0, 255.0).astype(np.uint8)
 
+    if fill_allowed_block is not None:
+        if fill_allowed_block.shape != source_valid_block.shape:
+            raise ValueError(
+                "fill_allowed_block must match the spatial shape of source_valid_block"
+            )
+        # Filled seam pixels should prefer land coverage so the final composite never exposes
+        # unexpected fully transparent gaps between land and ocean.
+        alpha_block = np.where(fill_allowed_block & ~source_valid_block, 255, alpha_block)
+
     if coverage_block is not None:
         if coverage_block.shape != source_valid_block.shape:
             raise ValueError("coverage_block must match the spatial shape of source_valid_block")
@@ -821,6 +830,7 @@ def build_alpha_block(
 def write_processed_blocks(
     averaged: np.ndarray,
     source_valid_mask: np.ndarray,
+    fill_allowed_mask: Optional[np.ndarray],
     gebco_band: Optional[gdal.Band],
     coverage_band: Optional[gdal.Band],
     mask_uses_alpha: bool,
@@ -880,20 +890,26 @@ def write_processed_blocks(
             coverage_block = coverage_band.ReadAsArray(
                 xoff, yoff, block_width, block_height
             ) >= 254.5
+        fill_allowed_block = None
+        if fill_allowed_mask is not None:
+            fill_allowed_block = fill_allowed_mask[
+                yoff : yoff + block_height, xoff : xoff + block_width
+            ]
         alpha_block = build_alpha_block(
             gebco_block,
             source_valid_block,
             mask_uses_alpha,
             coverage_block,
+            fill_allowed_block,
         )
         alpha_band.WriteArray(alpha_block, xoff=xoff, yoff=yoff)
 
 
 def warp_to_web_mercator(
-    source_path: str, destination_path: str, resample_alg: str
+    source_path: str, destination_path: str, resample_alg: str, max_zoom: int
 ) -> None:
     """Warp the temporary UTM GeoTIFF into the final EPSG:3857 intermediate."""
-    pixel_size = ocean_background.target_web_mercator_pixel_size()
+    pixel_size = ocean.target_web_mercator_pixel_size(max_zoom)
     warp_options = gdal.WarpOptions(
         format="GTiff",
         dstSRS="EPSG:3857",
@@ -962,6 +978,7 @@ def process_single_tile(
         write_processed_blocks(
             averaged,
             source_valid_mask,
+            fill_allowed_mask,
             ocean_mask.band if ocean_mask is not None else None,
             ocean_mask.coverage_band if ocean_mask is not None else None,
             ocean_mask.uses_alpha if ocean_mask is not None else False,
@@ -973,7 +990,7 @@ def process_single_tile(
         ds_out.FlushCache()
         ds_out = None
 
-        warp_to_web_mercator(temp_utm_path, temp_3857_path, args.resample_alg)
+        warp_to_web_mercator(temp_utm_path, temp_3857_path, args.resample_alg, args.max_zoom)
         os.remove(temp_utm_path)
         return temp_3857_path
     finally:
@@ -1161,6 +1178,13 @@ def main() -> None:
         "--bbox", help="WGS84 bounding box as min_lon,min_lat,max_lon,max_lat"
     )
     parser.add_argument(
+        "--max-zoom",
+        type=int,
+        choices=list(ocean.SUPPORTED_MAX_ZOOMS),
+        default=ocean.DEFAULT_MAX_ZOOM,
+        help="Target Web Mercator zoom used for output resolution",
+    )
+    parser.add_argument(
         "--vrt", action="store_true", help="Write final VRT and skip MBTiles"
     )
     parser.add_argument(
@@ -1249,6 +1273,7 @@ def main() -> None:
         requested_bbox,
         unique_id,
         args.resample_alg,
+        args.max_zoom,
     )
     if prepared_ocean_background:
         if prepared_ocean_background not in processed_tifs:
@@ -1261,7 +1286,7 @@ def main() -> None:
         sys.exit(1)
 
     master_vrt = f".temp/master_{unique_id}.vrt"
-    pixel_size = ocean_background.target_web_mercator_pixel_size()
+    pixel_size = ocean.target_web_mercator_pixel_size(args.max_zoom)
     gdal.BuildVRT(master_vrt, processed_tifs, resolution="user", xRes=pixel_size, yRes=pixel_size)
 
     if args.vrt:

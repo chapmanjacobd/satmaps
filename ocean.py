@@ -9,7 +9,8 @@ from typing import Sequence
 from xml.sax.saxutils import escape
 
 import numpy as np
-from osgeo import gdal
+from osgeo import gdal, ogr
+from scipy.ndimage import label
 
 from tiler import (
     MAKO_RAMP,
@@ -32,7 +33,8 @@ WEB_MERCATOR_WORLD_BOUNDS = (
     20037508.342789244,
     20037508.342789244,
 )
-OUTPUT_WEB_MERCATOR_ZOOM = 13
+DEFAULT_MAX_ZOOM = 13
+SUPPORTED_MAX_ZOOMS = (13, 14)
 GTIFF_CREATION_OPTIONS = (
     "BIGTIFF=YES",
     "TILED=YES",
@@ -52,6 +54,8 @@ OCEAN_DEFAULT_SATURATION = 1.0
 OCEAN_DEFAULT_BLACK_BREAK = 0.35
 OCEAN_DEFAULT_BLACK_SLOPE = 0.35
 OCEAN_FADE_DEPTH = -50.0
+SMALL_OCEAN_MAX_AREA_SQ_M = 1_500_000.0
+MAX_COMPONENT_CLEANUP_PIXELS = 120_000_000
 
 
 @dataclass(frozen=True)
@@ -141,7 +145,7 @@ def create_gebco_ocean_vrt(source_vrt: str, output_vrt: str) -> str:
 
 
 def create_alpha_vrt(source_vrt: str, output_vrt: str) -> str:
-    """Create an explicit alpha mask VRT from nodata and shallow-water thresholds."""
+    """Create an explicit alpha mask VRT from depth thresholds and land-preferred cleanup."""
     ds = gdal.Open(source_vrt)
     if ds is None:
         raise RuntimeError(f"Could not open source VRT for alpha generation: {source_vrt}")
@@ -151,31 +155,159 @@ def create_alpha_vrt(source_vrt: str, output_vrt: str) -> str:
     if nodata_value is None:
         nodata_value = GEBCO_OCEAN_NODATA
 
-    geotransform = ",".join(str(value) for value in ds.GetGeoTransform())
-    projection = escape(ds.GetProjection())
-    source_filename = escape(os.path.abspath(source_vrt))
     xsize = ds.RasterXSize
     ysize = ds.RasterYSize
-    ds = None
+    alpha_tif = str(Path(output_vrt).with_suffix(".tif"))
+    driver = gdal.GetDriverByName("GTiff")
+    alpha_ds = driver.Create(alpha_tif, xsize, ysize, 1, gdal.GDT_Byte, options=list(GTIFF_CREATION_OPTIONS))
+    if alpha_ds is None:
+        raise RuntimeError(f"Could not create alpha TIFF: {alpha_tif}")
+    alpha_ds.SetProjection(ds.GetProjection())
+    alpha_ds.SetGeoTransform(ds.GetGeoTransform())
+    alpha_band = alpha_ds.GetRasterBand(1)
 
-    with open(output_vrt, "w") as f:
-        f.write(
-            f"""<VRTDataset rasterXSize="{xsize}" rasterYSize="{ysize}">
-  <SRS>{projection}</SRS>
-  <GeoTransform>{geotransform}</GeoTransform>
-  <VRTRasterBand dataType="Float32" band="1" subClass="VRTDerivedRasterBand">
-    <PixelFunctionType>expression</PixelFunctionType>
-    <PixelFunctionArguments dialect="muparser" expression="B1 &lt;= {nodata_value + 0.1} || B1 &gt;= {OCEAN_FADE_DEPTH} ? 0 : 255"/>
-    <SimpleSource>
-      <SourceFilename relativeToVRT="0">{source_filename}</SourceFilename>
-      <SourceBand>1</SourceBand>
-    </SimpleSource>
-  </VRTRasterBand>
-</VRTDataset>
-"""
+    block_width, block_height = band.GetBlockSize()
+    if block_width <= 0:
+        block_width = 512
+    if block_height <= 0:
+        block_height = 512
+
+    for yoff in range(0, ysize, block_height):
+        bh = min(block_height, ysize - yoff)
+        for xoff in range(0, xsize, block_width):
+            bw = min(block_width, xsize - xoff)
+            depths = band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+            ocean_mask = (depths > nodata_value + 0.1) & (depths < OCEAN_FADE_DEPTH)
+            alpha_band.WriteArray(ocean_mask.astype(np.uint8) * 255, xoff=xoff, yoff=yoff)
+
+    alpha_band.FlushCache()
+    if xsize * ysize <= MAX_COMPONENT_CLEANUP_PIXELS:
+        ocean_mask = alpha_band.ReadAsArray().astype(bool)
+        cleaned_mask = remove_small_enclosed_ocean_regions(
+            ocean_mask,
+            ds.GetGeoTransform(),
+            SMALL_OCEAN_MAX_AREA_SQ_M,
+        )
+        alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
+        alpha_band.FlushCache()
+    else:
+        remove_small_enclosed_ocean_regions_vector(
+            alpha_ds,
+            alpha_band,
+            ds.GetGeoTransform(),
+            SMALL_OCEAN_MAX_AREA_SQ_M,
+            Path(alpha_tif).with_suffix(".gpkg"),
         )
 
+    alpha_ds = None
+    ds = None
+    gdal.BuildVRT(output_vrt, [alpha_tif])
     return output_vrt
+
+
+def remove_small_enclosed_ocean_regions(
+    ocean_mask: np.ndarray,
+    geotransform: Sequence[float],
+    max_area_sq_m: float,
+) -> np.ndarray:
+    """Remove enclosed ocean components smaller than the configured area threshold."""
+    if ocean_mask.ndim != 2:
+        raise ValueError("ocean_mask must be 2D")
+    if ocean_mask.size == 0 or max_area_sq_m <= 0.0:
+        return ocean_mask
+
+    pixel_area_sq_m = abs(geotransform[1] * geotransform[5] - geotransform[2] * geotransform[4])
+    if pixel_area_sq_m <= 0.0:
+        raise ValueError("geotransform must define a positive pixel area")
+
+    labels, component_count = label(ocean_mask, structure=np.ones((3, 3), dtype=np.uint8))
+    if component_count == 0:
+        return ocean_mask
+
+    component_sizes = np.bincount(labels.ravel(), minlength=component_count + 1)
+    edge_labels = np.unique(
+        np.concatenate((labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]))
+    )
+    enclosed_small_labels = [
+        label_id
+        for label_id in range(1, component_count + 1)
+        if label_id not in edge_labels and component_sizes[label_id] * pixel_area_sq_m < max_area_sq_m
+    ]
+    if not enclosed_small_labels:
+        return ocean_mask
+
+    cleaned_mask = ocean_mask.copy()
+    cleaned_mask[np.isin(labels, enclosed_small_labels)] = False
+    return cleaned_mask
+
+
+def remove_small_enclosed_ocean_regions_vector(
+    alpha_dataset: gdal.Dataset,
+    alpha_band: gdal.Band,
+    geotransform: Sequence[float],
+    max_area_sq_m: float,
+    vector_path: Path,
+) -> None:
+    """Remove small enclosed ocean polygons without loading the whole mask into memory."""
+    vector_driver = ogr.GetDriverByName("GPKG")
+    if vector_driver is None:
+        raise RuntimeError("Could not load OGR GPKG driver for ocean mask cleanup")
+    if vector_path.exists():
+        vector_driver.DeleteDataSource(str(vector_path))
+
+    vector_ds = vector_driver.CreateDataSource(str(vector_path))
+    if vector_ds is None:
+        raise RuntimeError(f"Could not create temporary vector dataset: {vector_path}")
+
+    spatial_ref = alpha_dataset.GetSpatialRef()
+    raw_layer = vector_ds.CreateLayer("raw_ocean", srs=spatial_ref, geom_type=ogr.wkbPolygon)
+    kept_layer = vector_ds.CreateLayer("kept_ocean", srs=spatial_ref, geom_type=ogr.wkbPolygon)
+    for layer in (raw_layer, kept_layer):
+        if layer is None:
+            raise RuntimeError(f"Could not create cleanup layer in {vector_path}")
+    value_field = ogr.FieldDefn("value", ogr.OFTInteger)
+    if raw_layer.CreateField(value_field) != 0:
+        raise RuntimeError(f"Could not create polygon value field in {vector_path}")
+
+    polygonize_result = gdal.Polygonize(alpha_band, None, raw_layer, 0, [], callback=None)
+    if polygonize_result != 0:
+        raise RuntimeError("Could not polygonize ocean alpha mask")
+
+    xsize = alpha_dataset.RasterXSize
+    ysize = alpha_dataset.RasterYSize
+    min_x = geotransform[0]
+    max_y = geotransform[3]
+    max_x = geotransform[0] + geotransform[1] * xsize + geotransform[2] * ysize
+    min_y = geotransform[3] + geotransform[4] * xsize + geotransform[5] * ysize
+    edge_tolerance = max(abs(geotransform[1]), abs(geotransform[5]))
+    kept_definition = kept_layer.GetLayerDefn()
+
+    for feature in raw_layer:
+        if feature.GetFieldAsInteger(0) != 255:
+            continue
+        geometry = feature.GetGeometryRef()
+        if geometry is None:
+            continue
+        envelope = geometry.GetEnvelope()
+        touches_edge = (
+            envelope[0] <= min_x + edge_tolerance
+            or envelope[1] >= max_x - edge_tolerance
+            or envelope[2] <= min_y + edge_tolerance
+            or envelope[3] >= max_y - edge_tolerance
+        )
+        if touches_edge or geometry.GetArea() >= max_area_sq_m:
+            kept_feature = ogr.Feature(kept_definition)
+            kept_feature.SetGeometry(geometry.Clone())
+            if kept_layer.CreateFeature(kept_feature) != 0:
+                raise RuntimeError(f"Could not write kept ocean feature into {vector_path}")
+            kept_feature = None
+
+    alpha_band.Fill(0)
+    rasterize_result = gdal.RasterizeLayer(alpha_dataset, [1], kept_layer, burn_values=[255])
+    if rasterize_result != 0:
+        raise RuntimeError("Could not rasterize cleaned ocean alpha mask")
+    alpha_band.FlushCache()
+    vector_ds = None
 
 
 def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
@@ -220,17 +352,18 @@ def colorize_ocean_depths(depths: np.ndarray, style: OceanStyleOptions) -> np.nd
     )
 
 
-def target_web_mercator_pixel_size() -> float:
+def target_web_mercator_pixel_size(max_zoom: int = DEFAULT_MAX_ZOOM) -> float:
     """Return the shared Web Mercator output pixel size used across exports."""
-    return web_mercator_pixel_size(OUTPUT_WEB_MERCATOR_ZOOM)
+    return web_mercator_pixel_size(max_zoom)
 
 
 def snapped_tile_grid_for_bbox(
     bbox: tuple[float, float, float, float],
+    max_zoom: int = DEFAULT_MAX_ZOOM,
 ) -> tuple[tuple[float, float, float, float], float, int]:
     """Snap a bbox outward to the target Web Mercator tile pixel grid."""
-    pixel_size = target_web_mercator_pixel_size()
-    zoom = OUTPUT_WEB_MERCATOR_ZOOM
+    pixel_size = target_web_mercator_pixel_size(max_zoom)
+    zoom = max_zoom
     mercator_bounds = lonlat_bbox_to_mercator_bounds(*bbox)
     snapped_bounds = snap_bounds_to_pixel_grid(mercator_bounds, pixel_size)
     return snapped_bounds, pixel_size, zoom
@@ -431,6 +564,7 @@ def generate_ocean_background(
     hillshade_z: float = 5.0,
     style: OceanStyleOptions | None = None,
     vrt: bool = False,
+    max_zoom: int = DEFAULT_MAX_ZOOM,
 ) -> OceanBackgroundArtifacts:
     """Generate a standalone RGBA ocean background output."""
     if which("gdaldem") is None:
@@ -460,10 +594,10 @@ def generate_ocean_background(
     }
     if bbox is None:
         warp_kwargs["outputBounds"] = WEB_MERCATOR_WORLD_BOUNDS
-        warp_kwargs["xRes"] = target_web_mercator_pixel_size()
-        warp_kwargs["yRes"] = target_web_mercator_pixel_size()
+        warp_kwargs["xRes"] = target_web_mercator_pixel_size(max_zoom)
+        warp_kwargs["yRes"] = target_web_mercator_pixel_size(max_zoom)
     else:
-        snapped_bounds, pixel_size, _zoom = snapped_tile_grid_for_bbox(bbox)
+        snapped_bounds, pixel_size, _zoom = snapped_tile_grid_for_bbox(bbox, max_zoom)
         warp_kwargs["outputBounds"] = snapped_bounds
         warp_kwargs["xRes"] = pixel_size
         warp_kwargs["yRes"] = pixel_size
@@ -504,8 +638,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a standalone GEBCO ocean hillshade GeoTIFF. "
-            f"Outputs target Web Mercator zoom {OUTPUT_WEB_MERCATOR_ZOOM} "
-            f"(~{target_web_mercator_pixel_size():.2f} m/px at the equator)."
+            f"Defaults to Web Mercator zoom {DEFAULT_MAX_ZOOM} "
+            f"(~{target_web_mercator_pixel_size(DEFAULT_MAX_ZOOM):.2f} m/px at the equator)."
         )
     )
     parser.add_argument(
@@ -519,8 +653,15 @@ def main() -> None:
         help=(
             "Optional WGS84 bbox as min_lon,min_lat,max_lon,max_lat. "
             f"When omitted, exports the full masked source raster in EPSG:3857 at "
-            f"Web Mercator zoom {OUTPUT_WEB_MERCATOR_ZOOM}."
+            f"Web Mercator zoom {DEFAULT_MAX_ZOOM}."
         ),
+    )
+    parser.add_argument(
+        "--max-zoom",
+        type=int,
+        choices=list(SUPPORTED_MAX_ZOOMS),
+        default=DEFAULT_MAX_ZOOM,
+        help="Target Web Mercator zoom used for output resolution",
     )
     parser.add_argument("--temp-dir", default=".temp", help="Directory for intermediary files")
     parser.add_argument(
@@ -616,6 +757,7 @@ def main() -> None:
             depth_max=args.depth_max,
         ),
         vrt=args.vrt,
+        max_zoom=args.max_zoom,
     )
     print(artifacts.output_tif)
 

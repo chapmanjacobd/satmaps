@@ -258,9 +258,11 @@ def get_chunk_tile_range(bounds: TEBounds, zoom: int) -> Tuple[int, int, int, in
     minx, miny, maxx, maxy = bounds
     max_t = (2**zoom) - 1
 
-    # We use a small epsilon to avoid including the next tile if the boundary
-    # just barely touches it due to floating point precision.
-    eps = 1e-8
+    # Nudge the sample point inward by a tiny fraction of a tile so exact
+    # south/east boundaries stay in the touched tile even at Web Mercator
+    # meter magnitudes where 1e-8 is smaller than floating-point resolution.
+    res = WEB_MERCATOR_LIMIT * 2 / (2**zoom)
+    eps = max(1e-8, res * 1e-9)
     tx_min, ty_min = meters_to_tile(minx + eps, maxy - eps, zoom)
     tx_max, ty_max = meters_to_tile(maxx - eps, miny + eps, zoom)
 
@@ -285,6 +287,14 @@ def intersect_te_bounds(bounds_a: TEBounds, bounds_b: TEBounds) -> Optional[TEBo
     return minx, miny, maxx, maxy
 
 
+def intersect_proj_win(proj_win_a: ProjWin, proj_win_b: ProjWin) -> Optional[ProjWin]:
+    """Calculate the intersection of two GDAL projWin tuples."""
+    intersection = intersect_te_bounds(proj_win_to_te(proj_win_a), proj_win_to_te(proj_win_b))
+    if intersection is None:
+        return None
+    return te_to_proj_win(intersection)
+
+
 def te_to_src_win(
     dataset: gdal.Dataset, te_bounds: TEBounds
 ) -> Tuple[int, int, int, int]:
@@ -300,6 +310,13 @@ def te_to_src_win(
     yend = min(dataset.RasterYSize, math.ceil(max(py_miny, py_maxy)))
 
     return xoff, yoff, max(0, xend - xoff), max(0, yend - yoff)
+
+
+def proj_win_to_src_win(
+    dataset: gdal.Dataset, proj_win: ProjWin
+) -> Tuple[int, int, int, int]:
+    """Convert a GDAL projWin tuple into a clipped pixel srcWin."""
+    return te_to_src_win(dataset, proj_win_to_te(proj_win))
 
 
 def process_chunk(args: ChunkTask) -> str:

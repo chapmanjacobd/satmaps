@@ -37,7 +37,7 @@ def test_tile_range_keeps_exact_south_boundary_in_same_tile() -> None:
     maxy = WEB_MERCATOR_LIMIT - (20.10 * res)
     miny = WEB_MERCATOR_LIMIT - (21.0 * res)
 
-    assert get_chunk_tile_range((minx, maxy, maxx, miny), zoom) == (10, 20, 10, 20)
+    assert get_chunk_tile_range((minx, miny, maxx, maxy), zoom) == (10, 20, 10, 20)
 
 
 def test_intersect_proj_win_clamps_partial_overlap() -> None:

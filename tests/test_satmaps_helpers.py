@@ -192,6 +192,19 @@ def test_build_alpha_block_masks_out_pixels_outside_ocean_render() -> None:
     )
 
 
+def test_build_alpha_block_prefers_land_for_filled_seam_pixels() -> None:
+    np.testing.assert_array_equal(
+        build_alpha_block(
+            np.array([[255.0, 255.0]], dtype=np.float32),
+            np.array([[False, True]], dtype=bool),
+            True,
+            np.array([[True, True]], dtype=bool),
+            np.array([[True, False]], dtype=bool),
+        ),
+        np.array([[255, 0]], dtype=np.uint8),
+    )
+
+
 def test_open_date_band_sets_raises_clear_error_when_dataset_open_fails(
     monkeypatch: object,
 ) -> None:

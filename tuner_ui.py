@@ -9,7 +9,7 @@ from numpy.typing import NDArray
 from osgeo import gdal
 from PIL import Image
 
-import ocean_background
+import ocean
 import tiler
 
 app = Flask(__name__)
@@ -204,9 +204,9 @@ def render() -> ResponseReturnValue:
         if RAW_GEBCO is None:
             return "No GEBCO zip found", 404
 
-        corrected = ocean_background.colorize_ocean_depths(
+        corrected = ocean.colorize_ocean_depths(
             RAW_GEBCO,
-            ocean_background.OceanStyleOptions(
+            ocean.OceanStyleOptions(
                 tonemap=tm_on,
                 grade=fg_on,
                 exposure=p["exp"],
