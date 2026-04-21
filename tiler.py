@@ -15,9 +15,9 @@ gdal.UseExceptions()
 
 WEB_MERCATOR_LIMIT = 20037508.342789244
 WEB_MERCATOR_MAX_LAT = 85.0511287798066
-ProjWin = Tuple[float, float, float, float]
-ChunkTask = Tuple[str, str, str, Dict[str, Any], ProjWin]
-RGB_COLOR_INTERPRETATIONS = ("Red", "Green", "Blue")
+TEBounds = Tuple[float, float, float, float]  # (minx, miny, maxx, maxy) - for Warp/BuildVRT
+ProjWin = Tuple[float, float, float, float]   # (minx, maxy, maxx, miny) - for Translate
+ChunkTask = Tuple[str, str, str, Dict[str, Any], TEBounds]
 
 # Tone-mapping constants
 SOFT_KNEE_SHADOW_BREAK = 0.3
@@ -173,12 +173,12 @@ def lonlat_to_3857(lon: float, lat: float) -> Tuple[float, float]:
 
 def lonlat_bbox_to_mercator_bounds(
     min_lon: float, min_lat: float, max_lon: float, max_lat: float
-) -> ProjWin:
-    """Convert a WGS84 bbox into projWin-style Web Mercator bounds."""
+) -> TEBounds:
+    """Convert a WGS84 bbox into (minx, miny, maxx, maxy) Web Mercator bounds."""
     west_x, south_y = lonlat_to_3857(min_lon, min_lat)
     east_x, north_y = lonlat_to_3857(max_lon, max_lat)
-    return min(west_x, east_x), max(north_y, south_y), max(west_x, east_x), min(
-        north_y, south_y
+    return min(west_x, east_x), min(south_y, north_y), max(west_x, east_x), max(
+        south_y, north_y
     )
 
 
@@ -187,37 +187,30 @@ def web_mercator_pixel_size(zoom: int) -> float:
     return float((WEB_MERCATOR_LIMIT * 2) / (256 * (2**zoom)))
 
 
-def zoom_for_pixel_size(pixel_size: float) -> int:
-    """Return the finest XYZ zoom whose pixel size is not coarser than the target."""
-    if pixel_size <= 0.0:
-        raise ValueError("pixel_size must be positive")
-    return max(0, math.ceil(math.log2((WEB_MERCATOR_LIMIT * 2) / (256 * pixel_size))))
-
-
-def snap_bounds_to_pixel_grid(bounds: ProjWin, pixel_size: float) -> ProjWin:
-    """Expand bounds outward to the global Web Mercator pixel grid."""
+def snap_bounds_to_pixel_grid(bounds: TEBounds, pixel_size: float) -> TEBounds:
+    """Expand bounds (minx, miny, maxx, maxy) outward to the global Web Mercator pixel grid."""
     if pixel_size <= 0.0:
         raise ValueError("pixel_size must be positive")
 
-    minx, maxy, maxx, miny = bounds
+    minx, miny, maxx, maxy = bounds
     snapped_minx = -WEB_MERCATOR_LIMIT + math.floor(
         (minx + WEB_MERCATOR_LIMIT) / pixel_size
     ) * pixel_size
     snapped_maxx = -WEB_MERCATOR_LIMIT + math.ceil(
         (maxx + WEB_MERCATOR_LIMIT) / pixel_size
     ) * pixel_size
-    snapped_maxy = WEB_MERCATOR_LIMIT - math.floor(
-        (WEB_MERCATOR_LIMIT - maxy) / pixel_size
+    snapped_maxy = -WEB_MERCATOR_LIMIT + math.ceil(
+        (maxy + WEB_MERCATOR_LIMIT) / pixel_size
     ) * pixel_size
-    snapped_miny = WEB_MERCATOR_LIMIT - math.ceil(
-        (WEB_MERCATOR_LIMIT - miny) / pixel_size
+    snapped_miny = -WEB_MERCATOR_LIMIT + math.floor(
+        (miny + WEB_MERCATOR_LIMIT) / pixel_size
     ) * pixel_size
-    return snapped_minx, snapped_maxy, snapped_maxx, snapped_miny
+    return snapped_minx, snapped_miny, snapped_maxx, snapped_maxy
 
 
 def get_web_mercator_bounds(
     z: int, x: int, y: int
-) -> Tuple[float, float, float, float]:
+) -> TEBounds:
     """Calculate Web Mercator (EPSG:3857) bounds for a given XYZ tile."""
     n = 2.0**z
     lon1 = x / n * 360.0 - 180.0
@@ -228,8 +221,7 @@ def get_web_mercator_bounds(
 
     x1, y1 = lonlat_to_3857(lon1, lat1)
     x2, y2 = lonlat_to_3857(lon2, lat2)
-    # Return (min_x, max_y, max_x, min_y) which is projWin format: [ulx, uly, lrx, lry]
-    return min(x1, x2), max(y1, y2), max(x1, x2), min(y1, y2)
+    return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
 
 
 def meters_to_tile(x_meters: float, y_meters: float, z: int) -> Tuple[int, int]:
@@ -240,18 +232,30 @@ def meters_to_tile(x_meters: float, y_meters: float, z: int) -> Tuple[int, int]:
     return tx, ty
 
 
-def get_dataset_bounds(dataset: gdal.Dataset) -> ProjWin:
-    """Return dataset bounds as a projWin-style tuple."""
+def get_dataset_bounds(dataset: gdal.Dataset) -> TEBounds:
+    """Return dataset bounds as (minx, miny, maxx, maxy)."""
     gt = dataset.GetGeoTransform()
-    minx, maxy = gt[0], gt[3]
+    # North-up assumed: gt[1] is xRes (>0), gt[5] is yRes (<0)
+    minx = gt[0]
+    maxy = gt[3]
     maxx = minx + gt[1] * dataset.RasterXSize
     miny = maxy + gt[5] * dataset.RasterYSize
-    return minx, maxy, maxx, miny
+    return minx, miny, maxx, maxy
 
 
-def get_chunk_tile_range(bounds: ProjWin, zoom: int) -> Tuple[int, int, int, int]:
+def te_to_proj_win(te: TEBounds) -> ProjWin:
+    """Convert (minx, miny, maxx, maxy) to (minx, maxy, maxx, miny)."""
+    return te[0], te[3], te[2], te[1]
+
+
+def proj_win_to_te(pw: ProjWin) -> TEBounds:
+    """Convert (minx, maxy, maxx, miny) to (minx, miny, maxx, maxy)."""
+    return pw[0], pw[3], pw[2], pw[1]
+
+
+def get_chunk_tile_range(bounds: TEBounds, zoom: int) -> Tuple[int, int, int, int]:
     """Return inclusive XYZ tile indices covering raster bounds at the chunk zoom."""
-    minx, maxy, maxx, miny = bounds
+    minx, miny, maxx, maxy = bounds
     max_t = (2**zoom) - 1
 
     # We use a small epsilon to avoid including the next tile if the boundary
@@ -268,38 +272,39 @@ def get_chunk_tile_range(bounds: ProjWin, zoom: int) -> Tuple[int, int, int, int
     )
 
 
-def intersect_proj_win(proj_win: ProjWin, dataset_bounds: ProjWin) -> Optional[ProjWin]:
-    """Clamp a projWin to the dataset extent, returning None for empty intersections."""
-    ulx = max(proj_win[0], dataset_bounds[0])
-    uly = min(proj_win[1], dataset_bounds[1])
-    lrx = min(proj_win[2], dataset_bounds[2])
-    lry = max(proj_win[3], dataset_bounds[3])
+def intersect_te_bounds(bounds_a: TEBounds, bounds_b: TEBounds) -> Optional[TEBounds]:
+    """Calculate the intersection of two (minx, miny, maxx, maxy) bounds."""
+    minx = max(bounds_a[0], bounds_b[0])
+    miny = max(bounds_a[1], bounds_b[1])
+    maxx = min(bounds_a[2], bounds_b[2])
+    maxy = min(bounds_a[3], bounds_b[3])
 
-    if ulx >= lrx or lry >= uly:
+    if minx >= maxx or miny >= maxy:
         return None
 
-    return ulx, uly, lrx, lry
+    return minx, miny, maxx, maxy
 
 
-def proj_win_to_src_win(
-    dataset: gdal.Dataset, proj_win: ProjWin
+def te_to_src_win(
+    dataset: gdal.Dataset, te_bounds: TEBounds
 ) -> Tuple[int, int, int, int]:
-    """Convert a georeferenced projWin into a clipped pixel srcWin for a north-up raster."""
+    """Convert (minx, miny, maxx, maxy) into a clipped pixel srcWin for a north-up raster."""
     inv_gt = gdal.InvGeoTransform(dataset.GetGeoTransform())
-    px_ul, py_ul = gdal.ApplyGeoTransform(inv_gt, proj_win[0], proj_win[1])
-    px_lr, py_lr = gdal.ApplyGeoTransform(inv_gt, proj_win[2], proj_win[3])
+    px_minx, py_miny = gdal.ApplyGeoTransform(inv_gt, te_bounds[0], te_bounds[1])
+    px_maxx, py_maxy = gdal.ApplyGeoTransform(inv_gt, te_bounds[2], te_bounds[3])
 
-    xoff = max(0, math.floor(min(px_ul, px_lr)))
-    yoff = max(0, math.floor(min(py_ul, py_lr)))
-    xend = min(dataset.RasterXSize, math.ceil(max(px_ul, px_lr)))
-    yend = min(dataset.RasterYSize, math.ceil(max(py_ul, py_lr)))
+    # For north-up images, py_maxy will be smaller than py_miny in pixel space
+    xoff = max(0, math.floor(min(px_minx, px_maxx)))
+    yoff = max(0, math.floor(min(py_miny, py_maxy)))
+    xend = min(dataset.RasterXSize, math.ceil(max(px_minx, px_maxx)))
+    yend = min(dataset.RasterYSize, math.ceil(max(py_miny, py_maxy)))
 
     return xoff, yoff, max(0, xend - xoff), max(0, yend - yoff)
 
 
 def process_chunk(args: ChunkTask) -> str:
     """Worker function for parallel gdal.Translate."""
-    input_vrt, chunk_file, format, options, proj_win = args
+    input_vrt, chunk_file, format, options, te_bounds = args
     ds = None
     temp_chunk_raster = chunk_file.replace(".mbtiles", ".tif")
     try:
@@ -310,11 +315,12 @@ def process_chunk(args: ChunkTask) -> str:
         if ds is None:
             return ""
 
-        clipped_proj_win = intersect_proj_win(proj_win, get_dataset_bounds(ds))
-        if clipped_proj_win is None:
+        dataset_bounds = get_dataset_bounds(ds)
+        clipped_te_bounds = intersect_te_bounds(te_bounds, dataset_bounds)
+        if clipped_te_bounds is None:
             return ""
 
-        src_win = proj_win_to_src_win(ds, clipped_proj_win)
+        src_win = te_to_src_win(ds, clipped_te_bounds)
         if src_win[2] <= 0 or src_win[3] <= 0:
             return ""
 
@@ -510,8 +516,8 @@ def run_tiling_simplified(
     dataset_bounds = get_dataset_bounds(ds)
     ds = None
 
-    requested_bounds = cast(ProjWin, options.get("chunk_bounds", dataset_bounds))
-    bounds = intersect_proj_win(requested_bounds, dataset_bounds)
+    requested_bounds = cast(TEBounds, options.get("chunk_bounds", dataset_bounds))
+    bounds = intersect_te_bounds(requested_bounds, dataset_bounds)
     if bounds is None:
         raise RuntimeError("Requested chunk bounds do not intersect the input raster")
 
@@ -527,9 +533,9 @@ def run_tiling_simplified(
             if os.path.exists(chunk_file):
                 continue
 
-            ulx, uly, lrx, lry = get_web_mercator_bounds(chunk_zoom, tx, ty)
+            te_bounds = get_web_mercator_bounds(chunk_zoom, tx, ty)
             tasks.append(
-                (input_vrt, chunk_file, tile_format, options, (ulx, uly, lrx, lry))
+                (input_vrt, chunk_file, tile_format, options, te_bounds)
             )
 
     # Parallel execution.

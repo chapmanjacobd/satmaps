@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, cast
 
 import mgrs
+from mgrs import core as mgrs_core
 import numpy as np
 import ocean_background
 from scipy.ndimage import distance_transform_edt
@@ -21,7 +22,6 @@ import tiler
 # Setup GDAL exceptions
 gdal.UseExceptions()
 
-AUTO_SCALE_MAX_PERCENTILE = 99.6
 DATE_PATH_QUARTERS = (
     ("07/01", "Q3"),
     ("10/01", "Q4"),
@@ -98,8 +98,8 @@ def list_mosaic_folders_for_tile(
             try:
                 if gdal.ReadDir(s3_path):
                     found.append((folder, date_path))
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                print(f"Warning: Could not inspect remote folder {s3_path}: {exc}")
 
     return found
 
@@ -188,7 +188,7 @@ def discover_mgrs_tiles_in_bbox(
                     mgrs_res.decode("utf-8") if isinstance(mgrs_res, bytes) else mgrs_res
                 )
                 discovered_mgrs.add(mgrs_str)
-            except Exception:
+            except mgrs_core.MGRSError:
                 continue
 
     return list(discovered_mgrs)
@@ -264,14 +264,28 @@ def restore_resume_state(resume_path: str) -> Optional[Dict[str, Any]]:
     """Load a previous run state and keep only surviving intermediate files."""
     try:
         with open(resume_path, "r") as f:
-            state = cast(Dict[str, Any], json.load(f))
-    except Exception as e:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            raise ValueError("state file must contain a JSON object")
+        unique_id = state["unique_id"]
+        completed_subtiles_raw = state["completed_subtiles"]
+        processed_tifs_raw = state["processed_tifs"]
+        if not isinstance(unique_id, str):
+            raise ValueError("unique_id must be a string")
+        if not isinstance(completed_subtiles_raw, list):
+            raise ValueError("completed_subtiles must be a list")
+        if not isinstance(processed_tifs_raw, list):
+            raise ValueError("processed_tifs must be a list")
+        if not all(isinstance(subtile, str) for subtile in completed_subtiles_raw):
+            raise ValueError("completed_subtiles entries must be strings")
+        if not all(isinstance(path, str) for path in processed_tifs_raw):
+            raise ValueError("processed_tifs entries must be strings")
+    except (OSError, ValueError, TypeError, KeyError) as e:
         print(f"Warning: Could not load state file: {e}")
         return None
 
-    unique_id = state["unique_id"]
-    completed_subtiles = set(state["completed_subtiles"])
-    processed_tifs = [path for path in state["processed_tifs"] if os.path.exists(path)]
+    completed_subtiles = set(completed_subtiles_raw)
+    processed_tifs = [path for path in processed_tifs_raw if os.path.exists(path)]
     print(f"Resuming from state file: {resume_path} (unique_id: {unique_id})")
     print(
         f"Already completed {len(completed_subtiles)} sub-tiles, {len(processed_tifs)} TIFs found."
@@ -373,33 +387,39 @@ def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
     m = mgrs.MGRS()
     try:
         clat, clon = m.toLatLon(mgrs_tile)
-    except Exception:
+    except mgrs_core.MGRSError:
         return True
 
     # 100km is roughly 1 degree. We'll sample a grid around the center.
     ds = gdal.Open(gebco_src)
-    band_details = get_ocean_mask_band_details(ds)
-    if band_details is None:
+    if ds is None:
+        print(f"Warning: Could not open GEBCO source for land check: {gebco_src}")
         return True
-    band_index, uses_alpha = band_details
-    band = ds.GetRasterBand(band_index)
-    gt = ds.GetGeoTransform()
-    inv_gt = gdal.InvGeoTransform(gt)
+    band_details = get_ocean_mask_band_details(ds)
+    try:
+        if band_details is None:
+            return True
+        band_index, uses_alpha = band_details
+        band = ds.GetRasterBand(band_index)
+        gt = ds.GetGeoTransform()
+        inv_gt = gdal.InvGeoTransform(gt)
 
-    # Sample a 1.2 degree box (13x13 points)
-    has_land = False
-    for dlat in np.linspace(-0.6, 0.6, 13):
-        for dlon in np.linspace(-0.6, 0.6, 13):
-            px, py = gdal.ApplyGeoTransform(inv_gt, clon + dlon, clat + dlat)
-            px, py = int(px), int(py)
-            if 0 <= px < ds.RasterXSize and 0 <= py < ds.RasterYSize:
-                val = band.ReadAsArray(px, py, 1, 1)[0, 0]
-                if (uses_alpha and val < 254.5) or (not uses_alpha and val > 0.001):
-                    has_land = True
-                    break
-        if has_land:
-            break
-    return has_land
+        # Sample a 1.2 degree box (13x13 points)
+        has_land = False
+        for dlat in np.linspace(-0.6, 0.6, 13):
+            for dlon in np.linspace(-0.6, 0.6, 13):
+                px, py = gdal.ApplyGeoTransform(inv_gt, clon + dlon, clat + dlat)
+                px, py = int(px), int(py)
+                if 0 <= px < ds.RasterXSize and 0 <= py < ds.RasterYSize:
+                    val = band.ReadAsArray(px, py, 1, 1)[0, 0]
+                    if (uses_alpha and val < 254.5) or (not uses_alpha and val > 0.001):
+                        has_land = True
+                        break
+            if has_land:
+                break
+        return has_land
+    finally:
+        ds = None
 
 
 def fill_nan_nearest(
@@ -428,43 +448,6 @@ def fill_nan_nearest(
     return filled
 
 
-def mosaic_date_stacks(date_stacks: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-    """Average only complete RGB observations and track where any date was valid."""
-    if not date_stacks:
-        raise ValueError("date_stacks must not be empty")
-
-    first_stack = date_stacks[0]
-    summed = np.zeros_like(first_stack, dtype=np.float32)
-    valid_counts = np.zeros(first_stack.shape[1:], dtype=np.uint16)
-    valid_source_mask = np.zeros(first_stack.shape[1:], dtype=bool)
-
-    for date_stack in date_stacks:
-        complete_rgb_mask = np.all(np.isfinite(date_stack), axis=0)
-        if not np.any(complete_rgb_mask):
-            continue
-
-        valid_source_mask |= complete_rgb_mask
-        valid_counts[complete_rgb_mask] += 1
-        for band_index in range(date_stack.shape[0]):
-            np.add(
-                summed[band_index],
-                date_stack[band_index],
-                out=summed[band_index],
-                where=complete_rgb_mask,
-            )
-
-    averaged = np.full_like(first_stack, np.nan, dtype=np.float32)
-    for band_index in range(first_stack.shape[0]):
-        np.divide(
-            summed[band_index],
-            valid_counts,
-            out=averaged[band_index],
-            where=valid_source_mask,
-        )
-
-    return averaged, valid_source_mask
-
-
 def load_tile_grid(red_path: str) -> TileGrid:
     """Read the common raster grid metadata from the red band."""
     dataset = gdal.Open(red_path)
@@ -482,10 +465,10 @@ def open_gebco_mask(
     gebco_src: Optional[str],
     tile_grid: TileGrid,
     mgrs_subtile: str,
-) -> Tuple[Optional[gdal.Band], Optional[gdal.Dataset], Optional[np.ndarray], bool]:
+) -> Tuple[Optional[gdal.Band], Optional[gdal.Dataset], bool]:
     """Warp GEBCO onto the tile grid so land/ocean blending can reuse it block-by-block."""
     if not gebco_src:
-        return None, None, None, False
+        return None, None, False
 
     try:
         gebco_ds = gdal.Open(gebco_src)
@@ -498,12 +481,16 @@ def open_gebco_mask(
 
         try:
             mem_driver = gdal.GetDriverByName("MEM")
+            if mem_driver is None:
+                raise RuntimeError("Could not load GDAL MEM driver")
             gebco_mem_ds = mem_driver.Create(
                 "", tile_grid.width, tile_grid.height, 1, gdal.GDT_Float32
             )
+            if gebco_mem_ds is None:
+                raise RuntimeError("Could not create in-memory GEBCO mask dataset")
             gebco_mem_ds.SetProjection(tile_grid.projection)
             gebco_mem_ds.SetGeoTransform(tile_grid.geotransform)
-            gdal.Warp(
+            warped = gdal.Warp(
                 gebco_mem_ds,
                 gebco_ds,
                 options=gdal.WarpOptions(
@@ -512,31 +499,79 @@ def open_gebco_mask(
                     dstBands=[1],
                 ),
             )
+            if warped is None:
+                raise RuntimeError(f"Could not warp GEBCO mask for {mgrs_subtile}")
         finally:
             gebco_ds = None
 
         return (
             gebco_mem_ds.GetRasterBand(1),
             gebco_mem_ds,
-            np.zeros((tile_grid.height, tile_grid.width), dtype=bool),
             uses_alpha,
         )
-    except Exception as e:
+    except RuntimeError as e:
         print(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
-        return None, None, None, False
+        return None, None, False
 
 
 def open_date_band_sets(
     folders: List[Tuple[str, str]], cache_dir: str
 ) -> List[Tuple[List[gdal.Band], List[gdal.Dataset]]]:
     """Open RGB band handles for every date so block reads stay sequential."""
-    date_band_sets = []
-    for folder_name, date_path in folders:
-        paths = get_tile_paths(folder_name, date_path, cache_dir, download=False)
-        datasets = [gdal.Open(paths[color_name]) for _, color_name in RGB_BANDS]
-        bands = [dataset.GetRasterBand(1) for dataset in datasets]
-        date_band_sets.append((bands, datasets))
-    return date_band_sets
+    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
+    try:
+        for folder_name, date_path in folders:
+            paths = get_tile_paths(folder_name, date_path, cache_dir, download=False)
+            datasets: List[gdal.Dataset] = []
+            bands: List[gdal.Band] = []
+            for band_id, color_name in RGB_BANDS:
+                try:
+                    dataset = gdal.Open(paths[color_name])
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"Could not open {color_name} band {band_id} for {folder_name} ({date_path}): {exc}"
+                    ) from exc
+                if dataset is None:
+                    raise RuntimeError(
+                        f"Could not open {color_name} band {band_id} for {folder_name} ({date_path})"
+                    )
+                band = dataset.GetRasterBand(1)
+                if band is None:
+                    raise RuntimeError(
+                        f"Could not read raster band 1 from {color_name} band {band_id} for {folder_name} ({date_path})"
+                    )
+                datasets.append(dataset)
+                bands.append(band)
+            date_band_sets.append((bands, datasets))
+        return date_band_sets
+    except RuntimeError:
+        for bands, datasets in date_band_sets:
+            bands.clear()
+            datasets.clear()
+        raise
+
+
+def write_resume_state(
+    state_file: str,
+    unique_id: str,
+    completed_subtiles: Set[str],
+    processed_tifs: List[str],
+    args: argparse.Namespace,
+) -> None:
+    """Persist resume state atomically so interrupted writes do not corrupt the JSON file."""
+    temp_state_file = f"{state_file}.tmp"
+    with open(temp_state_file, "w") as f:
+        json.dump(
+            {
+                "unique_id": unique_id,
+                "completed_subtiles": list(completed_subtiles),
+                "processed_tifs": processed_tifs,
+                "args": vars(args),
+            },
+            f,
+            indent=2,
+        )
+    os.replace(temp_state_file, state_file)
 
 
 def iter_processing_windows(tile_grid: TileGrid) -> Iterator[Tuple[int, int, int, int]]:
@@ -592,28 +627,31 @@ def average_block(
 def average_tile_blocks(
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]],
     tile_grid: TileGrid,
-    gebco_band: Optional[gdal.Band],
     fill_allowed_mask: Optional[np.ndarray],
-    mask_uses_alpha: bool,
 ) -> Tuple[np.ndarray, np.ndarray, bool]:
     """Average all tile windows while skipping pure-ocean blocks when GEBCO is available."""
     averaged = np.full((3, tile_grid.height, tile_grid.width), np.nan, dtype=np.float32)
     source_valid_mask = np.zeros((tile_grid.height, tile_grid.width), dtype=bool)
-    found_non_ocean_pixels = gebco_band is None
+    found_non_ocean_pixels = fill_allowed_mask is None
+
+    # Determine Y range to skip leading/trailing ocean-only slabs
+    y_min, y_max = 0, tile_grid.height
+    if fill_allowed_mask is not None:
+        rows_with_land = np.any(fill_allowed_mask, axis=1)
+        if not np.any(rows_with_land):
+            return averaged, source_valid_mask, False
+        y_min = int(np.argmax(rows_with_land))
+        y_max = int(len(rows_with_land) - np.argmax(rows_with_land[::-1]))
 
     for xoff, yoff, block_width, block_height in iter_processing_windows(tile_grid):
-        if gebco_band is not None:
-            gebco_block = gebco_band.ReadAsArray(
-                xoff, yoff, block_width, block_height
-            ).astype(np.float32)
-            assert fill_allowed_mask is not None
-            if mask_uses_alpha:
-                fill_allowed_block = gebco_block < 254.5
-            else:
-                fill_allowed_block = gebco_block > OCEAN_FADE_DEPTH
-            fill_allowed_mask[
+        # Skip slabs completely outside the land Y range
+        if yoff + block_height <= y_min or yoff >= y_max:
+            continue
+
+        if fill_allowed_mask is not None:
+            fill_allowed_block = fill_allowed_mask[
                 yoff : yoff + block_height, xoff : xoff + block_width
-            ] = fill_allowed_block
+            ]
             if not np.any(fill_allowed_block):
                 continue
             found_non_ocean_pixels = True
@@ -790,15 +828,28 @@ def process_single_tile(
     paths = get_tile_paths(first_folder, first_date, args.cache, download=False)
     tile_grid = load_tile_grid(paths["red"])
 
-    gebco_band, _gebco_mem_ds, fill_allowed_mask, mask_uses_alpha = open_gebco_mask(
+    gebco_band, _gebco_mem_ds, mask_uses_alpha = open_gebco_mask(
         gebco_src, tile_grid, mgrs_subtile
     )
+
+    # 1. Compute land mask early and check if any land exists in this subtile
+    fill_allowed_mask = None
+    if gebco_band is not None:
+        gebco_full = gebco_band.ReadAsArray().astype(np.float32)
+        if mask_uses_alpha:
+            fill_allowed_mask = gebco_full < 254.5
+        else:
+            fill_allowed_mask = gebco_full > OCEAN_FADE_DEPTH
+
+        if not np.any(fill_allowed_mask):
+            return None
+
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
     try:
         print(f"Processing tile {mgrs_subtile} across {len(folders)} date(s)...")
         date_band_sets = open_date_band_sets(folders, args.cache)
         averaged, source_valid_mask, found_non_ocean_pixels = average_tile_blocks(
-            date_band_sets, tile_grid, gebco_band, fill_allowed_mask, mask_uses_alpha
+            date_band_sets, tile_grid, fill_allowed_mask
         )
 
         if not found_non_ocean_pixels:
@@ -1079,17 +1130,9 @@ def main() -> None:
                     completed_subtiles.add(st)
                     if res:
                         processed_tifs.append(res)
-                    with open(state_file, "w") as f:
-                        json.dump(
-                            {
-                                "unique_id": unique_id,
-                                "completed_subtiles": list(completed_subtiles),
-                                "processed_tifs": processed_tifs,
-                                "args": vars(args),
-                            },
-                            f,
-                            indent=2,
-                        )
+                    write_resume_state(
+                        state_file, unique_id, completed_subtiles, processed_tifs, args
+                    )
         else:
             print("All sub-tiles already processed.")
     else:
@@ -1159,8 +1202,8 @@ def main() -> None:
         if os.path.exists(path):
             try:
                 os.remove(path)
-            except OSError:
-                pass
+            except OSError as exc:
+                print(f"Warning: Could not remove temporary file {path}: {exc}")
 
     if os.path.exists(state_file):
         os.remove(state_file)

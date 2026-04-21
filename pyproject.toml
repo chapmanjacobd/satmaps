@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["ocean_background", "satmaps", "tiler"]
+py-modules = ["ocean_background", "satmaps", "tiler", "tuner_ui"]
 
 [project.optional-dependencies]
 dev = [

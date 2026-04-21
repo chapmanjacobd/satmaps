@@ -17,6 +17,7 @@ from satmaps import (
     find_resume_path,
     iter_processing_windows,
     load_land_tiles,
+    open_date_band_sets,
     parse_bbox,
     restore_resume_state,
 )
@@ -48,6 +49,16 @@ def test_restore_resume_state_round_trip(
         "processed_tifs": [str(kept_tif)],
     }
     assert "Resuming from state file" in capsys.readouterr().out
+
+
+def test_restore_resume_state_returns_none_for_invalid_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state_file = tmp_path / "state.json"
+    state_file.write_text("{not json")
+
+    assert restore_resume_state(str(state_file)) is None
+    assert "Warning: Could not load state file" in capsys.readouterr().out
 
 
 def test_load_land_tiles_ignores_blank_lines_and_missing_file(tmp_path: Path) -> None:
@@ -155,3 +166,28 @@ def test_build_alpha_block_applies_gebco_fade_curve() -> None:
         ),
         np.array([[0, 0, 127, 255, 255]], dtype=np.uint8),
     )
+
+
+def test_open_date_band_sets_raises_clear_error_when_dataset_open_fails(
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(
+        "satmaps.get_tile_paths",
+        lambda folder_name, date_path, cache_dir, download=False: {
+            "red": "/tmp/red.tif",
+            "green": "/tmp/green.tif",
+            "blue": "/tmp/blue.tif",
+        },
+    )
+
+    def fake_open(path: str):
+        if path == "/tmp/green.tif":
+            return None
+        dataset = gdal.GetDriverByName("MEM").Create("", 1, 1, 1, gdal.GDT_Byte)
+        assert dataset is not None
+        return dataset
+
+    monkeypatch.setattr("satmaps.gdal.Open", fake_open)
+
+    with pytest.raises(RuntimeError, match="Could not open green band B03"):
+        open_date_band_sets([("folder", "2025/07/01")], ".cache")

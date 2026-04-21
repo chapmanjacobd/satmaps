@@ -9,7 +9,7 @@ from typing import Sequence
 from xml.sax.saxutils import escape
 
 import numpy as np
-from osgeo import gdal, osr
+from osgeo import gdal
 
 from tiler import (
     MAKO_RAMP,
@@ -26,7 +26,6 @@ gdal.UseExceptions()
 DEFAULT_GEBCO_ZIP = "gebco_2025_sub_ice_topo_geotiff.zip"
 DEFAULT_OUTPUT = "ocean.tif"
 GEBCO_OCEAN_NODATA = -32767.0
-EQUATORIAL_REFERENCE_BBOX = (-0.5, -0.5, 0.5, 0.5)
 WEB_MERCATOR_WORLD_BOUNDS = (
     -20037508.342789244,
     -20037508.342789244,
@@ -220,53 +219,6 @@ def colorize_ocean_depths(depths: np.ndarray, style: OceanStyleOptions) -> np.nd
     )
 
 
-def resolution_for_utm_10m_3857(
-    min_lon: float, min_lat: float, max_lon: float, max_lat: float
-) -> tuple[float, float]:
-    """Approximate the EPSG:3857 pixel size of a 10m UTM grid at the bbox center."""
-    center_lon = (min_lon + max_lon) / 2.0
-    center_lat = (min_lat + max_lat) / 2.0
-    if center_lat < -80.0 or center_lat > 84.0:
-        raise ValueError("UTM projection requires the bbox center to be between 80S and 84N")
-
-    zone = max(1, min(60, int((center_lon + 180.0) / 6.0) + 1))
-    epsg = (32600 if center_lat >= 0.0 else 32700) + zone
-
-    wgs84 = osr.SpatialReference()
-    utm = osr.SpatialReference()
-    web_mercator = osr.SpatialReference()
-    wgs84.ImportFromEPSG(4326)
-    utm.ImportFromEPSG(epsg)
-    web_mercator.ImportFromEPSG(3857)
-    wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    utm.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    web_mercator.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-
-    to_utm = osr.CoordinateTransformation(wgs84, utm)
-    to_3857 = osr.CoordinateTransformation(utm, web_mercator)
-
-    center_x, center_y, _ = to_utm.TransformPoint(center_lon, center_lat)
-    center_merc_x, center_merc_y, _ = to_3857.TransformPoint(center_x, center_y)
-    east_merc_x, _, _ = to_3857.TransformPoint(center_x + 10.0, center_y)
-    _, north_merc_y, _ = to_3857.TransformPoint(center_x, center_y + 10.0)
-
-    x_res = abs(east_merc_x - center_merc_x)
-    y_res = abs(north_merc_y - center_merc_y)
-    if x_res <= 0.0 or y_res <= 0.0:
-        raise RuntimeError(
-            "Could not derive a positive EPSG:3857 resolution from the bbox center"
-        )
-    return x_res, y_res
-
-
-def target_resolution_for_utm_10m_3857(
-    bbox: tuple[float, float, float, float] | None = None,
-) -> tuple[float, float]:
-    """Return the explicit 3857 pixel size used for styled ocean outputs."""
-    reference_bbox = bbox if bbox is not None else EQUATORIAL_REFERENCE_BBOX
-    return resolution_for_utm_10m_3857(*reference_bbox)
-
-
 def target_web_mercator_pixel_size() -> float:
     """Return the shared Web Mercator output pixel size used across exports."""
     return web_mercator_pixel_size(OUTPUT_WEB_MERCATOR_ZOOM)
@@ -416,65 +368,6 @@ def create_rgb_with_alpha_vrt(rgb_tif: str, alpha_vrt: str, output_vrt: str) -> 
     <SimpleSource>
       <SourceFilename relativeToVRT="0">{rgb_filename}</SourceFilename>
       <SourceBand>3</SourceBand>
-    </SimpleSource>
-  </VRTRasterBand>
-  <VRTRasterBand dataType="Byte" band="4">
-    <ColorInterp>Alpha</ColorInterp>
-    <SimpleSource>
-      <SourceFilename relativeToVRT="0">{alpha_filename}</SourceFilename>
-      <SourceBand>1</SourceBand>
-    </SimpleSource>
-  </VRTRasterBand>
-</VRTDataset>
-"""
-        )
-
-    return output_vrt
-
-
-def create_hillshade_rgba_vrt(hillshade_tif: str, alpha_vrt: str, output_vrt: str) -> str:
-    """Repeat a grayscale hillshade into RGB and attach an explicit alpha band."""
-    hillshade_ds = gdal.Open(hillshade_tif)
-    if hillshade_ds is None:
-        raise RuntimeError(f"Could not open hillshade TIFF: {hillshade_tif}")
-
-    alpha_ds = gdal.Open(alpha_vrt)
-    if alpha_ds is None:
-        raise RuntimeError(f"Could not open alpha VRT: {alpha_vrt}")
-
-    xsize = hillshade_ds.RasterXSize
-    ysize = hillshade_ds.RasterYSize
-    geotransform = ",".join(str(value) for value in hillshade_ds.GetGeoTransform())
-    projection = escape(hillshade_ds.GetProjection())
-    hillshade_filename = escape(os.path.abspath(hillshade_tif))
-    alpha_filename = escape(os.path.abspath(alpha_vrt))
-    hillshade_ds = None
-    alpha_ds = None
-
-    with open(output_vrt, "w") as f:
-        f.write(
-            f"""<VRTDataset rasterXSize="{xsize}" rasterYSize="{ysize}">
-  <SRS>{projection}</SRS>
-  <GeoTransform>{geotransform}</GeoTransform>
-  <VRTRasterBand dataType="Byte" band="1">
-    <ColorInterp>Red</ColorInterp>
-    <SimpleSource>
-      <SourceFilename relativeToVRT="0">{hillshade_filename}</SourceFilename>
-      <SourceBand>1</SourceBand>
-    </SimpleSource>
-  </VRTRasterBand>
-  <VRTRasterBand dataType="Byte" band="2">
-    <ColorInterp>Green</ColorInterp>
-    <SimpleSource>
-      <SourceFilename relativeToVRT="0">{hillshade_filename}</SourceFilename>
-      <SourceBand>1</SourceBand>
-    </SimpleSource>
-  </VRTRasterBand>
-  <VRTRasterBand dataType="Byte" band="3">
-    <ColorInterp>Blue</ColorInterp>
-    <SimpleSource>
-      <SourceFilename relativeToVRT="0">{hillshade_filename}</SourceFilename>
-      <SourceBand>1</SourceBand>
     </SimpleSource>
   </VRTRasterBand>
   <VRTRasterBand dataType="Byte" band="4">

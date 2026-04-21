@@ -15,7 +15,6 @@ from satmaps import (
     get_tile_paths,
     list_mosaic_folders_for_tile,
     main,
-    mosaic_date_stacks,
     process_single_tile,
 )
 
@@ -94,39 +93,6 @@ def test_fill_nan_nearest_uses_explicit_valid_mask() -> None:
     assert np.array_equal(filled, expected)
 
 
-def test_mosaic_date_stacks_prefers_any_complete_date_over_neighbor_fill() -> None:
-    date1 = np.array(
-        [
-            [[10.0, np.nan, np.nan]],
-            [[20.0, np.nan, np.nan]],
-            [[30.0, np.nan, np.nan]],
-        ],
-        dtype=np.float32,
-    )
-    date2 = np.array(
-        [
-            [[np.nan, 40.0, np.nan]],
-            [[50.0, 50.0, np.nan]],
-            [[60.0, 60.0, np.nan]],
-        ],
-        dtype=np.float32,
-    )
-
-    averaged, valid_mask = mosaic_date_stacks([date1, date2])
-
-    expected = np.array(
-        [
-            [[10.0, 40.0, np.nan]],
-            [[20.0, 50.0, np.nan]],
-            [[30.0, 60.0, np.nan]],
-        ],
-        dtype=np.float32,
-    )
-    np.testing.assert_allclose(averaged[:, :, :2], expected[:, :, :2])
-    assert np.isnan(averaged[:, :, 2]).all()
-    np.testing.assert_array_equal(valid_mask, np.array([[True, True, False]]))
-
-
 def test_create_gebco_ocean_vrt_masks_positive_values(tmp_path: Path) -> None:
     source_path = tmp_path / "gebco_source.tif"
     driver = gdal.GetDriverByName("GTiff")
@@ -154,34 +120,6 @@ def test_create_gebco_ocean_vrt_masks_positive_values(tmp_path: Path) -> None:
     assert nodata == -32767.0
 
     np.testing.assert_allclose(arr, np.array([[-5.0, 0.0, 0.0005, nodata]], dtype=np.float32))
-
-
-def test_resolution_for_utm_10m_3857_returns_positive_values() -> None:
-    x_res, y_res = ocean_background.resolution_for_utm_10m_3857(-4.0, 50.0, -3.0, 51.0)
-
-    assert x_res > 0.0
-    assert y_res > 0.0
-    assert np.isclose(x_res, y_res, rtol=0.05)
-
-
-def test_resolution_for_utm_10m_3857_clamps_dateline_zone() -> None:
-    x_res, y_res = ocean_background.resolution_for_utm_10m_3857(179.5, 0.0, 180.5, 1.0)
-
-    assert x_res > 0.0
-    assert y_res > 0.0
-
-
-def test_resolution_for_utm_10m_3857_rejects_polar_centers() -> None:
-    with pytest.raises(ValueError, match="UTM projection requires"):
-        ocean_background.resolution_for_utm_10m_3857(-10.0, 84.5, 10.0, 85.5)
-
-
-def test_target_resolution_for_utm_10m_3857_without_bbox_uses_equatorial_reference() -> None:
-    assert ocean_background.target_resolution_for_utm_10m_3857() == (
-        ocean_background.resolution_for_utm_10m_3857(
-            *ocean_background.EQUATORIAL_REFERENCE_BBOX
-        )
-    )
 
 
 def test_target_web_mercator_pixel_size_uses_output_zoom() -> None:
@@ -227,40 +165,6 @@ def test_create_alpha_vrt_masks_nodata_with_expression(tmp_path: Path) -> None:
     np.testing.assert_allclose(
         gdal.Open(str(alpha_vrt)).ReadAsArray(),
         np.array([[255.0, 0.0]], dtype=np.float32),
-    )
-
-
-def test_create_hillshade_rgba_vrt_repeats_gray_and_uses_alpha_vrt(tmp_path: Path) -> None:
-    driver = gdal.GetDriverByName("GTiff")
-
-    hillshade_path = tmp_path / "hillshade.tif"
-    hillshade_ds = driver.Create(str(hillshade_path), 2, 1, 1, gdal.GDT_Byte)
-    hillshade_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(3857)
-    hillshade_ds.SetProjection(srs.ExportToWkt())
-    hillshade_ds.GetRasterBand(1).WriteArray(np.array([[10, 20]], dtype=np.uint8))
-    hillshade_ds = None
-
-    alpha_path = tmp_path / "alpha.tif"
-    alpha_ds = driver.Create(str(alpha_path), 2, 1, 1, gdal.GDT_Byte)
-    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
-    alpha_ds.SetProjection(srs.ExportToWkt())
-    alpha_ds.GetRasterBand(1).WriteArray(np.array([[255, 0]], dtype=np.uint8))
-    alpha_ds = None
-
-    alpha_vrt = tmp_path / "alpha.vrt"
-    gdal.BuildVRT(str(alpha_vrt), [str(alpha_path)])
-
-    rgba_vrt = tmp_path / "ocean_rgba.vrt"
-    ocean_background.create_hillshade_rgba_vrt(str(hillshade_path), str(alpha_vrt), str(rgba_vrt))
-
-    rgba_ds = gdal.Open(str(rgba_vrt))
-    assert rgba_ds is not None
-    assert rgba_ds.RasterCount == 4
-    np.testing.assert_array_equal(
-        rgba_ds.ReadAsArray(),
-        np.array([[[10, 20]], [[10, 20]], [[10, 20]], [[255, 0]]], dtype=np.uint8),
     )
 
 
