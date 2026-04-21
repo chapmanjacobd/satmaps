@@ -9,7 +9,7 @@ This repository provides tools to fetch, process, and package Sentinel-2 mosaic 
 ## Core Components
 
 - `satmaps.py`: The primary engine. Handles GDAL S3 configuration, multi-date mosaicking, reprojection to Web Mercator (EPSG:3857), and PMTiles generation. Uses a NumPy-based pipeline for tone mapping and grading.
-- `ocean_background.py`: Builds a standalone styled Web Mercator ocean background from GEBCO, either cropped for a `--bbox` render or exported globally from the full masked source raster when no bbox is provided.
+- `ocean_background.py`: Builds a standalone styled Web Mercator ocean background from GEBCO, with both global and bbox exports targeting a shared Web Mercator zoom-13 output resolution.
 - `tuner_ui.py`: A Flask-based interactive web interface to fine-tune tone mapping parameters (exposure, contrast, saturation) in real-time on sample data.
 - `tiler.py`: Core logic for tile processing, tone mapping algorithms, and parallelized chunk execution.
 
@@ -44,17 +44,17 @@ Visit `http://localhost:5001` to adjust exposure, soft-knee curves, and saturati
 Build the standalone styled ocean background and reuse it as an ocean base layer:
 
 ```bash
-# Global export from the full masked GEBCO source raster
+# Global export from the full masked GEBCO source raster at Web Mercator zoom 13
 python3 ocean_background.py
 
-# Crop and reproject to the same snapped tile-grid resolution used by bbox renders
+# Crop and reproject to the same zoom-13 snapped tile-grid resolution used by bbox renders
 python3 ocean_background.py --bbox -161,18,-154,23
 
 # Inspect the final styled RGBA VRT without translating to GeoTIFF
 python3 ocean_background.py --vrt
 ```
 
-The first positional argument is the GEBCO zip path if you need something other than `gebco_2025_sub_ice_topo_geotiff.zip`, and the optional second positional argument is the output path (default: `ocean.tif`, or `ocean.vrt` when `--vrt` is used).
+The first positional argument is the GEBCO zip path if you need something other than `gebco_2025_sub_ice_topo_geotiff.zip`, and the optional second positional argument is the output path (default: `ocean.tif`, or `ocean.vrt` when `--vrt` is used). Standalone ocean outputs target Web Mercator zoom 13 (~19.11 m/px at the equator).
 
 ### 3. Generate PMTiles
 
@@ -94,6 +94,7 @@ python3 satmaps.py --global --estimate
 - `--parallel`: Number of worker processes/threads used for tile processing and chunk generation (default: `2`).
 - `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
 - `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before chunk generation.
+- Final Web Mercator land and ocean outputs target zoom 13 (~19.11 m/px at the equator) so merged VRTs and downstream tiling share one explicit output resolution.
 - `--land` / `--no-land`: Enable or skip Sentinel-2 land tile processing entirely.
 - `--tonemap` / `--no-tonemap`: Enable or disable the land tone-mapping stage.
 - `--grade` / `--no-grade`: Enable or disable final land grading.
@@ -107,7 +108,7 @@ python3 satmaps.py --global --estimate
 
 `ocean_background.py` supports the same tone-mapping controls as `satmaps.py`, plus:
 
-- `--bbox`: Export a Web Mercator ocean background cropped to a WGS84 bbox and snapped outward to the target Web Mercator tile pixel grid used for bbox renders in `satmaps.py`.
+- `--bbox`: Export a Web Mercator ocean background cropped to a WGS84 bbox and snapped outward to the zoom-13 Web Mercator tile grid used for bbox renders in `satmaps.py`.
 - `--hillshade-z`: Vertical exaggeration passed to `gdaldem hillshade`.
 - `--depth-min` / `--depth-max`: Depth range mapped onto the ocean color ramp.
 - `--resample-alg`: GEBCO upscale kernel (`cubicspline` or `lanczos`).

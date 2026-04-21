@@ -19,7 +19,6 @@ from tiler import (
     lonlat_bbox_to_mercator_bounds,
     snap_bounds_to_pixel_grid,
     web_mercator_pixel_size,
-    zoom_for_pixel_size,
 )
 
 gdal.UseExceptions()
@@ -34,6 +33,7 @@ WEB_MERCATOR_WORLD_BOUNDS = (
     20037508.342789244,
     20037508.342789244,
 )
+OUTPUT_WEB_MERCATOR_ZOOM = 13
 GTIFF_CREATION_OPTIONS = (
     "BIGTIFF=YES",
     "TILED=YES",
@@ -267,13 +267,17 @@ def target_resolution_for_utm_10m_3857(
     return resolution_for_utm_10m_3857(*reference_bbox)
 
 
+def target_web_mercator_pixel_size() -> float:
+    """Return the shared Web Mercator output pixel size used across exports."""
+    return web_mercator_pixel_size(OUTPUT_WEB_MERCATOR_ZOOM)
+
+
 def snapped_tile_grid_for_bbox(
     bbox: tuple[float, float, float, float],
 ) -> tuple[tuple[float, float, float, float], float, int]:
     """Snap a bbox outward to the target Web Mercator tile pixel grid."""
-    x_res, y_res = target_resolution_for_utm_10m_3857(bbox)
-    zoom = zoom_for_pixel_size(min(x_res, y_res))
-    pixel_size = web_mercator_pixel_size(zoom)
+    pixel_size = target_web_mercator_pixel_size()
+    zoom = OUTPUT_WEB_MERCATOR_ZOOM
     mercator_bounds = lonlat_bbox_to_mercator_bounds(*bbox)
     snapped_bounds = snap_bounds_to_pixel_grid(mercator_bounds, pixel_size)
     return snapped_bounds, pixel_size, zoom
@@ -548,10 +552,9 @@ def generate_ocean_background(
         "resampleAlg": resample_alg,
     }
     if bbox is None:
-        x_res, y_res = target_resolution_for_utm_10m_3857()
         warp_kwargs["outputBounds"] = WEB_MERCATOR_WORLD_BOUNDS
-        warp_kwargs["xRes"] = x_res
-        warp_kwargs["yRes"] = y_res
+        warp_kwargs["xRes"] = target_web_mercator_pixel_size()
+        warp_kwargs["yRes"] = target_web_mercator_pixel_size()
     else:
         snapped_bounds, pixel_size, _zoom = snapped_tile_grid_for_bbox(bbox)
         warp_kwargs["outputBounds"] = snapped_bounds
@@ -594,7 +597,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a standalone GEBCO ocean hillshade GeoTIFF. "
-            "Without --bbox, export the full masked source raster in EPSG:3857."
+            f"Outputs target Web Mercator zoom {OUTPUT_WEB_MERCATOR_ZOOM} "
+            f"(~{target_web_mercator_pixel_size():.2f} m/px at the equator)."
         )
     )
     parser.add_argument(
@@ -607,7 +611,8 @@ def main() -> None:
         "--bbox",
         help=(
             "Optional WGS84 bbox as min_lon,min_lat,max_lon,max_lat. "
-            "When omitted, exports the full masked source raster in EPSG:3857."
+            f"When omitted, exports the full masked source raster in EPSG:3857 at "
+            f"Web Mercator zoom {OUTPUT_WEB_MERCATOR_ZOOM}."
         ),
     )
     parser.add_argument("--temp-dir", default=".temp", help="Directory for intermediary files")

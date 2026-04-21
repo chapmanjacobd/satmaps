@@ -184,15 +184,19 @@ def test_target_resolution_for_utm_10m_3857_without_bbox_uses_equatorial_referen
     )
 
 
+def test_target_web_mercator_pixel_size_uses_output_zoom() -> None:
+    assert ocean_background.target_web_mercator_pixel_size() == pytest.approx(
+        satmaps.tiler.web_mercator_pixel_size(ocean_background.OUTPUT_WEB_MERCATOR_ZOOM)
+    )
+
+
 def test_snapped_tile_grid_for_bbox_expands_to_tile_pixel_grid() -> None:
     bbox = (-4.0, 50.0, -3.0, 51.0)
 
     snapped_bounds, pixel_size, zoom = ocean_background.snapped_tile_grid_for_bbox(bbox)
 
-    assert zoom == satmaps.tiler.zoom_for_pixel_size(
-        min(ocean_background.target_resolution_for_utm_10m_3857(bbox))
-    )
-    assert pixel_size == pytest.approx(satmaps.tiler.web_mercator_pixel_size(zoom))
+    assert zoom == ocean_background.OUTPUT_WEB_MERCATOR_ZOOM
+    assert pixel_size == pytest.approx(ocean_background.target_web_mercator_pixel_size())
 
     mercator_bounds = satmaps.tiler.lonlat_bbox_to_mercator_bounds(*bbox)
     assert snapped_bounds[0] <= mercator_bounds[0]
@@ -497,10 +501,10 @@ def test_generate_ocean_background_without_bbox_warps_global_raster(
     assert warp_calls[0][1] == artifacts.masked_vrt
     assert warp_options_calls[0]["outputBounds"] == ocean_background.WEB_MERCATOR_WORLD_BOUNDS
     assert warp_options_calls[0]["xRes"] == pytest.approx(
-        ocean_background.target_resolution_for_utm_10m_3857()[0]
+        ocean_background.target_web_mercator_pixel_size()
     )
     assert warp_options_calls[0]["yRes"] == pytest.approx(
-        ocean_background.target_resolution_for_utm_10m_3857()[1]
+        ocean_background.target_web_mercator_pixel_size()
     )
     assert commands == [[artifacts.warped_vrt, artifacts.hillshade_tif, "5.0"]]
     assert translated == [(artifacts.rgba_vrt, "ocean.tif")]
@@ -560,6 +564,26 @@ def test_generate_ocean_background_with_bbox_sets_explicit_target_resolution(
     assert "outputBoundsSRS" not in warp_options_calls[0]
     assert warp_options_calls[0]["xRes"] == pytest.approx(pixel_size)
     assert warp_options_calls[0]["yRes"] == pytest.approx(pixel_size)
+
+
+def test_warp_to_web_mercator_uses_shared_zoom13_resolution(monkeypatch: object) -> None:
+    warp_options_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "satmaps.gdal.WarpOptions",
+        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: None)
+
+    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos")
+
+    assert warp_options_calls[0]["dstSRS"] == "EPSG:3857"
+    assert warp_options_calls[0]["xRes"] == pytest.approx(
+        ocean_background.target_web_mercator_pixel_size()
+    )
+    assert warp_options_calls[0]["yRes"] == pytest.approx(
+        ocean_background.target_web_mercator_pixel_size()
+    )
 
 
 def test_generate_ocean_background_vrt_mode_skips_translate(monkeypatch: object) -> None:
@@ -701,6 +725,8 @@ def test_process_single_tile_full_pipeline(monkeypatch: object, tmp_path: Path) 
 def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
+    raster_size = 100
+    pixel_size = 100.0
 
     monkeypatch.setattr(
         "satmaps.list_mosaic_folders_for_tile",
@@ -715,8 +741,8 @@ def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path
             path = tmp_path / f"{b}.tif"
             if not path.exists():
                 driver = gdal.GetDriverByName("GTiff")
-                ds = driver.Create(str(path), 10, 10, 1, gdal.GDT_Int16)
-                ds.SetGeoTransform((0, 1, 0, 10, 0, -1))
+                ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
+                ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
                 srs = osr.SpatialReference()
                 srs.ImportFromEPSG(32631)
                 ds.SetProjection(srs.ExportToWkt())
@@ -728,12 +754,14 @@ def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path
     monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
 
     gebco_path = tmp_path / "gebco.tif"
-    gebco_ds = gdal.GetDriverByName("GTiff").Create(str(gebco_path), 10, 10, 1, gdal.GDT_Float32)
-    gebco_ds.SetGeoTransform((0, 1, 0, 10, 0, -1))
+    gebco_ds = gdal.GetDriverByName("GTiff").Create(
+        str(gebco_path), raster_size, raster_size, 1, gdal.GDT_Float32
+    )
+    gebco_ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(32631)
     gebco_ds.SetProjection(srs.ExportToWkt())
-    gebco_values = np.full((10, 10), 0.0, dtype=np.float32)
+    gebco_values = np.full((raster_size, raster_size), 0.0, dtype=np.float32)
     gebco_values[0, 0] = -60.0
     gebco_values[0, 1] = -45.0
     gebco_ds.GetRasterBand(1).WriteArray(gebco_values)
@@ -775,6 +803,8 @@ def test_process_single_tile_with_rgba_ocean_alpha_mask(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
+    raster_size = 100
+    pixel_size = 100.0
 
     monkeypatch.setattr(
         "satmaps.list_mosaic_folders_for_tile",
@@ -789,8 +819,8 @@ def test_process_single_tile_with_rgba_ocean_alpha_mask(
             path = tmp_path / f"{b}.tif"
             if not path.exists():
                 driver = gdal.GetDriverByName("GTiff")
-                ds = driver.Create(str(path), 10, 10, 1, gdal.GDT_Int16)
-                ds.SetGeoTransform((0, 1, 0, 10, 0, -1))
+                ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
+                ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
                 srs = osr.SpatialReference()
                 srs.ImportFromEPSG(32631)
                 ds.SetProjection(srs.ExportToWkt())
@@ -802,15 +832,17 @@ def test_process_single_tile_with_rgba_ocean_alpha_mask(
     monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
 
     ocean_path = tmp_path / "ocean_rgba.tif"
-    ocean_ds = gdal.GetDriverByName("GTiff").Create(str(ocean_path), 10, 10, 4, gdal.GDT_Byte)
-    ocean_ds.SetGeoTransform((0, 1, 0, 10, 0, -1))
+    ocean_ds = gdal.GetDriverByName("GTiff").Create(
+        str(ocean_path), raster_size, raster_size, 4, gdal.GDT_Byte
+    )
+    ocean_ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(32631)
     ocean_ds.SetProjection(srs.ExportToWkt())
     for band_index in range(1, 4):
         ocean_ds.GetRasterBand(band_index).Fill(0)
-    alpha_values = np.full((10, 10), 255, dtype=np.uint8)
-    alpha_values[:, :5] = 0
+    alpha_values = np.full((raster_size, raster_size), 255, dtype=np.uint8)
+    alpha_values[:, : raster_size // 2] = 0
     ocean_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
     ocean_ds.GetRasterBand(4).WriteArray(alpha_values)
     ocean_ds = None
@@ -1019,6 +1051,37 @@ def test_main_bbox_uses_standalone_ocean_background(monkeypatch: object, tmp_pat
     assert warp_options_calls[0]["outputBounds"] == pytest.approx(snapped_bounds)
     assert warp_options_calls[0]["xRes"] == pytest.approx(pixel_size)
     assert warp_options_calls[0]["yRes"] == pytest.approx(pixel_size)
+
+
+def test_main_builds_master_vrt_with_shared_zoom13_resolution(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    ocean_background_path = tmp_path / "ocean.tif"
+    ocean_background_path.write_text("fake ocean")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_build_vrt(out, src, **kwargs):
+        buildvrt_calls.append((list(src), kwargs))
+        Path(out).write_text("fake vrt")
+
+    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
+
+    main()
+
+    assert buildvrt_calls
+    _, kwargs = buildvrt_calls[-1]
+    assert kwargs["resolution"] == "user"
+    assert kwargs["xRes"] == pytest.approx(ocean_background.target_web_mercator_pixel_size())
+    assert kwargs["yRes"] == pytest.approx(ocean_background.target_web_mercator_pixel_size())
 
 
 def test_main_bbox_passes_chunk_bounds_to_tiler(

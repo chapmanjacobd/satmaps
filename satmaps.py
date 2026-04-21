@@ -757,9 +757,12 @@ def warp_to_web_mercator(
     source_path: str, destination_path: str, resample_alg: str
 ) -> None:
     """Warp the temporary UTM GeoTIFF into the final EPSG:3857 intermediate."""
+    pixel_size = ocean_background.target_web_mercator_pixel_size()
     warp_options = gdal.WarpOptions(
         format="GTiff",
         dstSRS="EPSG:3857",
+        xRes=pixel_size,
+        yRes=pixel_size,
         resampleAlg=resample_alg,
         creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "TILED=YES", "BIGTIFF=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512"],
     )
@@ -1114,7 +1117,8 @@ def main() -> None:
         sys.exit(1)
 
     master_vrt = f".temp/master_{unique_id}.vrt"
-    gdal.BuildVRT(master_vrt, processed_tifs, resolution="highest")
+    pixel_size = ocean_background.target_web_mercator_pixel_size()
+    gdal.BuildVRT(master_vrt, processed_tifs, resolution="user", xRes=pixel_size, yRes=pixel_size)
 
     if args.vrt:
         print(f"Success! Master VRT: {master_vrt}")
