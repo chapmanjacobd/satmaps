@@ -33,6 +33,7 @@ SUBTILE_OFFSETS = ((0, 0), (0, 1), (1, 0), (1, 1))
 SENTINEL_NODATA = -32768
 PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
+MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
 
 
 def temp_basename_from_output(output_path: str) -> str:
@@ -544,6 +545,8 @@ def prepare_ocean_background_for_output(
                 xRes=pixel_size,
                 yRes=pixel_size,
                 resampleAlg=resample_alg,
+                multithread=True,
+                warpOptions=["NUM_THREADS=ALL_CPUS"],
                 creationOptions=list(ocean.GTIFF_CREATION_OPTIONS),
             )
             prepared_ds = gdal.Warp(staged_ocean_path, ocean_background_path, options=warp_options)
@@ -738,15 +741,6 @@ def open_gebco_mask(
 
         try:
             mask_nodata = -1.0
-            alpha_source_ds = gdal.Translate(
-                "",
-                gebco_ds,
-                options=gdal.TranslateOptions(format="MEM", bandList=[band_index]),
-            )
-            if alpha_source_ds is None:
-                raise RuntimeError(f"Could not isolate GEBCO mask band for {mgrs_subtile}")
-            alpha_source_ds.GetRasterBand(1).SetColorInterpretation(gdal.GCI_GrayIndex)
-
             min_x = tile_grid.geotransform[0]
             max_y = tile_grid.geotransform[3]
             max_x = min_x + tile_grid.geotransform[1] * tile_grid.width
@@ -754,7 +748,7 @@ def open_gebco_mask(
 
             warped_mask_ds = gdal.Warp(
                 "",
-                alpha_source_ds,
+                gebco_ds,
                 options=gdal.WarpOptions(
                     format="MEM",
                     dstSRS=tile_grid.projection,
@@ -762,16 +756,18 @@ def open_gebco_mask(
                     width=tile_grid.width,
                     height=tile_grid.height,
                     resampleAlg="bilinear",
-                    srcBands=[1],
+                    srcBands=[band_index],
+                    srcAlpha=False,
                     dstNodata=mask_nodata,
                     workingType=gdal.GDT_Float32,
                     outputType=gdal.GDT_Float32,
+                    multithread=True,
+                    warpOptions=["NUM_THREADS=ALL_CPUS"],
                 ),
             )
             if warped_mask_ds is None:
                 raise RuntimeError(f"Could not warp GEBCO mask for {mgrs_subtile}")
             warped_mask_ds.GetRasterBand(1).SetNoDataValue(mask_nodata)
-            alpha_source_ds = None
         finally:
             gebco_ds = None
 
@@ -1136,38 +1132,24 @@ def write_processed_blocks(
     if scale <= 0.0:
         raise ValueError("stats_max must be greater than stats_min")
 
+    if processing_window.width * processing_window.height <= MAX_IN_MEMORY_WRITE_PIXELS:
+        byte_block = tone_mapped_byte_block(averaged, args, source_min, scale)
+        for band_index, out_band in enumerate(color_bands):
+            out_band.WriteArray(byte_block[band_index], xoff=processing_window.xoff, yoff=processing_window.yoff)
+        alpha_band.WriteArray(
+            alpha_mask,
+            xoff=processing_window.xoff,
+            yoff=processing_window.yoff,
+        )
+        return
+
     for relative_yoff in range(0, processing_window.height, PROCESS_SLAB_HEIGHT):
         yoff = processing_window.yoff + relative_yoff
         block_height = min(PROCESS_SLAB_HEIGHT, processing_window.height - relative_yoff)
         averaged_block = averaged[
             :, relative_yoff : relative_yoff + block_height, :
         ]
-        normalized = np.clip((averaged_block - source_min) / scale, 0.0, 1.0)
-        normalized[np.isnan(normalized)] = 0.0
-
-        if args.tonemap:
-            toned_block = tiler.apply_soft_knee_numpy(
-                normalized,
-                shadow_break=args.sb,
-                highlight_break=args.hb,
-                shadow_slope=args.ss,
-                mid_slope=args.ms,
-                highlight_slope=args.hs,
-                exposure=args.exposure,
-            )
-        else:
-            toned_block = np.clip(normalized * args.exposure, 0.0, 1.0)
-
-        if args.grade:
-            toned_block = tiler.apply_preview_correction_numpy(
-                toned_block,
-                saturation=args.sat,
-                darken_break=args.db,
-                low_slope=args.ls,
-                gamma=args.gamma,
-            )
-
-        byte_block = np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
+        byte_block = tone_mapped_byte_block(averaged_block, args, source_min, scale)
         for band_index, out_band in enumerate(color_bands):
             out_band.WriteArray(byte_block[band_index], xoff=processing_window.xoff, yoff=yoff)
         alpha_band.WriteArray(
@@ -1175,6 +1157,41 @@ def write_processed_blocks(
             xoff=processing_window.xoff,
             yoff=yoff,
         )
+
+
+def tone_mapped_byte_block(
+    averaged_block: np.ndarray,
+    args: argparse.Namespace,
+    source_min: float,
+    scale: float,
+) -> np.ndarray:
+    """Return an 8-bit RGB block after normalization, tonemapping, and grading."""
+    normalized = np.clip((averaged_block - source_min) / scale, 0.0, 1.0)
+    normalized[np.isnan(normalized)] = 0.0
+
+    if args.tonemap:
+        toned_block = tiler.apply_soft_knee_numpy(
+            normalized,
+            shadow_break=args.sb,
+            highlight_break=args.hb,
+            shadow_slope=args.ss,
+            mid_slope=args.ms,
+            highlight_slope=args.hs,
+            exposure=args.exposure,
+        )
+    else:
+        toned_block = np.clip(normalized * args.exposure, 0.0, 1.0)
+
+    if args.grade:
+        toned_block = tiler.apply_preview_correction_numpy(
+            toned_block,
+            saturation=args.sat,
+            darken_break=args.db,
+            low_slope=args.ls,
+            gamma=args.gamma,
+        )
+
+    return np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
 
 
 def warp_to_web_mercator(
@@ -1190,6 +1207,8 @@ def warp_to_web_mercator(
         yRes=pixel_size,
         resampleAlg=resample_alg,
         targetAlignedPixels=True,
+        multithread=True,
+        warpOptions=["NUM_THREADS=ALL_CPUS"],
         creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "TILED=YES", "BIGTIFF=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512"],
     )
     gdal.Warp(destination_path, source_path, options=warp_options)

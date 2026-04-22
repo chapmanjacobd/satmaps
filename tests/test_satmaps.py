@@ -440,6 +440,50 @@ def test_alpha_mask_coastline_seam_pixel_is_filled_opaquely(
     np.testing.assert_array_equal(rgba[:, 0, 1], np.array([255, 127, 63, 255], dtype=np.uint8))
 
 
+def test_write_processed_blocks_block_path_matches_in_memory_path(
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(satmaps, "MAX_IN_MEMORY_WRITE_PIXELS", 1)
+    processing_window = satmaps.ProcessingWindow(xoff=0, yoff=0, width=2, height=1)
+    averaged = np.array(
+        [[[1.0, 1.0]], [[0.5, 0.5]], [[0.25, 0.25]]],
+        dtype=np.float32,
+    )
+    alpha_mask = np.full((1, 2), 255, dtype=np.uint8)
+
+    dataset = gdal.GetDriverByName("MEM").Create("", 2, 1, 4, gdal.GDT_Byte)
+    assert dataset is not None
+    color_bands = [dataset.GetRasterBand(index + 1) for index in range(3)]
+    alpha_band = dataset.GetRasterBand(4)
+    satmaps.write_processed_blocks(
+        averaged,
+        alpha_mask,
+        processing_window,
+        argparse.Namespace(
+            stats_min=0.0,
+            stats_max=1.0,
+            tonemap=False,
+            grade=False,
+            exposure=1.0,
+            sb=0.3,
+            hb=0.75,
+            ss=1.4,
+            ms=0.9,
+            hs=0.5,
+            sat=1.0,
+            db=0.35,
+            ls=0.35,
+            gamma=1.2,
+        ),
+        color_bands,
+        alpha_band,
+    )
+
+    rgba = dataset.ReadAsArray()
+    np.testing.assert_array_equal(rgba[:, 0, 0], np.array([255, 127, 63, 255], dtype=np.uint8))
+    np.testing.assert_array_equal(rgba[:, 0, 1], np.array([255, 127, 63, 255], dtype=np.uint8))
+
+
 def test_open_gebco_mask_avoids_update_mode_warning(tmp_path: Path) -> None:
     gebco_path = tmp_path / "gebco.tif"
     gebco_ds = gdal.GetDriverByName("GTiff").Create(str(gebco_path), 4, 3, 4, gdal.GDT_Byte)
@@ -478,6 +522,44 @@ def test_open_gebco_mask_avoids_update_mode_warning(tmp_path: Path) -> None:
     assert mask.dataset.RasterYSize == tile_grid.height
     assert mask.alpha_band.GetNoDataValue() == -1.0
     assert not any("creation ignored in update mode" in message.lower() for message in messages)
+
+
+def test_open_gebco_mask_warps_alpha_band_directly(monkeypatch: object) -> None:
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32631)
+    gebco_ds = gdal.GetDriverByName("MEM").Create("", 4, 3, 4, gdal.GDT_Byte)
+    assert gebco_ds is not None
+    gebco_ds.SetGeoTransform((0.0, 100.0, 0.0, 300.0, 0.0, -100.0))
+    gebco_ds.SetProjection(srs.ExportToWkt())
+    gebco_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+
+    warp_options_calls: list[dict[str, object]] = []
+    warped_mask_ds = gdal.GetDriverByName("MEM").Create("", 4, 3, 1, gdal.GDT_Float32)
+    assert warped_mask_ds is not None
+
+    monkeypatch.setattr("satmaps.gdal.Open", lambda path: gebco_ds)
+    monkeypatch.setattr(
+        "satmaps.gdal.WarpOptions",
+        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        "satmaps.gdal.Warp",
+        lambda destination, source, options=None: warped_mask_ds,
+    )
+
+    tile_grid = satmaps.TileGrid(
+        projection=srs.ExportToWkt(),
+        geotransform=(0.0, 100.0, 0.0, 300.0, 0.0, -100.0),
+        width=4,
+        height=3,
+    )
+    mask = satmaps.open_gebco_mask("gebco.tif", tile_grid, "31TDF_0_0")
+
+    assert mask is not None
+    assert warp_options_calls[0]["srcBands"] == [4]
+    assert warp_options_calls[0]["srcAlpha"] is False
+    assert warp_options_calls[0]["multithread"] is True
+    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
 
 
 def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None:
@@ -732,8 +814,12 @@ def test_prepare_ocean_background_publishes_staged_tif_when_warping(
     source_path = tmp_path / "ocean.tif"
     source_path.write_text("ocean")
     destinations: list[str] = []
+    warp_options_calls: list[dict[str, object]] = []
 
-    monkeypatch.setattr("satmaps.gdal.WarpOptions", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        "satmaps.gdal.WarpOptions",
+        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+    )
     monkeypatch.setattr(
         "satmaps.gdal.Warp",
         lambda destination, source, options=None: destinations.append(destination)
@@ -752,6 +838,8 @@ def test_prepare_ocean_background_publishes_staged_tif_when_warping(
     assert destinations == [".temp/.temp_output_ocean_bbox.tif"]
     assert Path(prepared).exists()
     assert not Path(".temp/.temp_output_ocean_bbox.tif").exists()
+    assert warp_options_calls[0]["multithread"] is True
+    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
 
 
 def test_prepare_ocean_background_crops_aligned_mercator_source_without_warp(
@@ -1183,6 +1271,8 @@ def test_warp_to_web_mercator_uses_shared_zoom13_resolution(monkeypatch: object)
         satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
     )
     assert warp_options_calls[0]["targetAlignedPixels"] is True
+    assert warp_options_calls[0]["multithread"] is True
+    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
 
 
 def test_warp_to_web_mercator_respects_requested_zoom(monkeypatch: object) -> None:
@@ -1199,6 +1289,8 @@ def test_warp_to_web_mercator_respects_requested_zoom(monkeypatch: object) -> No
     assert warp_options_calls[0]["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
     assert warp_options_calls[0]["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
     assert warp_options_calls[0]["targetAlignedPixels"] is True
+    assert warp_options_calls[0]["multithread"] is True
+    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
 
 
 def test_warp_to_web_mercator_aligns_adjacent_tiles_to_shared_pixel_grid(
