@@ -102,8 +102,8 @@ satmaps --global --estimate
 - `--chunk-zoom`: Chunking zoom used during MBTiles generation (default: `4`).
 - `--parallel`: Number of worker processes/threads used for tile processing and chunk generation (default: `2`).
 - `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
-- `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before chunk generation.
-- Final Web Mercator land and ocean outputs target zoom 13 (~19.11 m/px at the equator) so merged VRTs and downstream tiling share one explicit output resolution.
+- `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before chunk generation. Coarser ocean masks (for example z11-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass.
+- Final Web Mercator land outputs target `--max-zoom` (default zoom 13, ~19.11 m/px at the equator). Ocean backgrounds may be reused from the same or a coarser zoom level and are resampled onto that final output grid during composition.
 - `--land` / `--no-land`: Enable or skip Sentinel-2 land tile processing entirely.
 - `--tonemap` / `--no-tonemap`: Enable or disable the land tone-mapping stage.
 - `--grade` / `--no-grade`: Enable or disable final land grading.
