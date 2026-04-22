@@ -14,7 +14,7 @@ import mgrs
 from mgrs import core as mgrs_core
 import numpy as np
 import ocean
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import binary_dilation, distance_transform_edt
 from osgeo import gdal
 
 import tiler
@@ -633,7 +633,14 @@ def collect_ocean_mask_slabs(
             ocean_mask.uses_alpha,
             coverage_block,
         )
-        cols_with_land = np.any(fill_allowed_block, axis=0)
+        slab_crop_block = fill_allowed_block
+        if ocean_mask.uses_alpha:
+            slab_crop_block = coverage_block & binary_dilation(
+                fill_allowed_block,
+                structure=np.ones((3, 3), dtype=bool),
+            )
+
+        cols_with_land = np.any(slab_crop_block, axis=0)
         if not np.any(cols_with_land):
             continue
 
@@ -822,6 +829,12 @@ def average_tile_blocks(
         if allowed_block is not None:
             averaged_block = np.where(allowed_block[np.newaxis, :, :], averaged_block, np.nan)
             block_valid_sources &= allowed_block
+            if mask_uses_alpha and coverage_block is not None:
+                seam_fill_block = coverage_block & ~allowed_block & binary_dilation(
+                    block_valid_sources,
+                    structure=np.ones((3, 3), dtype=bool),
+                )
+                allowed_block = allowed_block | seam_fill_block
 
         relative_xoff = actual_xoff - processing_window.xoff
         row_slice = slice(relative_yoff, relative_yoff + block_height)

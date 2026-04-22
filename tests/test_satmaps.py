@@ -364,6 +364,85 @@ def test_average_tile_blocks_masks_out_ocean_holes_inside_processed_slab(
     np.testing.assert_array_equal(averaged[:, :, 2], np.ones((3, 2), dtype=np.float32))
 
 
+def test_alpha_mask_coastline_seam_pixel_is_filled_opaquely(
+    monkeypatch: object,
+) -> None:
+    tile_grid = satmaps.TileGrid(
+        projection="EPSG:32631",
+        geotransform=(0.0, 1.0, 0.0, 0.0, 0.0, -1.0),
+        width=3,
+        height=1,
+    )
+    mask_dataset = gdal.GetDriverByName("MEM").Create("", 3, 1, 1, gdal.GDT_Float32)
+    coverage_dataset = gdal.GetDriverByName("MEM").Create("", 3, 1, 1, gdal.GDT_Byte)
+    assert mask_dataset is not None
+    assert coverage_dataset is not None
+    mask_dataset.GetRasterBand(1).WriteArray(np.array([[0.0, 255.0, 255.0]], dtype=np.float32))
+    coverage_dataset.GetRasterBand(1).WriteArray(np.array([[255, 255, 255]], dtype=np.uint8))
+
+    collected = satmaps.collect_ocean_mask_slabs(
+        satmaps.OceanMaskWarp(
+            band=mask_dataset.GetRasterBand(1),
+            dataset=mask_dataset,
+            uses_alpha=True,
+            coverage_band=coverage_dataset.GetRasterBand(1),
+            coverage_dataset=coverage_dataset,
+        ),
+        tile_grid,
+    )
+    assert collected is not None
+    processing_window, mask_slabs = collected
+    assert processing_window == satmaps.ProcessingWindow(xoff=0, yoff=0, width=2, height=1)
+
+    def mock_average_block(date_band_sets, xoff, yoff, width, height):
+        assert (xoff, yoff, width, height) == (0, 0, 2, 1)
+        averaged_block = np.array(
+            [[[1.0, 0.0]], [[0.5, 0.0]], [[0.25, 0.0]]],
+            dtype=np.float32,
+        )
+        source_valid = np.array([[True, False]], dtype=bool)
+        return averaged_block, source_valid
+
+    monkeypatch.setattr("satmaps.average_block", mock_average_block)
+
+    averaged, source_valid_mask, alpha_mask, fill_allowed_mask = satmaps.average_tile_blocks(
+        [], processing_window, mask_slabs, True
+    )
+    averaged = satmaps.fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
+
+    dataset = gdal.GetDriverByName("MEM").Create("", 2, 1, 4, gdal.GDT_Byte)
+    assert dataset is not None
+    color_bands = [dataset.GetRasterBand(index + 1) for index in range(3)]
+    alpha_band = dataset.GetRasterBand(4)
+    satmaps.write_processed_blocks(
+        averaged,
+        alpha_mask,
+        processing_window,
+        argparse.Namespace(
+            stats_min=0.0,
+            stats_max=1.0,
+            tonemap=False,
+            grade=False,
+            exposure=1.0,
+            sb=0.3,
+            hb=0.75,
+            ss=1.4,
+            ms=0.9,
+            hs=0.5,
+            sat=1.0,
+            db=0.35,
+            ls=0.35,
+            gamma=1.2,
+        ),
+        color_bands,
+        alpha_band,
+    )
+
+    rgba = dataset.ReadAsArray()
+    np.testing.assert_array_equal(rgba[:, 0, 0], np.array([255, 127, 63, 255], dtype=np.uint8))
+    np.testing.assert_array_equal(rgba[:, 0, 1], np.array([255, 127, 63, 255], dtype=np.uint8))
+
+
 def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
 
