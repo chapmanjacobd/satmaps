@@ -2,6 +2,7 @@
 import argparse
 import os
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import copyfile, which
@@ -65,6 +66,7 @@ class OceanBackgroundArtifacts:
     masked_vrt: str
     warped_vrt: str
     alpha_vrt: str
+    alpha_tif: str
     hillshade_tif: str
     color_tif: str
     rgba_vrt: str
@@ -89,6 +91,18 @@ class OceanStyleOptions:
     depth_max: float = 0.0
 
 
+def build_staged_path(path: str) -> str:
+    """Return the hidden staging path used before atomically publishing a file."""
+    directory, basename = os.path.split(path)
+    return os.path.join(directory, f".temp_{basename}")
+
+
+def publish_staged_path(staged_path: str, final_path: str) -> str:
+    """Atomically publish a staged file under its final name."""
+    os.replace(staged_path, final_path)
+    return final_path
+
+
 def build_gebco_source_vrt(gebco_zip: str, output_vrt: str) -> str:
     """Build a source VRT from the GEBCO zip archive."""
     if not os.path.exists(gebco_zip):
@@ -102,7 +116,10 @@ def build_gebco_source_vrt(gebco_zip: str, output_vrt: str) -> str:
     if not tif_paths:
         raise RuntimeError(f"No GeoTIFF files found in GEBCO zip: {gebco_zip}")
 
-    gdal.BuildVRT(output_vrt, tif_paths)
+    staged_output_vrt = build_staged_path(output_vrt)
+    remove_if_exists(staged_output_vrt)
+    gdal.BuildVRT(staged_output_vrt, tif_paths)
+    publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
 
 
@@ -124,7 +141,9 @@ def create_gebco_ocean_vrt(source_vrt: str, output_vrt: str) -> str:
     ysize = ds.RasterYSize
     ds = None
 
-    with open(output_vrt, "w") as f:
+    staged_output_vrt = build_staged_path(output_vrt)
+    remove_if_exists(staged_output_vrt)
+    with open(staged_output_vrt, "w") as f:
         f.write(
             f"""<VRTDataset rasterXSize="{xsize}" rasterYSize="{ysize}">
   <SRS>{projection}</SRS>
@@ -142,10 +161,16 @@ def create_gebco_ocean_vrt(source_vrt: str, output_vrt: str) -> str:
 """
         )
 
+    publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
 
 
-def create_alpha_vrt(source_vrt: str, output_vrt: str) -> str:
+def create_alpha_vrt(
+    source_vrt: str,
+    output_vrt: str,
+    alpha_tif: str | None = None,
+    vector_path: Path | None = None,
+) -> str:
     """Create an explicit alpha mask VRT from depth thresholds and land-preferred cleanup."""
     ds = gdal.Open(source_vrt)
     if ds is None:
@@ -158,9 +183,11 @@ def create_alpha_vrt(source_vrt: str, output_vrt: str) -> str:
 
     xsize = ds.RasterXSize
     ysize = ds.RasterYSize
-    alpha_tif = str(Path(output_vrt).with_suffix(".tif"))
+    alpha_tif = alpha_tif or str(Path(output_vrt).with_suffix(".tif"))
+    staged_alpha_tif = build_staged_path(alpha_tif)
+    remove_if_exists(staged_alpha_tif)
     driver = gdal.GetDriverByName("GTiff")
-    alpha_ds = driver.Create(alpha_tif, xsize, ysize, 1, gdal.GDT_Byte, options=list(GTIFF_CREATION_OPTIONS))
+    alpha_ds = driver.Create(staged_alpha_tif, xsize, ysize, 1, gdal.GDT_Byte, options=list(GTIFF_CREATION_OPTIONS))
     if alpha_ds is None:
         raise RuntimeError(f"Could not create alpha TIFF: {alpha_tif}")
     alpha_ds.SetProjection(ds.GetProjection())
@@ -192,17 +219,25 @@ def create_alpha_vrt(source_vrt: str, output_vrt: str) -> str:
         alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
         alpha_band.FlushCache()
     else:
+        cleanup_vector_path = vector_path or Path(alpha_tif).with_suffix(".gpkg")
+        staged_vector_path = Path(build_staged_path(str(cleanup_vector_path)))
+        remove_if_exists(str(staged_vector_path))
         remove_small_enclosed_ocean_regions_vector(
             alpha_ds,
             alpha_band,
             ds.GetGeoTransform(),
             SMALL_OCEAN_MAX_AREA_SQ_M,
-            Path(alpha_tif).with_suffix(".gpkg"),
+            staged_vector_path,
         )
+        publish_staged_path(str(staged_vector_path), str(cleanup_vector_path))
 
     alpha_ds = None
     ds = None
-    gdal.BuildVRT(output_vrt, [alpha_tif])
+    publish_staged_path(staged_alpha_tif, alpha_tif)
+    staged_output_vrt = build_staged_path(output_vrt)
+    remove_if_exists(staged_output_vrt)
+    gdal.BuildVRT(staged_output_vrt, [alpha_tif])
+    publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
 
 
@@ -411,8 +446,10 @@ def create_ocean_rgb_tif(
     ramp_colors = build_ocean_ramp_colors(style)
 
     driver = gdal.GetDriverByName("GTiff")
+    staged_output_tif = build_staged_path(output_tif)
+    remove_if_exists(staged_output_tif)
     color_ds = driver.Create(
-        output_tif,
+        staged_output_tif,
         hillshade_ds.RasterXSize,
         hillshade_ds.RasterYSize,
         3,
@@ -452,22 +489,25 @@ def create_ocean_rgb_tif(
     color_ds = None
     depth_ds = None
     hillshade_ds = None
+    publish_staged_path(staged_output_tif, output_tif)
     return output_tif
 
 
-def create_rgb_with_alpha_vrt(rgb_tif: str, alpha_vrt: str, output_vrt: str) -> str:
+def create_rgb_with_alpha_vrt(
+    rgb_tif: str,
+    alpha_vrt: str,
+    output_vrt: str,
+    alpha_tif: str | None = None,
+) -> str:
     """Attach an explicit alpha band to an RGB GeoTIFF via VRT."""
     rgb_ds = gdal.Open(rgb_tif)
     if rgb_ds is None:
         raise RuntimeError(f"Could not open RGB TIFF: {rgb_tif}")
 
-    alpha_ds = gdal.Open(alpha_vrt)
+    alpha_tif = alpha_tif or str(Path(alpha_vrt).with_suffix(".tif"))
+    alpha_ds = gdal.Open(alpha_tif)
     if alpha_ds is None:
-        raise RuntimeError(f"Could not open alpha VRT: {alpha_vrt}")
-
-    alpha_tif = str(Path(alpha_vrt).with_suffix(".tif"))
-    if not os.path.exists(alpha_tif):
-        raise RuntimeError(f"Could not locate alpha TIFF for {alpha_vrt}")
+        raise RuntimeError(f"Could not open alpha TIFF: {alpha_tif}")
 
     xsize = rgb_ds.RasterXSize
     ysize = rgb_ds.RasterYSize
@@ -478,7 +518,9 @@ def create_rgb_with_alpha_vrt(rgb_tif: str, alpha_vrt: str, output_vrt: str) -> 
     rgb_ds = None
     alpha_ds = None
 
-    with open(output_vrt, "w") as f:
+    staged_output_vrt = build_staged_path(output_vrt)
+    remove_if_exists(staged_output_vrt)
+    with open(staged_output_vrt, "w") as f:
         f.write(
             f"""<VRTDataset rasterXSize="{xsize}" rasterYSize="{ysize}">
   <SRS>{projection}</SRS>
@@ -515,7 +557,14 @@ def create_rgb_with_alpha_vrt(rgb_tif: str, alpha_vrt: str, output_vrt: str) -> 
 """
         )
 
+    publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
+
+
+def remove_if_exists(path: str) -> None:
+    """Delete a file if it exists."""
+    if os.path.exists(path):
+        os.remove(path)
 
 
 def translate_rgba_vrt(rgba_vrt: str, destination: str) -> str:
@@ -528,7 +577,10 @@ def translate_rgba_vrt(rgba_vrt: str, destination: str) -> str:
         format="GTiff",
         creationOptions=list(GTIFF_CREATION_OPTIONS),
     )
-    gdal.Translate(destination, rgba_vrt, options=options)
+    staged_destination = build_staged_path(destination)
+    remove_if_exists(staged_destination)
+    gdal.Translate(staged_destination, rgba_vrt, options=options)
+    publish_staged_path(staged_destination, destination)
     return destination
 
 
@@ -538,7 +590,10 @@ def write_rgba_vrt(rgba_vrt: str, destination: str) -> str:
     if destination_dir:
         os.makedirs(destination_dir, exist_ok=True)
 
-    copyfile(rgba_vrt, destination)
+    staged_destination = build_staged_path(destination)
+    remove_if_exists(staged_destination)
+    copyfile(rgba_vrt, staged_destination)
+    publish_staged_path(staged_destination, destination)
     return destination
 
 
@@ -559,14 +614,17 @@ def generate_ocean_background(
 
     os.makedirs(temp_dir, exist_ok=True)
     stem = Path(destination).stem or "ocean"
+    unique_id = uuid.uuid4().hex[:8]
 
-    source_vrt = os.path.join(temp_dir, f"{stem}_source.vrt")
-    masked_vrt = os.path.join(temp_dir, f"{stem}_masked.vrt")
-    warped_vrt = os.path.join(temp_dir, f"{stem}_3857.vrt")
-    alpha_vrt = os.path.join(temp_dir, f"{stem}_alpha.vrt")
+    source_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_source.vrt")
+    masked_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_masked.vrt")
+    warped_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_3857.vrt")
+    alpha_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_alpha.vrt")
+    alpha_tif = os.path.join(temp_dir, f"{stem}_alpha.tif")
     hillshade_tif = os.path.join(temp_dir, f"{stem}_hillshade.tif")
     color_tif = os.path.join(temp_dir, f"{stem}_color.tif")
-    rgba_vrt = os.path.join(temp_dir, f"{stem}_rgba.vrt")
+    rgba_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_rgba.vrt")
+    cleanup_gpkg = Path(os.path.join(temp_dir, f"{stem}_{unique_id}_alpha.gpkg"))
 
     build_gebco_source_vrt(gebco_zip, source_vrt)
     create_gebco_ocean_vrt(source_vrt, masked_vrt)
@@ -589,24 +647,37 @@ def generate_ocean_background(
         warp_kwargs["xRes"] = pixel_size
         warp_kwargs["yRes"] = pixel_size
     warp_options = gdal.WarpOptions(**warp_kwargs)
-    gdal.Warp(warped_vrt, masked_vrt, options=warp_options)
+    staged_warped_vrt = build_staged_path(warped_vrt)
+    remove_if_exists(staged_warped_vrt)
+    gdal.Warp(staged_warped_vrt, masked_vrt, options=warp_options)
+    publish_staged_path(staged_warped_vrt, warped_vrt)
 
-    create_alpha_vrt(warped_vrt, alpha_vrt)
-    subprocess.run(build_hillshade_command(warped_vrt, hillshade_tif, hillshade_z), check=True)
+    create_alpha_vrt(warped_vrt, alpha_vrt, alpha_tif=alpha_tif, vector_path=cleanup_gpkg)
+    staged_hillshade_tif = build_staged_path(hillshade_tif)
+    remove_if_exists(staged_hillshade_tif)
+    subprocess.run(
+        build_hillshade_command(warped_vrt, staged_hillshade_tif, hillshade_z),
+        check=True,
+    )
+    publish_staged_path(staged_hillshade_tif, hillshade_tif)
     create_ocean_rgb_tif(warped_vrt, hillshade_tif, color_tif, style)
-    create_rgb_with_alpha_vrt(color_tif, alpha_vrt, rgba_vrt)
+    create_rgb_with_alpha_vrt(color_tif, alpha_vrt, rgba_vrt, alpha_tif=alpha_tif)
     if vrt:
         translate_path = str(Path(destination).with_suffix(".vrt"))
         write_rgba_vrt(rgba_vrt, translate_path)
         destination = translate_path
+        remove_if_exists(hillshade_tif)
     else:
         translate_rgba_vrt(rgba_vrt, destination)
+        for path in (hillshade_tif, color_tif, alpha_tif):
+            remove_if_exists(path)
 
     return OceanBackgroundArtifacts(
         source_vrt=source_vrt,
         masked_vrt=masked_vrt,
         warped_vrt=warped_vrt,
         alpha_vrt=alpha_vrt,
+        alpha_tif=alpha_tif,
         hillshade_tif=hillshade_tif,
         color_tif=color_tif,
         rgba_vrt=rgba_vrt,

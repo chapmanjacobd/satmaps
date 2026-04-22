@@ -332,6 +332,7 @@ def process_chunk(args: ChunkTask) -> str:
     input_vrt, chunk_file, format, options, te_bounds = args
     ds = None
     temp_chunk_raster = chunk_file.replace(".mbtiles", ".tif")
+    staged_chunk_file = build_staged_path(chunk_file)
     try:
         gdal.UseExceptions()
 
@@ -383,7 +384,9 @@ def process_chunk(args: ChunkTask) -> str:
         if format.lower() == "webp":
             gdal.SetConfigOption("WEBP_LEVEL", str(options["quality"]))
 
-        gdal.Translate(chunk_file, temp_chunk_raster, options=translate_options)
+        remove_if_exists(staged_chunk_file)
+        gdal.Translate(staged_chunk_file, temp_chunk_raster, options=translate_options)
+        os.replace(staged_chunk_file, chunk_file)
         return chunk_file
     except Exception as e:
         print(f"Error processing chunk {chunk_file}: {e}")
@@ -394,6 +397,19 @@ def process_chunk(args: ChunkTask) -> str:
         ds = None
         if os.path.exists(temp_chunk_raster):
             os.remove(temp_chunk_raster)
+        remove_if_exists(staged_chunk_file)
+
+
+def build_staged_path(path: str) -> str:
+    """Return the hidden staging path used before atomically publishing a file."""
+    directory, basename = os.path.split(path)
+    return os.path.join(directory, f".temp_{basename}")
+
+
+def remove_if_exists(path: str) -> None:
+    """Delete a file if it exists."""
+    if os.path.exists(path):
+        os.remove(path)
 
 
 def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
@@ -532,7 +548,7 @@ def run_tiling_simplified(
     input_vrt: str, output_mbtiles: str, options: Dict[str, Any]
 ) -> TilingArtifacts:
     """Simplified tiling from a pre-processed Byte VRT."""
-    unique_id = options.get("unique_id", "tiles")
+    chunk_prefix = os.path.splitext(os.path.basename(output_mbtiles))[0] or "tiles"
     chunk_zoom = options.get("chunk_zoom", 4)
     tile_format = options.get("format", "webp")
 
@@ -552,7 +568,7 @@ def run_tiling_simplified(
     chunk_files: List[str] = []
     for ty in range(ty_min, ty_max + 1):
         for tx in range(tx_min, tx_max + 1):
-            chunk_file = f".temp/chunk_{chunk_zoom}_{tx}_{ty}_{unique_id}.mbtiles"
+            chunk_file = f".temp/{chunk_prefix}_chunk_{chunk_zoom}_{tx}_{ty}.mbtiles"
             chunk_files.append(chunk_file)
 
             if os.path.exists(chunk_file):
@@ -577,11 +593,13 @@ def run_tiling_simplified(
                 process_chunk(task)
 
     # Merge chunks.
-    merge_mbtiles(output_mbtiles, chunk_files)
+    staged_output_mbtiles = build_staged_path(output_mbtiles)
+    remove_if_exists(staged_output_mbtiles)
+    merge_mbtiles(staged_output_mbtiles, chunk_files)
 
     # Refresh metadata before building overviews so GDAL sees the merged extent,
     # not just the bounds from the first copied chunk.
-    finalize_mbtiles_metadata(output_mbtiles)
+    finalize_mbtiles_metadata(staged_output_mbtiles)
 
     # Build overviews (all levels from maxzoom down to 0)
     print("Building overviews...")
@@ -592,11 +610,12 @@ def run_tiling_simplified(
         "--config",
         "GDAL_NUM_THREADS",
         "ALL_CPUS",
-        output_mbtiles,
+        staged_output_mbtiles,
     ]
     subprocess.run(gdaladdo_cmd, check=True)
 
     # Finalize metadata again after gdaladdo adds lower zoom tiles.
-    finalize_mbtiles_metadata(output_mbtiles)
+    finalize_mbtiles_metadata(staged_output_mbtiles)
+    os.replace(staged_output_mbtiles, output_mbtiles)
 
     return TilingArtifacts(final_vrt=input_vrt, cleanup_paths=chunk_files)

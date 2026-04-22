@@ -14,6 +14,8 @@ help:
 	@echo "  clean        : Remove temporary files and build artifacts"
 	@echo "  clean-cache  : Remove cached tiles"
 
+all: test lint typecheck
+
 install:
 	$(PIP) install .
 

@@ -181,7 +181,6 @@ def test_run_tiling_simplified_creates_mbtiles(
         "resample_alg": "bilinear",
         "chunk_zoom": 10,
         "processes": 1,
-        "unique_id": "test",
         "name": "Test",
         "description": "Test",
     }
@@ -205,7 +204,7 @@ def test_run_tiling_simplified_creates_mbtiles(
             "--config",
             "GDAL_NUM_THREADS",
             "ALL_CPUS",
-            str(output_mbtiles),
+            str(tmp_path / ".temp_output.mbtiles"),
         ]
     ]
 
@@ -241,13 +240,19 @@ def test_run_tiling_simplified_uses_explicit_chunk_bounds(
 
     requested_bounds = get_web_mercator_bounds(4, 8, 7)
     seen_proj_wins: list[tuple[float, float, float, float]] = []
+    seen_chunk_files: list[str] = []
 
     def fake_process_chunk(task):
+        seen_chunk_files.append(task[1])
         seen_proj_wins.append(task[-1])
         return ""
 
     monkeypatch.setattr(tiler_module, "process_chunk", fake_process_chunk)
-    monkeypatch.setattr(tiler_module, "merge_mbtiles", lambda output, chunks: None)
+    monkeypatch.setattr(
+        tiler_module,
+        "merge_mbtiles",
+        lambda output, chunks: Path(output).write_text("mbtiles"),
+    )
     monkeypatch.setattr(tiler_module, "finalize_mbtiles_metadata", lambda path: None)
     monkeypatch.setattr(tiler_module.subprocess, "run", lambda cmd, check: None)
 
@@ -260,7 +265,6 @@ def test_run_tiling_simplified_uses_explicit_chunk_bounds(
             "resample_alg": "bilinear",
             "chunk_zoom": 4,
             "processes": 1,
-            "unique_id": "test-explicit-bounds",
             "name": "Test",
             "description": "Test",
             "chunk_bounds": requested_bounds,
@@ -268,6 +272,75 @@ def test_run_tiling_simplified_uses_explicit_chunk_bounds(
     )
 
     assert seen_proj_wins == [requested_bounds]
+    assert seen_chunk_files == [".temp/output_chunk_4_8_7.mbtiles"]
+
+
+def test_run_tiling_simplified_publishes_staged_output_mbtiles(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    input_path = tmp_path / "input.tif"
+    dataset = gdal.GetDriverByName("GTiff").Create(str(input_path), 16, 16, 3, gdal.GDT_Byte)
+    dataset.SetGeoTransform((0.0, 1000.0, 0.0, 16000.0, 0.0, -1000.0))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset.SetProjection(srs.ExportToWkt())
+    dataset = None
+
+    merge_outputs: list[str] = []
+    finalized: list[str] = []
+    gdaladdo_calls: list[list[str]] = []
+
+    monkeypatch.setattr(tiler_module, "process_chunk", lambda task: "")
+    monkeypatch.setattr(
+        tiler_module,
+        "merge_mbtiles",
+        lambda output, chunks: merge_outputs.append(output) or Path(output).write_text("mbtiles"),
+    )
+    monkeypatch.setattr(
+        tiler_module,
+        "finalize_mbtiles_metadata",
+        lambda path: finalized.append(path),
+    )
+    monkeypatch.setattr(
+        tiler_module.subprocess,
+        "run",
+        lambda cmd, check: gdaladdo_calls.append(cmd),
+    )
+
+    output_mbtiles = tmp_path / "output.mbtiles"
+    run_tiling_simplified(
+        str(input_path),
+        str(output_mbtiles),
+        {
+            "format": "png",
+            "quality": 75,
+            "resample_alg": "bilinear",
+            "chunk_zoom": 4,
+            "processes": 1,
+            "name": "Test",
+            "description": "Test",
+        },
+    )
+
+    staged_output = str(tmp_path / ".temp_output.mbtiles")
+    assert merge_outputs == [staged_output]
+    assert finalized == [staged_output, staged_output]
+    assert gdaladdo_calls == [
+        [
+            "gdaladdo",
+            "-r",
+            "bilinear",
+            "--config",
+            "GDAL_NUM_THREADS",
+            "ALL_CPUS",
+            staged_output,
+        ]
+    ]
+    assert output_mbtiles.exists()
+    assert not Path(staged_output).exists()
 
 
 @pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")

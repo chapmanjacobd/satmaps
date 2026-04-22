@@ -35,6 +35,59 @@ PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
 
 
+def temp_basename_from_output(output_path: str) -> str:
+    """Return a stable temp-file stem derived from the requested output path."""
+    stem = os.path.splitext(os.path.basename(output_path))[0]
+    return stem or "satmaps"
+
+
+def build_state_file_path(unique_id: str) -> str:
+    """Return the lightweight JSON resume state path."""
+    return f".temp/state_{unique_id}.json"
+
+
+def build_master_vrt_path(output_path: str, unique_id: str) -> str:
+    """Return the run-scoped lightweight master VRT path."""
+    return f".temp/master_{temp_basename_from_output(output_path)}_{unique_id}.vrt"
+
+
+def build_temp_mbtiles_path(output_path: str) -> str:
+    """Return the deterministic heavyweight MBTiles path."""
+    return f".temp/{temp_basename_from_output(output_path)}.mbtiles"
+
+
+def build_prepared_ocean_path(output_path: str) -> str:
+    """Return the deterministic heavyweight bbox-clipped ocean TIFF path."""
+    return f".temp/{temp_basename_from_output(output_path)}_ocean_bbox.tif"
+
+
+def build_processed_tile_paths(mgrs_subtile: str, output_path: str) -> Tuple[str, str]:
+    """Return the deterministic heavyweight TIFF paths for one processed subtile."""
+    stem = temp_basename_from_output(output_path)
+    return (
+        f".temp/{stem}_{mgrs_subtile}_utm.tif",
+        f".temp/{stem}_{mgrs_subtile}_3857.tif",
+    )
+
+
+def build_staged_path(path: str) -> str:
+    """Return the hidden staging path used before atomically publishing a file."""
+    directory, basename = os.path.split(path)
+    return os.path.join(directory, f".temp_{basename}")
+
+
+def publish_staged_path(staged_path: str, final_path: str) -> str:
+    """Atomically publish a staged file under its final name."""
+    os.replace(staged_path, final_path)
+    return final_path
+
+
+def remove_if_exists(path: str) -> None:
+    """Delete a file if it exists."""
+    if os.path.exists(path):
+        os.remove(path)
+
+
 @dataclass(frozen=True)
 class TileGrid:
     projection: str
@@ -415,7 +468,7 @@ def resolve_ocean_mask_source(ocean_background: str) -> Optional[str]:
 def prepare_ocean_background_for_output(
     ocean_background_path: str,
     requested_bbox: Optional[Tuple[float, float, float, float]],
-    unique_id: str,
+    output_path: str,
     resample_alg: str,
     max_zoom: int,
 ) -> Optional[str]:
@@ -426,7 +479,9 @@ def prepare_ocean_background_for_output(
         return ocean_background_path
 
     snapped_bounds, pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(requested_bbox, max_zoom)
-    prepared_ocean_path = f".temp/ocean_{unique_id}_bbox.tif"
+    prepared_ocean_path = build_prepared_ocean_path(output_path)
+    staged_ocean_path = build_staged_path(prepared_ocean_path)
+    remove_if_exists(staged_ocean_path)
     warp_options = gdal.WarpOptions(
         format="GTiff",
         dstSRS="EPSG:3857",
@@ -436,12 +491,13 @@ def prepare_ocean_background_for_output(
         resampleAlg=resample_alg,
         creationOptions=list(ocean.GTIFF_CREATION_OPTIONS),
     )
-    prepared_ds = gdal.Warp(prepared_ocean_path, ocean_background_path, options=warp_options)
+    prepared_ds = gdal.Warp(staged_ocean_path, ocean_background_path, options=warp_options)
     if prepared_ds is None:
         raise RuntimeError(
             f"Could not prepare bbox ocean background from {ocean_background_path}"
         )
     prepared_ds = None
+    publish_staged_path(staged_ocean_path, prepared_ocean_path)
     return prepared_ocean_path
 
 
@@ -1057,7 +1113,6 @@ def process_single_tile(
     mgrs_subtile: str,
     date_paths: List[str],
     args: argparse.Namespace,
-    unique_id: str,
     gebco_src: Optional[str] = None,
 ) -> Optional[str]:
     """Process a single MGRS sub-tile: fetch dates, average, tone-map, and warp to Web Mercator."""
@@ -1094,9 +1149,12 @@ def process_single_tile(
         )
 
         averaged = fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
-        temp_utm_path = f".temp/processed_{mgrs_subtile}_{unique_id}_utm.tif"
-        temp_3857_path = f".temp/processed_{mgrs_subtile}_{unique_id}_3857.tif"
-        ds_out, color_bands, alpha_band = create_output_dataset(temp_utm_path, tile_grid)
+        temp_utm_path, temp_3857_path = build_processed_tile_paths(mgrs_subtile, args.output)
+        staged_utm_path = build_staged_path(temp_utm_path)
+        staged_3857_path = build_staged_path(temp_3857_path)
+        remove_if_exists(staged_utm_path)
+        remove_if_exists(staged_3857_path)
+        ds_out, color_bands, alpha_band = create_output_dataset(staged_utm_path, tile_grid)
         write_processed_blocks(
             averaged,
             alpha_mask,
@@ -1108,7 +1166,9 @@ def process_single_tile(
         ds_out.FlushCache()
         ds_out = None
 
-        warp_to_web_mercator(temp_utm_path, temp_3857_path, args.resample_alg, args.max_zoom)
+        publish_staged_path(staged_utm_path, temp_utm_path)
+        warp_to_web_mercator(temp_utm_path, staged_3857_path, args.resample_alg, args.max_zoom)
+        publish_staged_path(staged_3857_path, temp_3857_path)
         os.remove(temp_utm_path)
         return temp_3857_path
     finally:
@@ -1118,6 +1178,8 @@ def process_single_tile(
         date_band_sets.clear()
         ocean_mask = None
         fill_allowed_mask = None
+        remove_if_exists(build_staged_path(build_processed_tile_paths(mgrs_subtile, args.output)[0]))
+        remove_if_exists(build_staged_path(build_processed_tile_paths(mgrs_subtile, args.output)[1]))
 
 
 def calculate_estimates(args: argparse.Namespace) -> None:
@@ -1314,7 +1376,7 @@ def main() -> None:
     os.makedirs(".temp", exist_ok=True)
 
     unique_id = uuid.uuid4().hex[:8]
-    state_file = f".temp/state_{unique_id}.json"
+    state_file = build_state_file_path(unique_id)
     completed_subtiles: Set[str] = set()
     processed_tifs: List[str] = []
 
@@ -1349,7 +1411,6 @@ def main() -> None:
                         st,
                         date_paths,
                         args,
-                        unique_id,
                         gebco_vrt_source,
                     ): st
                     for st in subtiles_to_process
@@ -1376,7 +1437,7 @@ def main() -> None:
     prepared_ocean_background = prepare_ocean_background_for_output(
         args.ocean_background,
         requested_bbox,
-        unique_id,
+        args.output,
         args.resample_alg,
         args.max_zoom,
     )
@@ -1390,15 +1451,24 @@ def main() -> None:
         print("Error: No data processed.")
         sys.exit(1)
 
-    master_vrt = f".temp/master_{unique_id}.vrt"
+    master_vrt = build_master_vrt_path(args.output, unique_id)
+    staged_master_vrt = build_staged_path(master_vrt)
     pixel_size = tiler.web_mercator_pixel_size(args.max_zoom)
-    gdal.BuildVRT(master_vrt, processed_tifs, resolution="user", xRes=pixel_size, yRes=pixel_size)
+    remove_if_exists(staged_master_vrt)
+    gdal.BuildVRT(
+        staged_master_vrt,
+        processed_tifs,
+        resolution="user",
+        xRes=pixel_size,
+        yRes=pixel_size,
+    )
+    publish_staged_path(staged_master_vrt, master_vrt)
 
     if args.vrt:
         print(f"Success! Master VRT: {master_vrt}")
         return
 
-    temp_mbtiles = f".temp/tiles_{unique_id}.mbtiles"
+    temp_mbtiles = build_temp_mbtiles_path(args.output)
     tiling_opts = {
         "format": args.format,
         "quality": args.quality,
@@ -1408,7 +1478,6 @@ def main() -> None:
         "blocksize": args.blocksize,
         "name": "Sentinel-2 Mosaic",
         "description": "Copernicus Sentinel data",
-        "unique_id": unique_id,
     }
     if requested_bbox is not None:
         tiling_opts["chunk_bounds"] = tiler.lonlat_bbox_to_mercator_bounds(
@@ -1429,7 +1498,7 @@ def main() -> None:
         if os.path.abspath(path) not in persistent_paths
     ]
 
-    for path in cleanup_paths + [master_vrt, temp_mbtiles] + artifacts.cleanup_paths:
+    for path in cleanup_paths + [temp_mbtiles] + artifacts.cleanup_paths:
         if os.path.exists(path):
             try:
                 os.remove(path)
