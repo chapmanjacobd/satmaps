@@ -173,7 +173,7 @@ def list_mosaic_folders_for_tile(
             if folder in S3_FOLDER_CACHE[date_path]:
                 found.append((folder, date_path))
         else:
-            # Fallback for non-global runs: check S3 directly for this specific folder
+            # Fallback when the shared S3 cache was not pre-populated: check this folder directly.
             s3_path = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder}"
             try:
                 if gdal.ReadDir(s3_path):
@@ -377,12 +377,11 @@ def discover_mgrs_tiles_from_ocean_mask(
 
 
 def discover_mgrs_bases(
-    args: argparse.Namespace,
+    bbox: Optional[Tuple[float, float, float, float]],
     gebco_vrt_source: Optional[str],
 ) -> List[str]:
-    """Resolve the requested MGRS tile list from bbox, global, or explicit inputs."""
-    if args.bbox:
-        bbox = parse_bbox(args.bbox)
+    """Resolve the requested MGRS tile list from bbox or the default all-tiles flow."""
+    if bbox is not None:
         if gebco_vrt_source:
             print("Scanning ocean mask for land tiles within bbox...")
             mgrs_bases = sorted(list(discover_mgrs_tiles_from_ocean_mask(gebco_vrt_source, bbox=bbox)))
@@ -393,32 +392,29 @@ def discover_mgrs_bases(
             print(f"Discovered {len(mgrs_bases)} MGRS tiles in bbox.")
         return mgrs_bases
 
-    if args.all_tiles:
-        # Extract unique MGRS tile IDs from the S3 folder cache
-        s3_mgrs_set: Set[str] = set()
-        for folders in S3_FOLDER_CACHE.values():
-            for folder in folders:
-                parts = folder.split("_")
-                if len(parts) >= 5:
-                    s3_mgrs_set.add(parts[4])
+    # Extract unique MGRS tile IDs from the S3 folder cache for the default all-tiles flow.
+    s3_mgrs_set: Set[str] = set()
+    for folders in S3_FOLDER_CACHE.values():
+        for folder in folders:
+            parts = folder.split("_")
+            if len(parts) >= 5:
+                s3_mgrs_set.add(parts[4])
 
-        if not s3_mgrs_set:
-            print("Error: --global found no tiles in S3 cache. Did you populate it?")
-            sys.exit(1)
+    if not s3_mgrs_set:
+        print("Error: non-bbox discovery found no tiles in the S3 cache.")
+        sys.exit(1)
 
-        if gebco_vrt_source:
-            print("Scanning ocean mask for land tiles...")
-            land_mgrs = discover_mgrs_tiles_from_ocean_mask(gebco_vrt_source)
-            # Intersection: only tiles that both have land/shallow-water and exist in S3
-            mgrs_bases = sorted(list(land_mgrs.intersection(s3_mgrs_set)))
-            print(f"Global mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water after S3 intersection.")
-        else:
-            mgrs_bases = sorted(list(s3_mgrs_set))
-            print(f"Global mode: {len(mgrs_bases)} MGRS tiles found from S3 cache (no ocean mask provided).")
+    if gebco_vrt_source:
+        print("Scanning ocean mask for land tiles...")
+        land_mgrs = discover_mgrs_tiles_from_ocean_mask(gebco_vrt_source)
+        # Intersection: only tiles that both have land/shallow-water and exist in S3
+        mgrs_bases = sorted(list(land_mgrs.intersection(s3_mgrs_set)))
+        print(f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water after S3 intersection.")
+    else:
+        mgrs_bases = sorted(list(s3_mgrs_set))
+        print(f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found from S3 cache (no ocean mask provided).")
 
-        return mgrs_bases
-
-    return [mgrs_tile.strip() for mgrs_tile in args.mgrs.split(",") if mgrs_tile.strip()]
+    return mgrs_bases
 
 
 def expand_subtiles(mgrs_bases: List[str]) -> List[str]:
@@ -526,14 +522,18 @@ def prepare_ocean_background_for_output(
         except RuntimeError:
             dataset = None
 
-        if dataset is not None and source_matches_web_mercator_grid(dataset, snapped_bounds, pixel_size):
-            src_win = tiler.te_to_src_win(dataset, snapped_bounds)
+        aligned_src_win = (
+            get_aligned_web_mercator_src_win(dataset, snapped_bounds, pixel_size)
+            if dataset is not None
+            else None
+        )
+        if aligned_src_win is not None:
             prepared_ds = gdal.Translate(
                 staged_ocean_path,
                 dataset,
                 options=gdal.TranslateOptions(
                     format="GTiff",
-                    srcWin=src_win,
+                    srcWin=aligned_src_win,
                     creationOptions=list(ocean.GTIFF_CREATION_OPTIONS),
                 ),
             )
@@ -602,26 +602,22 @@ def get_bbox_scan_window(
     bbox_geometry = build_bbox_geometry(bbox, dataset_srs)
     min_x, max_x, min_y, max_y = bbox_geometry.GetEnvelope()
     bbox_bounds = (min_x, min_y, max_x, max_y)
-    scan_bounds = tiler.intersect_te_bounds(tiler.get_dataset_bounds(dataset), bbox_bounds)
-    if scan_bounds is None:
-        return None
-
-    src_win = tiler.te_to_src_win(dataset, scan_bounds)
+    src_win = tiler.te_to_src_win(dataset, bbox_bounds)
     if src_win[2] <= 0 or src_win[3] <= 0:
         return None
 
     return src_win
 
 
-def source_matches_web_mercator_grid(
+def get_aligned_web_mercator_src_win(
     dataset: gdal.Dataset,
     target_bounds: Tuple[float, float, float, float],
     pixel_size: float,
-) -> bool:
-    """Return whether a source raster can be cropped directly to the requested 3857 grid."""
+) -> Optional[Tuple[int, int, int, int]]:
+    """Return a direct crop window when a source raster already matches the requested 3857 grid."""
     dataset_srs = dataset.GetSpatialRef()
     if dataset_srs is None:
-        return False
+        return None
 
     dataset_srs = dataset_srs.Clone()
     web_mercator_srs = osr.SpatialReference()
@@ -630,26 +626,17 @@ def source_matches_web_mercator_grid(
         web_mercator_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
         dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
     if not dataset_srs.IsSame(web_mercator_srs):
-        return False
+        return None
 
     gt = dataset.GetGeoTransform()
     if abs(gt[2]) > 1e-9 or abs(gt[4]) > 1e-9:
-        return False
+        return None
     if abs(gt[1] - pixel_size) > 1e-9 or abs(abs(gt[5]) - pixel_size) > 1e-9:
-        return False
-
-    inv_gt = gdal.InvGeoTransform(gt)
-    minx, miny, maxx, maxy = target_bounds
-    pixel_corners = (
-        gdal.ApplyGeoTransform(inv_gt, minx, maxy),
-        gdal.ApplyGeoTransform(inv_gt, maxx, miny),
-    )
-    if not all(abs(coord - round(coord)) <= 1e-6 for pair in pixel_corners for coord in pair):
-        return False
+        return None
 
     src_win = tiler.te_to_src_win(dataset, target_bounds)
     if src_win[2] <= 0 or src_win[3] <= 0:
-        return False
+        return None
 
     fitted_bounds = (
         gt[0] + src_win[0] * gt[1],
@@ -657,11 +644,14 @@ def source_matches_web_mercator_grid(
         gt[0] + (src_win[0] + src_win[2]) * gt[1],
         gt[3] + src_win[1] * gt[5],
     )
-    return all(abs(actual - expected) <= 1e-6 for actual, expected in zip(fitted_bounds, target_bounds))
+    if not all(abs(actual - expected) <= 1e-6 for actual, expected in zip(fitted_bounds, target_bounds)):
+        return None
+
+    return src_win
 
 
 def populate_s3_cache(date_paths: List[str]) -> None:
-    """Cache remote folder listings for global runs."""
+    """Cache remote folder listings for all-tiles runs."""
     print("Populating S3 folder cache...")
     for date_path in date_paths:
         s3_base = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}"
@@ -1289,15 +1279,16 @@ def process_single_tile(
 
 def calculate_estimates(args: argparse.Namespace) -> None:
     """Calculate and print estimations for the given command."""
+    requested_bbox = parse_bbox(args.bbox) if args.bbox else None
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     num_dates = len(date_paths)
 
     gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
 
-    if args.all_tiles:
+    if requested_bbox is None:
         populate_s3_cache(date_paths)
 
-    mgrs_bases = discover_mgrs_bases(args, gebco_vrt_source)
+    mgrs_bases = discover_mgrs_bases(requested_bbox, gebco_vrt_source)
 
     num_mgrs = len(mgrs_bases)
     num_subtiles = num_mgrs * 4
@@ -1346,13 +1337,6 @@ def calculate_estimates(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE (NumPy Refactor)."
-    )
-    parser.add_argument("mgrs", nargs="?", default="31TDF", help="MGRS tile ID")
-    parser.add_argument(
-        "--global",
-        dest="all_tiles",
-        action="store_true",
-        help="Process all available tiles",
     )
     parser.add_argument(
         "--date",
@@ -1499,10 +1483,10 @@ def main() -> None:
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
 
-    if args.all_tiles:
+    if requested_bbox is None:
         populate_s3_cache(date_paths)
 
-    mgrs_bases = discover_mgrs_bases(args, gebco_vrt_source)
+    mgrs_bases = discover_mgrs_bases(requested_bbox, gebco_vrt_source)
     subtiles = expand_subtiles(mgrs_bases)
 
     if args.land:

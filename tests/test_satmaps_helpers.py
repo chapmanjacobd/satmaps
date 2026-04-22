@@ -1,4 +1,3 @@
-import argparse
 import json
 import os
 import sys
@@ -134,13 +133,14 @@ def test_discover_mgrs_bases_uses_bbox_clipped_ocean_mask_when_available(
 
     monkeypatch.setattr("satmaps.discover_mgrs_tiles_from_ocean_mask", fake_discover)
 
-    args = argparse.Namespace(bbox="-158.0,20.8,-157.0,21.7", all_tiles=False, mgrs="")
-
-    assert satmaps.discover_mgrs_bases(args, "gebco.vrt") == ["04QFJ", "05QFJ"]
+    assert satmaps.discover_mgrs_bases((-158.0, 20.8, -157.0, 21.7), "gebco.vrt") == [
+        "04QFJ",
+        "05QFJ",
+    ]
     assert calls == [("gebco.vrt", (-158.0, 20.8, -157.0, 21.7))]
 
 
-def test_discover_mgrs_bases_intersects_global_s3_tiles_with_mask(monkeypatch: object) -> None:
+def test_discover_mgrs_bases_intersects_all_tiles_s3_cache_with_mask(monkeypatch: object) -> None:
     monkeypatch.setattr(
         "satmaps.discover_mgrs_tiles_from_ocean_mask",
         lambda ocean_mask_src, bbox=None: {"04QFJ", "99ZZZ"},
@@ -156,9 +156,7 @@ def test_discover_mgrs_bases_intersects_global_s3_tiles_with_mask(monkeypatch: o
         },
     )
 
-    args = argparse.Namespace(bbox=None, all_tiles=True, mgrs="")
-
-    assert satmaps.discover_mgrs_bases(args, "gebco.vrt") == ["04QFJ"]
+    assert satmaps.discover_mgrs_bases(None, "gebco.vrt") == ["04QFJ"]
 
 
 def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: object) -> None:

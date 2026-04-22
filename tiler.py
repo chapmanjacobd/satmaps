@@ -16,7 +16,6 @@ gdal.UseExceptions()
 WEB_MERCATOR_LIMIT = 20037508.342789244
 WEB_MERCATOR_MAX_LAT = 85.0511287798066
 TEBounds = Tuple[float, float, float, float]  # (minx, miny, maxx, maxy) - for Warp/BuildVRT
-ProjWin = Tuple[float, float, float, float]   # (minx, maxy, maxx, miny) - for Translate
 ChunkTask = Tuple[str, str, str, Dict[str, Any], TEBounds]
 
 # Tone-mapping constants
@@ -251,16 +250,6 @@ def get_dataset_bounds(dataset: gdal.Dataset) -> TEBounds:
     return minx, miny, maxx, maxy
 
 
-def te_to_proj_win(te: TEBounds) -> ProjWin:
-    """Convert (minx, miny, maxx, maxy) to (minx, maxy, maxx, miny)."""
-    return te[0], te[3], te[2], te[1]
-
-
-def proj_win_to_te(pw: ProjWin) -> TEBounds:
-    """Convert (minx, maxy, maxx, miny) to (minx, miny, maxx, maxy)."""
-    return pw[0], pw[3], pw[2], pw[1]
-
-
 def get_chunk_tile_range(bounds: TEBounds, zoom: int) -> Tuple[int, int, int, int]:
     """Return inclusive XYZ tile indices covering raster bounds at the chunk zoom."""
     minx, miny, maxx, maxy = bounds
@@ -295,14 +284,6 @@ def intersect_te_bounds(bounds_a: TEBounds, bounds_b: TEBounds) -> Optional[TEBo
     return minx, miny, maxx, maxy
 
 
-def intersect_proj_win(proj_win_a: ProjWin, proj_win_b: ProjWin) -> Optional[ProjWin]:
-    """Calculate the intersection of two GDAL projWin tuples."""
-    intersection = intersect_te_bounds(proj_win_to_te(proj_win_a), proj_win_to_te(proj_win_b))
-    if intersection is None:
-        return None
-    return te_to_proj_win(intersection)
-
-
 def te_to_src_win(
     dataset: gdal.Dataset, te_bounds: TEBounds
 ) -> Tuple[int, int, int, int]:
@@ -318,14 +299,6 @@ def te_to_src_win(
     yend = min(dataset.RasterYSize, math.ceil(max(py_miny, py_maxy)))
 
     return xoff, yoff, max(0, xend - xoff), max(0, yend - yoff)
-
-
-def proj_win_to_src_win(
-    dataset: gdal.Dataset, proj_win: ProjWin
-) -> Tuple[int, int, int, int]:
-    """Convert a GDAL projWin tuple into a clipped pixel srcWin."""
-    return te_to_src_win(dataset, proj_win_to_te(proj_win))
-
 
 def has_alpha_band(dataset: gdal.Dataset) -> bool:
     """Return whether the dataset advertises an explicit alpha band."""

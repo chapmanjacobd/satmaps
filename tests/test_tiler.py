@@ -16,11 +16,11 @@ from tiler import (
     apply_soft_knee_numpy,
     get_chunk_tile_range,
     get_web_mercator_bounds,
-    intersect_proj_win,
+    intersect_te_bounds,
     lonlat_bbox_to_mercator_bounds,
     merge_mbtiles,
-    proj_win_to_src_win,
     run_tiling_simplified,
+    te_to_src_win,
 )
 
 
@@ -40,17 +40,17 @@ def test_tile_range_keeps_exact_south_boundary_in_same_tile() -> None:
     assert get_chunk_tile_range((minx, miny, maxx, maxy), zoom) == (10, 20, 10, 20)
 
 
-def test_intersect_proj_win_clamps_partial_overlap() -> None:
-    assert intersect_proj_win((-5.0, 12.0, 8.0, -2.0), (0.0, 10.0, 10.0, 0.0)) == (
+def test_intersect_te_bounds_clamps_partial_overlap() -> None:
+    assert intersect_te_bounds((-5.0, -2.0, 8.0, 12.0), (0.0, 0.0, 10.0, 10.0)) == (
         0.0,
-        10.0,
+        0.0,
         8.0,
-        0.0,
+        10.0,
     )
 
 
-def test_intersect_proj_win_rejects_touching_window() -> None:
-    assert intersect_proj_win((10.0, 10.0, 20.0, 0.0), (0.0, 10.0, 10.0, 0.0)) is None
+def test_intersect_te_bounds_rejects_touching_bounds() -> None:
+    assert intersect_te_bounds((10.0, 0.0, 20.0, 10.0), (0.0, 0.0, 10.0, 10.0)) is None
 
 
 def test_lonlat_bbox_to_mercator_bounds_matches_chunk_tile() -> None:
@@ -140,7 +140,7 @@ def test_apply_preview_correction_numpy_basics() -> None:
     np.testing.assert_allclose(corrected, expected, atol=1e-5)
 
 
-def test_proj_win_to_src_win_converts_bounds_to_pixel_window(tmp_path: Path) -> None:
+def test_te_to_src_win_converts_bounds_to_pixel_window(tmp_path: Path) -> None:
     input_path = tmp_path / "window.tif"
 
     driver = gdal.GetDriverByName("GTiff")
@@ -153,7 +153,7 @@ def test_proj_win_to_src_win_converts_bounds_to_pixel_window(tmp_path: Path) -> 
     dataset = None
 
     opened = gdal.Open(str(input_path))
-    assert proj_win_to_src_win(opened, (20.0, 90.0, 50.0, 40.0)) == (2, 1, 3, 5)
+    assert te_to_src_win(opened, (20.0, 40.0, 50.0, 90.0)) == (2, 1, 3, 5)
 
 
 def test_run_tiling_simplified_creates_mbtiles(

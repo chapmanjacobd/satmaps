@@ -64,37 +64,30 @@ The first positional argument is the GEBCO zip path if you need something other 
 
 ### 3. Generate PMTiles
 
-Generate PMTiles for specific MGRS tiles or a global run:
+Generate PMTiles for either a bbox subset or the default all-tiles run:
 
 ```bash
-# Single tile (defaults to 2025/07/01 and 2025/01/01 mosaics)
-satmaps 31TDF -o barcelona.pmtiles
-
-# Multiple tiles with custom quality and format
-satmaps 31TCF,31TDF,31TCE,31TDE --format webp --quality 80 -o region.pmtiles
-
-# BBox render using either a global or bbox-matched standalone ocean background
+# BBox render using either a full-coverage or bbox-matched standalone ocean background
 satmaps --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii.pmtiles
 
 # Makefile shortcut for the graded Hawaii bbox preset
 make hawaii
 
-# Global run
-satmaps --global --ocean-background ocean.tif -o global.pmtiles
+# Default all-tiles run
+satmaps --ocean-background ocean.tif -o all-tiles.pmtiles
 ```
 
 ### 4. Estimate Resources
 
-Before a global run, estimate the time and storage required:
+Before an all-tiles run, estimate the time and storage required:
 
 ```bash
-satmaps --global --estimate
+satmaps --estimate
 ```
 
 ## Advanced Options
 
-- `--global`: Process all discovered land tiles from the source mosaics.
-- `--bbox`: Discover MGRS tiles touched by a WGS84 bbox (`min_lon,min_lat,max_lon,max_lat`).
+- `--bbox`: Discover MGRS tiles touched by a WGS84 bbox (`min_lon,min_lat,max_lon,max_lat`). When `--bbox` is omitted, `satmaps` processes all discovered land tiles from the source mosaics.
 - `--date`: Comma-separated list of mosaic dates (default: `2025/07/01,2025/01/01`). Overlapping areas are averaged.
 - `--format`: Output tile format (`webp`, `jpg`, `png`, `png8`).
 - `--quality`: Output tile quality for lossy formats.
@@ -135,7 +128,7 @@ You can override the defaults (tuned via `satmaps-tuner`):
 
 ## Technical Details
 
-1.  Discovery: Lists S3 folders for requested MGRS tiles and dates, or discovers touched MGRS tiles from `--bbox`.
+1.  Discovery: Lists S3 folders for all available tiles and dates when no bbox is supplied, or discovers touched MGRS tiles from `--bbox`.
 2.  Mosaicking: Opens RGB bands (B04, B03, B02) for each date and averages complete observations to reduce cloud artifacts.
 3.  Masking: Optionally warps the configured ocean background onto each tile grid so coastal alpha and fill decisions happen block-by-block.
 4.  Reprojection: Warps processed land tiles to Web Mercator (EPSG:3857) and composites them with the standalone ocean background.

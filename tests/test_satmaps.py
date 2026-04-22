@@ -1776,9 +1776,11 @@ def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
-        ["satmaps.py", "31TDF", "--vrt", "--parallel", "1", "--date", "2025/07/01"],
+        ["satmaps.py", "--vrt", "--parallel", "1", "--date", "2025/07/01"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: ["31TDF"])
 
     # Mock process_single_tile to return a fake path
     def fake_process_single_tile(st, dates, args, gebco_src=None):
@@ -1820,7 +1822,6 @@ def test_main_passes_ocean_path_to_tile_processing(
         "argv",
         [
             "satmaps.py",
-            "31TDF",
             "--vrt",
             "--parallel",
             "1",
@@ -1831,6 +1832,8 @@ def test_main_passes_ocean_path_to_tile_processing(
         ],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: ["31TDF"])
     gebco_sources: list[str | None] = []
 
     def fake_process_single_tile(st, dates, args, gebco_src=None):
@@ -1870,7 +1873,6 @@ def test_main_uses_rgba_ocean_as_alpha_mask_source(
         "argv",
         [
             "satmaps.py",
-            "31TDF",
             "--vrt",
             "--parallel",
             "1",
@@ -1881,6 +1883,8 @@ def test_main_uses_rgba_ocean_as_alpha_mask_source(
         ],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: ["31TDF"])
     gebco_sources: list[str | None] = []
 
     def fake_process_single_tile(st, dates, args, gebco_src=None):
@@ -1959,6 +1963,8 @@ def test_main_builds_master_vrt_with_shared_zoom13_resolution(
         ["satmaps.py", "--no-land", "--vrt", "--parallel", "1"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: [])
     buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
 
     def fake_build_vrt(out, src, **kwargs):
@@ -1990,6 +1996,8 @@ def test_main_builds_master_vrt_with_requested_zoom14_resolution(
         ["satmaps.py", "--no-land", "--vrt", "--parallel", "1", "--max-zoom", "14"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: [])
     buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
 
     def fake_build_vrt(out, src, **kwargs):
@@ -2061,9 +2069,11 @@ def test_main_non_bbox_can_use_standalone_ocean(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["satmaps.py", "31TDF", "--no-land", "--vrt", "--parallel", "1"],
+        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: [])
     buildvrt_sources: list[list[str]] = []
 
     def fake_build_vrt(out, src, **kwargs):
@@ -2090,9 +2100,11 @@ def test_main_keeps_ocean_after_processing(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["satmaps.py", "31TDF", "--no-land", "--parallel", "1"],
+        ["satmaps.py", "--no-land", "--parallel", "1"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: [])
     monkeypatch.setattr(
         "satmaps.gdal.BuildVRT",
         lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
