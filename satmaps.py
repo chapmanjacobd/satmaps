@@ -15,7 +15,7 @@ from mgrs import core as mgrs_core
 import numpy as np
 import ocean
 from scipy.ndimage import binary_dilation, distance_transform_edt
-from osgeo import gdal, ogr
+from osgeo import gdal, ogr, osr
 
 import tiler
 
@@ -100,8 +100,6 @@ class TileGrid:
 class OceanMaskWarp:
     alpha_band: gdal.Band
     dataset: gdal.Dataset
-    coverage_band: gdal.Band
-    coverage_dataset: gdal.Dataset
 
 
 @dataclass(frozen=True)
@@ -318,14 +316,22 @@ def discover_mgrs_tiles_from_ocean_mask(ocean_mask_src: str) -> Set[str]:
     layer.CreateField(ogr.FieldDefn("dn", ogr.OFTInteger))
 
     gdal.Polygonize(mask_band, None, layer, 0, [], callback=None)
+    to_wgs84 = build_dataset_to_wgs84_transform(ds)
 
     for feature in layer:
         if feature.GetField("dn") == 1:
             geom = feature.GetGeometryRef()
+            if geom is None:
+                continue
+            sample_geom = geom.Clone()
+            if sample_geom is None:
+                continue
+            if to_wgs84 is not None:
+                sample_geom.Transform(to_wgs84)
             # Sample points within or on the boundary of the polygon
             # For efficiency, we can just use the envelope or centroid for small polygons,
             # or sample points for larger ones.
-            envelope = geom.GetEnvelope()  # (minX, maxX, minY, maxY)
+            envelope = sample_geom.GetEnvelope()  # (minX, maxX, minY, maxY)
             # Sample at 0.5 degree intervals within the envelope
             lons = np.arange(envelope[0], envelope[1] + 0.5, 0.5)
             lats = np.arange(envelope[2], envelope[3] + 0.5, 0.5)
@@ -333,7 +339,7 @@ def discover_mgrs_tiles_from_ocean_mask(ocean_mask_src: str) -> Set[str]:
                 for lat in lats:
                     point = ogr.Geometry(ogr.wkbPoint)
                     point.AddPoint(lon, lat)
-                    if geom.Contains(point):
+                    if sample_geom.Contains(point):
                         try:
                             tile = m.toMGRS(lat, lon, MGRSPrecision=0)
                             mgrs_tiles.add(tile.decode() if isinstance(tile, bytes) else tile)
@@ -482,23 +488,44 @@ def prepare_ocean_background_for_output(
     prepared_ocean_path = build_prepared_ocean_path(output_path)
     staged_ocean_path = build_staged_path(prepared_ocean_path)
     remove_if_exists(staged_ocean_path)
-    warp_options = gdal.WarpOptions(
-        format="GTiff",
-        dstSRS="EPSG:3857",
-        outputBounds=snapped_bounds,
-        xRes=pixel_size,
-        yRes=pixel_size,
-        resampleAlg=resample_alg,
-        creationOptions=list(ocean.GTIFF_CREATION_OPTIONS),
-    )
-    prepared_ds = gdal.Warp(staged_ocean_path, ocean_background_path, options=warp_options)
-    if prepared_ds is None:
-        raise RuntimeError(
-            f"Could not prepare bbox ocean background from {ocean_background_path}"
-        )
-    prepared_ds = None
-    publish_staged_path(staged_ocean_path, prepared_ocean_path)
-    return prepared_ocean_path
+    dataset: Optional[gdal.Dataset] = None
+    try:
+        try:
+            dataset = gdal.Open(ocean_background_path)
+        except RuntimeError:
+            dataset = None
+
+        if dataset is not None and source_matches_web_mercator_grid(dataset, snapped_bounds, pixel_size):
+            src_win = tiler.te_to_src_win(dataset, snapped_bounds)
+            prepared_ds = gdal.Translate(
+                staged_ocean_path,
+                dataset,
+                options=gdal.TranslateOptions(
+                    format="GTiff",
+                    srcWin=src_win,
+                    creationOptions=list(ocean.GTIFF_CREATION_OPTIONS),
+                ),
+            )
+        else:
+            warp_options = gdal.WarpOptions(
+                format="GTiff",
+                dstSRS="EPSG:3857",
+                outputBounds=snapped_bounds,
+                xRes=pixel_size,
+                yRes=pixel_size,
+                resampleAlg=resample_alg,
+                creationOptions=list(ocean.GTIFF_CREATION_OPTIONS),
+            )
+            prepared_ds = gdal.Warp(staged_ocean_path, ocean_background_path, options=warp_options)
+        if prepared_ds is None:
+            raise RuntimeError(
+                f"Could not prepare bbox ocean background from {ocean_background_path}"
+            )
+        prepared_ds = None
+        publish_staged_path(staged_ocean_path, prepared_ocean_path)
+        return prepared_ocean_path
+    finally:
+        dataset = None
 
 
 def get_ocean_mask_band_index(dataset: gdal.Dataset) -> Optional[int]:
@@ -508,6 +535,109 @@ def get_ocean_mask_band_index(dataset: gdal.Dataset) -> Optional[int]:
             return band_index
 
     return None
+
+
+def get_mgrs_tile_bounds(mgrs_tile: str) -> Optional[Tuple[float, float, float, float]]:
+    """Return the approximate WGS84 bounds of a 100 km MGRS tile."""
+    m = mgrs.MGRS()
+    try:
+        sw_lat, sw_lon = m.toLatLon(f"{mgrs_tile}0000000000")
+        ne_lat, ne_lon = m.toLatLon(f"{mgrs_tile}9999999999")
+    except mgrs_core.MGRSError:
+        return None
+
+    min_lon = min(sw_lon, ne_lon)
+    min_lat = min(sw_lat, ne_lat)
+    max_lon = max(sw_lon, ne_lon)
+    max_lat = max(sw_lat, ne_lat)
+    return min_lon, min_lat, max_lon, max_lat
+
+
+def build_wgs84_to_dataset_transform(dataset: gdal.Dataset) -> Optional[osr.CoordinateTransformation]:
+    """Build a lon/lat-to-dataset transform when the raster is not already in WGS84."""
+    dataset_srs = dataset.GetSpatialRef()
+    if dataset_srs is None:
+        return None
+
+    dataset_srs = dataset_srs.Clone()
+    wgs84_srs = osr.SpatialReference()
+    wgs84_srs.ImportFromEPSG(4326)
+
+    if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
+        wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+    if dataset_srs.IsSameGeogCS(wgs84_srs) and dataset_srs.IsGeographic():
+        return None
+
+    return osr.CoordinateTransformation(wgs84_srs, dataset_srs)
+
+
+def build_dataset_to_wgs84_transform(dataset: gdal.Dataset) -> Optional[osr.CoordinateTransformation]:
+    """Build a dataset-to-lon/lat transform when the raster is not already in WGS84."""
+    dataset_srs = dataset.GetSpatialRef()
+    if dataset_srs is None:
+        return None
+
+    dataset_srs = dataset_srs.Clone()
+    wgs84_srs = osr.SpatialReference()
+    wgs84_srs.ImportFromEPSG(4326)
+
+    if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
+        wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+    if dataset_srs.IsSameGeogCS(wgs84_srs) and dataset_srs.IsGeographic():
+        return None
+
+    return osr.CoordinateTransformation(dataset_srs, wgs84_srs)
+
+
+def source_matches_web_mercator_grid(
+    dataset: gdal.Dataset,
+    target_bounds: Tuple[float, float, float, float],
+    pixel_size: float,
+) -> bool:
+    """Return whether a source raster can be cropped directly to the requested 3857 grid."""
+    dataset_srs = dataset.GetSpatialRef()
+    if dataset_srs is None:
+        return False
+
+    dataset_srs = dataset_srs.Clone()
+    web_mercator_srs = osr.SpatialReference()
+    web_mercator_srs.ImportFromEPSG(3857)
+    if hasattr(web_mercator_srs, "SetAxisMappingStrategy"):
+        web_mercator_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    if not dataset_srs.IsSame(web_mercator_srs):
+        return False
+
+    gt = dataset.GetGeoTransform()
+    if abs(gt[2]) > 1e-9 or abs(gt[4]) > 1e-9:
+        return False
+    if abs(gt[1] - pixel_size) > 1e-9 or abs(abs(gt[5]) - pixel_size) > 1e-9:
+        return False
+
+    inv_gt = gdal.InvGeoTransform(gt)
+    minx, miny, maxx, maxy = target_bounds
+    pixel_corners = (
+        gdal.ApplyGeoTransform(inv_gt, minx, maxy),
+        gdal.ApplyGeoTransform(inv_gt, maxx, miny),
+    )
+    if not all(abs(coord - round(coord)) <= 1e-6 for pair in pixel_corners for coord in pair):
+        return False
+
+    src_win = tiler.te_to_src_win(dataset, target_bounds)
+    if src_win[2] <= 0 or src_win[3] <= 0:
+        return False
+
+    fitted_bounds = (
+        gt[0] + src_win[0] * gt[1],
+        gt[3] + (src_win[1] + src_win[3]) * gt[5],
+        gt[0] + (src_win[0] + src_win[2]) * gt[1],
+        gt[3] + src_win[1] * gt[5],
+    )
+    return all(abs(actual - expected) <= 1e-6 for actual, expected in zip(fitted_bounds, target_bounds))
 
 
 def populate_s3_cache(date_paths: List[str]) -> None:
@@ -527,13 +657,11 @@ def populate_s3_cache(date_paths: List[str]) -> None:
 
 def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
     """Check if an MGRS tile contains land according to GEBCO (sampling)."""
-    m = mgrs.MGRS()
-    try:
-        clat, clon = m.toLatLon(mgrs_tile)
-    except mgrs_core.MGRSError:
+    tile_bounds = get_mgrs_tile_bounds(mgrs_tile)
+    if tile_bounds is None:
         return True
+    min_lon, min_lat, max_lon, max_lat = tile_bounds
 
-    # 100km is roughly 1 degree. We'll sample a grid around the center.
     ds = gdal.Open(gebco_src)
     if ds is None:
         print(f"Warning: Could not open GEBCO source for land check: {gebco_src}")
@@ -545,13 +673,17 @@ def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
         band = ds.GetRasterBand(band_index)
         gt = ds.GetGeoTransform()
         inv_gt = gdal.InvGeoTransform(gt)
+        transform = build_wgs84_to_dataset_transform(ds)
 
-        # Sample a 1.2 degree box (13x13 points), but read the smallest
-        # covering window once instead of issuing 169 tiny GDAL reads.
+        # Sample the actual 100 km tile bounds, but read the smallest covering
+        # window once instead of issuing many tiny GDAL reads.
         sample_points: list[tuple[int, int]] = []
-        for dlat in np.linspace(-0.6, 0.6, 13):
-            for dlon in np.linspace(-0.6, 0.6, 13):
-                px, py = gdal.ApplyGeoTransform(inv_gt, clon + dlon, clat + dlat)
+        for lat in np.linspace(min_lat, max_lat, 25):
+            for lon in np.linspace(min_lon, max_lon, 25):
+                sample_x, sample_y = lon, lat
+                if transform is not None:
+                    sample_x, sample_y, _ = transform.TransformPoint(lon, lat)
+                px, py = gdal.ApplyGeoTransform(inv_gt, sample_x, sample_y)
                 px, py = int(px), int(py)
                 if 0 <= px < ds.RasterXSize and 0 <= py < ds.RasterYSize:
                     sample_points.append((px, py))
@@ -641,64 +773,46 @@ def open_gebco_mask(
             mem_driver = gdal.GetDriverByName("MEM")
             if mem_driver is None:
                 raise RuntimeError("Could not load GDAL MEM driver")
-            mask_data_type = gebco_ds.GetRasterBand(band_index).DataType
+            mask_nodata = -1.0
+            alpha_source_ds = gdal.Translate(
+                "",
+                gebco_ds,
+                options=gdal.TranslateOptions(format="MEM", bandList=[band_index]),
+            )
+            if alpha_source_ds is None:
+                raise RuntimeError(f"Could not isolate GEBCO mask band for {mgrs_subtile}")
+            alpha_source_ds.GetRasterBand(1).SetColorInterpretation(gdal.GCI_GrayIndex)
 
             warped_mask_ds = mem_driver.Create(
-                "", tile_grid.width, tile_grid.height, 1, mask_data_type
+                "", tile_grid.width, tile_grid.height, 1, gdal.GDT_Float32
             )
             if warped_mask_ds is None:
                 raise RuntimeError("Could not create in-memory GEBCO mask dataset")
             warped_mask_ds.SetProjection(tile_grid.projection)
             warped_mask_ds.SetGeoTransform(tile_grid.geotransform)
+            warped_mask_ds.GetRasterBand(1).SetNoDataValue(mask_nodata)
+            warped_mask_ds.GetRasterBand(1).Fill(mask_nodata)
             warped = gdal.Warp(
                 warped_mask_ds,
-                gebco_ds,
+                alpha_source_ds,
                 options=gdal.WarpOptions(
                     resampleAlg="bilinear",
-                    srcBands=[band_index],
+                    srcBands=[1],
                     dstBands=[1],
+                    dstNodata=mask_nodata,
+                    workingType=gdal.GDT_Float32,
+                    outputType=gdal.GDT_Float32,
                 ),
             )
             if warped is None:
                 raise RuntimeError(f"Could not warp GEBCO mask for {mgrs_subtile}")
-
-            coverage_source_ds = mem_driver.Create(
-                "", gebco_ds.RasterXSize, gebco_ds.RasterYSize, 1, gdal.GDT_Byte
-            )
-            if coverage_source_ds is None:
-                raise RuntimeError("Could not create source coverage dataset")
-            coverage_source_ds.SetProjection(gebco_ds.GetProjection())
-            coverage_source_ds.SetGeoTransform(gebco_ds.GetGeoTransform())
-            coverage_source_ds.GetRasterBand(1).Fill(255)
-
-            coverage_mem_ds = mem_driver.Create(
-                "", tile_grid.width, tile_grid.height, 1, gdal.GDT_Byte
-            )
-            if coverage_mem_ds is None:
-                raise RuntimeError("Could not create in-memory GEBCO coverage dataset")
-            coverage_mem_ds.SetProjection(tile_grid.projection)
-            coverage_mem_ds.SetGeoTransform(tile_grid.geotransform)
-            coverage_mem_ds.GetRasterBand(1).Fill(0)
-            warped_coverage = gdal.Warp(
-                coverage_mem_ds,
-                coverage_source_ds,
-                options=gdal.WarpOptions(
-                    resampleAlg="near",
-                    srcBands=[1],
-                    dstBands=[1],
-                ),
-            )
-            coverage_source_ds = None
-            if warped_coverage is None:
-                raise RuntimeError(f"Could not warp GEBCO coverage for {mgrs_subtile}")
+            alpha_source_ds = None
         finally:
             gebco_ds = None
 
         return OceanMaskWarp(
             alpha_band=warped_mask_ds.GetRasterBand(1),
             dataset=warped_mask_ds,
-            coverage_band=coverage_mem_ds.GetRasterBand(1),
-            coverage_dataset=coverage_mem_ds,
         )
     except RuntimeError as e:
         print(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
@@ -733,17 +847,20 @@ def collect_ocean_mask_slabs(
     max_x = 0
     min_y = tile_grid.height
     max_y = 0
+    mask_nodata = ocean_mask.alpha_band.GetNoDataValue()
 
     for _xoff, yoff, block_width, block_height in iter_processing_windows(tile_grid):
         alpha_block = ocean_mask.alpha_band.ReadAsArray(0, yoff, block_width, block_height).astype(
             np.float32
         )
-        coverage_block = (
-            ocean_mask.coverage_band.ReadAsArray(0, yoff, block_width, block_height) >= 254.5
-        )
+        if mask_nodata is None:
+            coverage_block = np.ones(alpha_block.shape, dtype=bool)
+        else:
+            coverage_block = alpha_block != mask_nodata
         fill_allowed_block = build_fill_allowed_mask(
             alpha_block,
             coverage_block,
+            nodata_value=mask_nodata,
         )
         slab_crop_block = coverage_block & binary_dilation(
             fill_allowed_block,

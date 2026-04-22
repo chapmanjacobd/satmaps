@@ -379,18 +379,13 @@ def test_alpha_mask_coastline_seam_pixel_is_filled_opaquely(
         height=1,
     )
     mask_dataset = gdal.GetDriverByName("MEM").Create("", 3, 1, 1, gdal.GDT_Float32)
-    coverage_dataset = gdal.GetDriverByName("MEM").Create("", 3, 1, 1, gdal.GDT_Byte)
     assert mask_dataset is not None
-    assert coverage_dataset is not None
     mask_dataset.GetRasterBand(1).WriteArray(np.array([[0.0, 255.0, 255.0]], dtype=np.float32))
-    coverage_dataset.GetRasterBand(1).WriteArray(np.array([[255, 255, 255]], dtype=np.uint8))
 
     collected = satmaps.collect_ocean_mask_slabs(
         satmaps.OceanMaskWarp(
             alpha_band=mask_dataset.GetRasterBand(1),
             dataset=mask_dataset,
-            coverage_band=coverage_dataset.GetRasterBand(1),
-            coverage_dataset=coverage_dataset,
         ),
         tile_grid,
     )
@@ -603,7 +598,7 @@ def test_translate_rgba_vrt_preserves_alpha_values(tmp_path: Path) -> None:
     assert not (tmp_path / ".temp_out.tif").exists()
 
 
-def test_prepare_ocean_background_publishes_staged_tif(
+def test_prepare_ocean_background_publishes_staged_tif_when_warping(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -631,6 +626,48 @@ def test_prepare_ocean_background_publishes_staged_tif(
     assert destinations == [".temp/.temp_output_ocean_bbox.tif"]
     assert Path(prepared).exists()
     assert not Path(".temp/.temp_output_ocean_bbox.tif").exists()
+
+
+def test_prepare_ocean_background_crops_aligned_mercator_source_without_warp(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    bbox = (0.0, 0.0, 1.0, 1.0)
+    snapped_bounds, pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(bbox, 13)
+    width = int(round((snapped_bounds[2] - snapped_bounds[0]) / pixel_size))
+    height = int(round((snapped_bounds[3] - snapped_bounds[1]) / pixel_size))
+
+    source_path = tmp_path / "ocean.tif"
+    source_ds = gdal.GetDriverByName("GTiff").Create(str(source_path), width, height, 4, gdal.GDT_Byte)
+    assert source_ds is not None
+    source_ds.SetGeoTransform((snapped_bounds[0], pixel_size, 0.0, snapped_bounds[3], 0.0, -pixel_size))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    source_ds.SetProjection(srs.ExportToWkt())
+    source_ds.GetRasterBand(1).Fill(1)
+    source_ds = None
+
+    monkeypatch.setattr(
+        "satmaps.gdal.Warp",
+        lambda destination, source, options=None: (_ for _ in ()).throw(AssertionError("unexpected warp")),
+    )
+
+    prepared = satmaps.prepare_ocean_background_for_output(
+        str(source_path),
+        bbox,
+        "output.pmtiles",
+        "lanczos",
+        13,
+    )
+
+    assert prepared == ".temp/output_ocean_bbox.tif"
+    prepared_ds = gdal.Open(prepared)
+    assert prepared_ds is not None
+    assert prepared_ds.GetGeoTransform() == pytest.approx(
+        (snapped_bounds[0], pixel_size, 0.0, snapped_bounds[3], 0.0, -pixel_size)
+    )
+    prepared_ds = None
 
 
 def test_build_hillshade_command_matches_expected_flags(tmp_path: Path) -> None:
