@@ -14,7 +14,15 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["ocean_background", "satmaps", "tiler", "tuner_ui"]
+py-modules = ["ocean", "satmaps", "tiler", "tuner_ui"]
+
+[tool.setuptools.package-data]
+"*" = ["templates/*.html", "HLS.land.tiles.txt"]
+
+[project.scripts]
+ocean = "ocean:main"
+satmaps = "satmaps:main"
+satmaps-tuner = "tuner_ui:main"
 
 [project.optional-dependencies]
 dev = [

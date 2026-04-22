@@ -234,5 +234,9 @@ def render() -> ResponseReturnValue:
     return send_file(img_io, mimetype="image/jpeg")
 
 
-if __name__ == "__main__":
+def main() -> None:
     app.run(debug=True, port=5001)
+
+
+if __name__ == "__main__":
+    main()
