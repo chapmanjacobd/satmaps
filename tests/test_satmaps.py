@@ -244,7 +244,7 @@ def test_average_tile_blocks_skips_horizontal_ocean(monkeypatch: object) -> None
             yoff=0,
             width=4,
             height=4,
-            gebco_block=np.zeros((4, 4), dtype=np.float32),
+            alpha_block=np.zeros((4, 4), dtype=np.float32),
             coverage_block=np.ones((4, 4), dtype=bool),
             fill_allowed_block=np.ones((4, 4), dtype=bool),
         )
@@ -262,7 +262,7 @@ def test_average_tile_blocks_skips_horizontal_ocean(monkeypatch: object) -> None
 
     date_band_sets = []  # Empty for this test
 
-    average_tile_blocks(date_band_sets, processing_window, mask_slabs, False)
+    average_tile_blocks(date_band_sets, processing_window, mask_slabs)
 
     # It should have called mock_average_block with xoff=3 and width=4
     # Note: PROCESS_SLAB_HEIGHT is 24, so it should be one call for 4 rows
@@ -280,7 +280,7 @@ def test_average_tile_blocks_skips_empty_slabs(monkeypatch: object) -> None:
             yoff=24,
             width=10,
             height=24,
-            gebco_block=np.zeros((24, 10), dtype=np.float32),
+            alpha_block=np.zeros((24, 10), dtype=np.float32),
             coverage_block=np.ones((24, 10), dtype=bool),
             fill_allowed_block=np.ones((24, 10), dtype=bool),
         )
@@ -297,7 +297,7 @@ def test_average_tile_blocks_skips_empty_slabs(monkeypatch: object) -> None:
     monkeypatch.setattr("satmaps.average_block", mock_average_block)
 
     date_band_sets = []
-    average_tile_blocks(date_band_sets, processing_window, mask_slabs, False)
+    average_tile_blocks(date_band_sets, processing_window, mask_slabs)
 
     # SLAB_HEIGHT is 24.
     # Slab 0: 0-24 (Skip)
@@ -321,7 +321,7 @@ def test_average_tile_blocks_masks_out_ocean_holes_inside_processed_slab(
             yoff=0,
             width=3,
             height=2,
-            gebco_block=np.zeros((2, 3), dtype=np.float32),
+            alpha_block=np.zeros((2, 3), dtype=np.float32),
             coverage_block=np.ones((2, 3), dtype=bool),
             fill_allowed_block=np.array(
                 [
@@ -341,11 +341,16 @@ def test_average_tile_blocks_masks_out_ocean_holes_inside_processed_slab(
 
     monkeypatch.setattr("satmaps.average_block", mock_average_block)
 
-    averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
-        [], processing_window, mask_slabs, False
-    )
+    averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks([], processing_window, mask_slabs)
 
     expected_fill_allowed = np.array(
+        [
+            [True, True, True],
+            [True, True, True],
+        ],
+        dtype=bool,
+    )
+    expected_source_valid = np.array(
         [
             [True, False, True],
             [True, False, True],
@@ -354,7 +359,7 @@ def test_average_tile_blocks_masks_out_ocean_holes_inside_processed_slab(
     )
     assert fill_allowed_mask is not None
     np.testing.assert_array_equal(fill_allowed_mask, expected_fill_allowed)
-    np.testing.assert_array_equal(source_valid_mask, expected_fill_allowed)
+    np.testing.assert_array_equal(source_valid_mask, expected_source_valid)
     np.testing.assert_array_equal(
         alpha_mask,
         np.full((2, 3), 255, dtype=np.uint8),
@@ -382,9 +387,8 @@ def test_alpha_mask_coastline_seam_pixel_is_filled_opaquely(
 
     collected = satmaps.collect_ocean_mask_slabs(
         satmaps.OceanMaskWarp(
-            band=mask_dataset.GetRasterBand(1),
+            alpha_band=mask_dataset.GetRasterBand(1),
             dataset=mask_dataset,
-            uses_alpha=True,
             coverage_band=coverage_dataset.GetRasterBand(1),
             coverage_dataset=coverage_dataset,
         ),
@@ -405,9 +409,7 @@ def test_alpha_mask_coastline_seam_pixel_is_filled_opaquely(
 
     monkeypatch.setattr("satmaps.average_block", mock_average_block)
 
-    averaged, source_valid_mask, alpha_mask, fill_allowed_mask = satmaps.average_tile_blocks(
-        [], processing_window, mask_slabs, True
-    )
+    averaged, source_valid_mask, alpha_mask, fill_allowed_mask = satmaps.average_tile_blocks([], processing_window, mask_slabs)
     averaged = satmaps.fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
 
     dataset = gdal.GetDriverByName("MEM").Create("", 2, 1, 4, gdal.GDT_Byte)
@@ -652,12 +654,7 @@ def test_ocean_main_uses_default_positionals(monkeypatch: object) -> None:
     assert called["destination"] == ocean.DEFAULT_OUTPUT
     assert called["bbox"] is None
     assert called["vrt"] is False
-    assert called["style"] == ocean.OceanStyleOptions(
-        gamma=1.2,
-        saturation=1.0,
-        black_break=0.35,
-        black_slope=0.35,
-    )
+    assert called["style"] == ocean.OceanStyleOptions()
 
 
 def test_ocean_main_parses_bbox_when_provided(monkeypatch: object) -> None:
@@ -1093,16 +1090,18 @@ def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path
 
     gebco_path = tmp_path / "gebco.tif"
     gebco_ds = gdal.GetDriverByName("GTiff").Create(
-        str(gebco_path), raster_size, raster_size, 1, gdal.GDT_Float32
+        str(gebco_path), raster_size, raster_size, 4, gdal.GDT_Byte
     )
     gebco_ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(32631)
     gebco_ds.SetProjection(srs.ExportToWkt())
-    gebco_values = np.full((raster_size, raster_size), 0.0, dtype=np.float32)
-    gebco_values[0, 0] = -60.0
-    gebco_values[0, 1] = -45.0
-    gebco_ds.GetRasterBand(1).WriteArray(gebco_values)
+    gebco_values = np.full((raster_size, raster_size), 255, dtype=np.uint8)
+    gebco_values[0, 0] = 0
+    gebco_values[0, 1] = 0
+    gebco_alpha_band = gebco_ds.GetRasterBand(4)
+    gebco_alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
+    gebco_alpha_band.WriteArray(gebco_values)
     gebco_ds = None
 
     args = argparse.Namespace(
@@ -1134,7 +1133,6 @@ def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path
     alpha = out_ds.GetRasterBand(4).ReadAsArray()
     assert np.any(alpha == 0)
     assert np.any(alpha == 255)
-    assert np.any((alpha > 0) & (alpha < 255))
 
 
 def test_process_single_tile_with_rgba_ocean_alpha_mask(
@@ -1256,10 +1254,11 @@ def test_main_passes_ocean_path_to_tile_processing(
     (tmp_path / ".temp").mkdir()
     custom_ocean_path = tmp_path / "custom-ocean.tif"
     custom_ocean_ds = gdal.GetDriverByName("GTiff").Create(
-        str(custom_ocean_path), 1, 1, 1, gdal.GDT_Byte
+        str(custom_ocean_path), 1, 1, 4, gdal.GDT_Byte
     )
     assert custom_ocean_ds is not None
-    custom_ocean_ds.GetRasterBand(1).Fill(1)
+    custom_ocean_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    custom_ocean_ds.GetRasterBand(4).Fill(255)
     custom_ocean_ds = None
 
     monkeypatch.setattr(

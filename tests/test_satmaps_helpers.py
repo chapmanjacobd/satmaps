@@ -16,8 +16,8 @@ from satmaps import (
     expand_subtiles,
     filter_mgrs_tiles,
     find_resume_path,
+    get_ocean_mask_band_index,
     iter_processing_windows,
-    load_land_tiles,
     open_date_band_sets,
     parse_bbox,
     restore_resume_state,
@@ -61,15 +61,6 @@ def test_restore_resume_state_returns_none_for_invalid_json(
     assert restore_resume_state(str(state_file)) is None
     assert "Warning: Could not load state file" in capsys.readouterr().out
 
-
-def test_load_land_tiles_ignores_blank_lines_and_missing_file(tmp_path: Path) -> None:
-    land_tiles = tmp_path / "land_tiles.txt"
-    land_tiles.write_text("\n31TDF\n\n32TLP  \n31TDF\n")
-
-    assert load_land_tiles(str(land_tiles)) == {"31TDF", "32TLP"}
-    assert load_land_tiles(str(tmp_path / "missing.txt")) is None
-
-
 def test_parse_bbox_parses_numbers_and_exits_on_invalid_input(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -81,7 +72,7 @@ def test_parse_bbox_parses_numbers_and_exits_on_invalid_input(
     assert "Error: Invalid bbox format: not,a,bbox" in capsys.readouterr().out
 
 
-def test_filter_mgrs_tiles_respects_land_set_and_gebco_fallback(monkeypatch: object) -> None:
+def test_filter_mgrs_tiles_uses_ocean_mask_filter_when_available(monkeypatch: object) -> None:
     calls: list[tuple[str, str]] = []
 
     def fake_check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
@@ -90,16 +81,12 @@ def test_filter_mgrs_tiles_respects_land_set_and_gebco_fallback(monkeypatch: obj
 
     monkeypatch.setattr("satmaps.check_land_gebco", fake_check_land_gebco)
 
-    assert filter_mgrs_tiles(["31TDF", "32TLP", "33TWN"], {"31TDF"}, "gebco.vrt") == [
-        "31TDF",
-        "32TLP",
-    ]
-    assert calls == [("32TLP", "gebco.vrt"), ("33TWN", "gebco.vrt")]
+    assert filter_mgrs_tiles(["31TDF", "32TLP", "33TWN"], "gebco.vrt") == ["32TLP"]
+    assert calls == [("31TDF", "gebco.vrt"), ("32TLP", "gebco.vrt"), ("33TWN", "gebco.vrt")]
 
     calls.clear()
-    assert filter_mgrs_tiles(["31TDF", "32TLP"], None, "gebco.vrt") == ["31TDF", "32TLP"]
-    assert calls == [("31TDF", "gebco.vrt"), ("32TLP", "gebco.vrt")]
-    assert filter_mgrs_tiles(["31TDF", "32TLP"], None, None) == ["31TDF", "32TLP"]
+    assert filter_mgrs_tiles(["31TDF", "32TLP"], None) == ["31TDF", "32TLP"]
+    assert calls == []
 
 
 def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: object) -> None:
@@ -147,34 +134,47 @@ def test_build_alpha_block_uses_source_mask_without_gebco() -> None:
     source_valid_mask = np.array([[True, False, True]], dtype=bool)
 
     np.testing.assert_array_equal(
-        build_alpha_block(None, source_valid_mask, False),
+        build_alpha_block(None, source_valid_mask),
         np.array([[255, 0, 255]], dtype=np.uint8),
     )
 
 
-def test_build_alpha_block_applies_gebco_fade_curve() -> None:
-    dataset = gdal.GetDriverByName("MEM").Create("", 5, 1, 1, gdal.GDT_Float32)
-    assert dataset is not None
-    dataset.GetRasterBand(1).WriteArray(
-        np.array([[-60.0, -50.0, -46.0, -42.0, 0.0]], dtype=np.float32)
-    )
-
+def test_build_alpha_block_inverts_ocean_alpha() -> None:
     np.testing.assert_array_equal(
         build_alpha_block(
-            dataset.GetRasterBand(1).ReadAsArray().astype(np.float32),
-            np.zeros((1, 5), dtype=bool),
-            False,
+            np.array([[255.0, 128.0, 0.0]], dtype=np.float32),
+            np.zeros((1, 3), dtype=bool),
         ),
-        np.array([[0, 0, 127, 255, 255]], dtype=np.uint8),
+        np.array([[0, 127, 255]], dtype=np.uint8),
     )
+
+
+def test_get_ocean_mask_band_index_requires_explicit_alpha_band() -> None:
+    alpha_dataset = gdal.GetDriverByName("MEM").Create("", 1, 1, 4, gdal.GDT_Byte)
+    assert alpha_dataset is not None
+    alpha_dataset.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    assert get_ocean_mask_band_index(alpha_dataset) == 4
+
+    single_band_dataset = gdal.GetDriverByName("MEM").Create("", 1, 1, 1, gdal.GDT_Byte)
+    assert single_band_dataset is not None
+    assert get_ocean_mask_band_index(single_band_dataset) is None
 
 
 def test_build_fill_allowed_mask_uses_alpha_and_coverage() -> None:
     np.testing.assert_array_equal(
         build_fill_allowed_mask(
             np.array([[0.0, 255.0, 0.0]], dtype=np.float32),
-            True,
             np.array([[True, True, False]], dtype=bool),
+        ),
+        np.array([[True, False, False]], dtype=bool),
+    )
+
+
+def test_build_fill_allowed_mask_excludes_nodata_pixels() -> None:
+    np.testing.assert_array_equal(
+        build_fill_allowed_mask(
+            np.array([[0.0, -1.0, 255.0]], dtype=np.float32),
+            nodata_value=-1.0,
         ),
         np.array([[True, False, False]], dtype=bool),
     )
@@ -185,7 +185,6 @@ def test_build_alpha_block_masks_out_pixels_outside_ocean_render() -> None:
         build_alpha_block(
             np.array([[0.0, 255.0, 0.0]], dtype=np.float32),
             np.array([[True, True, True]], dtype=bool),
-            True,
             np.array([[True, True, False]], dtype=bool),
         ),
         np.array([[255, 0, 0]], dtype=np.uint8),
@@ -197,11 +196,20 @@ def test_build_alpha_block_prefers_land_for_filled_seam_pixels() -> None:
         build_alpha_block(
             np.array([[255.0, 255.0]], dtype=np.float32),
             np.array([[False, True]], dtype=bool),
-            True,
             np.array([[True, True]], dtype=bool),
             np.array([[True, False]], dtype=bool),
         ),
         np.array([[255, 0]], dtype=np.uint8),
+    )
+
+
+def test_build_alpha_block_preserves_ocean_alpha_gradient() -> None:
+    np.testing.assert_array_equal(
+        build_alpha_block(
+            np.array([[255.0, 200.0, 0.0]], dtype=np.float32),
+            np.zeros((1, 3), dtype=bool),
+        ),
+        np.array([[0, 55, 255]], dtype=np.uint8),
     )
 
 
