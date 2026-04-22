@@ -507,6 +507,37 @@ def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None
     )
 
 
+def test_create_alpha_vrt_block_path_matches_threshold_output(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(ocean, "MAX_IN_MEMORY_ALPHA_PIXELS", 1)
+    driver = gdal.GetDriverByName("GTiff")
+
+    alpha_source = tmp_path / "ocean_source_block.tif"
+    alpha_ds = driver.Create(str(alpha_source), 4, 1, 1, gdal.GDT_Float32)
+    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    alpha_ds.SetProjection(srs.ExportToWkt())
+    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    alpha_ds.GetRasterBand(1).WriteArray(
+        np.array([[-60.0, -50.0, -5.0, -32767.0]], dtype=np.float32)
+    )
+    alpha_ds = None
+
+    alpha_source_vrt = tmp_path / "ocean_source_block.vrt"
+    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+
+    alpha_vrt = tmp_path / "alpha_block.vrt"
+    ocean.create_alpha_vrt(str(alpha_source_vrt), str(alpha_vrt))
+
+    np.testing.assert_allclose(
+        gdal.Open(str(alpha_vrt)).ReadAsArray(),
+        np.array([[255.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+    )
+
+
 def test_create_ocean_rgb_tif_colorizes_in_blocks(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
     srs = osr.SpatialReference()
@@ -558,6 +589,61 @@ def test_create_ocean_rgb_tif_colorizes_in_blocks(tmp_path: Path) -> None:
         np.uint8
     )
     np.testing.assert_array_equal(arr, expected)
+
+
+def test_create_ocean_rgb_tif_block_path_matches_full_read(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(ocean, "MAX_IN_MEMORY_COLOR_PIXELS", 1)
+    driver = gdal.GetDriverByName("GTiff")
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+
+    depth_path = tmp_path / "depth_block.tif"
+    depth_ds = driver.Create(str(depth_path), 2, 2, 1, gdal.GDT_Float32)
+    depth_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    depth_ds.SetProjection(srs.ExportToWkt())
+    depth_ds.GetRasterBand(1).WriteArray(
+        np.array([[-1000.0, -500.0], [-250.0, 0.0]], dtype=np.float32)
+    )
+    depth_ds = None
+
+    hillshade_path = tmp_path / "hillshade_block.tif"
+    hillshade_ds = driver.Create(str(hillshade_path), 2, 2, 1, gdal.GDT_Byte)
+    hillshade_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    hillshade_ds.SetProjection(srs.ExportToWkt())
+    hillshade_ds.GetRasterBand(1).WriteArray(
+        np.array([[0, 64], [128, 255]], dtype=np.uint8)
+    )
+    hillshade_ds = None
+
+    output_path = tmp_path / "ocean_rgb_block.tif"
+    style = ocean.OceanStyleOptions(tonemap=False, grade=False)
+    ocean.create_ocean_rgb_tif(
+        str(depth_path),
+        str(hillshade_path),
+        str(output_path),
+        style,
+    )
+
+    rgb_ds = gdal.Open(str(output_path))
+    assert rgb_ds is not None
+    expected_rgb = ocean.colorize_ocean_depths(
+        np.array([[-1000.0, -500.0], [-250.0, 0.0]], dtype=np.float32),
+        style,
+    )
+    expected_shade = 0.35 + 0.65 * np.clip(
+        np.array([[0, 64], [128, 255]], dtype=np.float32) / 255.0,
+        0.0,
+        1.0,
+    )
+    np.testing.assert_array_equal(
+        rgb_ds.ReadAsArray(),
+        (np.clip(expected_rgb * expected_shade[np.newaxis, :, :], 0.0, 1.0) * 255.0).astype(
+            np.uint8
+        ),
+    )
 
 
 def test_create_rgb_with_alpha_vrt_preserves_alpha_values(tmp_path: Path) -> None:
@@ -756,6 +842,49 @@ def test_build_hillshade_command_matches_expected_flags(tmp_path: Path) -> None:
     assert "COMPRESS=ZSTD" in command
 
 
+def test_create_hillshade_tif_uses_gdal_demprocessing(monkeypatch: object, tmp_path: Path) -> None:
+    dem_processing_calls: list[tuple[str, str, str, object]] = []
+    options_calls: list[dict[str, object]] = []
+
+    class DummyDataset:
+        pass
+
+    monkeypatch.setattr(
+        "ocean.gdal.DEMProcessingOptions",
+        lambda **kwargs: options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        "ocean.gdal.DEMProcessing",
+        lambda destination, source, processing, options=None: dem_processing_calls.append(
+            (destination, source, processing, options)
+        )
+        or Path(destination).write_text("hillshade")
+        or DummyDataset(),
+    )
+
+    output_path = tmp_path / "hillshade.tif"
+    result = ocean.create_hillshade_tif(str(tmp_path / "in.vrt"), str(output_path), 5.0)
+
+    assert result == str(output_path)
+    assert options_calls == [
+        {
+            "format": "GTiff",
+            "creationOptions": list(ocean.GTIFF_CREATION_OPTIONS),
+            "multiDirectional": True,
+            "zFactor": 5.0,
+        }
+    ]
+    assert dem_processing_calls == [
+        (
+            str(tmp_path / ".temp_hillshade.tif"),
+            str(tmp_path / "in.vrt"),
+            "hillshade",
+            options_calls[0],
+        )
+    ]
+    assert output_path.exists()
+
+
 def test_ocean_main_uses_default_positionals(monkeypatch: object) -> None:
     called: dict[str, object] = {}
 
@@ -855,12 +984,11 @@ def test_ocean_main_enables_vrt_mode(monkeypatch: object) -> None:
 def test_generate_ocean_without_bbox_warps_global_raster(
     monkeypatch: object,
 ) -> None:
-    commands: list[list[str]] = []
+    hillshade_calls: list[tuple[str, str, float]] = []
     translated: list[tuple[str, str]] = []
     warp_calls: list[tuple[str, str, object]] = []
     warp_options_calls: list[dict[str, object]] = []
 
-    monkeypatch.setattr("ocean.which", lambda cmd: "/usr/bin/gdaldem")
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "ocean.build_gebco_source_vrt",
@@ -887,12 +1015,12 @@ def test_generate_ocean_without_bbox_warps_global_raster(
         lambda rgba_vrt, destination: translated.append((rgba_vrt, destination)) or destination,
     )
     monkeypatch.setattr(
-        "ocean.build_hillshade_command",
-        lambda input_vrt, output_tif, z_factor: [input_vrt, output_tif, str(z_factor)],
-    )
-    monkeypatch.setattr(
-        "ocean.subprocess.run",
-        lambda cmd, check: (commands.append(cmd), Path(cmd[1]).write_text("hillshade"))[-1],
+        "ocean.create_hillshade_tif",
+        lambda input_vrt, output_tif, z_factor: (
+            hillshade_calls.append((input_vrt, output_tif, z_factor)),
+            Path(output_tif).write_text("hillshade"),
+            output_tif,
+        )[-1],
     )
     monkeypatch.setattr(
         "ocean.gdal.WarpOptions",
@@ -929,9 +1057,9 @@ def test_generate_ocean_without_bbox_warps_global_raster(
     assert warp_options_calls[0]["yRes"] == pytest.approx(
         satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
     )
-    assert commands == [
-        [artifacts.warped_vrt, ocean.build_staged_path(artifacts.hillshade_tif), "5.0"]
-    ]
+    assert warp_options_calls[0]["multithread"] is True
+    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
+    assert hillshade_calls == [(artifacts.warped_vrt, artifacts.hillshade_tif, 5.0)]
     assert translated == [(artifacts.rgba_vrt, "ocean.tif")]
 
 
@@ -940,7 +1068,6 @@ def test_generate_ocean_with_bbox_sets_explicit_target_resolution(
 ) -> None:
     warp_options_calls: list[dict[str, object]] = []
 
-    monkeypatch.setattr("ocean.which", lambda cmd: "/usr/bin/gdaldem")
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "ocean.build_gebco_source_vrt",
@@ -964,12 +1091,8 @@ def test_generate_ocean_with_bbox_sets_explicit_target_resolution(
     )
     monkeypatch.setattr("ocean.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
     monkeypatch.setattr(
-        "ocean.build_hillshade_command",
-        lambda input_vrt, output_tif, z_factor: [input_vrt, output_tif, str(z_factor)],
-    )
-    monkeypatch.setattr(
-        "ocean.subprocess.run",
-        lambda cmd, check: Path(cmd[1]).write_text("hillshade"),
+        "ocean.create_hillshade_tif",
+        lambda input_vrt, output_tif, z_factor: Path(output_tif).write_text("hillshade") or output_tif,
     )
     monkeypatch.setattr(
         "ocean.gdal.WarpOptions",
@@ -992,12 +1115,13 @@ def test_generate_ocean_with_bbox_sets_explicit_target_resolution(
     assert "outputBoundsSRS" not in warp_options_calls[0]
     assert warp_options_calls[0]["xRes"] == pytest.approx(pixel_size)
     assert warp_options_calls[0]["yRes"] == pytest.approx(pixel_size)
+    assert warp_options_calls[0]["multithread"] is True
+    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
 
 
 def test_generate_ocean_uses_requested_zoom_resolution(monkeypatch: object) -> None:
     warp_options_calls: list[dict[str, object]] = []
 
-    monkeypatch.setattr("ocean.which", lambda cmd: "/usr/bin/gdaldem")
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
     monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
     monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
@@ -1015,12 +1139,8 @@ def test_generate_ocean_uses_requested_zoom_resolution(monkeypatch: object) -> N
     )
     monkeypatch.setattr("ocean.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
     monkeypatch.setattr(
-        "ocean.build_hillshade_command",
-        lambda input_vrt, output_tif, z_factor: [input_vrt, output_tif, str(z_factor)],
-    )
-    monkeypatch.setattr(
-        "ocean.subprocess.run",
-        lambda cmd, check: Path(cmd[1]).write_text("hillshade"),
+        "ocean.create_hillshade_tif",
+        lambda input_vrt, output_tif, z_factor: Path(output_tif).write_text("hillshade") or output_tif,
     )
     monkeypatch.setattr(
         "ocean.gdal.WarpOptions",
@@ -1040,6 +1160,8 @@ def test_generate_ocean_uses_requested_zoom_resolution(monkeypatch: object) -> N
 
     assert warp_options_calls[0]["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
     assert warp_options_calls[0]["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
+    assert warp_options_calls[0]["multithread"] is True
+    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
 
 
 def test_warp_to_web_mercator_uses_shared_zoom13_resolution(monkeypatch: object) -> None:
@@ -1128,7 +1250,6 @@ def test_warp_to_web_mercator_removes_existing_destination(monkeypatch: object) 
 def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:
     vrt_outputs: list[tuple[str, str]] = []
 
-    monkeypatch.setattr("ocean.which", lambda cmd: "/usr/bin/gdaldem")
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "ocean.build_gebco_source_vrt",
@@ -1159,12 +1280,8 @@ def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:
         lambda rgba_vrt, destination: (_ for _ in ()).throw(AssertionError("Translate should not be called")),
     )
     monkeypatch.setattr(
-        "ocean.build_hillshade_command",
-        lambda input_vrt, output_tif, z_factor: [input_vrt, output_tif, str(z_factor)],
-    )
-    monkeypatch.setattr(
-        "ocean.subprocess.run",
-        lambda cmd, check: Path(cmd[1]).write_text("hillshade"),
+        "ocean.create_hillshade_tif",
+        lambda input_vrt, output_tif, z_factor: Path(output_tif).write_text("hillshade") or output_tif,
     )
     monkeypatch.setattr("ocean.gdal.WarpOptions", lambda **kwargs: kwargs)
     monkeypatch.setattr(
@@ -1186,7 +1303,6 @@ def test_generate_ocean_deletes_heavy_non_output_tifs(tmp_path: Path, monkeypatc
     temp_dir = tmp_path / ".temp"
     temp_dir.mkdir()
 
-    monkeypatch.setattr("ocean.which", lambda cmd: "/usr/bin/gdaldem")
     monkeypatch.setattr(
         "ocean.build_gebco_source_vrt",
         lambda gebco_zip, output_vrt: (Path(output_vrt).write_text("source"), output_vrt)[1],
@@ -1222,12 +1338,8 @@ def test_generate_ocean_deletes_heavy_non_output_tifs(tmp_path: Path, monkeypatc
         lambda rgba_vrt, destination: (Path(destination).write_text("final"), destination)[1],
     )
     monkeypatch.setattr(
-        "ocean.build_hillshade_command",
-        lambda input_vrt, output_tif, z_factor: [input_vrt, output_tif, str(z_factor)],
-    )
-    monkeypatch.setattr(
-        "ocean.subprocess.run",
-        lambda cmd, check: Path(cmd[1]).write_text("hillshade"),
+        "ocean.create_hillshade_tif",
+        lambda input_vrt, output_tif, z_factor: Path(output_tif).write_text("hillshade") or output_tif,
     )
     monkeypatch.setattr("ocean.gdal.WarpOptions", lambda **kwargs: kwargs)
     monkeypatch.setattr(
@@ -1258,7 +1370,6 @@ def test_generate_ocean_vrt_mode_keeps_output_dependent_tifs(
     temp_dir = tmp_path / ".temp"
     temp_dir.mkdir()
 
-    monkeypatch.setattr("ocean.which", lambda cmd: "/usr/bin/gdaldem")
     monkeypatch.setattr(
         "ocean.build_gebco_source_vrt",
         lambda gebco_zip, output_vrt: (Path(output_vrt).write_text("source"), output_vrt)[1],
@@ -1297,12 +1408,8 @@ def test_generate_ocean_vrt_mode_keeps_output_dependent_tifs(
         )[-1],
     )
     monkeypatch.setattr(
-        "ocean.build_hillshade_command",
-        lambda input_vrt, output_tif, z_factor: [input_vrt, output_tif, str(z_factor)],
-    )
-    monkeypatch.setattr(
-        "ocean.subprocess.run",
-        lambda cmd, check: Path(cmd[1]).write_text("hillshade"),
+        "ocean.create_hillshade_tif",
+        lambda input_vrt, output_tif, z_factor: Path(output_tif).write_text("hillshade") or output_tif,
     )
     monkeypatch.setattr("ocean.gdal.WarpOptions", lambda **kwargs: kwargs)
     monkeypatch.setattr(

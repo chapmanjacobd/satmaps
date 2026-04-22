@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import os
-import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from shutil import copyfile, which
+from shutil import copyfile
 from typing import Sequence
 from xml.sax.saxutils import escape
 
@@ -58,6 +57,8 @@ OCEAN_DEFAULT_BLACK_SLOPE = 0.25
 OCEAN_FADE_DEPTH = -50.0
 SMALL_OCEAN_MAX_AREA_SQ_M = 1_500_000.0
 MAX_COMPONENT_CLEANUP_PIXELS = 120_000_000
+MAX_IN_MEMORY_ALPHA_PIXELS = 12_000_000
+MAX_IN_MEMORY_COLOR_PIXELS = 4_000_000
 
 
 @dataclass(frozen=True)
@@ -194,23 +195,9 @@ def create_alpha_vrt(
     alpha_ds.SetGeoTransform(ds.GetGeoTransform())
     alpha_band = alpha_ds.GetRasterBand(1)
 
-    block_width, block_height = band.GetBlockSize()
-    if block_width <= 0:
-        block_width = 512
-    if block_height <= 0:
-        block_height = 512
-
-    for yoff in range(0, ysize, block_height):
-        bh = min(block_height, ysize - yoff)
-        for xoff in range(0, xsize, block_width):
-            bw = min(block_width, xsize - xoff)
-            depths = band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
-            ocean_mask = (depths > nodata_value + 0.1) & (depths < OCEAN_FADE_DEPTH)
-            alpha_band.WriteArray(ocean_mask.astype(np.uint8) * 255, xoff=xoff, yoff=yoff)
-
-    alpha_band.FlushCache()
-    if xsize * ysize <= MAX_COMPONENT_CLEANUP_PIXELS:
-        ocean_mask = alpha_band.ReadAsArray().astype(bool)
+    if xsize * ysize <= MAX_IN_MEMORY_ALPHA_PIXELS:
+        depths = band.ReadAsArray().astype(np.float32)
+        ocean_mask = build_ocean_threshold_mask(depths, nodata_value)
         cleaned_mask = remove_small_enclosed_ocean_regions(
             ocean_mask,
             ds.GetGeoTransform(),
@@ -219,17 +206,42 @@ def create_alpha_vrt(
         alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
         alpha_band.FlushCache()
     else:
-        cleanup_vector_path = vector_path or Path(alpha_tif).with_suffix(".gpkg")
-        staged_vector_path = Path(build_staged_path(str(cleanup_vector_path)))
-        remove_if_exists(str(staged_vector_path))
-        remove_small_enclosed_ocean_regions_vector(
-            alpha_ds,
-            alpha_band,
-            ds.GetGeoTransform(),
-            SMALL_OCEAN_MAX_AREA_SQ_M,
-            staged_vector_path,
-        )
-        publish_staged_path(str(staged_vector_path), str(cleanup_vector_path))
+        block_width, block_height = band.GetBlockSize()
+        if block_width <= 0:
+            block_width = 512
+        if block_height <= 0:
+            block_height = 512
+
+        for yoff in range(0, ysize, block_height):
+            bh = min(block_height, ysize - yoff)
+            for xoff in range(0, xsize, block_width):
+                bw = min(block_width, xsize - xoff)
+                depths = band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+                ocean_mask = build_ocean_threshold_mask(depths, nodata_value)
+                alpha_band.WriteArray(ocean_mask.astype(np.uint8) * 255, xoff=xoff, yoff=yoff)
+
+        alpha_band.FlushCache()
+        if xsize * ysize <= MAX_COMPONENT_CLEANUP_PIXELS:
+            ocean_mask = alpha_band.ReadAsArray().astype(bool)
+            cleaned_mask = remove_small_enclosed_ocean_regions(
+                ocean_mask,
+                ds.GetGeoTransform(),
+                SMALL_OCEAN_MAX_AREA_SQ_M,
+            )
+            alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
+            alpha_band.FlushCache()
+        else:
+            cleanup_vector_path = vector_path or Path(alpha_tif).with_suffix(".gpkg")
+            staged_vector_path = Path(build_staged_path(str(cleanup_vector_path)))
+            remove_if_exists(str(staged_vector_path))
+            remove_small_enclosed_ocean_regions_vector(
+                alpha_ds,
+                alpha_band,
+                ds.GetGeoTransform(),
+                SMALL_OCEAN_MAX_AREA_SQ_M,
+                staged_vector_path,
+            )
+            publish_staged_path(str(staged_vector_path), str(cleanup_vector_path))
 
     alpha_ds = None
     ds = None
@@ -239,6 +251,11 @@ def create_alpha_vrt(
     gdal.BuildVRT(staged_output_vrt, [alpha_tif])
     publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
+
+
+def build_ocean_threshold_mask(depths: np.ndarray, nodata_value: float) -> np.ndarray:
+    """Return the boolean mask for ocean depths deep enough to render as ocean."""
+    return (depths > nodata_value + 0.1) & (depths < OCEAN_FADE_DEPTH)
 
 
 def remove_small_enclosed_ocean_regions(
@@ -421,6 +438,28 @@ def build_hillshade_command(
     return command
 
 
+def create_hillshade_tif(
+    input_vrt: str,
+    output_tif: str,
+    z_factor: float,
+) -> str:
+    """Create the ocean hillshade GeoTIFF with GDAL's in-process DEM pipeline."""
+    staged_output_tif = build_staged_path(output_tif)
+    remove_if_exists(staged_output_tif)
+    options = gdal.DEMProcessingOptions(
+        format="GTiff",
+        creationOptions=list(GTIFF_CREATION_OPTIONS),
+        multiDirectional=True,
+        zFactor=z_factor,
+    )
+    hillshade_ds = gdal.DEMProcessing(staged_output_tif, input_vrt, "hillshade", options=options)
+    if hillshade_ds is None:
+        raise RuntimeError(f"Could not create hillshade TIFF: {output_tif}")
+    hillshade_ds = None
+    publish_staged_path(staged_output_tif, output_tif)
+    return output_tif
+
+
 def create_ocean_rgb_tif(
     depth_vrt: str,
     hillshade_tif: str,
@@ -467,23 +506,22 @@ def create_ocean_rgb_tif(
         band.SetColorInterpretation(getattr(gdal, f"GCI_{color_name}"))
 
     color_bands = [color_ds.GetRasterBand(index) for index in range(1, 4)]
-    for yoff in range(0, hillshade_ds.RasterYSize, block_height):
-        bh = min(block_height, hillshade_ds.RasterYSize - yoff)
-        for xoff in range(0, hillshade_ds.RasterXSize, block_width):
-            bw = min(block_width, hillshade_ds.RasterXSize - xoff)
-            depths = depth_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
-            hillshade = hillshade_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
-            rgb = colorize_depth_numpy(
-                depths,
-                ramp_colors,
-                style.depth_min,
-                style.depth_max,
-            )
-            shade = 0.35 + 0.65 * np.clip(hillshade / 255.0, 0.0, 1.0)
-            shaded_rgb = np.clip(rgb * shade[np.newaxis, :, :], 0.0, 1.0)
-            byte_arr = (shaded_rgb * 255.0).astype(np.uint8)
-            for band_index, band in enumerate(color_bands):
-                band.WriteArray(byte_arr[band_index], xoff=xoff, yoff=yoff)
+    if hillshade_ds.RasterXSize * hillshade_ds.RasterYSize <= MAX_IN_MEMORY_COLOR_PIXELS:
+        depths = depth_band.ReadAsArray().astype(np.float32)
+        hillshade = hillshade_band.ReadAsArray().astype(np.float32)
+        byte_arr = shade_ocean_rgb(depths, hillshade, ramp_colors, style)
+        for band_index, band in enumerate(color_bands):
+            band.WriteArray(byte_arr[band_index])
+    else:
+        for yoff in range(0, hillshade_ds.RasterYSize, block_height):
+            bh = min(block_height, hillshade_ds.RasterYSize - yoff)
+            for xoff in range(0, hillshade_ds.RasterXSize, block_width):
+                bw = min(block_width, hillshade_ds.RasterXSize - xoff)
+                depths = depth_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+                hillshade = hillshade_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+                byte_arr = shade_ocean_rgb(depths, hillshade, ramp_colors, style)
+                for band_index, band in enumerate(color_bands):
+                    band.WriteArray(byte_arr[band_index], xoff=xoff, yoff=yoff)
 
     color_ds.FlushCache()
     color_ds = None
@@ -491,6 +529,24 @@ def create_ocean_rgb_tif(
     hillshade_ds = None
     publish_staged_path(staged_output_tif, output_tif)
     return output_tif
+
+
+def shade_ocean_rgb(
+    depths: np.ndarray,
+    hillshade: np.ndarray,
+    ramp_colors: np.ndarray,
+    style: OceanStyleOptions,
+) -> np.ndarray:
+    """Return a shaded RGB byte array for one ocean raster block."""
+    rgb = colorize_depth_numpy(
+        depths,
+        ramp_colors,
+        style.depth_min,
+        style.depth_max,
+    )
+    shade = (0.35 + 0.65 * np.clip(hillshade / 255.0, 0.0, 1.0)).astype(np.float32, copy=False)
+    shaded_rgb = np.clip(rgb * shade[np.newaxis, :, :], 0.0, 1.0)
+    return (shaded_rgb * 255.0).astype(np.uint8)
 
 
 def create_rgb_with_alpha_vrt(
@@ -612,8 +668,8 @@ def generate_ocean_background(
     max_zoom: int = DEFAULT_MAX_ZOOM,
 ) -> OceanBackgroundArtifacts:
     """Generate a standalone RGBA ocean background output."""
-    if which("gdaldem") is None:
-        raise RuntimeError("gdaldem is required to generate the ocean background")
+    if not hasattr(gdal, "DEMProcessing"):
+        raise RuntimeError("GDAL DEMProcessing is required to generate the ocean background")
 
     os.makedirs(temp_dir, exist_ok=True)
     stem = Path(destination).stem or "ocean"
@@ -639,6 +695,8 @@ def generate_ocean_background(
         "format": "VRT",
         "dstSRS": "EPSG:3857",
         "resampleAlg": resample_alg,
+        "multithread": True,
+        "warpOptions": ["NUM_THREADS=ALL_CPUS"],
     }
     if bbox is None:
         warp_kwargs["outputBounds"] = WEB_MERCATOR_WORLD_BOUNDS
@@ -656,13 +714,7 @@ def generate_ocean_background(
     publish_staged_path(staged_warped_vrt, warped_vrt)
 
     create_alpha_vrt(warped_vrt, alpha_vrt, alpha_tif=alpha_tif, vector_path=cleanup_gpkg)
-    staged_hillshade_tif = build_staged_path(hillshade_tif)
-    remove_if_exists(staged_hillshade_tif)
-    subprocess.run(
-        build_hillshade_command(warped_vrt, staged_hillshade_tif, hillshade_z),
-        check=True,
-    )
-    publish_staged_path(staged_hillshade_tif, hillshade_tif)
+    create_hillshade_tif(warped_vrt, hillshade_tif, hillshade_z)
     create_ocean_rgb_tif(warped_vrt, hillshade_tif, color_tif, style)
     create_rgb_with_alpha_vrt(color_tif, alpha_vrt, rgba_vrt, alpha_tif=alpha_tif)
     if vrt:

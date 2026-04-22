@@ -80,11 +80,11 @@ def colorize_depth_numpy(
     frac = np.clip((depths - depth_min) / (depth_max - depth_min), 0.0, 1.0)
     ramp_fracs = np.linspace(0.0, 1.0, len(ramp_colors))
 
-    r = np.interp(frac, ramp_fracs, ramp_colors[:, 0])
-    g = np.interp(frac, ramp_fracs, ramp_colors[:, 1])
-    b = np.interp(frac, ramp_fracs, ramp_colors[:, 2])
+    r = np.interp(frac, ramp_fracs, ramp_colors[:, 0]).astype(np.float32, copy=False)
+    g = np.interp(frac, ramp_fracs, ramp_colors[:, 1]).astype(np.float32, copy=False)
+    b = np.interp(frac, ramp_fracs, ramp_colors[:, 2]).astype(np.float32, copy=False)
 
-    return np.stack([r, g, b])
+    return np.stack([r, g, b]).astype(np.float32, copy=False)
 
 
 def apply_soft_knee_numpy(
