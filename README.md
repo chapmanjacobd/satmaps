@@ -76,6 +76,9 @@ satmaps 31TCF,31TDF,31TCE,31TDE --format webp --quality 80 -o region.pmtiles
 # BBox render using either a global or bbox-matched standalone ocean background
 satmaps --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii.pmtiles
 
+# Makefile shortcut for the graded Hawaii bbox preset
+make hawaii
+
 # Global run
 satmaps --global --ocean-background ocean.tif -o global.pmtiles
 ```
