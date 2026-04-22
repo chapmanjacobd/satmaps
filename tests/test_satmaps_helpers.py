@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import sys
@@ -13,17 +14,58 @@ import satmaps
 from satmaps import (
     build_alpha_block,
     build_fill_allowed_mask,
-    check_land_gebco,
+    build_bbox_geometry,
     expand_subtiles,
-    filter_mgrs_tiles,
     find_resume_path,
     get_ocean_mask_band_index,
-    get_mgrs_tile_bounds,
     iter_processing_windows,
     open_date_band_sets,
     parse_bbox,
     restore_resume_state,
 )
+
+QFJ_TILE_BOUNDS = (
+    -158.039128863903,
+    20.7971889977951,
+    -157.06683030196527,
+    21.692137914318558,
+)
+
+
+def build_projected_ocean_mask(
+    mask_path: Path,
+    land_patch: np.ndarray,
+) -> None:
+    min_lon, min_lat, max_lon, max_lat = QFJ_TILE_BOUNDS
+    wgs84 = osr.SpatialReference()
+    wgs84.ImportFromEPSG(4326)
+    web_mercator = osr.SpatialReference()
+    web_mercator.ImportFromEPSG(3857)
+    if hasattr(wgs84, "SetAxisMappingStrategy"):
+        wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        web_mercator.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    transform = osr.CoordinateTransformation(wgs84, web_mercator)
+
+    min_x, min_y, _ = transform.TransformPoint(min_lon, min_lat)
+    max_x, max_y, _ = transform.TransformPoint(max_lon, max_lat)
+    left = min(min_x, max_x) - 1000.0
+    right = max(min_x, max_x) + 1000.0
+    bottom = min(min_y, max_y) - 1000.0
+    top = max(min_y, max_y) + 1000.0
+
+    height, width = land_patch.shape
+    pixel_width = (right - left) / width
+    pixel_height = (top - bottom) / height
+
+    ds = gdal.GetDriverByName("GTiff").Create(str(mask_path), width, height, 4, gdal.GDT_Byte)
+    assert ds is not None
+    ds.SetGeoTransform((left, pixel_width, 0.0, top, 0.0, -pixel_height))
+    ds.SetProjection(web_mercator.ExportToWkt())
+    alpha_band = ds.GetRasterBand(4)
+    alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
+    alpha_band.Fill(255)
+    alpha_band.WriteArray(land_patch)
+    ds = None
 
 
 def test_restore_resume_state_round_trip(
@@ -74,21 +116,45 @@ def test_parse_bbox_parses_numbers_and_exits_on_invalid_input(
     assert "Error: Invalid bbox format: not,a,bbox" in capsys.readouterr().out
 
 
-def test_filter_mgrs_tiles_uses_ocean_mask_filter_when_available(monkeypatch: object) -> None:
-    calls: list[tuple[str, str]] = []
+def test_discover_mgrs_bases_uses_bbox_clipped_ocean_mask_when_available(
+    monkeypatch: object,
+) -> None:
+    calls: list[tuple[str, tuple[float, float, float, float] | None]] = []
 
-    def fake_check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
-        calls.append((mgrs_tile, gebco_src))
-        return mgrs_tile == "32TLP"
+    def fake_discover(
+        ocean_mask_src: str,
+        bbox: tuple[float, float, float, float] | None = None,
+    ) -> set[str]:
+        calls.append((ocean_mask_src, bbox))
+        return {"05QFJ", "04QFJ"}
 
-    monkeypatch.setattr("satmaps.check_land_gebco", fake_check_land_gebco)
+    monkeypatch.setattr("satmaps.discover_mgrs_tiles_from_ocean_mask", fake_discover)
 
-    assert filter_mgrs_tiles(["31TDF", "32TLP", "33TWN"], "gebco.vrt") == ["32TLP"]
-    assert calls == [("31TDF", "gebco.vrt"), ("32TLP", "gebco.vrt"), ("33TWN", "gebco.vrt")]
+    args = argparse.Namespace(bbox="-158.0,20.8,-157.0,21.7", all_tiles=False, mgrs="")
 
-    calls.clear()
-    assert filter_mgrs_tiles(["31TDF", "32TLP"], None) == ["31TDF", "32TLP"]
-    assert calls == []
+    assert satmaps.discover_mgrs_bases(args, "gebco.vrt") == ["04QFJ", "05QFJ"]
+    assert calls == [("gebco.vrt", (-158.0, 20.8, -157.0, 21.7))]
+
+
+def test_discover_mgrs_bases_intersects_global_s3_tiles_with_mask(monkeypatch: object) -> None:
+    monkeypatch.setattr(
+        "satmaps.discover_mgrs_tiles_from_ocean_mask",
+        lambda ocean_mask_src, bbox=None: {"04QFJ", "99ZZZ"},
+    )
+    monkeypatch.setattr(
+        satmaps,
+        "S3_FOLDER_CACHE",
+        {
+            "2025/07/01": {
+                "Sentinel-2_mosaic_2025_Q3_04QFJ_0_0",
+                "Sentinel-2_mosaic_2025_Q3_31TDF_0_0",
+            }
+        },
+    )
+
+    args = argparse.Namespace(bbox=None, all_tiles=True, mgrs="")
+
+    assert satmaps.discover_mgrs_bases(args, "gebco.vrt") == ["04QFJ"]
 
 
 def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: object) -> None:
@@ -182,104 +248,56 @@ def test_build_fill_allowed_mask_excludes_nodata_pixels() -> None:
     )
 
 
-def test_get_mgrs_tile_bounds_uses_full_tile_extent() -> None:
-    tile_bounds = get_mgrs_tile_bounds("4QFJ")
-    assert tile_bounds is not None
-    min_lon, min_lat, max_lon, max_lat = tile_bounds
-
-    assert min_lon == pytest.approx(-158.039128863903)
-    assert min_lat == pytest.approx(20.7971889977951)
-    assert max_lon == pytest.approx(-157.06683030196527)
-    assert max_lat == pytest.approx(21.692137914318558)
-
-
-def test_check_land_gebco_samples_projected_mask_across_tile_extent(tmp_path: Path) -> None:
-    tile_bounds = get_mgrs_tile_bounds("4QFJ")
-    assert tile_bounds is not None
-    min_lon, min_lat, max_lon, max_lat = tile_bounds
-
-    wgs84 = osr.SpatialReference()
-    wgs84.ImportFromEPSG(4326)
+def test_build_bbox_geometry_reprojects_bbox_to_dataset_srs() -> None:
     web_mercator = osr.SpatialReference()
     web_mercator.ImportFromEPSG(3857)
-    if hasattr(wgs84, "SetAxisMappingStrategy"):
-        wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        web_mercator.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    transform = osr.CoordinateTransformation(wgs84, web_mercator)
+    bbox_geom = build_bbox_geometry(QFJ_TILE_BOUNDS, web_mercator)
 
-    min_x, min_y, _ = transform.TransformPoint(min_lon, min_lat)
-    max_x, max_y, _ = transform.TransformPoint(max_lon, max_lat)
-    left = min(min_x, max_x) - 1000.0
-    right = max(min_x, max_x) + 1000.0
-    bottom = min(min_y, max_y) - 1000.0
-    top = max(min_y, max_y) + 1000.0
+    min_lon, min_lat, max_lon, max_lat = QFJ_TILE_BOUNDS
+    expected_bounds = satmaps.tiler.lonlat_bbox_to_mercator_bounds(
+        min_lon, min_lat, max_lon, max_lat
+    )
+    envelope = bbox_geom.GetEnvelope()
 
-    width = 100
-    height = 100
-    pixel_width = (right - left) / width
-    pixel_height = (top - bottom) / height
-
-    ocean_mask_path = tmp_path / "ocean-mask-3857.tif"
-    ds = gdal.GetDriverByName("GTiff").Create(str(ocean_mask_path), width, height, 4, gdal.GDT_Byte)
-    assert ds is not None
-    ds.SetGeoTransform((left, pixel_width, 0.0, top, 0.0, -pixel_height))
-    ds.SetProjection(web_mercator.ExportToWkt())
-    alpha_band = ds.GetRasterBand(4)
-    alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
-    alpha_band.Fill(255)
-
-    land_patch = np.full((height, width), 255, dtype=np.uint8)
-    ne_x, ne_y, _ = transform.TransformPoint(max_lon, max_lat)
-    px = min(max(int((ne_x - left) / pixel_width), 1), width - 2)
-    py = min(max(int((top - ne_y) / pixel_height), 1), height - 2)
-    land_patch[py - 1 : py + 2, px - 1 : px + 2] = 0
-    alpha_band.WriteArray(land_patch)
-    ds = None
-
-    assert check_land_gebco("4QFJ", str(ocean_mask_path))
+    assert envelope == pytest.approx(
+        (
+            expected_bounds[0],
+            expected_bounds[2],
+            expected_bounds[1],
+            expected_bounds[3],
+        )
+    )
 
 
 def test_discover_mgrs_tiles_from_projected_ocean_mask_uses_wgs84_sampling(tmp_path: Path) -> None:
-    tile_bounds = get_mgrs_tile_bounds("4QFJ")
-    assert tile_bounds is not None
-    min_lon, min_lat, max_lon, max_lat = tile_bounds
-
-    wgs84 = osr.SpatialReference()
-    wgs84.ImportFromEPSG(4326)
-    web_mercator = osr.SpatialReference()
-    web_mercator.ImportFromEPSG(3857)
-    if hasattr(wgs84, "SetAxisMappingStrategy"):
-        wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        web_mercator.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    transform = osr.CoordinateTransformation(wgs84, web_mercator)
-
-    min_x, min_y, _ = transform.TransformPoint(min_lon, min_lat)
-    max_x, max_y, _ = transform.TransformPoint(max_lon, max_lat)
-    left = min(min_x, max_x) - 1000.0
-    right = max(min_x, max_x) + 1000.0
-    bottom = min(min_y, max_y) - 1000.0
-    top = max(min_y, max_y) + 1000.0
-
-    width = 100
-    height = 100
-    pixel_width = (right - left) / width
-    pixel_height = (top - bottom) / height
-
     ocean_mask_path = tmp_path / "ocean-mask-3857.tif"
-    ds = gdal.GetDriverByName("GTiff").Create(str(ocean_mask_path), width, height, 4, gdal.GDT_Byte)
-    assert ds is not None
-    ds.SetGeoTransform((left, pixel_width, 0.0, top, 0.0, -pixel_height))
-    ds.SetProjection(web_mercator.ExportToWkt())
-    alpha_band = ds.GetRasterBand(4)
-    alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
-    alpha_band.Fill(255)
-
-    land_patch = np.full((height, width), 255, dtype=np.uint8)
+    land_patch = np.full((100, 100), 255, dtype=np.uint8)
     land_patch[20:80, 20:80] = 0
-    alpha_band.WriteArray(land_patch)
-    ds = None
+    build_projected_ocean_mask(ocean_mask_path, land_patch)
 
     assert "04QFJ" in satmaps.discover_mgrs_tiles_from_ocean_mask(str(ocean_mask_path))
+
+
+def test_discover_mgrs_tiles_from_projected_ocean_mask_respects_bbox_clip(
+    tmp_path: Path,
+) -> None:
+    ocean_mask_path = tmp_path / "ocean-mask-3857.tif"
+    land_patch = np.full((100, 100), 255, dtype=np.uint8)
+    land_patch[10:30, 60:80] = 0
+    build_projected_ocean_mask(ocean_mask_path, land_patch)
+
+    min_lon, min_lat, max_lon, max_lat = QFJ_TILE_BOUNDS
+    southwest_bbox = (min_lon, min_lat, (min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0)
+    northeast_bbox = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0, max_lon, max_lat)
+
+    assert satmaps.discover_mgrs_tiles_from_ocean_mask(
+        str(ocean_mask_path),
+        bbox=southwest_bbox,
+    ) == set()
+    assert satmaps.discover_mgrs_tiles_from_ocean_mask(
+        str(ocean_mask_path),
+        bbox=northeast_bbox,
+    ) == {"04QFJ"}
 
 
 def test_build_alpha_block_masks_out_pixels_outside_ocean_render() -> None:

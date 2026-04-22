@@ -261,22 +261,40 @@ def discover_mgrs_tiles_in_bbox(
     return list(discovered_mgrs)
 
 
-def filter_mgrs_tiles(
-    discovered_mgrs: List[str],
-    gebco_vrt_source: Optional[str],
-) -> List[str]:
-    """Keep only tiles that should participate in land rendering."""
-    mgrs_bases = []
-    for mgrs_tile in discovered_mgrs:
-        if gebco_vrt_source and check_land_gebco(mgrs_tile, gebco_vrt_source):
-            mgrs_bases.append(mgrs_tile)
-        elif not gebco_vrt_source:
-            mgrs_bases.append(mgrs_tile)
+def build_bbox_geometry(
+    bbox: Tuple[float, float, float, float],
+    target_srs: Optional[osr.SpatialReference] = None,
+) -> ogr.Geometry:
+    """Build a bbox polygon, reprojecting it from WGS84 when a target SRS is supplied."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    ring.AddPoint(min_lon, min_lat)
+    ring.AddPoint(max_lon, min_lat)
+    ring.AddPoint(max_lon, max_lat)
+    ring.AddPoint(min_lon, max_lat)
+    ring.AddPoint(min_lon, min_lat)
+    polygon = ogr.Geometry(ogr.wkbPolygon)
+    polygon.AddGeometry(ring)
 
-    return mgrs_bases
+    if target_srs is None:
+        return polygon
+
+    dataset_srs = target_srs.Clone()
+    wgs84_srs = osr.SpatialReference()
+    wgs84_srs.ImportFromEPSG(4326)
+    if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
+        wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    if not (dataset_srs.IsSameGeogCS(wgs84_srs) and dataset_srs.IsGeographic()):
+        polygon.Transform(osr.CoordinateTransformation(wgs84_srs, dataset_srs))
+
+    return polygon
 
 
-def discover_mgrs_tiles_from_ocean_mask(ocean_mask_src: str) -> Set[str]:
+def discover_mgrs_tiles_from_ocean_mask(
+    ocean_mask_src: str,
+    bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> Set[str]:
     """Discover MGRS tiles that contain land or shallow water using an existing ocean mask."""
     ds = gdal.Open(ocean_mask_src)
     if ds is None:
@@ -310,41 +328,65 @@ def discover_mgrs_tiles_from_ocean_mask(ocean_mask_src: str) -> Set[str]:
     # Polygonize the mask
     mgrs_tiles: Set[str] = set()
     m = mgrs.MGRS()
+    dataset_srs = ds.GetSpatialRef()
 
     mem_ds = ogr.GetDriverByName("Memory").CreateDataSource("mask")
-    layer = mem_ds.CreateLayer("mask", srs=ds.GetSpatialRef())
+    layer = mem_ds.CreateLayer("mask", srs=dataset_srs)
     layer.CreateField(ogr.FieldDefn("dn", ogr.OFTInteger))
 
     gdal.Polygonize(mask_band, None, layer, 0, [], callback=None)
+    clip_geom = build_bbox_geometry(bbox, dataset_srs) if bbox is not None else None
     to_wgs84 = build_dataset_to_wgs84_transform(ds)
 
     for feature in layer:
-        if feature.GetField("dn") == 1:
-            geom = feature.GetGeometryRef()
-            if geom is None:
+        if feature.GetField("dn") != 1:
+            continue
+        geom = feature.GetGeometryRef()
+        if geom is None:
+            continue
+        sample_geom = geom.Clone()
+        if sample_geom is None:
+            continue
+        if clip_geom is not None:
+            if not sample_geom.Intersects(clip_geom):
                 continue
-            sample_geom = geom.Clone()
-            if sample_geom is None:
+            clipped_geom = sample_geom.Intersection(clip_geom)
+            if clipped_geom is None or clipped_geom.IsEmpty():
                 continue
-            if to_wgs84 is not None:
-                sample_geom.Transform(to_wgs84)
-            # Sample points within or on the boundary of the polygon
-            # For efficiency, we can just use the envelope or centroid for small polygons,
-            # or sample points for larger ones.
-            envelope = sample_geom.GetEnvelope()  # (minX, maxX, minY, maxY)
-            # Sample at 0.5 degree intervals within the envelope
-            lons = np.arange(envelope[0], envelope[1] + 0.5, 0.5)
-            lats = np.arange(envelope[2], envelope[3] + 0.5, 0.5)
-            for lon in lons:
-                for lat in lats:
-                    point = ogr.Geometry(ogr.wkbPoint)
-                    point.AddPoint(lon, lat)
-                    if sample_geom.Contains(point):
-                        try:
-                            tile = m.toMGRS(lat, lon, MGRSPrecision=0)
-                            mgrs_tiles.add(tile.decode() if isinstance(tile, bytes) else tile)
-                        except Exception:
-                            continue
+            sample_geom = clipped_geom
+        if to_wgs84 is not None:
+            sample_geom.Transform(to_wgs84)
+        envelope = sample_geom.GetEnvelope()  # (minX, maxX, minY, maxY)
+        sample_points: Set[Tuple[float, float]] = set()
+        centroid = sample_geom.Centroid()
+        if centroid is not None and not centroid.IsEmpty():
+            sample_points.add((centroid.GetX(), centroid.GetY()))
+        lon_candidates = (
+            envelope[0],
+            (envelope[0] + envelope[1]) / 2.0,
+            envelope[1],
+        )
+        lat_candidates = (
+            envelope[2],
+            (envelope[2] + envelope[3]) / 2.0,
+            envelope[3],
+        )
+        for lon in lon_candidates:
+            for lat in lat_candidates:
+                sample_points.add((lon, lat))
+        for lon in np.arange(envelope[0], envelope[1] + 0.5, 0.5):
+            for lat in np.arange(envelope[2], envelope[3] + 0.5, 0.5):
+                sample_points.add((float(lon), float(lat)))
+
+        for lon, lat in sample_points:
+            point = ogr.Geometry(ogr.wkbPoint)
+            point.AddPoint(lon, lat)
+            if sample_geom.Intersects(point):
+                try:
+                    tile = m.toMGRS(lat, lon, MGRSPrecision=0)
+                    mgrs_tiles.add(tile.decode() if isinstance(tile, bytes) else tile)
+                except mgrs_core.MGRSError:
+                    continue
     return mgrs_tiles
 
 
@@ -354,12 +396,15 @@ def discover_mgrs_bases(
 ) -> List[str]:
     """Resolve the requested MGRS tile list from bbox, global, or explicit inputs."""
     if args.bbox:
-        min_lon, min_lat, max_lon, max_lat = parse_bbox(args.bbox)
-        discovered_mgrs = discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat)
-        mgrs_bases = filter_mgrs_tiles(discovered_mgrs, gebco_vrt_source)
-        print(
-            f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} kept after ocean-mask filtering."
-        )
+        bbox = parse_bbox(args.bbox)
+        if gebco_vrt_source:
+            print("Scanning ocean mask for land tiles within bbox...")
+            mgrs_bases = sorted(list(discover_mgrs_tiles_from_ocean_mask(gebco_vrt_source, bbox=bbox)))
+            print(f"Discovered {len(mgrs_bases)} MGRS tiles with land/shallow water inside bbox.")
+        else:
+            min_lon, min_lat, max_lon, max_lat = bbox
+            mgrs_bases = discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat)
+            print(f"Discovered {len(mgrs_bases)} MGRS tiles in bbox.")
         return mgrs_bases
 
     if args.all_tiles:
@@ -537,42 +582,6 @@ def get_ocean_mask_band_index(dataset: gdal.Dataset) -> Optional[int]:
     return None
 
 
-def get_mgrs_tile_bounds(mgrs_tile: str) -> Optional[Tuple[float, float, float, float]]:
-    """Return the approximate WGS84 bounds of a 100 km MGRS tile."""
-    m = mgrs.MGRS()
-    try:
-        sw_lat, sw_lon = m.toLatLon(f"{mgrs_tile}0000000000")
-        ne_lat, ne_lon = m.toLatLon(f"{mgrs_tile}9999999999")
-    except mgrs_core.MGRSError:
-        return None
-
-    min_lon = min(sw_lon, ne_lon)
-    min_lat = min(sw_lat, ne_lat)
-    max_lon = max(sw_lon, ne_lon)
-    max_lat = max(sw_lat, ne_lat)
-    return min_lon, min_lat, max_lon, max_lat
-
-
-def build_wgs84_to_dataset_transform(dataset: gdal.Dataset) -> Optional[osr.CoordinateTransformation]:
-    """Build a lon/lat-to-dataset transform when the raster is not already in WGS84."""
-    dataset_srs = dataset.GetSpatialRef()
-    if dataset_srs is None:
-        return None
-
-    dataset_srs = dataset_srs.Clone()
-    wgs84_srs = osr.SpatialReference()
-    wgs84_srs.ImportFromEPSG(4326)
-
-    if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
-        wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-
-    if dataset_srs.IsSameGeogCS(wgs84_srs) and dataset_srs.IsGeographic():
-        return None
-
-    return osr.CoordinateTransformation(wgs84_srs, dataset_srs)
-
-
 def build_dataset_to_wgs84_transform(dataset: gdal.Dataset) -> Optional[osr.CoordinateTransformation]:
     """Build a dataset-to-lon/lat transform when the raster is not already in WGS84."""
     dataset_srs = dataset.GetSpatialRef()
@@ -653,56 +662,6 @@ def populate_s3_cache(date_paths: List[str]) -> None:
 
 
 # --- Processing Layer (NumPy Manipulation) ---
-
-
-def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
-    """Check if an MGRS tile contains land according to GEBCO (sampling)."""
-    tile_bounds = get_mgrs_tile_bounds(mgrs_tile)
-    if tile_bounds is None:
-        return True
-    min_lon, min_lat, max_lon, max_lat = tile_bounds
-
-    ds = gdal.Open(gebco_src)
-    if ds is None:
-        print(f"Warning: Could not open GEBCO source for land check: {gebco_src}")
-        return True
-    band_index = get_ocean_mask_band_index(ds)
-    try:
-        if band_index is None:
-            return True
-        band = ds.GetRasterBand(band_index)
-        gt = ds.GetGeoTransform()
-        inv_gt = gdal.InvGeoTransform(gt)
-        transform = build_wgs84_to_dataset_transform(ds)
-
-        # Sample the actual 100 km tile bounds, but read the smallest covering
-        # window once instead of issuing many tiny GDAL reads.
-        sample_points: list[tuple[int, int]] = []
-        for lat in np.linspace(min_lat, max_lat, 25):
-            for lon in np.linspace(min_lon, max_lon, 25):
-                sample_x, sample_y = lon, lat
-                if transform is not None:
-                    sample_x, sample_y, _ = transform.TransformPoint(lon, lat)
-                px, py = gdal.ApplyGeoTransform(inv_gt, sample_x, sample_y)
-                px, py = int(px), int(py)
-                if 0 <= px < ds.RasterXSize and 0 <= py < ds.RasterYSize:
-                    sample_points.append((px, py))
-        if not sample_points:
-            return False
-
-        xoff = min(px for px, _ in sample_points)
-        yoff = min(py for _, py in sample_points)
-        xend = max(px for px, _ in sample_points) + 1
-        yend = max(py for _, py in sample_points) + 1
-        sampled = band.ReadAsArray(xoff, yoff, xend - xoff, yend - yoff).astype(np.float32)
-
-        for px, py in sample_points:
-            val = sampled[py - yoff, px - xoff]
-            if val < OCEAN_MASK_ALPHA_THRESHOLD:
-                return True
-        return False
-    finally:
-        ds = None
 
 
 def fill_nan_nearest(
