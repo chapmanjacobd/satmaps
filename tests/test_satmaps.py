@@ -710,6 +710,32 @@ def test_prepare_ocean_background_crops_aligned_mercator_source_without_warp(
     prepared_ds = None
 
 
+def test_get_bbox_scan_window_crops_before_scanning(tmp_path: Path) -> None:
+    source_path = tmp_path / "scan_window.tif"
+    dataset = gdal.GetDriverByName("GTiff").Create(str(source_path), 100, 100, 1, gdal.GDT_Byte)
+    assert dataset is not None
+    dataset.SetGeoTransform((0.0, 0.1, 0.0, 10.0, 0.0, -0.1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    dataset.SetProjection(srs.ExportToWkt())
+
+    src_win = satmaps.get_bbox_scan_window(dataset, (1.0, 1.0, 2.0, 2.0))
+
+    assert src_win == (10, 80, 10, 10)
+
+
+def test_get_bbox_scan_window_returns_none_outside_dataset(tmp_path: Path) -> None:
+    source_path = tmp_path / "scan_window_outside.tif"
+    dataset = gdal.GetDriverByName("GTiff").Create(str(source_path), 100, 100, 1, gdal.GDT_Byte)
+    assert dataset is not None
+    dataset.SetGeoTransform((0.0, 0.1, 0.0, 10.0, 0.0, -0.1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    dataset.SetProjection(srs.ExportToWkt())
+
+    assert satmaps.get_bbox_scan_window(dataset, (20.0, 20.0, 21.0, 21.0)) is None
+
+
 def test_build_hillshade_command_matches_expected_flags(tmp_path: Path) -> None:
     command = ocean.build_hillshade_command(
         str(tmp_path / "in.vrt"),
@@ -1034,6 +1060,7 @@ def test_warp_to_web_mercator_uses_shared_zoom13_resolution(monkeypatch: object)
     assert warp_options_calls[0]["yRes"] == pytest.approx(
         satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
     )
+    assert warp_options_calls[0]["targetAlignedPixels"] is True
 
 
 def test_warp_to_web_mercator_respects_requested_zoom(monkeypatch: object) -> None:
@@ -1049,6 +1076,41 @@ def test_warp_to_web_mercator_respects_requested_zoom(monkeypatch: object) -> No
 
     assert warp_options_calls[0]["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
     assert warp_options_calls[0]["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
+    assert warp_options_calls[0]["targetAlignedPixels"] is True
+
+
+def test_warp_to_web_mercator_aligns_adjacent_tiles_to_shared_pixel_grid(
+    tmp_path: Path,
+) -> None:
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32604)
+    pixel_size = satmaps.tiler.web_mercator_pixel_size(13)
+
+    warped_datasets = []
+    for index, x_origin in enumerate((500000.0, 501920.0), start=1):
+        source_path = tmp_path / f"tile_{index}.tif"
+        dataset = gdal.GetDriverByName("GTiff").Create(str(source_path), 64, 64, 4, gdal.GDT_Byte)
+        assert dataset is not None
+        dataset.SetProjection(srs.ExportToWkt())
+        dataset.SetGeoTransform((x_origin, 30.0, 0.0, 2300.0, 0.0, -30.0))
+        for band_index, value in enumerate((40 * index, 80, 120), start=1):
+            dataset.GetRasterBand(band_index).WriteArray(np.full((64, 64), value, dtype=np.uint8))
+        dataset.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+        dataset.GetRasterBand(4).WriteArray(np.full((64, 64), 255, dtype=np.uint8))
+        dataset = None
+
+        warped_path = tmp_path / f"tile_{index}_3857.tif"
+        satmaps.warp_to_web_mercator(str(source_path), str(warped_path), "lanczos", 13)
+        warped_dataset = gdal.Open(str(warped_path))
+        assert warped_dataset is not None
+        warped_datasets.append(warped_dataset)
+
+    gt_1 = warped_datasets[0].GetGeoTransform()
+    gt_2 = warped_datasets[1].GetGeoTransform()
+
+    for value in (gt_1[0], gt_1[3], gt_2[0], gt_2[3]):
+        assert (value / pixel_size) == pytest.approx(round(value / pixel_size), abs=1e-6)
+    assert gt_1[3] == pytest.approx(gt_2[3], abs=1e-6)
 
 
 def test_warp_to_web_mercator_removes_existing_destination(monkeypatch: object) -> None:

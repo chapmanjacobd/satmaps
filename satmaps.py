@@ -60,7 +60,6 @@ def build_prepared_ocean_path(output_path: str) -> str:
     """Return the deterministic heavyweight bbox-clipped ocean TIFF path."""
     return f".temp/{temp_basename_from_output(output_path)}_ocean_bbox.tif"
 
-
 def build_processed_tile_paths(mgrs_subtile: str, output_path: str) -> Tuple[str, str]:
     """Return the deterministic heavyweight TIFF paths for one processed subtile."""
     stem = temp_basename_from_output(output_path)
@@ -314,14 +313,18 @@ def discover_mgrs_tiles_from_ocean_mask(
     to_wgs84 = build_dataset_to_wgs84_transform(ds)
     geotransform = ds.GetGeoTransform()
     block_x, block_y = band.GetBlockSize()
+    scan_window = get_bbox_scan_window(ds, bbox)
+    if scan_window is None:
+        return set()
+    scan_xoff, scan_yoff, scan_width, scan_height = scan_window
     min_lon = min_lat = max_lon = max_lat = None
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
 
-    for yoff in range(0, ds.RasterYSize, block_y):
-        height = min(block_y, ds.RasterYSize - yoff)
-        for xoff in range(0, ds.RasterXSize, block_x):
-            width = min(block_x, ds.RasterXSize - xoff)
+    for yoff in range(scan_yoff, scan_yoff + scan_height, block_y):
+        height = min(block_y, scan_yoff + scan_height - yoff)
+        for xoff in range(scan_xoff, scan_xoff + scan_width, block_x):
+            width = min(block_x, scan_xoff + scan_width - xoff)
             data = band.ReadAsArray(xoff, yoff, width, height).astype(np.float32)
             fill_allowed_mask = build_fill_allowed_mask(data, nodata_value=nodata)
             if not np.any(fill_allowed_mask):
@@ -582,6 +585,29 @@ def build_dataset_to_wgs84_transform(dataset: gdal.Dataset) -> Optional[osr.Coor
         return None
 
     return osr.CoordinateTransformation(dataset_srs, wgs84_srs)
+
+
+def get_bbox_scan_window(
+    dataset: gdal.Dataset,
+    bbox: Optional[Tuple[float, float, float, float]],
+) -> Optional[Tuple[int, int, int, int]]:
+    """Return the source window covering the requested bbox before block iteration starts."""
+    if bbox is None:
+        return 0, 0, dataset.RasterXSize, dataset.RasterYSize
+
+    dataset_srs = dataset.GetSpatialRef()
+    bbox_geometry = build_bbox_geometry(bbox, dataset_srs)
+    min_x, max_x, min_y, max_y = bbox_geometry.GetEnvelope()
+    bbox_bounds = (min_x, min_y, max_x, max_y)
+    scan_bounds = tiler.intersect_te_bounds(tiler.get_dataset_bounds(dataset), bbox_bounds)
+    if scan_bounds is None:
+        return None
+
+    src_win = tiler.te_to_src_win(dataset, scan_bounds)
+    if src_win[2] <= 0 or src_win[3] <= 0:
+        return None
+
+    return src_win
 
 
 def source_matches_web_mercator_grid(
@@ -1073,6 +1099,8 @@ def build_alpha_block(
     """Build the output alpha band for one block."""
     if ocean_mask_alpha is None:
         alpha_block = source_valid_block.astype(np.uint8) * 255
+    elif fill_allowed_block is not None:
+        alpha_block = fill_allowed_block.astype(np.uint8) * 255
     else:
         alpha_block = np.clip(255.0 - ocean_mask_alpha, 0.0, 255.0).astype(np.uint8)
 
@@ -1161,6 +1189,7 @@ def warp_to_web_mercator(
         xRes=pixel_size,
         yRes=pixel_size,
         resampleAlg=resample_alg,
+        targetAlignedPixels=True,
         creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "TILED=YES", "BIGTIFF=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512"],
     )
     gdal.Warp(destination_path, source_path, options=warp_options)

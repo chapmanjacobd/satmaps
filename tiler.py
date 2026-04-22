@@ -327,11 +327,20 @@ def proj_win_to_src_win(
     return te_to_src_win(dataset, proj_win_to_te(proj_win))
 
 
+def has_alpha_band(dataset: gdal.Dataset) -> bool:
+    """Return whether the dataset advertises an explicit alpha band."""
+    return any(
+        dataset.GetRasterBand(index).GetColorInterpretation() == gdal.GCI_AlphaBand
+        for index in range(1, dataset.RasterCount + 1)
+    )
+
+
 def process_chunk(args: ChunkTask) -> str:
     """Worker function for parallel gdal.Translate."""
     input_vrt, chunk_file, format, options, te_bounds = args
     ds = None
     temp_chunk_raster = chunk_file.replace(".mbtiles", ".tif")
+    temp_chunk_rgb = chunk_file.replace(".mbtiles", "_rgb.tif")
     staged_chunk_file = build_staged_path(chunk_file)
     try:
         gdal.UseExceptions()
@@ -361,6 +370,24 @@ def process_chunk(args: ChunkTask) -> str:
         temp_ds.FlushCache()
         temp_ds = None
 
+        chunk_source = temp_chunk_raster
+        chunk_ds = gdal.Open(temp_chunk_raster)
+        if chunk_ds is None:
+            return ""
+        if has_alpha_band(chunk_ds):
+            remove_if_exists(temp_chunk_rgb)
+            rgb_ds = gdal.Translate(
+                temp_chunk_rgb,
+                temp_chunk_raster,
+                options=gdal.TranslateOptions(format="GTiff", bandList=[1, 2, 3]),
+            )
+            if rgb_ds is None:
+                return ""
+            rgb_ds.FlushCache()
+            rgb_ds = None
+            chunk_source = temp_chunk_rgb
+        chunk_ds = None
+
         translate_options = gdal.TranslateOptions(
             format="MBTiles",
             outputType=gdal.GDT_Byte,
@@ -377,7 +404,7 @@ def process_chunk(args: ChunkTask) -> str:
                 f"QUALITY={options['quality']}",
                 f"RESAMPLING={options['resample_alg'] if options['resample_alg'] != 'gauss' else 'bilinear'}",
                 f"BLOCKSIZE={options.get('blocksize', 512)}",
-                "ZOOM_LEVEL_STRATEGY=UPPER",
+                "ZOOM_LEVEL_STRATEGY=LOWER",
             ],
         )
 
@@ -385,7 +412,7 @@ def process_chunk(args: ChunkTask) -> str:
             gdal.SetConfigOption("WEBP_LEVEL", str(options["quality"]))
 
         remove_if_exists(staged_chunk_file)
-        gdal.Translate(staged_chunk_file, temp_chunk_raster, options=translate_options)
+        gdal.Translate(staged_chunk_file, chunk_source, options=translate_options)
         os.replace(staged_chunk_file, chunk_file)
         return chunk_file
     except Exception as e:
@@ -397,6 +424,8 @@ def process_chunk(args: ChunkTask) -> str:
         ds = None
         if os.path.exists(temp_chunk_raster):
             os.remove(temp_chunk_raster)
+        if os.path.exists(temp_chunk_rgb):
+            os.remove(temp_chunk_rgb)
         remove_if_exists(staged_chunk_file)
 
 

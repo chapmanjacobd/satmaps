@@ -392,6 +392,18 @@ def test_build_alpha_block_prefers_land_for_filled_seam_pixels() -> None:
     )
 
 
+def test_build_alpha_block_uses_hard_mask_when_fill_allowed_is_present() -> None:
+    np.testing.assert_array_equal(
+        build_alpha_block(
+            np.array([[255.0, 200.0, 0.0]], dtype=np.float32),
+            np.array([[False, False, False]], dtype=bool),
+            np.array([[True, True, True]], dtype=bool),
+            np.array([[False, True, False]], dtype=bool),
+        ),
+        np.array([[0, 255, 0]], dtype=np.uint8),
+    )
+
+
 def test_build_alpha_block_preserves_ocean_alpha_gradient() -> None:
     np.testing.assert_array_equal(
         build_alpha_block(

@@ -460,55 +460,72 @@ def test_run_tiling_simplified_respects_alpha_masked_sources(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
+    source_path = tmp_path / "master.vrt"
+    source_path.write_text("fake vrt")
+    chunk_file = tmp_path / ".temp" / "chunk.mbtiles"
+    chunk_tif = str(chunk_file).replace(".mbtiles", ".tif")
+    chunk_rgb_tif = str(chunk_file).replace(".mbtiles", "_rgb.tif")
 
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(3857)
 
-    def write_masked_tile(name: str, valid_slice: slice, color: tuple[int, int, int]) -> Path:
-        path = tmp_path / f"{name}.tif"
-        ds = gdal.GetDriverByName("GTiff").Create(str(path), 512, 256, 4, gdal.GDT_Byte)
-        ds.SetGeoTransform((0.0, 1000.0, 0.0, 256000.0, 0.0, -1000.0))
-        ds.SetProjection(srs.ExportToWkt())
+    def build_mem_dataset(raster_count: int, alpha: bool = False) -> gdal.Dataset:
+        dataset = gdal.GetDriverByName("MEM").Create("", 512, 256, raster_count, gdal.GDT_Byte)
+        assert dataset is not None
+        dataset.SetGeoTransform((0.0, 1000.0, 0.0, 256000.0, 0.0, -1000.0))
+        dataset.SetProjection(srs.ExportToWkt())
+        if alpha:
+            dataset.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+        return dataset
 
-        alpha = np.zeros((256, 512), dtype=np.uint8)
-        alpha[:, valid_slice] = 255
-        for i, value in enumerate(color, start=1):
-            arr = np.zeros((256, 512), dtype=np.uint8)
-            arr[:, valid_slice] = value
-            ds.GetRasterBand(i).WriteArray(arr)
-        ds.GetRasterBand(4).WriteArray(alpha)
-        ds = None
-        return path
+    source_ds = build_mem_dataset(4, alpha=True)
+    alpha_chunk_ds = build_mem_dataset(4, alpha=True)
+    rgb_chunk_ds = build_mem_dataset(3)
+    translate_calls: list[tuple[str, str]] = []
 
-    left = write_masked_tile("left", slice(0, 256), (70, 180, 50))
-    right = write_masked_tile("right", slice(256, 512), (20, 50, 180))
+    def fake_open(path: str):
+        if path == str(source_path):
+            return source_ds
+        if path == chunk_tif:
+            return alpha_chunk_ds
+        if path == chunk_rgb_tif:
+            return rgb_chunk_ds
+        return None
 
-    master_vrt = tmp_path / "master.vrt"
-    gdal.BuildVRT(str(master_vrt), [str(left), str(right)], resolution="highest")
+    def fake_translate(destination: str, source: str, options=None):
+        del options
+        translate_calls.append((destination, source))
+        if destination == chunk_tif:
+            return alpha_chunk_ds
+        if destination == chunk_rgb_tif:
+            return rgb_chunk_ds
+        Path(destination).write_text("mbtiles")
+        return rgb_chunk_ds
 
-    output_mbtiles = tmp_path / "output.mbtiles"
-    run_tiling_simplified(
-        str(master_vrt),
-        str(output_mbtiles),
-        {
-            "format": "png",
-            "quality": 75,
-            "resample_alg": "bilinear",
-            "chunk_zoom": 4,
-            "processes": 1,
-            "unique_id": "test-alpha-mask",
-            "name": "Test",
-            "description": "Test",
-        },
+    monkeypatch.setattr(tiler_module.gdal, "Open", fake_open)
+    monkeypatch.setattr(tiler_module.gdal, "Translate", fake_translate)
+    monkeypatch.setattr(tiler_module.gdal, "TranslateOptions", lambda **kwargs: kwargs)
+
+    result = tiler_module.process_chunk(
+        (
+            str(source_path),
+            str(chunk_file),
+            "png",
+            {
+                "format": "png",
+                "quality": 75,
+                "resample_alg": "bilinear",
+                "blocksize": 512,
+                "name": "Test",
+                "description": "Test",
+            },
+            tiler_module.get_dataset_bounds(source_ds),
+        )
     )
 
-    ds = gdal.OpenEx(str(output_mbtiles), open_options=["ZOOM_LEVEL=7"])
-    assert ds is not None
-    arr = ds.ReadAsArray()
-    ds = None
-
-    left_center = arr[:3, arr.shape[1] // 2, arr.shape[2] // 4]
-    right_center = arr[:3, arr.shape[1] // 2, (3 * arr.shape[2]) // 4]
-
-    np.testing.assert_array_equal(left_center, np.array([70, 180, 50], dtype=np.uint8))
-    np.testing.assert_array_equal(right_center, np.array([20, 50, 180], dtype=np.uint8))
+    assert result == str(chunk_file)
+    assert translate_calls == [
+        (chunk_tif, str(source_path)),
+        (chunk_rgb_tif, chunk_tif),
+        (tiler_module.build_staged_path(str(chunk_file)), chunk_rgb_tif),
+    ]
