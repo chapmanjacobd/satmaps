@@ -564,7 +564,10 @@ def create_rgb_with_alpha_vrt(
 def remove_if_exists(path: str) -> None:
     """Delete a file if it exists."""
     if os.path.exists(path):
-        os.remove(path)
+        try:
+            gdal.Unlink(path)
+        except RuntimeError:
+            os.remove(path)
 
 
 def translate_rgba_vrt(rgba_vrt: str, destination: str) -> str:

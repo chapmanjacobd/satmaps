@@ -409,7 +409,10 @@ def build_staged_path(path: str) -> str:
 def remove_if_exists(path: str) -> None:
     """Delete a file if it exists."""
     if os.path.exists(path):
-        os.remove(path)
+        try:
+            gdal.Unlink(path)
+        except RuntimeError:
+            os.remove(path)
 
 
 def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:

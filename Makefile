@@ -36,12 +36,12 @@ test:
 tune:
 	$(PYTHON) tuner_ui.py
 
-hawaii:
+hawaii: clean
 	$(PYTHON) ocean.py --grade --bbox -158.4172265727475519,20.7947063146676037,-156.1288551802102802,21.8768578466807000
 	$(PYTHON) satmaps.py --grade --bbox -158.4172265727475519,20.7947063146676037,-156.1288551802102802,21.8768578466807000 --output hawaii.pmtiles
 
 vrt:
-	$(PYTHON) satmaps.py --grade --bbox -158.4172265727475519,20.7947063146676037,-156.1288551802102802,21.8768578466807000 --output hawaii.pmtiles --vrt
+	$(PYTHON) satmaps.py --grade --bbox -158.4172265727475519,20.7947063146676037,-156.1288551802102802,21.8768578466807000 --output hawaii.pmtiles --vrt --resume
 
 clean:
 	rm -rf __pycache__ .ruff_cache .mypy_cache .temp

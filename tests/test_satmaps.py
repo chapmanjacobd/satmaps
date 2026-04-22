@@ -440,6 +440,46 @@ def test_alpha_mask_coastline_seam_pixel_is_filled_opaquely(
     np.testing.assert_array_equal(rgba[:, 0, 1], np.array([255, 127, 63, 255], dtype=np.uint8))
 
 
+def test_open_gebco_mask_avoids_update_mode_warning(tmp_path: Path) -> None:
+    gebco_path = tmp_path / "gebco.tif"
+    gebco_ds = gdal.GetDriverByName("GTiff").Create(str(gebco_path), 4, 3, 4, gdal.GDT_Byte)
+    assert gebco_ds is not None
+    gebco_ds.SetGeoTransform((0.0, 100.0, 0.0, 300.0, 0.0, -100.0))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32631)
+    gebco_ds.SetProjection(srs.ExportToWkt())
+    alpha_band = gebco_ds.GetRasterBand(4)
+    alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
+    alpha_band.WriteArray(np.full((3, 4), 255, dtype=np.uint8))
+    gebco_ds = None
+
+    tile_grid = satmaps.TileGrid(
+        projection=srs.ExportToWkt(),
+        geotransform=(0.0, 100.0, 0.0, 300.0, 0.0, -100.0),
+        width=4,
+        height=3,
+    )
+
+    messages: list[str] = []
+
+    def handler(err_class: int, err_num: int, msg: str) -> None:
+        del err_class, err_num
+        messages.append(msg)
+
+    gdal.PushErrorHandler(handler)
+    try:
+        mask = satmaps.open_gebco_mask(str(gebco_path), tile_grid, "31TDF_0_0")
+    finally:
+        gdal.PopErrorHandler()
+
+    assert mask is not None
+    assert mask.dataset.GetGeoTransform() == pytest.approx(tile_grid.geotransform)
+    assert mask.dataset.RasterXSize == tile_grid.width
+    assert mask.dataset.RasterYSize == tile_grid.height
+    assert mask.alpha_band.GetNoDataValue() == -1.0
+    assert not any("creation ignored in update mode" in message.lower() for message in messages)
+
+
 def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
 
@@ -1009,6 +1049,18 @@ def test_warp_to_web_mercator_respects_requested_zoom(monkeypatch: object) -> No
 
     assert warp_options_calls[0]["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
     assert warp_options_calls[0]["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
+
+
+def test_warp_to_web_mercator_removes_existing_destination(monkeypatch: object) -> None:
+    removed: list[str] = []
+
+    monkeypatch.setattr("satmaps.remove_if_exists", lambda path: removed.append(path))
+    monkeypatch.setattr("satmaps.gdal.WarpOptions", lambda **kwargs: kwargs)
+    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: None)
+
+    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 14)
+
+    assert removed == ["output.tif"]
 
 
 def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:

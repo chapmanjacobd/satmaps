@@ -85,7 +85,10 @@ def publish_staged_path(staged_path: str, final_path: str) -> str:
 def remove_if_exists(path: str) -> None:
     """Delete a file if it exists."""
     if os.path.exists(path):
-        os.remove(path)
+        try:
+            gdal.Unlink(path)
+        except RuntimeError:
+            os.remove(path)
 
 
 @dataclass(frozen=True)
@@ -306,84 +309,63 @@ def discover_mgrs_tiles_from_ocean_mask(
 
     band = ds.GetRasterBand(band_index)
     nodata = band.GetNoDataValue()
-
-    # Create a temporary memory dataset for the mask
-    mem_driver = gdal.GetDriverByName("MEM")
-    mask_ds = mem_driver.Create("", ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Byte)
-    mask_ds.SetProjection(ds.GetProjection())
-    mask_ds.SetGeoTransform(ds.GetGeoTransform())
-    mask_band = mask_ds.GetRasterBand(1)
-
-    # Process in blocks to save memory
-    block_x, block_y = band.GetBlockSize()
-    for y in range(0, ds.RasterYSize, block_y):
-        h = min(block_y, ds.RasterYSize - y)
-        for x in range(0, ds.RasterXSize, block_x):
-            w = min(block_x, ds.RasterXSize - x)
-            data = band.ReadAsArray(x, y, w, h).astype(np.float32)
-
-            mask = build_fill_allowed_mask(data, nodata_value=nodata)
-            mask_band.WriteArray(mask.astype(np.uint8), x, y)
-
-    # Polygonize the mask
     mgrs_tiles: Set[str] = set()
     m = mgrs.MGRS()
-    dataset_srs = ds.GetSpatialRef()
-
-    mem_ds = ogr.GetDriverByName("Memory").CreateDataSource("mask")
-    layer = mem_ds.CreateLayer("mask", srs=dataset_srs)
-    layer.CreateField(ogr.FieldDefn("dn", ogr.OFTInteger))
-
-    gdal.Polygonize(mask_band, None, layer, 0, [], callback=None)
-    clip_geom = build_bbox_geometry(bbox, dataset_srs) if bbox is not None else None
     to_wgs84 = build_dataset_to_wgs84_transform(ds)
+    geotransform = ds.GetGeoTransform()
+    block_x, block_y = band.GetBlockSize()
+    min_lon = min_lat = max_lon = max_lat = None
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
 
-    for feature in layer:
-        if feature.GetField("dn") != 1:
-            continue
-        geom = feature.GetGeometryRef()
-        if geom is None:
-            continue
-        sample_geom = geom.Clone()
-        if sample_geom is None:
-            continue
-        if clip_geom is not None:
-            if not sample_geom.Intersects(clip_geom):
+    for yoff in range(0, ds.RasterYSize, block_y):
+        height = min(block_y, ds.RasterYSize - yoff)
+        for xoff in range(0, ds.RasterXSize, block_x):
+            width = min(block_x, ds.RasterXSize - xoff)
+            data = band.ReadAsArray(xoff, yoff, width, height).astype(np.float32)
+            fill_allowed_mask = build_fill_allowed_mask(data, nodata_value=nodata)
+            if not np.any(fill_allowed_mask):
                 continue
-            clipped_geom = sample_geom.Intersection(clip_geom)
-            if clipped_geom is None or clipped_geom.IsEmpty():
-                continue
-            sample_geom = clipped_geom
-        if to_wgs84 is not None:
-            sample_geom.Transform(to_wgs84)
-        envelope = sample_geom.GetEnvelope()  # (minX, maxX, minY, maxY)
-        sample_points: Set[Tuple[float, float]] = set()
-        centroid = sample_geom.Centroid()
-        if centroid is not None and not centroid.IsEmpty():
-            sample_points.add((centroid.GetX(), centroid.GetY()))
-        lon_candidates = (
-            envelope[0],
-            (envelope[0] + envelope[1]) / 2.0,
-            envelope[1],
-        )
-        lat_candidates = (
-            envelope[2],
-            (envelope[2] + envelope[3]) / 2.0,
-            envelope[3],
-        )
-        for lon in lon_candidates:
-            for lat in lat_candidates:
-                sample_points.add((lon, lat))
-        for lon in np.arange(envelope[0], envelope[1] + 0.5, 0.5):
-            for lat in np.arange(envelope[2], envelope[3] + 0.5, 0.5):
-                sample_points.add((float(lon), float(lat)))
 
-        for lon, lat in sample_points:
-            point = ogr.Geometry(ogr.wkbPoint)
-            point.AddPoint(lon, lat)
-            if sample_geom.Intersects(point):
+            rows, cols = np.nonzero(fill_allowed_mask)
+            pixel_x = xoff + cols.astype(np.float64) + 0.5
+            pixel_y = yoff + rows.astype(np.float64) + 0.5
+            xs = (
+                geotransform[0]
+                + pixel_x * geotransform[1]
+                + pixel_y * geotransform[2]
+            )
+            ys = (
+                geotransform[3]
+                + pixel_x * geotransform[4]
+                + pixel_y * geotransform[5]
+            )
+
+            if to_wgs84 is None:
+                lons = xs
+                lats = ys
+            else:
+                transformed_points = to_wgs84.TransformPoints(
+                    list(zip(xs.tolist(), ys.tolist(), strict=False))
+                )
+                lons = np.array([point[0] for point in transformed_points], dtype=np.float64)
+                lats = np.array([point[1] for point in transformed_points], dtype=np.float64)
+
+            if bbox is not None:
+                in_bbox = (
+                    (lons >= min_lon)
+                    & (lons <= max_lon)
+                    & (lats >= min_lat)
+                    & (lats <= max_lat)
+                )
+                if not np.any(in_bbox):
+                    continue
+                lons = lons[in_bbox]
+                lats = lats[in_bbox]
+
+            for lon, lat in zip(lons, lats, strict=False):
                 try:
-                    tile = m.toMGRS(lat, lon, MGRSPrecision=0)
+                    tile = m.toMGRS(float(lat), float(lon), MGRSPrecision=0)
                     mgrs_tiles.add(tile.decode() if isinstance(tile, bytes) else tile)
                 except mgrs_core.MGRSError:
                     continue
@@ -729,9 +711,6 @@ def open_gebco_mask(
             raise RuntimeError(f"Could not find a usable mask band in: {gebco_src}")
 
         try:
-            mem_driver = gdal.GetDriverByName("MEM")
-            if mem_driver is None:
-                raise RuntimeError("Could not load GDAL MEM driver")
             mask_nodata = -1.0
             alpha_source_ds = gdal.Translate(
                 "",
@@ -742,29 +721,30 @@ def open_gebco_mask(
                 raise RuntimeError(f"Could not isolate GEBCO mask band for {mgrs_subtile}")
             alpha_source_ds.GetRasterBand(1).SetColorInterpretation(gdal.GCI_GrayIndex)
 
-            warped_mask_ds = mem_driver.Create(
-                "", tile_grid.width, tile_grid.height, 1, gdal.GDT_Float32
-            )
-            if warped_mask_ds is None:
-                raise RuntimeError("Could not create in-memory GEBCO mask dataset")
-            warped_mask_ds.SetProjection(tile_grid.projection)
-            warped_mask_ds.SetGeoTransform(tile_grid.geotransform)
-            warped_mask_ds.GetRasterBand(1).SetNoDataValue(mask_nodata)
-            warped_mask_ds.GetRasterBand(1).Fill(mask_nodata)
-            warped = gdal.Warp(
-                warped_mask_ds,
+            min_x = tile_grid.geotransform[0]
+            max_y = tile_grid.geotransform[3]
+            max_x = min_x + tile_grid.geotransform[1] * tile_grid.width
+            min_y = max_y + tile_grid.geotransform[5] * tile_grid.height
+
+            warped_mask_ds = gdal.Warp(
+                "",
                 alpha_source_ds,
                 options=gdal.WarpOptions(
+                    format="MEM",
+                    dstSRS=tile_grid.projection,
+                    outputBounds=(min_x, min_y, max_x, max_y),
+                    width=tile_grid.width,
+                    height=tile_grid.height,
                     resampleAlg="bilinear",
                     srcBands=[1],
-                    dstBands=[1],
                     dstNodata=mask_nodata,
                     workingType=gdal.GDT_Float32,
                     outputType=gdal.GDT_Float32,
                 ),
             )
-            if warped is None:
+            if warped_mask_ds is None:
                 raise RuntimeError(f"Could not warp GEBCO mask for {mgrs_subtile}")
+            warped_mask_ds.GetRasterBand(1).SetNoDataValue(mask_nodata)
             alpha_source_ds = None
         finally:
             gebco_ds = None
@@ -1173,6 +1153,7 @@ def warp_to_web_mercator(
     source_path: str, destination_path: str, resample_alg: str, max_zoom: int
 ) -> None:
     """Warp the temporary UTM GeoTIFF into the final EPSG:3857 intermediate."""
+    remove_if_exists(destination_path)
     pixel_size = tiler.web_mercator_pixel_size(max_zoom)
     warp_options = gdal.WarpOptions(
         format="GTiff",

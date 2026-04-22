@@ -10,7 +10,9 @@ from osgeo import gdal, osr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import ocean
 import satmaps
+import tiler
 from satmaps import (
     build_alpha_block,
     build_fill_allowed_mask,
@@ -30,13 +32,15 @@ QFJ_TILE_BOUNDS = (
     -157.06683030196527,
     21.692137914318558,
 )
+WIDE_HAWAII_BOUNDS = (-158.0, 20.8, -155.8, 22.2)
 
 
 def build_projected_ocean_mask(
     mask_path: Path,
     land_patch: np.ndarray,
+    bounds: tuple[float, float, float, float] = QFJ_TILE_BOUNDS,
 ) -> None:
-    min_lon, min_lat, max_lon, max_lat = QFJ_TILE_BOUNDS
+    min_lon, min_lat, max_lon, max_lat = bounds
     wgs84 = osr.SpatialReference()
     wgs84.ImportFromEPSG(4326)
     web_mercator = osr.SpatialReference()
@@ -183,6 +187,40 @@ def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: objec
     assert find_resume_path(True) == str(Path(".temp") / "state_new.json")
 
 
+@pytest.mark.parametrize("module", [satmaps, ocean, tiler])
+def test_remove_if_exists_prefers_gdal_unlink(monkeypatch: object, module: object) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(module.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(module.gdal, "Unlink", lambda path: calls.append(path))
+    monkeypatch.setattr(
+        module.os,
+        "remove",
+        lambda path: (_ for _ in ()).throw(AssertionError("unexpected os.remove fallback")),
+    )
+
+    module.remove_if_exists("output.tif")
+
+    assert calls == ["output.tif"]
+
+
+@pytest.mark.parametrize("module", [satmaps, ocean, tiler])
+def test_remove_if_exists_falls_back_to_os_remove(monkeypatch: object, module: object) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(module.os.path, "exists", lambda path: True)
+
+    def fail_unlink(path: str) -> None:
+        raise RuntimeError("unlink failed")
+
+    monkeypatch.setattr(module.gdal, "Unlink", fail_unlink)
+    monkeypatch.setattr(module.os, "remove", lambda path: calls.append(path))
+
+    module.remove_if_exists("output.tif")
+
+    assert calls == ["output.tif"]
+
+
 def test_iter_processing_windows_uses_full_width_row_slabs() -> None:
     tile_grid = satmaps.TileGrid(
         projection="EPSG:32631",
@@ -298,6 +336,37 @@ def test_discover_mgrs_tiles_from_projected_ocean_mask_respects_bbox_clip(
         str(ocean_mask_path),
         bbox=northeast_bbox,
     ) == {"04QFJ"}
+
+
+def test_discover_mgrs_tiles_from_projected_ocean_mask_misses_zigzag_hawaii_tiles(
+    tmp_path: Path,
+) -> None:
+    ocean_mask_path = tmp_path / "ocean-mask-zigzag-3857.tif"
+    land_patch = np.full((320, 480), 255, dtype=np.uint8)
+    for y in range(land_patch.shape[0]):
+        center_x = int((0.25 + 0.5 * np.sin(y / 22.0)) * land_patch.shape[1])
+        land_patch[y, max(0, center_x - 8) : min(land_patch.shape[1], center_x + 9)] = 0
+    build_projected_ocean_mask(
+        ocean_mask_path,
+        land_patch,
+        bounds=WIDE_HAWAII_BOUNDS,
+    )
+
+    assert satmaps.discover_mgrs_tiles_from_ocean_mask(
+        str(ocean_mask_path),
+        bbox=WIDE_HAWAII_BOUNDS,
+    ) == {
+        "04QFJ",
+        "04QFK",
+        "04QGJ",
+        "04QGK",
+        "04QHJ",
+        "04QHK",
+        "05QJD",
+        "05QJE",
+        "05QKD",
+        "05QKE",
+    }
 
 
 def test_build_alpha_block_masks_out_pixels_outside_ocean_render() -> None:
