@@ -15,7 +15,7 @@ from mgrs import core as mgrs_core
 import numpy as np
 import ocean
 from scipy.ndimage import binary_dilation, distance_transform_edt
-from osgeo import gdal
+from osgeo import gdal, ogr
 
 import tiler
 
@@ -178,15 +178,6 @@ def get_tile_paths(
     return paths
 
 
-def load_land_tiles(land_only_file: str) -> Optional[Set[str]]:
-    """Load the precomputed land tile list if present."""
-    if not os.path.exists(land_only_file):
-        return None
-
-    with open(land_only_file, "r") as f:
-        return {line.strip() for line in f if line.strip()}
-
-
 def parse_bbox(bbox: str) -> Tuple[float, float, float, float]:
     """Parse a bbox argument or exit with the existing CLI error message."""
     try:
@@ -223,46 +214,129 @@ def discover_mgrs_tiles_in_bbox(
 
 def filter_mgrs_tiles(
     discovered_mgrs: List[str],
-    land_set: Optional[Set[str]],
     gebco_vrt_source: Optional[str],
 ) -> List[str]:
     """Keep only tiles that should participate in land rendering."""
     mgrs_bases = []
     for mgrs_tile in discovered_mgrs:
-        is_land = False
-        if land_set and mgrs_tile in land_set:
-            is_land = True
-        elif gebco_vrt_source and check_land_gebco(mgrs_tile, gebco_vrt_source):
-            is_land = True
-        elif land_set is None:
-            is_land = True
-
-        if is_land:
+        if gebco_vrt_source and check_land_gebco(mgrs_tile, gebco_vrt_source):
+            mgrs_bases.append(mgrs_tile)
+        elif not gebco_vrt_source:
             mgrs_bases.append(mgrs_tile)
 
     return mgrs_bases
 
 
+def discover_mgrs_tiles_from_ocean_mask(ocean_mask_src: str) -> Set[str]:
+    """Discover MGRS tiles that contain land or shallow water using an existing ocean mask."""
+    ds = gdal.Open(ocean_mask_src)
+    if ds is None:
+        return set()
+
+    band_details = get_ocean_mask_band_details(ds)
+    if band_details is None:
+        return set()
+
+    band_index, uses_alpha = band_details
+    band = ds.GetRasterBand(band_index)
+    nodata = band.GetNoDataValue()
+
+    # Create a temporary memory dataset for the mask
+    mem_driver = gdal.GetDriverByName("MEM")
+    mask_ds = mem_driver.Create("", ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Byte)
+    mask_ds.SetProjection(ds.GetProjection())
+    mask_ds.SetGeoTransform(ds.GetGeoTransform())
+    mask_band = mask_ds.GetRasterBand(1)
+
+    # Process in blocks to save memory
+    block_x, block_y = band.GetBlockSize()
+    for y in range(0, ds.RasterYSize, block_y):
+        h = min(block_y, ds.RasterYSize - y)
+        for x in range(0, ds.RasterXSize, block_x):
+            w = min(block_x, ds.RasterXSize - x)
+            data = band.ReadAsArray(x, y, w, h).astype(np.float32)
+
+            # Match check_land_gebco logic:
+            # Alpha < 255 is land/shallow.
+            # Elevation > 0 is land.
+            if uses_alpha:
+                mask = (data < 254.5) & (data != nodata if nodata is not None else True)
+            else:
+                mask = (data > 0.001) & (data != nodata if nodata is not None else True)
+
+            mask_band.WriteArray(mask.astype(np.uint8), x, y)
+
+    # Polygonize the mask
+    mgrs_tiles: Set[str] = set()
+    m = mgrs.MGRS()
+
+    mem_ds = ogr.GetDriverByName("Memory").CreateDataSource("mask")
+    layer = mem_ds.CreateLayer("mask", srs=ds.GetSpatialRef())
+    layer.CreateField(ogr.FieldDefn("dn", ogr.OFTInteger))
+
+    gdal.Polygonize(mask_band, None, layer, 0, [], callback=None)
+
+    for feature in layer:
+        if feature.GetField("dn") == 1:
+            geom = feature.GetGeometryRef()
+            # Sample points within or on the boundary of the polygon
+            # For efficiency, we can just use the envelope or centroid for small polygons,
+            # or sample points for larger ones.
+            envelope = geom.GetEnvelope()  # (minX, maxX, minY, maxY)
+            # Sample at 0.5 degree intervals within the envelope
+            lons = np.arange(envelope[0], envelope[1] + 0.5, 0.5)
+            lats = np.arange(envelope[2], envelope[3] + 0.5, 0.5)
+            for lon in lons:
+                for lat in lats:
+                    point = ogr.Geometry(ogr.wkbPoint)
+                    point.AddPoint(lon, lat)
+                    if geom.Contains(point):
+                        try:
+                            tile = m.toMGRS(lat, lon, MGRSPrecision=0)
+                            mgrs_tiles.add(tile.decode() if isinstance(tile, bytes) else tile)
+                        except Exception:
+                            continue
+    return mgrs_tiles
+
+
 def discover_mgrs_bases(
     args: argparse.Namespace,
-    land_set: Optional[Set[str]],
     gebco_vrt_source: Optional[str],
 ) -> List[str]:
     """Resolve the requested MGRS tile list from bbox, global, or explicit inputs."""
     if args.bbox:
         min_lon, min_lat, max_lon, max_lat = parse_bbox(args.bbox)
         discovered_mgrs = discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat)
-        mgrs_bases = filter_mgrs_tiles(discovered_mgrs, land_set, gebco_vrt_source)
+        mgrs_bases = filter_mgrs_tiles(discovered_mgrs, gebco_vrt_source)
         print(
-            f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} kept after ocean-mask/land filtering."
+            f"Discovered {len(discovered_mgrs)} MGRS tiles in bbox, {len(mgrs_bases)} kept after ocean-mask filtering."
         )
         return mgrs_bases
 
     if args.all_tiles:
-        if land_set is not None:
-            return list(land_set)
-        print("Error: --global requires HLS.land.tiles.txt to be present.")
-        sys.exit(1)
+        # Extract unique MGRS tile IDs from the S3 folder cache
+        s3_mgrs_set: Set[str] = set()
+        for folders in S3_FOLDER_CACHE.values():
+            for folder in folders:
+                parts = folder.split("_")
+                if len(parts) >= 5:
+                    s3_mgrs_set.add(parts[4])
+
+        if not s3_mgrs_set:
+            print("Error: --global found no tiles in S3 cache. Did you populate it?")
+            sys.exit(1)
+
+        if gebco_vrt_source:
+            print("Scanning ocean mask for land tiles...")
+            land_mgrs = discover_mgrs_tiles_from_ocean_mask(gebco_vrt_source)
+            # Intersection: only tiles that both have land/shallow-water and exist in S3
+            mgrs_bases = sorted(list(land_mgrs.intersection(s3_mgrs_set)))
+            print(f"Global mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water after S3 intersection.")
+        else:
+            mgrs_bases = sorted(list(s3_mgrs_set))
+            print(f"Global mode: {len(mgrs_bases)} MGRS tiles found from S3 cache (no ocean mask provided).")
+
+        return mgrs_bases
 
     return [mgrs_tile.strip() for mgrs_tile in args.mgrs.split(",") if mgrs_tile.strip()]
 
@@ -1082,24 +1156,12 @@ def calculate_estimates(args: argparse.Namespace) -> None:
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     num_dates = len(date_paths)
 
-    land_set = load_land_tiles("HLS.land.tiles.txt")
+    gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
 
-    if args.bbox:
-        min_lon, min_lat, max_lon, max_lat = parse_bbox(args.bbox)
-        discovered_mgrs = discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat)
+    if args.all_tiles:
+        populate_s3_cache(date_paths)
 
-        if land_set is not None:
-            mgrs_bases = [m for m in discovered_mgrs if m in land_set]
-        else:
-            mgrs_bases = list(discovered_mgrs)
-    elif args.all_tiles:
-        if land_set is not None:
-            mgrs_bases = list(land_set)
-        else:
-            print("Error: --global requires HLS.land.tiles.txt to be present.")
-            sys.exit(1)
-    else:
-        mgrs_bases = [m.strip() for m in args.mgrs.split(",") if m.strip()]
+    mgrs_bases = discover_mgrs_bases(args, gebco_vrt_source)
 
     num_mgrs = len(mgrs_bases)
     num_subtiles = num_mgrs * 4
@@ -1304,8 +1366,7 @@ def main() -> None:
     if args.all_tiles:
         populate_s3_cache(date_paths)
 
-    land_set = load_land_tiles("HLS.land.tiles.txt")
-    mgrs_bases = discover_mgrs_bases(args, land_set, gebco_vrt_source)
+    mgrs_bases = discover_mgrs_bases(args, gebco_vrt_source)
     subtiles = expand_subtiles(mgrs_bases)
 
     if args.land:

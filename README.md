@@ -9,7 +9,7 @@ This repository provides tools to fetch, process, and package Sentinel-2 mosaic 
 ## Core Components
 
 - `satmaps.py`: The primary engine. Handles GDAL S3 configuration, multi-date mosaicking, reprojection to Web Mercator (EPSG:3857), and PMTiles generation. Uses a NumPy-based pipeline for tone mapping and grading.
-- `ocean_background.py`: Builds a standalone styled Web Mercator ocean background from GEBCO, with both global and bbox exports targeting a shared Web Mercator zoom-13 output resolution.
+- `ocean.py`: Builds a standalone styled Web Mercator ocean background from GEBCO, with both global and bbox exports targeting a shared Web Mercator zoom-13 output resolution.
 - `tuner_ui.py`: A Flask-based interactive web interface to fine-tune tone mapping parameters (exposure, contrast, saturation) in real-time on sample data.
 - `tiler.py`: Core logic for tile processing, tone mapping algorithms, and parallelized chunk execution.
 
@@ -28,6 +28,12 @@ Configure an AWS profile named `cdse` with your [CDSE S3 credentials](https://do
 aws configure --profile cdse
 ```
 
+## Installation
+
+```bash
+pip install git+https://github.com/chapmanjacobd/satmaps.git
+```
+
 ## Usage
 
 ### 1. Tune Visuals (Optional)
@@ -35,9 +41,9 @@ aws configure --profile cdse
 Before a large run, use the Tuner UI to find the best visual parameters:
 
 ```bash
-python3 tuner_ui.py
+satmaps-tuner
 ```
-Visit `http://localhost:5001` to adjust exposure, soft-knee curves, and saturation. Note: Requires some data in `.cache/2025-07-01` (e.g., from a small `satmaps.py` run).
+Visit `http://localhost:5001` to adjust exposure, soft-knee curves, and saturation. Note: Requires some data in `.cache/2025-07-01` (e.g., from a small `satmaps` run).
 
 ### 2. Generate the Ocean Background
 
@@ -45,13 +51,13 @@ Build the standalone styled ocean background and reuse it as an ocean base layer
 
 ```bash
 # Global export from the full masked GEBCO source raster at Web Mercator zoom 13
-python3 ocean_background.py
+ocean
 
 # Crop and reproject to the same zoom-13 snapped tile-grid resolution used by bbox renders
-python3 ocean_background.py --bbox -161,18,-154,23
+ocean --bbox -161,18,-154,23
 
 # Inspect the final styled RGBA VRT without translating to GeoTIFF
-python3 ocean_background.py --vrt
+ocean --vrt
 ```
 
 The first positional argument is the GEBCO zip path if you need something other than `gebco_2025_sub_ice_topo_geotiff.zip`, and the optional second positional argument is the output path (default: `ocean.tif`, or `ocean.vrt` when `--vrt` is used). Standalone ocean outputs target Web Mercator zoom 13 (~19.11 m/px at the equator).
@@ -62,16 +68,16 @@ Generate PMTiles for specific MGRS tiles or a global run:
 
 ```bash
 # Single tile (defaults to 2025/07/01 and 2025/01/01 mosaics)
-python3 satmaps.py 31TDF -o barcelona.pmtiles
+satmaps 31TDF -o barcelona.pmtiles
 
 # Multiple tiles with custom quality and format
-python3 satmaps.py 31TCF,31TDF,31TCE,31TDE --format webp --quality 80 -o region.pmtiles
+satmaps 31TCF,31TDF,31TCE,31TDE --format webp --quality 80 -o region.pmtiles
 
 # BBox render using either a global or bbox-matched standalone ocean background
-python3 satmaps.py --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii.pmtiles
+satmaps --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii.pmtiles
 
-# Global run using the auto-detected HLS.land.tiles.txt land filter
-python3 satmaps.py --global --ocean-background ocean.tif -o global.pmtiles
+# Global run
+satmaps --global --ocean-background ocean.tif -o global.pmtiles
 ```
 
 ### 4. Estimate Resources
@@ -79,12 +85,12 @@ python3 satmaps.py --global --ocean-background ocean.tif -o global.pmtiles
 Before a global run, estimate the time and storage required:
 
 ```bash
-python3 satmaps.py --global --estimate
+satmaps --global --estimate
 ```
 
 ## Advanced Options
 
-- `--global`: Process all land tiles listed in `HLS.land.tiles.txt`. If that file is missing, global mode exits with an error.
+- `--global`: Process all discovered land tiles from the source mosaics.
 - `--bbox`: Discover MGRS tiles touched by a WGS84 bbox (`min_lon,min_lat,max_lon,max_lat`).
 - `--date`: Comma-separated list of mosaic dates (default: `2025/07/01,2025/01/01`). Overlapping areas are averaged.
 - `--format`: Output tile format (`webp`, `jpg`, `png`, `png8`).
@@ -106,9 +112,9 @@ python3 satmaps.py --global --estimate
 
 ### Ocean Background Options
 
-`ocean_background.py` supports the same tone-mapping controls as `satmaps.py`, plus:
+`ocean` supports the same tone-mapping controls as `satmaps`, plus:
 
-- `--bbox`: Export a Web Mercator ocean background cropped to a WGS84 bbox and snapped outward to the zoom-13 Web Mercator tile grid used for bbox renders in `satmaps.py`.
+- `--bbox`: Export a Web Mercator ocean background cropped to a WGS84 bbox and snapped outward to the zoom-13 Web Mercator tile grid used for bbox renders in `satmaps`.
 - `--hillshade-z`: Vertical exaggeration passed to `gdaldem hillshade`.
 - `--depth-min` / `--depth-max`: Depth range mapped onto the ocean color ramp.
 - `--resample-alg`: GEBCO upscale kernel (`cubicspline` or `lanczos`).
@@ -117,7 +123,7 @@ python3 satmaps.py --global --estimate
 
 ### Tone Mapping Parameters
 
-You can override the defaults (tuned via `tuner_ui.py`):
+You can override the defaults (tuned via `satmaps-tuner`):
 - `--exposure`: Global brightness multiplier.
 - `--sb`, `--hb`: Shadow and highlight "break" points for the soft-knee curve.
 - `--ss`, `--ms`, `--hs`: Slopes for shadow, mid-tone, and highlight segments.
