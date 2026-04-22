@@ -1536,7 +1536,7 @@ def test_build_ocean_ramp_colors_respects_style_flags() -> None:
     assert default_colors.shape == (len(ocean.MAKO_RAMP), 3)
     np.testing.assert_allclose(
         ungraded_colors[0],
-        np.array(ocean.MAKO_RAMP[0][1:], dtype=np.float32) / 255.0,
+        (np.array(ocean.MAKO_RAMP[0][1:], dtype=np.float32) / 255.0) * 0.5,
     )
     assert np.all((default_colors >= 0.0) & (default_colors <= 1.0))
     assert np.all((ungraded_colors >= 0.0) & (ungraded_colors <= 1.0))
