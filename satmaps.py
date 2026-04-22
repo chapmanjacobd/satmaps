@@ -53,6 +53,25 @@ class OceanMaskWarp:
     coverage_dataset: gdal.Dataset
 
 
+@dataclass(frozen=True)
+class ProcessingWindow:
+    xoff: int
+    yoff: int
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class OceanMaskSlab:
+    xoff: int
+    yoff: int
+    width: int
+    height: int
+    gebco_block: np.ndarray
+    coverage_block: np.ndarray
+    fill_allowed_block: np.ndarray
+
+
 # --- Discovery Layer (S3/CDSE Utils) ---
 
 
@@ -171,8 +190,7 @@ def load_land_tiles(land_only_file: str) -> Optional[Set[str]]:
 def parse_bbox(bbox: str) -> Tuple[float, float, float, float]:
     """Parse a bbox argument or exit with the existing CLI error message."""
     try:
-        min_lon, min_lat, max_lon, max_lat = (float(value) for value in bbox.split(","))
-        return min_lon, min_lat, max_lon, max_lat
+        return tiler.parse_bbox_string(bbox)
     except ValueError:
         print(f"Error: Invalid bbox format: {bbox}")
         sys.exit(1)
@@ -412,26 +430,37 @@ def check_land_gebco(mgrs_tile: str, gebco_src: str) -> bool:
         gt = ds.GetGeoTransform()
         inv_gt = gdal.InvGeoTransform(gt)
 
-        # Sample a 1.2 degree box (13x13 points)
-        has_land = False
+        # Sample a 1.2 degree box (13x13 points), but read the smallest
+        # covering window once instead of issuing 169 tiny GDAL reads.
+        sample_points: list[tuple[int, int]] = []
         for dlat in np.linspace(-0.6, 0.6, 13):
             for dlon in np.linspace(-0.6, 0.6, 13):
                 px, py = gdal.ApplyGeoTransform(inv_gt, clon + dlon, clat + dlat)
                 px, py = int(px), int(py)
                 if 0 <= px < ds.RasterXSize and 0 <= py < ds.RasterYSize:
-                    val = band.ReadAsArray(px, py, 1, 1)[0, 0]
-                    if (uses_alpha and val < 254.5) or (not uses_alpha and val > 0.001):
-                        has_land = True
-                        break
-            if has_land:
-                break
-        return has_land
+                    sample_points.append((px, py))
+        if not sample_points:
+            return False
+
+        xoff = min(px for px, _ in sample_points)
+        yoff = min(py for _, py in sample_points)
+        xend = max(px for px, _ in sample_points) + 1
+        yend = max(py for _, py in sample_points) + 1
+        sampled = band.ReadAsArray(xoff, yoff, xend - xoff, yend - yoff).astype(np.float32)
+
+        for px, py in sample_points:
+            val = sampled[py - yoff, px - xoff]
+            if (uses_alpha and val < 254.5) or (not uses_alpha and val > 0.001):
+                return True
+        return False
     finally:
         ds = None
 
 
 def fill_nan_nearest(
-    arr: np.ndarray, valid_mask: Optional[np.ndarray] = None
+    arr: np.ndarray,
+    valid_mask: Optional[np.ndarray] = None,
+    fill_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Fill invalid pixels in a (C, H, W) array with the nearest valid pixel."""
     if valid_mask is None:
@@ -440,7 +469,14 @@ def fill_nan_nearest(
     if valid_mask.shape != arr.shape[1:]:
         raise ValueError("valid_mask must match the spatial shape of arr")
 
-    if np.all(valid_mask) or not np.any(valid_mask):
+    if fill_mask is not None and fill_mask.shape != arr.shape[1:]:
+        raise ValueError("fill_mask must match the spatial shape of arr")
+
+    target_mask = ~valid_mask
+    if fill_mask is not None:
+        target_mask &= fill_mask
+
+    if not np.any(target_mask) or not np.any(valid_mask):
         return arr
 
     indices = distance_transform_edt(
@@ -448,10 +484,9 @@ def fill_nan_nearest(
     )
 
     filled = np.array(arr, copy=True)
-    invalid_mask = ~valid_mask
     for i in range(arr.shape[0]):
         nearest_band = arr[i][tuple(indices)]
-        filled[i][invalid_mask] = nearest_band[invalid_mask]
+        filled[i][target_mask] = nearest_band[target_mask]
 
     return filled
 
@@ -575,6 +610,64 @@ def build_fill_allowed_mask(
     return fill_allowed_mask
 
 
+def collect_ocean_mask_slabs(
+    ocean_mask: OceanMaskWarp,
+    tile_grid: TileGrid,
+) -> tuple[ProcessingWindow, dict[int, OceanMaskSlab]] | None:
+    """Read cropped mask slabs once so later stages can reuse them without rereads."""
+    slabs: dict[int, OceanMaskSlab] = {}
+    min_x = tile_grid.width
+    max_x = 0
+    min_y = tile_grid.height
+    max_y = 0
+
+    for _xoff, yoff, block_width, block_height in iter_processing_windows(tile_grid):
+        gebco_block = ocean_mask.band.ReadAsArray(0, yoff, block_width, block_height).astype(
+            np.float32
+        )
+        coverage_block = (
+            ocean_mask.coverage_band.ReadAsArray(0, yoff, block_width, block_height) >= 254.5
+        )
+        fill_allowed_block = build_fill_allowed_mask(
+            gebco_block,
+            ocean_mask.uses_alpha,
+            coverage_block,
+        )
+        cols_with_land = np.any(fill_allowed_block, axis=0)
+        if not np.any(cols_with_land):
+            continue
+
+        x_start = int(np.argmax(cols_with_land))
+        x_end = int(len(cols_with_land) - np.argmax(cols_with_land[::-1]))
+        cropped = OceanMaskSlab(
+            xoff=x_start,
+            yoff=yoff,
+            width=x_end - x_start,
+            height=block_height,
+            gebco_block=gebco_block[:, x_start:x_end],
+            coverage_block=coverage_block[:, x_start:x_end],
+            fill_allowed_block=fill_allowed_block[:, x_start:x_end],
+        )
+        slabs[yoff] = cropped
+        min_x = min(min_x, cropped.xoff)
+        max_x = max(max_x, cropped.xoff + cropped.width)
+        min_y = min(min_y, cropped.yoff)
+        max_y = max(max_y, cropped.yoff + cropped.height)
+
+    if not slabs:
+        return None
+
+    return (
+        ProcessingWindow(
+            xoff=min_x,
+            yoff=min_y,
+            width=max_x - min_x,
+            height=max_y - min_y,
+        ),
+        slabs,
+    )
+
+
 def open_date_band_sets(
     folders: List[Tuple[str, str]], cache_dir: str
 ) -> List[Tuple[List[gdal.Band], List[gdal.Dataset]]]:
@@ -687,68 +780,66 @@ def average_block(
 
 def average_tile_blocks(
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]],
-    tile_grid: TileGrid,
-    fill_allowed_mask: Optional[np.ndarray],
-) -> Tuple[np.ndarray, np.ndarray, bool]:
-    """Average all tile windows while skipping pure-ocean blocks when GEBCO is available."""
-    averaged = np.full((3, tile_grid.height, tile_grid.width), np.nan, dtype=np.float32)
-    source_valid_mask = np.zeros((tile_grid.height, tile_grid.width), dtype=bool)
-    found_non_ocean_pixels = fill_allowed_mask is None
+    processing_window: ProcessingWindow,
+    mask_slabs: Optional[dict[int, OceanMaskSlab]],
+    mask_uses_alpha: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Average the processing window and retain the matching output alpha blocks."""
+    averaged = np.full(
+        (3, processing_window.height, processing_window.width), np.nan, dtype=np.float32
+    )
+    source_valid_mask = np.zeros((processing_window.height, processing_window.width), dtype=bool)
+    alpha_mask = np.zeros((processing_window.height, processing_window.width), dtype=np.uint8)
+    fill_allowed_mask = (
+        np.zeros((processing_window.height, processing_window.width), dtype=bool)
+        if mask_slabs is not None
+        else None
+    )
 
-    # Determine Y range to skip leading/trailing ocean-only slabs
-    y_min, y_max = 0, tile_grid.height
-    if fill_allowed_mask is not None:
-        rows_with_land = np.any(fill_allowed_mask, axis=1)
-        if not np.any(rows_with_land):
-            return averaged, source_valid_mask, False
-        y_min = int(np.argmax(rows_with_land))
-        y_max = int(len(rows_with_land) - np.argmax(rows_with_land[::-1]))
+    for relative_yoff in range(0, processing_window.height, PROCESS_SLAB_HEIGHT):
+        yoff = processing_window.yoff + relative_yoff
+        block_height = min(PROCESS_SLAB_HEIGHT, processing_window.height - relative_yoff)
 
-    for xoff, yoff, block_width, block_height in iter_processing_windows(tile_grid):
-        # Skip slabs completely outside the land Y range
-        if yoff + block_height <= y_min or yoff >= y_max:
-            continue
-
-        # Default to full slab width if no mask is provided
-        actual_xoff = xoff
-        actual_width = block_width
-
-        if fill_allowed_mask is not None:
-            # Refine the horizontal bounds for this specific row slab
-            fill_allowed_slab = fill_allowed_mask[
-                yoff : yoff + block_height, :
-            ]
-            cols_with_land = np.any(fill_allowed_slab, axis=0)
-            if not np.any(cols_with_land):
+        if mask_slabs is None:
+            actual_xoff = processing_window.xoff
+            actual_width = processing_window.width
+            gebco_block = None
+            coverage_block = None
+            allowed_block = None
+        else:
+            slab = mask_slabs.get(yoff)
+            if slab is None:
                 continue
-
-            x_start = int(np.argmax(cols_with_land))
-            x_end = int(len(cols_with_land) - np.argmax(cols_with_land[::-1]))
-
-            actual_xoff = x_start
-            actual_width = x_end - x_start
-            found_non_ocean_pixels = True
+            actual_xoff = slab.xoff
+            actual_width = slab.width
+            gebco_block = slab.gebco_block
+            coverage_block = slab.coverage_block
+            allowed_block = slab.fill_allowed_block
 
         averaged_block, block_valid_sources = average_block(
             date_band_sets, actual_xoff, yoff, actual_width, block_height
         )
-        if fill_allowed_mask is not None:
-            allowed_block = fill_allowed_mask[
-                yoff : yoff + block_height, actual_xoff : actual_xoff + actual_width
-            ]
+        if allowed_block is not None:
             averaged_block = np.where(allowed_block[np.newaxis, :, :], averaged_block, np.nan)
             block_valid_sources &= allowed_block
-        if not np.any(block_valid_sources):
-            continue
 
-        averaged[:, yoff : yoff + block_height, actual_xoff : actual_xoff + actual_width] = (
-            averaged_block
+        relative_xoff = actual_xoff - processing_window.xoff
+        row_slice = slice(relative_yoff, relative_yoff + block_height)
+        col_slice = slice(relative_xoff, relative_xoff + actual_width)
+        averaged[:, row_slice, col_slice] = averaged_block
+        source_valid_mask[row_slice, col_slice] = block_valid_sources
+
+        alpha_mask[row_slice, col_slice] = build_alpha_block(
+            gebco_block,
+            block_valid_sources,
+            mask_uses_alpha,
+            coverage_block,
+            allowed_block,
         )
-        source_valid_mask[
-            yoff : yoff + block_height, actual_xoff : actual_xoff + actual_width
-        ] = block_valid_sources
+        if fill_allowed_mask is not None and allowed_block is not None:
+            fill_allowed_mask[row_slice, col_slice] = allowed_block
 
-    return averaged, source_valid_mask, found_non_ocean_pixels
+    return averaged, source_valid_mask, alpha_mask, fill_allowed_mask
 
 
 def fill_missing_pixels(
@@ -761,7 +852,11 @@ def fill_missing_pixels(
     if fill_allowed_mask is not None:
         fill_mask &= fill_allowed_mask
     if np.any(fill_mask):
-        return fill_nan_nearest(averaged, valid_mask=source_valid_mask)
+        return fill_nan_nearest(
+            averaged,
+            valid_mask=source_valid_mask,
+            fill_mask=fill_allowed_mask,
+        )
     return averaged
 
 
@@ -784,9 +879,11 @@ def create_output_dataset(
     color_bands = [dataset.GetRasterBand(index + 1) for index in range(3)]
     for band_index, color_name in enumerate(("RedBand", "GreenBand", "BlueBand")):
         color_bands[band_index].SetColorInterpretation(getattr(gdal, f"GCI_{color_name}"))
+        color_bands[band_index].Fill(0)
 
     alpha_band = dataset.GetRasterBand(4)
     alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
+    alpha_band.Fill(0)
     return dataset, color_bands, alpha_band
 
 
@@ -829,12 +926,8 @@ def build_alpha_block(
 
 def write_processed_blocks(
     averaged: np.ndarray,
-    source_valid_mask: np.ndarray,
-    fill_allowed_mask: Optional[np.ndarray],
-    gebco_band: Optional[gdal.Band],
-    coverage_band: Optional[gdal.Band],
-    mask_uses_alpha: bool,
-    tile_grid: TileGrid,
+    alpha_mask: np.ndarray,
+    processing_window: ProcessingWindow,
     args: argparse.Namespace,
     color_bands: List[gdal.Band],
     alpha_band: gdal.Band,
@@ -846,8 +939,12 @@ def write_processed_blocks(
     if scale <= 0.0:
         raise ValueError("stats_max must be greater than stats_min")
 
-    for xoff, yoff, block_width, block_height in iter_processing_windows(tile_grid):
-        averaged_block = averaged[:, yoff : yoff + block_height, xoff : xoff + block_width]
+    for relative_yoff in range(0, processing_window.height, PROCESS_SLAB_HEIGHT):
+        yoff = processing_window.yoff + relative_yoff
+        block_height = min(PROCESS_SLAB_HEIGHT, processing_window.height - relative_yoff)
+        averaged_block = averaged[
+            :, relative_yoff : relative_yoff + block_height, :
+        ]
         normalized = np.clip((averaged_block - source_min) / scale, 0.0, 1.0)
         normalized[np.isnan(normalized)] = 0.0
 
@@ -875,41 +972,19 @@ def write_processed_blocks(
 
         byte_block = np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
         for band_index, out_band in enumerate(color_bands):
-            out_band.WriteArray(byte_block[band_index], xoff=xoff, yoff=yoff)
-
-        source_valid_block = source_valid_mask[
-            yoff : yoff + block_height, xoff : xoff + block_width
-        ]
-        gebco_block = None
-        if gebco_band is not None:
-            gebco_block = gebco_band.ReadAsArray(
-                xoff, yoff, block_width, block_height
-            ).astype(np.float32)
-        coverage_block = None
-        if coverage_band is not None:
-            coverage_block = coverage_band.ReadAsArray(
-                xoff, yoff, block_width, block_height
-            ) >= 254.5
-        fill_allowed_block = None
-        if fill_allowed_mask is not None:
-            fill_allowed_block = fill_allowed_mask[
-                yoff : yoff + block_height, xoff : xoff + block_width
-            ]
-        alpha_block = build_alpha_block(
-            gebco_block,
-            source_valid_block,
-            mask_uses_alpha,
-            coverage_block,
-            fill_allowed_block,
+            out_band.WriteArray(byte_block[band_index], xoff=processing_window.xoff, yoff=yoff)
+        alpha_band.WriteArray(
+            alpha_mask[relative_yoff : relative_yoff + block_height, :],
+            xoff=processing_window.xoff,
+            yoff=yoff,
         )
-        alpha_band.WriteArray(alpha_block, xoff=xoff, yoff=yoff)
 
 
 def warp_to_web_mercator(
     source_path: str, destination_path: str, resample_alg: str, max_zoom: int
 ) -> None:
     """Warp the temporary UTM GeoTIFF into the final EPSG:3857 intermediate."""
-    pixel_size = ocean.target_web_mercator_pixel_size(max_zoom)
+    pixel_size = tiler.web_mercator_pixel_size(max_zoom)
     warp_options = gdal.WarpOptions(
         format="GTiff",
         dstSRS="EPSG:3857",
@@ -943,33 +1018,24 @@ def process_single_tile(
     tile_grid = load_tile_grid(paths["red"])
 
     ocean_mask = open_gebco_mask(gebco_src, tile_grid, mgrs_subtile)
-
-    # 1. Compute land mask early and check if any land exists in this subtile
-    fill_allowed_mask = None
+    processing_window = ProcessingWindow(0, 0, tile_grid.width, tile_grid.height)
+    mask_slabs: Optional[dict[int, OceanMaskSlab]] = None
     if ocean_mask is not None:
-        gebco_full = ocean_mask.band.ReadAsArray()
-        coverage_full = ocean_mask.coverage_band.ReadAsArray() >= 254.5
-        fill_allowed_mask = build_fill_allowed_mask(
-            gebco_full,
-            ocean_mask.uses_alpha,
-            coverage_full,
-        )
-        gebco_full = None
-        coverage_full = None
-
-        if not np.any(fill_allowed_mask):
+        collected = collect_ocean_mask_slabs(ocean_mask, tile_grid)
+        if collected is None:
             return None
+        processing_window, mask_slabs = collected
 
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
     try:
         print(f"Processing tile {mgrs_subtile} across {len(folders)} date(s)...")
         date_band_sets = open_date_band_sets(folders, args.cache)
-        averaged, source_valid_mask, found_non_ocean_pixels = average_tile_blocks(
-            date_band_sets, tile_grid, fill_allowed_mask
+        averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
+            date_band_sets,
+            processing_window,
+            mask_slabs,
+            ocean_mask.uses_alpha if ocean_mask is not None else False,
         )
-
-        if not found_non_ocean_pixels:
-            return None
 
         averaged = fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
         temp_utm_path = f".temp/processed_{mgrs_subtile}_{unique_id}_utm.tif"
@@ -977,12 +1043,8 @@ def process_single_tile(
         ds_out, color_bands, alpha_band = create_output_dataset(temp_utm_path, tile_grid)
         write_processed_blocks(
             averaged,
-            source_valid_mask,
-            fill_allowed_mask,
-            ocean_mask.band if ocean_mask is not None else None,
-            ocean_mask.coverage_band if ocean_mask is not None else None,
-            ocean_mask.uses_alpha if ocean_mask is not None else False,
-            tile_grid,
+            alpha_mask,
+            processing_window,
             args,
             color_bands,
             alpha_band,
@@ -1286,7 +1348,7 @@ def main() -> None:
         sys.exit(1)
 
     master_vrt = f".temp/master_{unique_id}.vrt"
-    pixel_size = ocean.target_web_mercator_pixel_size(args.max_zoom)
+    pixel_size = tiler.web_mercator_pixel_size(args.max_zoom)
     gdal.BuildVRT(master_vrt, processed_tifs, resolution="user", xRes=pixel_size, yRes=pixel_size)
 
     if args.vrt:

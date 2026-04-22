@@ -18,6 +18,7 @@ from tiler import (
     apply_soft_knee_numpy,
     colorize_depth_numpy,
     lonlat_bbox_to_mercator_bounds,
+    parse_bbox_string,
     snap_bounds_to_pixel_grid,
     web_mercator_pixel_size,
 )
@@ -352,17 +353,12 @@ def colorize_ocean_depths(depths: np.ndarray, style: OceanStyleOptions) -> np.nd
     )
 
 
-def target_web_mercator_pixel_size(max_zoom: int = DEFAULT_MAX_ZOOM) -> float:
-    """Return the shared Web Mercator output pixel size used across exports."""
-    return web_mercator_pixel_size(max_zoom)
-
-
 def snapped_tile_grid_for_bbox(
     bbox: tuple[float, float, float, float],
     max_zoom: int = DEFAULT_MAX_ZOOM,
 ) -> tuple[tuple[float, float, float, float], float, int]:
     """Snap a bbox outward to the target Web Mercator tile pixel grid."""
-    pixel_size = target_web_mercator_pixel_size(max_zoom)
+    pixel_size = web_mercator_pixel_size(max_zoom)
     zoom = max_zoom
     mercator_bounds = lonlat_bbox_to_mercator_bounds(*bbox)
     snapped_bounds = snap_bounds_to_pixel_grid(mercator_bounds, pixel_size)
@@ -469,18 +465,9 @@ def create_rgb_with_alpha_vrt(rgb_tif: str, alpha_vrt: str, output_vrt: str) -> 
     if alpha_ds is None:
         raise RuntimeError(f"Could not open alpha VRT: {alpha_vrt}")
 
-    alpha_tif = str(Path(output_vrt).with_suffix(".alpha.tif"))
-    translated_alpha = gdal.Translate(
-        alpha_tif,
-        alpha_vrt,
-        options=gdal.TranslateOptions(
-            format="GTiff",
-            creationOptions=list(GTIFF_CREATION_OPTIONS),
-        ),
-    )
-    if translated_alpha is None:
-        raise RuntimeError(f"Could not materialize alpha TIFF: {alpha_tif}")
-    translated_alpha = None
+    alpha_tif = str(Path(alpha_vrt).with_suffix(".tif"))
+    if not os.path.exists(alpha_tif):
+        raise RuntimeError(f"Could not locate alpha TIFF for {alpha_vrt}")
 
     xsize = rgb_ds.RasterXSize
     ysize = rgb_ds.RasterYSize
@@ -594,8 +581,8 @@ def generate_ocean_background(
     }
     if bbox is None:
         warp_kwargs["outputBounds"] = WEB_MERCATOR_WORLD_BOUNDS
-        warp_kwargs["xRes"] = target_web_mercator_pixel_size(max_zoom)
-        warp_kwargs["yRes"] = target_web_mercator_pixel_size(max_zoom)
+        warp_kwargs["xRes"] = web_mercator_pixel_size(max_zoom)
+        warp_kwargs["yRes"] = web_mercator_pixel_size(max_zoom)
     else:
         snapped_bounds, pixel_size, _zoom = snapped_tile_grid_for_bbox(bbox, max_zoom)
         warp_kwargs["outputBounds"] = snapped_bounds
@@ -628,10 +615,7 @@ def generate_ocean_background(
 
 
 def parse_bbox(bbox: str) -> tuple[float, float, float, float]:
-    values = tuple(float(value) for value in bbox.split(","))
-    if len(values) != 4:
-        raise ValueError("bbox must contain four comma-separated values")
-    return (values[0], values[1], values[2], values[3])
+    return parse_bbox_string(bbox)
 
 
 def main() -> None:
@@ -639,7 +623,7 @@ def main() -> None:
         description=(
             "Generate a standalone GEBCO ocean hillshade GeoTIFF. "
             f"Defaults to Web Mercator zoom {DEFAULT_MAX_ZOOM} "
-            f"(~{target_web_mercator_pixel_size(DEFAULT_MAX_ZOOM):.2f} m/px at the equator)."
+            f"(~{web_mercator_pixel_size(DEFAULT_MAX_ZOOM):.2f} m/px at the equator)."
         )
     )
     parser.add_argument(

@@ -93,6 +93,31 @@ def test_fill_nan_nearest_uses_explicit_valid_mask() -> None:
     assert np.array_equal(filled, expected)
 
 
+def test_fill_nan_nearest_respects_fill_mask() -> None:
+    arr = np.array(
+        [
+            [[10.0, 99.0, 50.0]],
+            [[20.0, 88.0, 60.0]],
+            [[30.0, 77.0, 70.0]],
+        ],
+        dtype=np.float32,
+    )
+    valid_mask = np.array([[True, False, False]])
+    fill_mask = np.array([[False, True, False]])
+
+    filled = fill_nan_nearest(arr, valid_mask=valid_mask, fill_mask=fill_mask)
+
+    expected = np.array(
+        [
+            [[10.0, 10.0, 50.0]],
+            [[20.0, 20.0, 60.0]],
+            [[30.0, 30.0, 70.0]],
+        ],
+        dtype=np.float32,
+    )
+    assert np.array_equal(filled, expected)
+
+
 def test_create_gebco_ocean_vrt_masks_positive_values(tmp_path: Path) -> None:
     source_path = tmp_path / "gebco_source.tif"
     driver = gdal.GetDriverByName("GTiff")
@@ -122,14 +147,14 @@ def test_create_gebco_ocean_vrt_masks_positive_values(tmp_path: Path) -> None:
     np.testing.assert_allclose(arr, np.array([[-5.0, 0.0, 0.0005, nodata]], dtype=np.float32))
 
 
-def test_target_web_mercator_pixel_size_uses_output_zoom() -> None:
-    assert ocean.target_web_mercator_pixel_size() == pytest.approx(
+def test_web_mercator_pixel_size_uses_output_zoom() -> None:
+    assert satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM) == pytest.approx(
         satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
     )
 
 
-def test_target_web_mercator_pixel_size_accepts_requested_zoom() -> None:
-    assert ocean.target_web_mercator_pixel_size(14) == pytest.approx(
+def test_web_mercator_pixel_size_accepts_requested_zoom() -> None:
+    assert satmaps.tiler.web_mercator_pixel_size(14) == pytest.approx(
         satmaps.tiler.web_mercator_pixel_size(14)
     )
 
@@ -140,7 +165,9 @@ def test_snapped_tile_grid_for_bbox_expands_to_tile_pixel_grid() -> None:
     snapped_bounds, pixel_size, zoom = ocean.snapped_tile_grid_for_bbox(bbox)
 
     assert zoom == ocean.DEFAULT_MAX_ZOOM
-    assert pixel_size == pytest.approx(ocean.target_web_mercator_pixel_size())
+    assert pixel_size == pytest.approx(
+        satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
+    )
 
     mercator_bounds = satmaps.tiler.lonlat_bbox_to_mercator_bounds(*bbox)
     assert snapped_bounds[0] <= mercator_bounds[0]
@@ -155,7 +182,7 @@ def test_snapped_tile_grid_for_bbox_uses_requested_zoom() -> None:
     snapped_bounds, pixel_size, zoom = ocean.snapped_tile_grid_for_bbox(bbox, 14)
 
     assert zoom == 14
-    assert pixel_size == pytest.approx(ocean.target_web_mercator_pixel_size(14))
+    assert pixel_size == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
     mercator_bounds = satmaps.tiler.lonlat_bbox_to_mercator_bounds(*bbox)
     assert snapped_bounds[0] <= mercator_bounds[0]
     assert snapped_bounds[1] <= mercator_bounds[1]
@@ -208,18 +235,20 @@ def test_remove_small_enclosed_ocean_regions_prefers_land() -> None:
 
 
 def test_average_tile_blocks_skips_horizontal_ocean(monkeypatch: object) -> None:
-    from satmaps import TileGrid, average_tile_blocks
+    from satmaps import OceanMaskSlab, ProcessingWindow, average_tile_blocks
 
-    tile_grid = TileGrid(
-        projection="EPSG:3857",
-        geotransform=(0, 1, 0, 0, 0, -1),
-        width=10,
-        height=4,
-    )
-
-    # Land is only in columns 3 to 6
-    fill_allowed_mask = np.zeros((4, 10), dtype=bool)
-    fill_allowed_mask[:, 3:7] = True
+    processing_window = ProcessingWindow(xoff=3, yoff=0, width=4, height=4)
+    mask_slabs = {
+        0: OceanMaskSlab(
+            xoff=3,
+            yoff=0,
+            width=4,
+            height=4,
+            gebco_block=np.zeros((4, 4), dtype=np.float32),
+            coverage_block=np.ones((4, 4), dtype=bool),
+            fill_allowed_block=np.ones((4, 4), dtype=bool),
+        )
+    }
 
     calls = []
 
@@ -233,7 +262,7 @@ def test_average_tile_blocks_skips_horizontal_ocean(monkeypatch: object) -> None
 
     date_band_sets = []  # Empty for this test
 
-    average_tile_blocks(date_band_sets, tile_grid, fill_allowed_mask)
+    average_tile_blocks(date_band_sets, processing_window, mask_slabs, False)
 
     # It should have called mock_average_block with xoff=3 and width=4
     # Note: PROCESS_SLAB_HEIGHT is 24, so it should be one call for 4 rows
@@ -242,18 +271,20 @@ def test_average_tile_blocks_skips_horizontal_ocean(monkeypatch: object) -> None
 
 
 def test_average_tile_blocks_skips_empty_slabs(monkeypatch: object) -> None:
-    from satmaps import TileGrid, average_tile_blocks
+    from satmaps import OceanMaskSlab, ProcessingWindow, average_tile_blocks
 
-    tile_grid = TileGrid(
-        projection="EPSG:3857",
-        geotransform=(0, 1, 0, 0, 0, -1),
-        width=10,
-        height=100,
-    )
-
-    # Land is only in rows 30 to 40
-    fill_allowed_mask = np.zeros((100, 10), dtype=bool)
-    fill_allowed_mask[30:41, :] = True
+    processing_window = ProcessingWindow(xoff=0, yoff=24, width=10, height=24)
+    mask_slabs = {
+        24: OceanMaskSlab(
+            xoff=0,
+            yoff=24,
+            width=10,
+            height=24,
+            gebco_block=np.zeros((24, 10), dtype=np.float32),
+            coverage_block=np.ones((24, 10), dtype=bool),
+            fill_allowed_block=np.ones((24, 10), dtype=bool),
+        )
+    }
 
     calls = []
 
@@ -266,7 +297,7 @@ def test_average_tile_blocks_skips_empty_slabs(monkeypatch: object) -> None:
     monkeypatch.setattr("satmaps.average_block", mock_average_block)
 
     date_band_sets = []
-    average_tile_blocks(date_band_sets, tile_grid, fill_allowed_mask)
+    average_tile_blocks(date_band_sets, processing_window, mask_slabs, False)
 
     # SLAB_HEIGHT is 24.
     # Slab 0: 0-24 (Skip)
@@ -282,21 +313,25 @@ def test_average_tile_blocks_skips_empty_slabs(monkeypatch: object) -> None:
 def test_average_tile_blocks_masks_out_ocean_holes_inside_processed_slab(
     monkeypatch: object,
 ) -> None:
-    from satmaps import TileGrid, average_tile_blocks
-
-    tile_grid = TileGrid(
-        projection="EPSG:3857",
-        geotransform=(0, 1, 0, 0, 0, -1),
-        width=6,
-        height=2,
-    )
-    fill_allowed_mask = np.array(
-        [
-            [False, True, False, True, False, False],
-            [False, True, False, True, False, False],
-        ],
-        dtype=bool,
-    )
+    from satmaps import OceanMaskSlab, ProcessingWindow, average_tile_blocks
+    processing_window = ProcessingWindow(xoff=1, yoff=0, width=3, height=2)
+    mask_slabs = {
+        0: OceanMaskSlab(
+            xoff=1,
+            yoff=0,
+            width=3,
+            height=2,
+            gebco_block=np.zeros((2, 3), dtype=np.float32),
+            coverage_block=np.ones((2, 3), dtype=bool),
+            fill_allowed_block=np.array(
+                [
+                    [True, False, True],
+                    [True, False, True],
+                ],
+                dtype=bool,
+            ),
+        )
+    }
 
     def mock_average_block(date_band_sets, xoff, yoff, width, height):
         assert (xoff, yoff, width, height) == (1, 0, 3, 2)
@@ -306,18 +341,27 @@ def test_average_tile_blocks_masks_out_ocean_holes_inside_processed_slab(
 
     monkeypatch.setattr("satmaps.average_block", mock_average_block)
 
-    averaged, source_valid_mask, found_non_ocean_pixels = average_tile_blocks(
-        [], tile_grid, fill_allowed_mask
+    averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
+        [], processing_window, mask_slabs, False
     )
 
-    assert found_non_ocean_pixels is True
-    np.testing.assert_array_equal(source_valid_mask, fill_allowed_mask)
-    assert np.isnan(averaged[:, :, 0]).all()
-    assert np.isnan(averaged[:, :, 2]).all()
-    assert np.isnan(averaged[:, :, 4]).all()
-    assert np.isnan(averaged[:, :, 5]).all()
-    np.testing.assert_array_equal(averaged[:, :, 1], np.ones((3, 2), dtype=np.float32))
-    np.testing.assert_array_equal(averaged[:, :, 3], np.ones((3, 2), dtype=np.float32))
+    expected_fill_allowed = np.array(
+        [
+            [True, False, True],
+            [True, False, True],
+        ],
+        dtype=bool,
+    )
+    assert fill_allowed_mask is not None
+    np.testing.assert_array_equal(fill_allowed_mask, expected_fill_allowed)
+    np.testing.assert_array_equal(source_valid_mask, expected_fill_allowed)
+    np.testing.assert_array_equal(
+        alpha_mask,
+        np.full((2, 3), 255, dtype=np.uint8),
+    )
+    np.testing.assert_array_equal(averaged[:, :, 0], np.ones((3, 2), dtype=np.float32))
+    assert np.isnan(averaged[:, :, 1]).all()
+    np.testing.assert_array_equal(averaged[:, :, 2], np.ones((3, 2), dtype=np.float32))
 
 
 def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None:
@@ -428,6 +472,7 @@ def test_create_rgb_with_alpha_vrt_preserves_alpha_values(tmp_path: Path) -> Non
 
     rgba_vrt = tmp_path / "rgba.vrt"
     ocean.create_rgb_with_alpha_vrt(str(rgb_path), str(alpha_vrt), str(rgba_vrt))
+    assert not (tmp_path / "rgba.alpha.tif").exists()
 
     rgba_ds = gdal.Open(str(rgba_vrt))
     assert rgba_ds is not None
@@ -660,10 +705,10 @@ def test_generate_ocean_without_bbox_warps_global_raster(
     assert warp_calls[0][1] == artifacts.masked_vrt
     assert warp_options_calls[0]["outputBounds"] == ocean.WEB_MERCATOR_WORLD_BOUNDS
     assert warp_options_calls[0]["xRes"] == pytest.approx(
-        ocean.target_web_mercator_pixel_size()
+        satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
     )
     assert warp_options_calls[0]["yRes"] == pytest.approx(
-        ocean.target_web_mercator_pixel_size()
+        satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
     )
     assert commands == [[artifacts.warped_vrt, artifacts.hillshade_tif, "5.0"]]
     assert translated == [(artifacts.rgba_vrt, "ocean.tif")]
@@ -760,8 +805,8 @@ def test_generate_ocean_uses_requested_zoom_resolution(monkeypatch: object) -> N
         max_zoom=14,
     )
 
-    assert warp_options_calls[0]["xRes"] == pytest.approx(ocean.target_web_mercator_pixel_size(14))
-    assert warp_options_calls[0]["yRes"] == pytest.approx(ocean.target_web_mercator_pixel_size(14))
+    assert warp_options_calls[0]["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
+    assert warp_options_calls[0]["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
 
 
 def test_warp_to_web_mercator_uses_shared_zoom13_resolution(monkeypatch: object) -> None:
@@ -777,10 +822,10 @@ def test_warp_to_web_mercator_uses_shared_zoom13_resolution(monkeypatch: object)
 
     assert warp_options_calls[0]["dstSRS"] == "EPSG:3857"
     assert warp_options_calls[0]["xRes"] == pytest.approx(
-        ocean.target_web_mercator_pixel_size()
+        satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
     )
     assert warp_options_calls[0]["yRes"] == pytest.approx(
-        ocean.target_web_mercator_pixel_size()
+        satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
     )
 
 
@@ -795,8 +840,8 @@ def test_warp_to_web_mercator_respects_requested_zoom(monkeypatch: object) -> No
 
     satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 14)
 
-    assert warp_options_calls[0]["xRes"] == pytest.approx(ocean.target_web_mercator_pixel_size(14))
-    assert warp_options_calls[0]["yRes"] == pytest.approx(ocean.target_web_mercator_pixel_size(14))
+    assert warp_options_calls[0]["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
+    assert warp_options_calls[0]["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
 
 
 def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:
@@ -1296,8 +1341,8 @@ def test_main_builds_master_vrt_with_shared_zoom13_resolution(
     assert buildvrt_calls
     _, kwargs = buildvrt_calls[-1]
     assert kwargs["resolution"] == "user"
-    assert kwargs["xRes"] == pytest.approx(ocean.target_web_mercator_pixel_size())
-    assert kwargs["yRes"] == pytest.approx(ocean.target_web_mercator_pixel_size())
+    assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM))
+    assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM))
 
 
 def test_main_builds_master_vrt_with_requested_zoom14_resolution(
@@ -1326,8 +1371,8 @@ def test_main_builds_master_vrt_with_requested_zoom14_resolution(
 
     assert buildvrt_calls
     _, kwargs = buildvrt_calls[-1]
-    assert kwargs["xRes"] == pytest.approx(ocean.target_web_mercator_pixel_size(14))
-    assert kwargs["yRes"] == pytest.approx(ocean.target_web_mercator_pixel_size(14))
+    assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
+    assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
 
 
 def test_main_bbox_passes_chunk_bounds_to_tiler(

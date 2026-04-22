@@ -182,6 +182,14 @@ def lonlat_bbox_to_mercator_bounds(
     )
 
 
+def parse_bbox_string(bbox: str) -> TEBounds:
+    """Parse a min_lon,min_lat,max_lon,max_lat string into floats."""
+    values = tuple(float(value) for value in bbox.split(","))
+    if len(values) != 4:
+        raise ValueError("bbox must contain four comma-separated values")
+    return values
+
+
 def web_mercator_pixel_size(zoom: int) -> float:
     """Return the meters-per-pixel value for a Web Mercator XYZ zoom level."""
     return float((WEB_MERCATOR_LIMIT * 2) / (256 * (2**zoom)))
