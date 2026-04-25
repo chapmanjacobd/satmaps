@@ -14,6 +14,7 @@ from tiler import (
     WEB_MERCATOR_LIMIT,
     apply_preview_correction_numpy,
     apply_soft_knee_numpy,
+    encode_terrarium_numpy,
     get_chunk_tile_range,
     get_web_mercator_bounds,
     intersect_te_bounds,
@@ -138,6 +139,20 @@ def test_apply_preview_correction_numpy_basics() -> None:
     )
     expected = np.array([[[0.35]], [[0.35]], [[0.35]]], dtype=np.float32)
     np.testing.assert_allclose(corrected, expected, atol=1e-5)
+
+
+def test_encode_terrarium_numpy_round_trips_elevations() -> None:
+    elevations = np.array([[-11000.25, -1.0, 0.0, 1234.5, 8848.0]], dtype=np.float32)
+
+    encoded = encode_terrarium_numpy(elevations)
+    decoded = (
+        encoded[0].astype(np.float32) * 256.0
+        + encoded[1].astype(np.float32)
+        + encoded[2].astype(np.float32) / 256.0
+        - 32768.0
+    )
+
+    np.testing.assert_allclose(decoded, elevations, atol=1 / 256)
 
 
 def test_te_to_src_win_converts_bounds_to_pixel_window(tmp_path: Path) -> None:
@@ -527,5 +542,89 @@ def test_run_tiling_simplified_respects_alpha_masked_sources(
     assert translate_calls == [
         (chunk_tif, str(source_path)),
         (chunk_rgb_tif, chunk_tif),
+        (tiler_module.build_staged_path(str(chunk_file)), chunk_rgb_tif),
+    ]
+
+
+def test_process_chunk_uses_terrarium_encoding_for_dem_sources(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source_path = tmp_path / "terrain.vrt"
+    source_path.write_text("fake vrt")
+    chunk_file = tmp_path / ".temp" / "terrain.mbtiles"
+    chunk_file.parent.mkdir()
+    chunk_tif = str(chunk_file).replace(".mbtiles", ".tif")
+    chunk_rgb_tif = str(chunk_file).replace(".mbtiles", "_rgb.tif")
+
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+
+    def build_mem_dataset(raster_count: int) -> gdal.Dataset:
+        dataset = gdal.GetDriverByName("MEM").Create("", 512, 256, raster_count, gdal.GDT_Float32)
+        assert dataset is not None
+        dataset.SetGeoTransform((0.0, 1000.0, 0.0, 256000.0, 0.0, -1000.0))
+        dataset.SetProjection(srs.ExportToWkt())
+        return dataset
+
+    source_ds = build_mem_dataset(1)
+    chunk_ds = build_mem_dataset(1)
+    rgb_ds = gdal.GetDriverByName("MEM").Create("", 512, 256, 3, gdal.GDT_Byte)
+    assert rgb_ds is not None
+    rgb_ds.SetGeoTransform(chunk_ds.GetGeoTransform())
+    rgb_ds.SetProjection(chunk_ds.GetProjection())
+
+    translate_calls: list[tuple[str, str]] = []
+    terrarium_calls: list[str] = []
+
+    def fake_open(path: str):
+        if path == str(source_path):
+            return source_ds
+        if path == chunk_tif:
+            return chunk_ds
+        if path == chunk_rgb_tif:
+            return rgb_ds
+        return None
+
+    def fake_translate(destination: str, source: str, options=None):
+        del options
+        translate_calls.append((destination, source))
+        if destination == chunk_tif:
+            return chunk_ds
+        Path(destination).write_text("mbtiles")
+        return rgb_ds
+
+    def fake_write_terrarium_geotiff(source_dataset: gdal.Dataset, output_path: str) -> str:
+        assert source_dataset is chunk_ds
+        terrarium_calls.append(output_path)
+        return output_path
+
+    monkeypatch.setattr(tiler_module.gdal, "Open", fake_open)
+    monkeypatch.setattr(tiler_module.gdal, "Translate", fake_translate)
+    monkeypatch.setattr(tiler_module.gdal, "TranslateOptions", lambda **kwargs: kwargs)
+    monkeypatch.setattr(tiler_module, "write_terrarium_geotiff", fake_write_terrarium_geotiff)
+
+    result = tiler_module.process_chunk(
+        (
+            str(source_path),
+            str(chunk_file),
+            "png",
+            {
+                "format": "png",
+                "quality": 100,
+                "resample_alg": "bilinear",
+                "blocksize": 512,
+                "name": "Terrain",
+                "description": "Terrain",
+                "elevation_encoding": "terrarium",
+            },
+            tiler_module.get_dataset_bounds(source_ds),
+        )
+    )
+
+    assert result == str(chunk_file)
+    assert terrarium_calls == [chunk_rgb_tif]
+    assert translate_calls == [
+        (chunk_tif, str(source_path)),
         (tiler_module.build_staged_path(str(chunk_file)), chunk_rgb_tif),
     ]

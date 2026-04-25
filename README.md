@@ -10,6 +10,7 @@ This repository provides tools to fetch, process, and package Sentinel-2 mosaic 
 
 - `satmaps.py`: The primary engine. Handles GDAL S3 configuration, multi-date mosaicking, reprojection to Web Mercator (EPSG:3857), and PMTiles generation. Uses a NumPy-based pipeline for tone mapping and grading.
 - `ocean.py`: Builds a standalone styled Web Mercator ocean background from GEBCO, with both global and bbox exports targeting a shared Web Mercator zoom-13 output resolution.
+- `terrain.py`: Builds Terrarium-encoded Web Mercator PMTiles from GEBCO elevation data for `raster-dem` terrain sources.
 - `tuner_ui.py`: A Flask-based interactive web interface to fine-tune tone mapping parameters (exposure, contrast, saturation) in real-time on sample data.
 - `tiler.py`: Core logic for tile processing, tone mapping algorithms, and parallelized chunk execution.
 
@@ -62,7 +63,21 @@ ocean --vrt
 
 The first positional argument is the GEBCO zip path if you need something other than `gebco_2025_sub_ice_topo_geotiff.zip`, and the optional second positional argument is the output path (default: `ocean.tif`, or `ocean.vrt` when `--vrt` is used). Standalone ocean outputs target Web Mercator zoom 13 (~19.11 m/px at the equator).
 
-### 3. Generate PMTiles
+### 3. Generate Terrain PMTiles
+
+Build Terrarium-encoded terrain PMTiles directly from GEBCO:
+
+```bash
+# Global Terrarium DEM PMTiles from the full GEBCO raster
+terrain
+
+# BBox subset snapped to the same Web Mercator pixel grid used elsewhere
+terrain --bbox -161,18,-154,23 --max-zoom 14 gebco_2025_sub_ice_topo_geotiff.zip hawaii-terrain.pmtiles
+```
+
+`terrain` keeps the raw GEBCO elevations, including bathymetry, and encodes them as Terrarium PNG tiles suitable for MapLibre `raster-dem` sources such as maps.black.
+
+### 4. Generate Imagery PMTiles
 
 Generate PMTiles for either a bbox subset or the default all-tiles run:
 
@@ -77,7 +92,7 @@ make hawaii
 satmaps --ocean-background ocean.tif -o all-tiles.pmtiles
 ```
 
-### 4. Estimate Resources
+### 5. Estimate Resources
 
 Before an all-tiles run, estimate the time and storage required:
 
@@ -96,7 +111,7 @@ satmaps --estimate
 - `--parallel`: Number of worker processes/threads used for tile processing and chunk generation (default: `2`).
 - `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
 - `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before chunk generation. Coarser ocean masks (for example z11-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass.
-- Final Web Mercator land outputs target `--max-zoom` (default zoom 13, ~19.11 m/px at the equator). Ocean backgrounds may be reused from the same or a coarser zoom level and are resampled onto that final output grid during composition.
+- Final Web Mercator land outputs target `--max-zoom` (supported: 11, 12, 13, 14; default zoom 13, ~19.11 m/px at the equator). Ocean backgrounds may be reused from the same or a coarser zoom level and are resampled onto that final output grid during composition.
 - `--land` / `--no-land`: Enable or skip Sentinel-2 land tile processing entirely.
 - `--tonemap` / `--no-tonemap`: Enable or disable the land tone-mapping stage.
 - `--grade` / `--no-grade`: Enable or disable final land grading.
@@ -111,11 +126,24 @@ satmaps --estimate
 `ocean` supports the same tone-mapping controls as `satmaps`, plus:
 
 - `--bbox`: Export a Web Mercator ocean background cropped to a WGS84 bbox and snapped outward to the zoom-13 Web Mercator tile grid used for bbox renders in `satmaps`.
+- `--max-zoom`: Target Web Mercator zoom used for output resolution (`11`, `12`, `13`, or `14`).
 - `--hillshade-z`: Vertical exaggeration passed to `gdaldem hillshade`.
 - `--depth-min` / `--depth-max`: Depth range mapped onto the ocean color ramp.
 - `--resample-alg`: GEBCO upscale kernel (`cubicspline` or `lanczos`).
 - `--temp-dir`: Directory for intermediate rasters/VRTs.
 - `--vrt`: Write the final styled RGBA VRT instead of translating to GeoTIFF.
+
+### Terrain Options
+
+`terrain` supports:
+
+- `--bbox`: Export a WGS84 bbox subset instead of the full GEBCO DEM.
+- `--max-zoom`: Target Web Mercator zoom used for the DEM resolution (`11`, `12`, `13`, or `14`).
+- `--chunk-zoom`: Chunking zoom used during Terrarium MBTiles generation (default: `8`).
+- `--parallel`: Number of chunk worker processes (default: `2`).
+- `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
+- `--resample-alg`: GEBCO warp kernel (`bilinear`, `cubicspline`, or `lanczos`).
+- `--temp-dir`: Directory for intermediate rasters/VRTs.
 
 ### Tone Mapping Parameters
 

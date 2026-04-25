@@ -33,6 +33,8 @@ PREVIEW_DARKEN_LOW_SLOPE = 0.7
 # New default constants
 DEFAULT_EXPOSURE = 1.0
 DEFAULT_GAMMA = 1.0
+TERRARIUM_OFFSET = 32768.0
+TERRARIUM_MAX_VALUE = 65535.99609375
 
 MAKO_RAMP = [
     (0.00, 0, 8, 37),
@@ -155,6 +157,82 @@ class TilingArtifacts:
 
     final_vrt: str
     cleanup_paths: List[str]
+
+
+def encode_terrarium_numpy(
+    elevations: np.ndarray, nodata_value: Optional[float] = None
+) -> np.ndarray:
+    """Encode elevations in meters into Terrarium RGB bytes."""
+    values = np.asarray(elevations, dtype=np.float32)
+    valid_mask = np.isfinite(values)
+    if nodata_value is not None:
+        valid_mask &= ~np.isclose(values, nodata_value)
+
+    shifted = np.zeros_like(values, dtype=np.float32)
+    shifted[valid_mask] = np.clip(
+        values[valid_mask] + TERRARIUM_OFFSET,
+        0.0,
+        TERRARIUM_MAX_VALUE,
+    )
+
+    integer_part = np.floor(shifted).astype(np.int64, copy=False)
+    red = (integer_part // 256).astype(np.uint8, copy=False)
+    green = (integer_part % 256).astype(np.uint8, copy=False)
+    blue = np.floor((shifted - integer_part) * 256.0).astype(np.uint8, copy=False)
+    return np.stack((red, green, blue))
+
+
+def write_terrarium_geotiff(source_dataset: gdal.Dataset, output_path: str) -> str:
+    """Materialize a Terrarium RGB GeoTIFF from a single-band elevation dataset."""
+    if source_dataset.RasterCount < 1:
+        raise RuntimeError("Terrarium encoding requires at least one raster band")
+
+    source_band = source_dataset.GetRasterBand(1)
+    nodata_value = source_band.GetNoDataValue()
+    block_width, block_height = source_band.GetBlockSize()
+    if block_width <= 0:
+        block_width = 512
+    if block_height <= 0:
+        block_height = 512
+
+    driver = gdal.GetDriverByName("GTiff")
+    terrarium_ds = driver.Create(
+        output_path,
+        source_dataset.RasterXSize,
+        source_dataset.RasterYSize,
+        3,
+        gdal.GDT_Byte,
+        options=[
+            "TILED=YES",
+            "COMPRESS=DEFLATE",
+            "PREDICTOR=2",
+            "BLOCKXSIZE=512",
+            "BLOCKYSIZE=512",
+        ],
+    )
+    if terrarium_ds is None:
+        raise RuntimeError(f"Could not create Terrarium GeoTIFF: {output_path}")
+
+    terrarium_ds.SetProjection(source_dataset.GetProjection())
+    terrarium_ds.SetGeoTransform(source_dataset.GetGeoTransform())
+
+    for band_index, color_name in enumerate(("RedBand", "GreenBand", "BlueBand"), start=1):
+        terrarium_band = terrarium_ds.GetRasterBand(band_index)
+        terrarium_band.SetColorInterpretation(getattr(gdal, f"GCI_{color_name}"))
+
+    terrarium_bands = [terrarium_ds.GetRasterBand(index) for index in range(1, 4)]
+    for yoff in range(0, source_dataset.RasterYSize, block_height):
+        bh = min(block_height, source_dataset.RasterYSize - yoff)
+        for xoff in range(0, source_dataset.RasterXSize, block_width):
+            bw = min(block_width, source_dataset.RasterXSize - xoff)
+            elevations = source_band.ReadAsArray(xoff, yoff, bw, bh).astype(np.float32)
+            rgb = encode_terrarium_numpy(elevations, nodata_value)
+            for band_index, terrarium_band in enumerate(terrarium_bands):
+                terrarium_band.WriteArray(rgb[band_index], xoff=xoff, yoff=yoff)
+
+    terrarium_ds.FlushCache()
+    terrarium_ds = None
+    return output_path
 
 
 def lonlat_to_3857(lon: float, lat: float) -> Tuple[float, float]:
@@ -347,7 +425,13 @@ def process_chunk(args: ChunkTask) -> str:
         chunk_ds = gdal.Open(temp_chunk_raster)
         if chunk_ds is None:
             return ""
-        if has_alpha_band(chunk_ds):
+        if options.get("elevation_encoding") == "terrarium":
+            if format.lower() != "png":
+                raise RuntimeError("Terrarium DEM tiles must use PNG output")
+            remove_if_exists(temp_chunk_rgb)
+            write_terrarium_geotiff(chunk_ds, temp_chunk_rgb)
+            chunk_source = temp_chunk_rgb
+        elif has_alpha_band(chunk_ds):
             remove_if_exists(temp_chunk_rgb)
             rgb_ds = gdal.Translate(
                 temp_chunk_rgb,

@@ -190,6 +190,34 @@ def test_snapped_tile_grid_for_bbox_uses_requested_zoom() -> None:
     assert snapped_bounds[3] >= mercator_bounds[3]
 
 
+def test_snapped_tile_grid_for_bbox_accepts_zoom_11() -> None:
+    bbox = (-4.0, 50.0, -3.0, 51.0)
+
+    snapped_bounds, pixel_size, zoom = ocean.snapped_tile_grid_for_bbox(bbox, 11)
+
+    assert zoom == 11
+    assert pixel_size == pytest.approx(satmaps.tiler.web_mercator_pixel_size(11))
+    mercator_bounds = satmaps.tiler.lonlat_bbox_to_mercator_bounds(*bbox)
+    assert snapped_bounds[0] <= mercator_bounds[0]
+    assert snapped_bounds[1] <= mercator_bounds[1]
+    assert snapped_bounds[2] >= mercator_bounds[2]
+    assert snapped_bounds[3] >= mercator_bounds[3]
+
+
+def test_snapped_tile_grid_for_bbox_accepts_zoom_12() -> None:
+    bbox = (-4.0, 50.0, -3.0, 51.0)
+
+    snapped_bounds, pixel_size, zoom = ocean.snapped_tile_grid_for_bbox(bbox, 12)
+
+    assert zoom == 12
+    assert pixel_size == pytest.approx(satmaps.tiler.web_mercator_pixel_size(12))
+    mercator_bounds = satmaps.tiler.lonlat_bbox_to_mercator_bounds(*bbox)
+    assert snapped_bounds[0] <= mercator_bounds[0]
+    assert snapped_bounds[1] <= mercator_bounds[1]
+    assert snapped_bounds[2] >= mercator_bounds[2]
+    assert snapped_bounds[3] >= mercator_bounds[3]
+
+
 def test_create_alpha_vrt_handles_near_nodata_and_shallow_values(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
 
@@ -2012,6 +2040,70 @@ def test_main_builds_master_vrt_with_requested_zoom14_resolution(
     _, kwargs = buildvrt_calls[-1]
     assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
     assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
+
+
+def test_main_builds_master_vrt_with_requested_zoom11_resolution(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    ocean_path = tmp_path / "ocean.tif"
+    ocean_path.write_text("fake ocean")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1", "--max-zoom", "11"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: [])
+    buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_build_vrt(out, src, **kwargs):
+        buildvrt_calls.append((list(src), kwargs))
+        Path(out).write_text("fake vrt")
+
+    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
+
+    main()
+
+    assert buildvrt_calls
+    _, kwargs = buildvrt_calls[-1]
+    assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(11))
+    assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(11))
+
+
+def test_main_builds_master_vrt_with_requested_zoom12_resolution(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    ocean_path = tmp_path / "ocean.tif"
+    ocean_path.write_text("fake ocean")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1", "--max-zoom", "12"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: [])
+    buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_build_vrt(out, src, **kwargs):
+        buildvrt_calls.append((list(src), kwargs))
+        Path(out).write_text("fake vrt")
+
+    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
+
+    main()
+
+    assert buildvrt_calls
+    _, kwargs = buildvrt_calls[-1]
+    assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(12))
+    assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(12))
 
 
 def test_main_bbox_passes_chunk_bounds_to_tiler(

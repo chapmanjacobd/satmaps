@@ -57,6 +57,56 @@ def build_temp_mbtiles_path(output_path: str) -> str:
     return f".temp/{temp_basename_from_output(output_path)}.mbtiles"
 
 
+@dataclass(frozen=True)
+class PackagedPMTiles:
+    temp_mbtiles: str
+    tiling_artifacts: tiler.TilingArtifacts
+
+
+def convert_raster_to_pmtiles(
+    input_raster: str,
+    output_path: str,
+    *,
+    tile_format: str,
+    quality: int,
+    resample_alg: str,
+    chunk_zoom: int,
+    parallel: int,
+    blocksize: int,
+    name: str,
+    description: str,
+    requested_bbox: Optional[Tuple[float, float, float, float]] = None,
+    tiling_options: Optional[Dict[str, object]] = None,
+) -> PackagedPMTiles:
+    """Tile a Web Mercator raster into MBTiles and convert the result to PMTiles."""
+    temp_mbtiles = build_temp_mbtiles_path(output_path)
+    run_options: Dict[str, object] = {
+        "format": tile_format,
+        "quality": quality,
+        "resample_alg": resample_alg,
+        "chunk_zoom": chunk_zoom,
+        "processes": parallel,
+        "blocksize": blocksize,
+        "name": name,
+        "description": description,
+    }
+    if requested_bbox is not None:
+        run_options["chunk_bounds"] = tiler.lonlat_bbox_to_mercator_bounds(*requested_bbox)
+    if tiling_options:
+        run_options.update(tiling_options)
+
+    print("Generating MBTiles...")
+    tiling_artifacts = tiler.run_tiling_simplified(input_raster, temp_mbtiles, run_options)
+
+    print("Converting to PMTiles...")
+    subprocess.run(["pmtiles", "convert", temp_mbtiles, output_path], check=True)
+    print(f"Success! {output_path}")
+    return PackagedPMTiles(
+        temp_mbtiles=temp_mbtiles,
+        tiling_artifacts=tiling_artifacts,
+    )
+
+
 def build_prepared_ocean_path(output_path: str) -> str:
     """Return the deterministic heavyweight bbox-clipped ocean TIFF path."""
     return f".temp/{temp_basename_from_output(output_path)}_ocean_bbox.tif"
@@ -1557,28 +1607,19 @@ def main() -> None:
         print(f"Success! Master VRT: {master_vrt}")
         return
 
-    temp_mbtiles = build_temp_mbtiles_path(args.output)
-    tiling_opts = {
-        "format": args.format,
-        "quality": args.quality,
-        "resample_alg": args.resample_alg,
-        "chunk_zoom": args.chunk_zoom,
-        "processes": args.parallel,
-        "blocksize": args.blocksize,
-        "name": "Sentinel-2 Mosaic",
-        "description": "Copernicus Sentinel data",
-    }
-    if requested_bbox is not None:
-        tiling_opts["chunk_bounds"] = tiler.lonlat_bbox_to_mercator_bounds(
-            *requested_bbox
-        )
-
-    print("Generating MBTiles...")
-    artifacts = tiler.run_tiling_simplified(master_vrt, temp_mbtiles, tiling_opts)
-
-    print("Converting to PMTiles...")
-    subprocess.run(["pmtiles", "convert", temp_mbtiles, args.output], check=True)
-    print(f"Success! {args.output}")
+    packaged_tiles = convert_raster_to_pmtiles(
+        master_vrt,
+        args.output,
+        tile_format=args.format,
+        quality=args.quality,
+        resample_alg=args.resample_alg,
+        chunk_zoom=args.chunk_zoom,
+        parallel=args.parallel,
+        blocksize=args.blocksize,
+        name="Sentinel-2 Mosaic",
+        description="Copernicus Sentinel data",
+        requested_bbox=requested_bbox,
+    )
 
     persistent_paths = {os.path.abspath(args.ocean_background)}
     cleanup_paths = [
@@ -1587,7 +1628,11 @@ def main() -> None:
         if os.path.abspath(path) not in persistent_paths
     ]
 
-    for path in cleanup_paths + [temp_mbtiles] + artifacts.cleanup_paths:
+    for path in (
+        cleanup_paths
+        + [packaged_tiles.temp_mbtiles]
+        + packaged_tiles.tiling_artifacts.cleanup_paths
+    ):
         if os.path.exists(path):
             try:
                 os.remove(path)
