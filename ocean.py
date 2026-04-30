@@ -674,6 +674,8 @@ def generate_ocean_background(
     os.makedirs(temp_dir, exist_ok=True)
     stem = Path(destination).stem or "ocean"
     unique_id = uuid.uuid4().hex[:8]
+    run_mode = "bbox" if bbox is not None else "global"
+    print(f"Ocean build: {run_mode} run at z{max_zoom} -> {destination}")
 
     source_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_source.vrt")
     masked_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_masked.vrt")
@@ -685,7 +687,9 @@ def generate_ocean_background(
     rgba_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_rgba.vrt")
     cleanup_gpkg = Path(os.path.join(temp_dir, f"{stem}_{unique_id}_alpha.gpkg"))
 
+    print("[1/8] Building GEBCO source VRT...")
     build_gebco_source_vrt(gebco_zip, source_vrt)
+    print("[2/8] Masking land from GEBCO source...")
     create_gebco_ocean_vrt(source_vrt, masked_vrt)
 
     if style is None:
@@ -699,11 +703,20 @@ def generate_ocean_background(
         "warpOptions": ["NUM_THREADS=ALL_CPUS"],
     }
     if bbox is None:
+        pixel_size = web_mercator_pixel_size(max_zoom)
+        print(
+            f"[3/8] Warping masked ocean to global Web Mercator "
+            f"at ~{pixel_size:.2f} m/px..."
+        )
         warp_kwargs["outputBounds"] = WEB_MERCATOR_WORLD_BOUNDS
-        warp_kwargs["xRes"] = web_mercator_pixel_size(max_zoom)
-        warp_kwargs["yRes"] = web_mercator_pixel_size(max_zoom)
+        warp_kwargs["xRes"] = pixel_size
+        warp_kwargs["yRes"] = pixel_size
     else:
         snapped_bounds, pixel_size, _zoom = snapped_tile_grid_for_bbox(bbox, max_zoom)
+        print(
+            f"[3/8] Warping masked ocean to bbox-aligned Web Mercator grid "
+            f"at ~{pixel_size:.2f} m/px..."
+        )
         warp_kwargs["outputBounds"] = snapped_bounds
         warp_kwargs["xRes"] = pixel_size
         warp_kwargs["yRes"] = pixel_size
@@ -713,19 +726,27 @@ def generate_ocean_background(
     gdal.Warp(staged_warped_vrt, masked_vrt, options=warp_options)
     publish_staged_path(staged_warped_vrt, warped_vrt)
 
+    print("[4/8] Building ocean alpha mask...")
     create_alpha_vrt(warped_vrt, alpha_vrt, alpha_tif=alpha_tif, vector_path=cleanup_gpkg)
+    print("[5/8] Generating ocean hillshade...")
     create_hillshade_tif(warped_vrt, hillshade_tif, hillshade_z)
+    print("[6/8] Colorizing ocean raster...")
     create_ocean_rgb_tif(warped_vrt, hillshade_tif, color_tif, style)
+    print("[7/8] Combining RGB + alpha...")
     create_rgb_with_alpha_vrt(color_tif, alpha_vrt, rgba_vrt, alpha_tif=alpha_tif)
     if vrt:
         translate_path = str(Path(destination).with_suffix(".vrt"))
+        print("[8/8] Writing final RGBA VRT...")
         write_rgba_vrt(rgba_vrt, translate_path)
         destination = translate_path
         remove_if_exists(hillshade_tif)
     else:
+        print("[8/8] Translating final RGBA GeoTIFF...")
         translate_rgba_vrt(rgba_vrt, destination)
         for path in (hillshade_tif, color_tif, alpha_tif):
             remove_if_exists(path)
+
+    print(f"Ocean build complete: {destination}")
 
     return OceanBackgroundArtifacts(
         source_vrt=source_vrt,

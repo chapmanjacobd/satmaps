@@ -2,6 +2,7 @@
 import argparse
 import glob
 import json
+import math
 import os
 import subprocess
 import sys
@@ -55,6 +56,27 @@ def build_master_vrt_path(output_path: str, unique_id: str) -> str:
 def build_temp_mbtiles_path(output_path: str) -> str:
     """Return the deterministic heavyweight MBTiles path."""
     return f".temp/{temp_basename_from_output(output_path)}.mbtiles"
+
+
+def format_progress(current: int, total: int) -> str:
+    """Return a short human-readable progress string."""
+    if total <= 0:
+        return "0/0 (0%)"
+    bounded_current = min(max(current, 0), total)
+    percent = round((bounded_current / total) * 100)
+    return f"{bounded_current}/{total} ({percent}%)"
+
+
+def build_progress_checkpoints(total_steps: int) -> set[int]:
+    """Return coarse progress checkpoints that keep long runs chatty but not noisy."""
+    if total_steps <= 0:
+        return set()
+    checkpoints = {total_steps}
+    if total_steps < 10:
+        return checkpoints
+    for percent in range(10, 100, 10):
+        checkpoints.add(max(1, math.ceil(total_steps * percent / 100)))
+    return checkpoints
 
 
 @dataclass(frozen=True)
@@ -372,6 +394,14 @@ def discover_mgrs_tiles_from_ocean_mask(
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
 
+    total_row_blocks = math.ceil(scan_height / block_y) if block_y > 0 else 0
+    completed_row_blocks = 0
+    progress_checkpoints = build_progress_checkpoints(total_row_blocks)
+    print(
+        "Ocean mask scan window: "
+        f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks."
+    )
+
     for yoff in range(scan_yoff, scan_yoff + scan_height, block_y):
         height = min(block_y, scan_yoff + scan_height - yoff)
         for xoff in range(scan_xoff, scan_xoff + scan_width, block_x):
@@ -423,6 +453,13 @@ def discover_mgrs_tiles_from_ocean_mask(
                     mgrs_tiles.add(tile.decode() if isinstance(tile, bytes) else tile)
                 except mgrs_core.MGRSError:
                     continue
+        completed_row_blocks += 1
+        if completed_row_blocks in progress_checkpoints:
+            print(
+                "Ocean mask scan progress: "
+                f"{format_progress(completed_row_blocks, total_row_blocks)}; "
+                f"{len(mgrs_tiles)} tiles found so far."
+            )
     return mgrs_tiles
 
 
@@ -702,14 +739,22 @@ def get_aligned_web_mercator_src_win(
 
 def populate_s3_cache(date_paths: List[str]) -> None:
     """Cache remote folder listings for all-tiles runs."""
-    print("Populating S3 folder cache...")
-    for date_path in date_paths:
+    print(f"Populating S3 folder cache for {len(date_paths)} date(s)...")
+    total_folders = 0
+    for index, date_path in enumerate(date_paths, start=1):
         s3_base = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}"
+        print(f"S3 cache progress: {format_progress(index, len(date_paths))}; listing {date_path}...")
         dirs = gdal.ReadDir(s3_base)
         if dirs:
             S3_FOLDER_CACHE[date_path] = set(dirs)
+            total_folders += len(dirs)
+            print(f"Cached {len(dirs)} folders for {date_path}.")
         else:
             print(f"Warning: Could not list folders for {date_path}")
+    print(
+        f"S3 folder cache ready: {len(S3_FOLDER_CACHE)} date(s), "
+        f"{total_folders} folders total."
+    )
 
 
 # --- Processing Layer (NumPy Manipulation) ---
@@ -1266,6 +1311,7 @@ def process_single_tile(
         return None
 
     if args.download:
+        print(f"Downloading tile {mgrs_subtile} across {len(folders)} date(s)...")
         for folder_name, date_path in folders:
             get_tile_paths(folder_name, date_path, args.cache, download=True)
         return None
@@ -1315,6 +1361,7 @@ def process_single_tile(
         warp_to_web_mercator(temp_utm_path, staged_3857_path, args.resample_alg, args.max_zoom)
         publish_staged_path(staged_3857_path, temp_3857_path)
         os.remove(temp_utm_path)
+        print(f"Finished tile {mgrs_subtile}: {temp_3857_path}")
         return temp_3857_path
     finally:
         for bands, datasets in date_band_sets:
@@ -1538,11 +1585,19 @@ def main() -> None:
 
     mgrs_bases = discover_mgrs_bases(requested_bbox, gebco_vrt_source)
     subtiles = expand_subtiles(mgrs_bases)
+    print(
+        f"Expanded {len(mgrs_bases)} MGRS tiles into {len(subtiles)} sub-tiles "
+        f"across {len(date_paths)} date(s)."
+    )
 
     if args.land:
         subtiles_to_process = [st for st in subtiles if st not in completed_subtiles]
         if subtiles_to_process:
-            print(f"Starting processing for {len(subtiles_to_process)} sub-tiles...")
+            print(
+                "Starting land processing for "
+                f"{len(subtiles_to_process)} sub-tiles with {args.parallel} worker(s); "
+                f"{len(completed_subtiles)} already complete."
+            )
             with ThreadPoolExecutor(max_workers=args.parallel) as executor:
                 future_to_st = {
                     executor.submit(
@@ -1560,6 +1615,11 @@ def main() -> None:
                     completed_subtiles.add(st)
                     if res:
                         processed_tifs.append(res)
+                    print(
+                        "Land processing progress: "
+                        f"{format_progress(len(completed_subtiles), len(subtiles))}; "
+                        f"{len(processed_tifs)} raster(s) ready."
+                    )
                     write_resume_state(
                         state_file, unique_id, completed_subtiles, processed_tifs, args
                     )
@@ -1581,6 +1641,7 @@ def main() -> None:
         args.max_zoom,
     )
     if prepared_ocean_background:
+        print(f"Using ocean background: {prepared_ocean_background}")
         if prepared_ocean_background not in processed_tifs:
             processed_tifs.insert(0, prepared_ocean_background)
     elif args.bbox:
@@ -1594,6 +1655,7 @@ def main() -> None:
     staged_master_vrt = build_staged_path(master_vrt)
     pixel_size = tiler.web_mercator_pixel_size(args.max_zoom)
     remove_if_exists(staged_master_vrt)
+    print(f"Building master VRT from {len(processed_tifs)} raster(s)...")
     gdal.BuildVRT(
         staged_master_vrt,
         processed_tifs,

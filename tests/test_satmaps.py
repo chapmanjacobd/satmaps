@@ -1179,6 +1179,45 @@ def test_generate_ocean_without_bbox_warps_global_raster(
     assert translated == [(artifacts.rgba_vrt, "ocean.tif")]
 
 
+def test_generate_ocean_without_bbox_reports_stage_progress(
+    monkeypatch: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
+    monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
+    monkeypatch.setattr(
+        "ocean.create_alpha_vrt",
+        lambda source_vrt, output_vrt, **kwargs: output_vrt,
+    )
+    monkeypatch.setattr(
+        "ocean.create_ocean_rgb_tif",
+        lambda depth_vrt, hillshade_tif, output_tif, style: output_tif,
+    )
+    monkeypatch.setattr(
+        "ocean.create_rgb_with_alpha_vrt",
+        lambda rgb_tif, alpha_vrt, output_vrt, **kwargs: output_vrt,
+    )
+    monkeypatch.setattr("ocean.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
+    monkeypatch.setattr("ocean.create_hillshade_tif", lambda input_vrt, output_tif, z_factor: output_tif)
+    monkeypatch.setattr("ocean.gdal.WarpOptions", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        "ocean.gdal.Warp",
+        lambda destination, source, options=None: Path(destination).write_text("warped") or destination,
+    )
+
+    ocean.generate_ocean_background(
+        gebco_zip="gebco.zip",
+        destination="ocean.tif",
+        bbox=None,
+    )
+
+    out = capsys.readouterr().out
+    assert "Ocean build: global run at z13 -> ocean.tif" in out
+    assert "[3/8] Warping masked ocean to global Web Mercator" in out
+    assert "[8/8] Translating final RGBA GeoTIFF..." in out
+    assert "Ocean build complete: ocean.tif" in out
+
+
 def test_generate_ocean_with_bbox_sets_explicit_target_resolution(
     monkeypatch: object,
 ) -> None:
@@ -1829,6 +1868,40 @@ def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
     # Check that the master VRT was created
     master_vrts = list(tmp_path.glob(".temp/master_*.vrt"))
     assert len(master_vrts) == 1
+
+
+def test_main_reports_land_progress(
+    monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "--vrt", "--parallel", "1", "--date", "2025/07/01"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: ["31TDF"])
+
+    def fake_process_single_tile(st, dates, args, gebco_src=None):
+        path = tmp_path / f"processed_{st}.tif"
+        path.write_text("fake tif")
+        return str(path)
+
+    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
+    monkeypatch.setattr(
+        "satmaps.gdal.BuildVRT",
+        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+    )
+
+    main()
+
+    out = capsys.readouterr().out
+    assert "Expanded 1 MGRS tiles into 4 sub-tiles across 1 date(s)." in out
+    assert "Land processing progress: 4/4 (100%); 4 raster(s) ready." in out
+    assert "Building master VRT from 4 raster(s)..." in out
 
 
 def test_main_passes_ocean_path_to_tile_processing(

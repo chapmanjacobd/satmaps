@@ -16,8 +16,10 @@ from satmaps import (
     build_alpha_block,
     build_fill_allowed_mask,
     build_bbox_geometry,
+    build_progress_checkpoints,
     expand_subtiles,
     find_resume_path,
+    format_progress,
     get_ocean_mask_band_index,
     iter_processing_windows,
     open_date_band_sets,
@@ -232,6 +234,36 @@ def test_iter_processing_windows_uses_full_width_row_slabs() -> None:
         (0, 24, 10008, 24),
         (0, 48, 10008, 2),
     ]
+
+
+def test_format_progress_and_checkpoints_cover_long_runs() -> None:
+    assert format_progress(3, 12) == "3/12 (25%)"
+    assert build_progress_checkpoints(0) == set()
+    assert build_progress_checkpoints(5) == {5}
+    assert build_progress_checkpoints(12) == {2, 3, 4, 5, 6, 8, 9, 10, 11, 12}
+
+
+def test_populate_s3_cache_reports_progress(
+    monkeypatch: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    satmaps.S3_FOLDER_CACHE.clear()
+
+    def fake_readdir(path: str) -> list[str] | None:
+        if path.endswith("/2025/07/01"):
+            return ["Sentinel-2_mosaic_2025_Q3_31TDF_0_0"]
+        if path.endswith("/2025/01/01"):
+            return ["Sentinel-2_mosaic_2025_Q1_31TDF_0_0", "Sentinel-2_mosaic_2025_Q1_32TLP_0_0"]
+        raise AssertionError(f"Unexpected path: {path}")
+
+    monkeypatch.setattr(satmaps.gdal, "ReadDir", fake_readdir)
+
+    satmaps.populate_s3_cache(["2025/07/01", "2025/01/01"])
+
+    out = capsys.readouterr().out
+    assert "Populating S3 folder cache for 2 date(s)..." in out
+    assert "S3 cache progress: 1/2 (50%); listing 2025/07/01..." in out
+    assert "Cached 2 folders for 2025/01/01." in out
+    assert "S3 folder cache ready: 2 date(s), 3 folders total." in out
 
 
 def test_build_alpha_block_uses_source_mask_without_gebco() -> None:
