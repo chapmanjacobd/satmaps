@@ -34,7 +34,17 @@ SUBTILE_OFFSETS = ((0, 0), (0, 1), (1, 0), (1, 1))
 SENTINEL_NODATA = -32768
 PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
-MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
+DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
+
+
+def max_in_memory_write_pixels() -> int:
+    """Return the live pixel budget for whole-window RGB(A) writes."""
+    return tiler.compute_in_memory_pixel_limit(
+        48,
+        usage_fraction=0.2,
+        fallback_pixels=DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS,
+        max_pixels=64_000_000,
+    )
 
 
 def temp_basename_from_output(output_path: str) -> str:
@@ -1217,7 +1227,7 @@ def write_processed_blocks(
     if scale <= 0.0:
         raise ValueError("stats_max must be greater than stats_min")
 
-    if processing_window.width * processing_window.height <= MAX_IN_MEMORY_WRITE_PIXELS:
+    if processing_window.width * processing_window.height <= max_in_memory_write_pixels():
         byte_block = tone_mapped_byte_block(averaged, args, source_min, scale)
         for band_index, out_band in enumerate(color_bands):
             out_band.WriteArray(byte_block[band_index], xoff=processing_window.xoff, yoff=processing_window.yoff)

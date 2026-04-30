@@ -16,6 +16,7 @@ from tiler import (
     MAKO_RAMP,
     apply_preview_correction_numpy,
     apply_soft_knee_numpy,
+    compute_in_memory_pixel_limit,
     colorize_depth_numpy,
     lonlat_bbox_to_mercator_bounds,
     parse_bbox_string,
@@ -57,8 +58,15 @@ OCEAN_DEFAULT_BLACK_SLOPE = 0.25
 OCEAN_FADE_DEPTH = -50.0
 SMALL_OCEAN_MAX_AREA_SQ_M = 1_500_000.0
 MAX_COMPONENT_CLEANUP_PIXELS = 120_000_000
-MAX_IN_MEMORY_ALPHA_PIXELS = 12_000_000
-MAX_IN_MEMORY_COLOR_PIXELS = 4_000_000
+DEFAULT_MAX_IN_MEMORY_ALPHA_PIXELS = 12_000_000
+DEFAULT_MAX_IN_MEMORY_COLOR_PIXELS = 4_000_000
+DEFAULT_MAX_IN_MEMORY_SIEVE_MASK_PIXELS = 512_000_000
+TEMPORARY_TILED_GTIFF_OPTIONS = (
+    "BIGTIFF=IF_SAFER",
+    "TILED=YES",
+    "BLOCKXSIZE=512",
+    "BLOCKYSIZE=512",
+)
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,36 @@ class OceanStyleOptions:
     black_slope: float = OCEAN_DEFAULT_BLACK_SLOPE
     depth_min: float = -11000.0
     depth_max: float = 0.0
+
+
+def max_in_memory_alpha_pixels() -> int:
+    """Return the live pixel budget for full alpha-mask generation in memory."""
+    return compute_in_memory_pixel_limit(
+        32,
+        usage_fraction=0.15,
+        fallback_pixels=DEFAULT_MAX_IN_MEMORY_ALPHA_PIXELS,
+        max_pixels=96_000_000,
+    )
+
+
+def max_in_memory_color_pixels() -> int:
+    """Return the live pixel budget for full ocean RGB shading in memory."""
+    return compute_in_memory_pixel_limit(
+        40,
+        usage_fraction=0.15,
+        fallback_pixels=DEFAULT_MAX_IN_MEMORY_COLOR_PIXELS,
+        max_pixels=64_000_000,
+    )
+
+
+def max_in_memory_sieve_mask_pixels() -> int:
+    """Return the live pixel budget for keeping the sieve land mask in memory."""
+    return compute_in_memory_pixel_limit(
+        2,
+        usage_fraction=0.2,
+        fallback_pixels=DEFAULT_MAX_IN_MEMORY_SIEVE_MASK_PIXELS,
+        max_pixels=1_500_000_000,
+    )
 
 
 def build_staged_path(path: str) -> str:
@@ -195,7 +233,7 @@ def create_alpha_vrt(
     alpha_ds.SetGeoTransform(ds.GetGeoTransform())
     alpha_band = alpha_ds.GetRasterBand(1)
 
-    if xsize * ysize <= MAX_IN_MEMORY_ALPHA_PIXELS:
+    if xsize * ysize <= max_in_memory_alpha_pixels():
         depths = band.ReadAsArray().astype(np.float32)
         ocean_mask = build_ocean_threshold_mask(depths, nodata_value)
         cleaned_mask = remove_small_enclosed_ocean_regions(
@@ -304,22 +342,10 @@ def remove_small_ocean_regions_sieve(
         raise ValueError("geotransform must define a positive pixel area")
 
     sieve_threshold_pixels = max(1, int(np.ceil(max_area_sq_m / pixel_area_sq_m)))
-    mask_driver = gdal.GetDriverByName("GTiff")
-    if mask_driver is None:
-        raise RuntimeError("Could not load GTiff driver for ocean cleanup")
-
-    staged_cleanup_mask = build_staged_path(str(cleanup_mask_path))
-    remove_if_exists(staged_cleanup_mask)
-    land_mask_ds = mask_driver.Create(
-        staged_cleanup_mask,
-        alpha_dataset.RasterXSize,
-        alpha_dataset.RasterYSize,
-        1,
-        gdal.GDT_Byte,
-        options=list(GTIFF_CREATION_OPTIONS),
+    land_mask_ds, staged_cleanup_mask = create_sieve_cleanup_mask_dataset(
+        alpha_dataset,
+        cleanup_mask_path,
     )
-    if land_mask_ds is None:
-        raise RuntimeError(f"Could not create temporary cleanup mask: {cleanup_mask_path}")
 
     land_mask_ds.SetProjection(alpha_dataset.GetProjection())
     land_mask_ds.SetGeoTransform(alpha_dataset.GetGeoTransform())
@@ -352,7 +378,46 @@ def remove_small_ocean_regions_sieve(
 
     alpha_band.FlushCache()
     land_mask_ds = None
+    if staged_cleanup_mask is not None:
+        remove_if_exists(staged_cleanup_mask)
+
+
+def create_sieve_cleanup_mask_dataset(
+    alpha_dataset: gdal.Dataset,
+    cleanup_mask_path: Path,
+) -> tuple[gdal.Dataset, str | None]:
+    """Create the temporary land-mask dataset used to restore original land after sieving."""
+    pixel_count = alpha_dataset.RasterXSize * alpha_dataset.RasterYSize
+    if pixel_count <= max_in_memory_sieve_mask_pixels():
+        mem_driver = gdal.GetDriverByName("MEM")
+        if mem_driver is not None:
+            land_mask_ds = mem_driver.Create(
+                "",
+                alpha_dataset.RasterXSize,
+                alpha_dataset.RasterYSize,
+                1,
+                gdal.GDT_Byte,
+            )
+            if land_mask_ds is not None:
+                return land_mask_ds, None
+
+    mask_driver = gdal.GetDriverByName("GTiff")
+    if mask_driver is None:
+        raise RuntimeError("Could not load GTiff driver for ocean cleanup")
+
+    staged_cleanup_mask = build_staged_path(str(cleanup_mask_path))
     remove_if_exists(staged_cleanup_mask)
+    land_mask_ds = mask_driver.Create(
+        staged_cleanup_mask,
+        alpha_dataset.RasterXSize,
+        alpha_dataset.RasterYSize,
+        1,
+        gdal.GDT_Byte,
+        options=list(TEMPORARY_TILED_GTIFF_OPTIONS),
+    )
+    if land_mask_ds is None:
+        raise RuntimeError(f"Could not create temporary cleanup mask: {cleanup_mask_path}")
+    return land_mask_ds, staged_cleanup_mask
 
 
 def remove_small_enclosed_ocean_regions_vector(
@@ -567,7 +632,7 @@ def create_ocean_rgb_tif(
         band.SetColorInterpretation(getattr(gdal, f"GCI_{color_name}"))
 
     color_bands = [color_ds.GetRasterBand(index) for index in range(1, 4)]
-    if hillshade_ds.RasterXSize * hillshade_ds.RasterYSize <= MAX_IN_MEMORY_COLOR_PIXELS:
+    if hillshade_ds.RasterXSize * hillshade_ds.RasterYSize <= max_in_memory_color_pixels():
         depths = depth_band.ReadAsArray().astype(np.float32)
         hillshade = hillshade_band.ReadAsArray().astype(np.float32)
         byte_arr = shade_ocean_rgb(depths, hillshade, ramp_colors, style)

@@ -63,6 +63,65 @@ MAKO_RAMP = [
 LUMA_RED = 0.2126
 LUMA_GREEN = 0.7152
 LUMA_BLUE = 0.0722
+DEFAULT_MEMORY_RESERVE_BYTES = 1 << 30
+
+
+def get_available_memory_bytes() -> int:
+    """Return the current available system memory in bytes when it can be detected."""
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return max(0, int(parts[1]) * 1024)
+                    break
+    except OSError:
+        pass
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+    except (AttributeError, OSError, ValueError):
+        return 0
+
+    if page_size <= 0 or available_pages <= 0:
+        return 0
+    return page_size * available_pages
+
+
+def compute_in_memory_pixel_limit(
+    bytes_per_pixel: int,
+    *,
+    usage_fraction: float,
+    fallback_pixels: int,
+    reserve_bytes: int = DEFAULT_MEMORY_RESERVE_BYTES,
+    min_pixels: int = 1,
+    max_pixels: int | None = None,
+) -> int:
+    """Convert available-memory headroom into a runtime pixel budget."""
+    if bytes_per_pixel <= 0:
+        raise ValueError("bytes_per_pixel must be positive")
+    if not 0.0 < usage_fraction <= 1.0:
+        raise ValueError("usage_fraction must be between 0 and 1")
+    if fallback_pixels <= 0:
+        raise ValueError("fallback_pixels must be positive")
+    if min_pixels <= 0:
+        raise ValueError("min_pixels must be positive")
+    if max_pixels is not None and max_pixels < min_pixels:
+        raise ValueError("max_pixels must be at least min_pixels")
+
+    available_bytes = get_available_memory_bytes()
+    if available_bytes <= 0:
+        pixel_limit = fallback_pixels
+    else:
+        usable_bytes = available_bytes if available_bytes <= reserve_bytes else available_bytes - reserve_bytes
+        budget_bytes = max(int(usable_bytes * usage_fraction), bytes_per_pixel * min_pixels)
+        pixel_limit = max(min_pixels, budget_bytes // bytes_per_pixel)
+
+    if max_pixels is not None:
+        pixel_limit = min(pixel_limit, max_pixels)
+    return max(min_pixels, pixel_limit)
 
 
 def colorize_depth_numpy(

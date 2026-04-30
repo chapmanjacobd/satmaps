@@ -159,6 +159,47 @@ def test_web_mercator_pixel_size_accepts_requested_zoom() -> None:
     )
 
 
+def test_compute_in_memory_pixel_limit_uses_available_memory_and_cap(
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(satmaps.tiler, "get_available_memory_bytes", lambda: 1_000_000)
+
+    assert (
+        satmaps.tiler.compute_in_memory_pixel_limit(
+            10,
+            usage_fraction=0.5,
+            fallback_pixels=123,
+            reserve_bytes=200_000,
+            max_pixels=35_000,
+        )
+        == 35_000
+    )
+
+
+def test_compute_in_memory_pixel_limit_falls_back_when_memory_unknown(
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(satmaps.tiler, "get_available_memory_bytes", lambda: 0)
+
+    assert (
+        satmaps.tiler.compute_in_memory_pixel_limit(
+            10,
+            usage_fraction=0.5,
+            fallback_pixels=123,
+        )
+        == 123
+    )
+
+
+def test_runtime_memory_limits_scale_above_defaults(monkeypatch: object) -> None:
+    monkeypatch.setattr(satmaps.tiler, "get_available_memory_bytes", lambda: 12 * 1024**3)
+
+    assert satmaps.max_in_memory_write_pixels() > satmaps.DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS
+    assert ocean.max_in_memory_alpha_pixels() > ocean.DEFAULT_MAX_IN_MEMORY_ALPHA_PIXELS
+    assert ocean.max_in_memory_color_pixels() > ocean.DEFAULT_MAX_IN_MEMORY_COLOR_PIXELS
+    assert ocean.max_in_memory_sieve_mask_pixels() > ocean.DEFAULT_MAX_IN_MEMORY_SIEVE_MASK_PIXELS
+
+
 def test_snapped_tile_grid_for_bbox_expands_to_tile_pixel_grid() -> None:
     bbox = (-4.0, 50.0, -3.0, 51.0)
 
@@ -471,7 +512,7 @@ def test_alpha_mask_coastline_seam_pixel_is_filled_opaquely(
 def test_write_processed_blocks_block_path_matches_in_memory_path(
     monkeypatch: object,
 ) -> None:
-    monkeypatch.setattr(satmaps, "MAX_IN_MEMORY_WRITE_PIXELS", 1)
+    monkeypatch.setattr(satmaps, "max_in_memory_write_pixels", lambda: 1)
     processing_window = satmaps.ProcessingWindow(xoff=0, yoff=0, width=2, height=1)
     averaged = np.array(
         [[[1.0, 1.0]], [[0.5, 0.5]], [[0.25, 0.25]]],
@@ -621,7 +662,7 @@ def test_create_alpha_vrt_block_path_matches_threshold_output(
     tmp_path: Path,
     monkeypatch: object,
 ) -> None:
-    monkeypatch.setattr(ocean, "MAX_IN_MEMORY_ALPHA_PIXELS", 1)
+    monkeypatch.setattr(ocean, "max_in_memory_alpha_pixels", lambda: 1)
     driver = gdal.GetDriverByName("GTiff")
 
     alpha_source = tmp_path / "ocean_source_block.tif"
@@ -652,7 +693,7 @@ def test_create_alpha_vrt_large_cleanup_removes_small_ocean_regions(
     tmp_path: Path,
     monkeypatch: object,
 ) -> None:
-    monkeypatch.setattr(ocean, "MAX_IN_MEMORY_ALPHA_PIXELS", 1)
+    monkeypatch.setattr(ocean, "max_in_memory_alpha_pixels", lambda: 1)
     monkeypatch.setattr(ocean, "MAX_COMPONENT_CLEANUP_PIXELS", 0)
     monkeypatch.setattr(ocean, "SMALL_OCEAN_MAX_AREA_SQ_M", 2.0)
     driver = gdal.GetDriverByName("GTiff")
@@ -692,7 +733,7 @@ def test_create_alpha_vrt_large_cleanup_preserves_land_holes(
     tmp_path: Path,
     monkeypatch: object,
 ) -> None:
-    monkeypatch.setattr(ocean, "MAX_IN_MEMORY_ALPHA_PIXELS", 1)
+    monkeypatch.setattr(ocean, "max_in_memory_alpha_pixels", lambda: 1)
     monkeypatch.setattr(ocean, "MAX_COMPONENT_CLEANUP_PIXELS", 0)
     monkeypatch.setattr(ocean, "SMALL_OCEAN_MAX_AREA_SQ_M", 2.0)
     driver = gdal.GetDriverByName("GTiff")
@@ -733,6 +774,40 @@ def test_create_alpha_vrt_large_cleanup_preserves_land_holes(
             dtype=np.uint8,
         ),
     )
+
+
+def test_create_sieve_cleanup_mask_dataset_prefers_mem(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setattr(ocean, "max_in_memory_sieve_mask_pixels", lambda: 9)
+    driver = gdal.GetDriverByName("MEM")
+    alpha_ds = driver.Create("", 3, 3, 1, gdal.GDT_Byte)
+
+    cleanup_ds, cleanup_path = ocean.create_sieve_cleanup_mask_dataset(
+        alpha_ds,
+        tmp_path / "cleanup_mask.tif",
+    )
+
+    assert cleanup_ds.GetDriver().ShortName == "MEM"
+    assert cleanup_path is None
+
+
+def test_create_sieve_cleanup_mask_dataset_uses_uncompressed_gtiff(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(ocean, "max_in_memory_sieve_mask_pixels", lambda: 0)
+    alpha_ds = gdal.GetDriverByName("MEM").Create("", 3, 3, 1, gdal.GDT_Byte)
+
+    cleanup_ds, cleanup_path = ocean.create_sieve_cleanup_mask_dataset(
+        alpha_ds,
+        tmp_path / "cleanup_mask.tif",
+    )
+
+    assert cleanup_ds.GetDriver().ShortName == "GTiff"
+    assert cleanup_path is not None
+    assert cleanup_ds.GetMetadata("IMAGE_STRUCTURE").get("COMPRESSION") != "ZSTD"
+
+    cleanup_ds = None
+    ocean.remove_if_exists(cleanup_path)
 
 
 def test_create_ocean_rgb_tif_colorizes_in_blocks(tmp_path: Path) -> None:
@@ -792,7 +867,7 @@ def test_create_ocean_rgb_tif_block_path_matches_full_read(
     tmp_path: Path,
     monkeypatch: object,
 ) -> None:
-    monkeypatch.setattr(ocean, "MAX_IN_MEMORY_COLOR_PIXELS", 1)
+    monkeypatch.setattr(ocean, "max_in_memory_color_pixels", lambda: 1)
     driver = gdal.GetDriverByName("GTiff")
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(3857)
