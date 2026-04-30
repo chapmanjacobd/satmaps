@@ -648,6 +648,93 @@ def test_create_alpha_vrt_block_path_matches_threshold_output(
     )
 
 
+def test_create_alpha_vrt_large_cleanup_removes_small_ocean_regions(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(ocean, "MAX_IN_MEMORY_ALPHA_PIXELS", 1)
+    monkeypatch.setattr(ocean, "MAX_COMPONENT_CLEANUP_PIXELS", 0)
+    monkeypatch.setattr(ocean, "SMALL_OCEAN_MAX_AREA_SQ_M", 2.0)
+    driver = gdal.GetDriverByName("GTiff")
+
+    alpha_source = tmp_path / "ocean_source_large_cleanup.tif"
+    alpha_ds = driver.Create(str(alpha_source), 3, 3, 1, gdal.GDT_Float32)
+    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    alpha_ds.SetProjection(srs.ExportToWkt())
+    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    alpha_ds.GetRasterBand(1).WriteArray(
+        np.array(
+            [
+                [-5.0, -5.0, -5.0],
+                [-5.0, -60.0, -5.0],
+                [-5.0, -5.0, -5.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    alpha_ds = None
+
+    alpha_source_vrt = tmp_path / "ocean_source_large_cleanup.vrt"
+    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+
+    alpha_vrt = tmp_path / "alpha_large_cleanup.vrt"
+    ocean.create_alpha_vrt(str(alpha_source_vrt), str(alpha_vrt))
+
+    np.testing.assert_array_equal(
+        gdal.Open(str(alpha_vrt)).ReadAsArray(),
+        np.zeros((3, 3), dtype=np.uint8),
+    )
+
+
+def test_create_alpha_vrt_large_cleanup_preserves_land_holes(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(ocean, "MAX_IN_MEMORY_ALPHA_PIXELS", 1)
+    monkeypatch.setattr(ocean, "MAX_COMPONENT_CLEANUP_PIXELS", 0)
+    monkeypatch.setattr(ocean, "SMALL_OCEAN_MAX_AREA_SQ_M", 2.0)
+    driver = gdal.GetDriverByName("GTiff")
+
+    alpha_source = tmp_path / "ocean_source_large_hole.tif"
+    alpha_ds = driver.Create(str(alpha_source), 3, 3, 1, gdal.GDT_Float32)
+    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    alpha_ds.SetProjection(srs.ExportToWkt())
+    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    alpha_ds.GetRasterBand(1).WriteArray(
+        np.array(
+            [
+                [-60.0, -60.0, -60.0],
+                [-60.0, -5.0, -60.0],
+                [-60.0, -60.0, -60.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    alpha_ds = None
+
+    alpha_source_vrt = tmp_path / "ocean_source_large_hole.vrt"
+    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+
+    alpha_vrt = tmp_path / "alpha_large_hole.vrt"
+    ocean.create_alpha_vrt(str(alpha_source_vrt), str(alpha_vrt))
+
+    np.testing.assert_array_equal(
+        gdal.Open(str(alpha_vrt)).ReadAsArray(),
+        np.array(
+            [
+                [255, 255, 255],
+                [255, 0, 255],
+                [255, 255, 255],
+            ],
+            dtype=np.uint8,
+        ),
+    )
+
+
 def test_create_ocean_rgb_tif_colorizes_in_blocks(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
     srs = osr.SpatialReference()

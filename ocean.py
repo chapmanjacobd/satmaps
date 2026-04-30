@@ -170,7 +170,7 @@ def create_alpha_vrt(
     source_vrt: str,
     output_vrt: str,
     alpha_tif: str | None = None,
-    vector_path: Path | None = None,
+    cleanup_path: Path | None = None,
 ) -> str:
     """Create an explicit alpha mask VRT from depth thresholds and land-preferred cleanup."""
     ds = gdal.Open(source_vrt)
@@ -231,17 +231,14 @@ def create_alpha_vrt(
             alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
             alpha_band.FlushCache()
         else:
-            cleanup_vector_path = vector_path or Path(alpha_tif).with_suffix(".gpkg")
-            staged_vector_path = Path(build_staged_path(str(cleanup_vector_path)))
-            remove_if_exists(str(staged_vector_path))
-            remove_small_enclosed_ocean_regions_vector(
+            cleanup_mask_path = cleanup_path or Path(alpha_tif).with_suffix(".land_mask.tif")
+            remove_small_ocean_regions_sieve(
                 alpha_ds,
                 alpha_band,
                 ds.GetGeoTransform(),
                 SMALL_OCEAN_MAX_AREA_SQ_M,
-                staged_vector_path,
+                cleanup_mask_path,
             )
-            publish_staged_path(str(staged_vector_path), str(cleanup_vector_path))
 
     alpha_ds = None
     ds = None
@@ -292,6 +289,70 @@ def remove_small_enclosed_ocean_regions(
     cleaned_mask = ocean_mask.copy()
     cleaned_mask[np.isin(labels, enclosed_small_labels)] = False
     return cleaned_mask
+
+
+def remove_small_ocean_regions_sieve(
+    alpha_dataset: gdal.Dataset,
+    alpha_band: gdal.Band,
+    geotransform: Sequence[float],
+    max_area_sq_m: float,
+    cleanup_mask_path: Path,
+) -> None:
+    """Remove small ocean regions with GDAL sieve while preserving original land pixels."""
+    pixel_area_sq_m = abs(geotransform[1] * geotransform[5] - geotransform[2] * geotransform[4])
+    if pixel_area_sq_m <= 0.0:
+        raise ValueError("geotransform must define a positive pixel area")
+
+    sieve_threshold_pixels = max(1, int(np.ceil(max_area_sq_m / pixel_area_sq_m)))
+    mask_driver = gdal.GetDriverByName("GTiff")
+    if mask_driver is None:
+        raise RuntimeError("Could not load GTiff driver for ocean cleanup")
+
+    staged_cleanup_mask = build_staged_path(str(cleanup_mask_path))
+    remove_if_exists(staged_cleanup_mask)
+    land_mask_ds = mask_driver.Create(
+        staged_cleanup_mask,
+        alpha_dataset.RasterXSize,
+        alpha_dataset.RasterYSize,
+        1,
+        gdal.GDT_Byte,
+        options=list(GTIFF_CREATION_OPTIONS),
+    )
+    if land_mask_ds is None:
+        raise RuntimeError(f"Could not create temporary cleanup mask: {cleanup_mask_path}")
+
+    land_mask_ds.SetProjection(alpha_dataset.GetProjection())
+    land_mask_ds.SetGeoTransform(alpha_dataset.GetGeoTransform())
+    land_mask_band = land_mask_ds.GetRasterBand(1)
+
+    block_width, block_height = alpha_band.GetBlockSize()
+    if block_width <= 0:
+        block_width = 512
+    if block_height <= 0:
+        block_height = 512
+
+    for yoff in range(0, alpha_dataset.RasterYSize, block_height):
+        bh = min(block_height, alpha_dataset.RasterYSize - yoff)
+        for xoff in range(0, alpha_dataset.RasterXSize, block_width):
+            bw = min(block_width, alpha_dataset.RasterXSize - xoff)
+            alpha_block = alpha_band.ReadAsArray(xoff, yoff, bw, bh)
+            land_mask_band.WriteArray((alpha_block == 0).astype(np.uint8) * 255, xoff=xoff, yoff=yoff)
+
+    land_mask_band.FlushCache()
+    gdal.SieveFilter(alpha_band, None, alpha_band, sieve_threshold_pixels, 8)
+
+    for yoff in range(0, alpha_dataset.RasterYSize, block_height):
+        bh = min(block_height, alpha_dataset.RasterYSize - yoff)
+        for xoff in range(0, alpha_dataset.RasterXSize, block_width):
+            bw = min(block_width, alpha_dataset.RasterXSize - xoff)
+            cleaned_block = alpha_band.ReadAsArray(xoff, yoff, bw, bh)
+            land_block = land_mask_band.ReadAsArray(xoff, yoff, bw, bh)
+            cleaned_block[land_block != 0] = 0
+            alpha_band.WriteArray(cleaned_block, xoff=xoff, yoff=yoff)
+
+    alpha_band.FlushCache()
+    land_mask_ds = None
+    remove_if_exists(staged_cleanup_mask)
 
 
 def remove_small_enclosed_ocean_regions_vector(
@@ -685,7 +746,7 @@ def generate_ocean_background(
     hillshade_tif = os.path.join(temp_dir, f"{stem}_hillshade.tif")
     color_tif = os.path.join(temp_dir, f"{stem}_color.tif")
     rgba_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_rgba.vrt")
-    cleanup_gpkg = Path(os.path.join(temp_dir, f"{stem}_{unique_id}_alpha.gpkg"))
+    cleanup_mask_tif = Path(os.path.join(temp_dir, f"{stem}_{unique_id}_alpha_land_mask.tif"))
 
     print("[1/8] Building GEBCO source VRT...")
     build_gebco_source_vrt(gebco_zip, source_vrt)
@@ -727,7 +788,7 @@ def generate_ocean_background(
     publish_staged_path(staged_warped_vrt, warped_vrt)
 
     print("[4/8] Building ocean alpha mask...")
-    create_alpha_vrt(warped_vrt, alpha_vrt, alpha_tif=alpha_tif, vector_path=cleanup_gpkg)
+    create_alpha_vrt(warped_vrt, alpha_vrt, alpha_tif=alpha_tif, cleanup_path=cleanup_mask_tif)
     print("[5/8] Generating ocean hillshade...")
     create_hillshade_tif(warped_vrt, hillshade_tif, hillshade_z)
     print("[6/8] Colorizing ocean raster...")
