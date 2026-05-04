@@ -1196,6 +1196,8 @@ def test_ocean_main_uses_default_positionals(monkeypatch: object) -> None:
     assert called["destination"] == ocean.DEFAULT_OUTPUT
     assert called["bbox"] is None
     assert called["vrt"] is False
+    assert called["parallel"] is None
+    assert called["chunk_size"] == ocean.DEFAULT_OCEAN_CHUNK_SIZE
     assert called["style"] == ocean.OceanStyleOptions()
 
 
@@ -1259,57 +1261,104 @@ def test_ocean_main_enables_vrt_mode(monkeypatch: object) -> None:
     assert called["vrt"] is True
 
 
-def test_generate_ocean_without_bbox_warps_global_raster(
-    monkeypatch: object,
-) -> None:
-    hillshade_calls: list[tuple[str, str, float]] = []
+def test_ocean_main_passes_parallel_chunk_flags(monkeypatch: object) -> None:
+    called: dict[str, object] = {}
+
+    def fake_generate_ocean_background(**kwargs):
+        called.update(kwargs)
+        return ocean.OceanBackgroundArtifacts(
+            source_vrt=".temp/source.vrt",
+            masked_vrt=".temp/masked.vrt",
+            warped_vrt=".temp/warped.vrt",
+            alpha_vrt=".temp/alpha.vrt",
+            alpha_tif=".temp/alpha.tif",
+            hillshade_tif=".temp/ocean_hillshade.tif",
+            color_tif=".temp/ocean_color.tif",
+            rgba_vrt=".temp/ocean_rgba.vrt",
+            output_tif="ocean.vrt",
+        )
+
+    monkeypatch.setattr(sys, "argv", ["ocean.py", "--parallel", "4", "--chunk-size", "2048"])
+    monkeypatch.setattr("ocean.generate_ocean_background", fake_generate_ocean_background)
+
+    ocean.main()
+
+    assert called["parallel"] == 4
+    assert called["chunk_size"] == 2048
+
+
+def test_build_ocean_output_plan_splits_aligned_chunks() -> None:
+    bbox = (-4.0, 50.0, -3.0, 51.0)
+    plan = ocean.build_ocean_output_plan(bbox, max_zoom=13, chunk_size=1024)
+
+    assert plan.width > 0
+    assert plan.height > 0
+    assert plan.total_pixels == plan.width * plan.height
+    assert plan.chunk_size == 1024
+    assert plan.halo_pixels >= 1
+    assert plan.chunks
+
+    first_chunk = plan.chunks[0]
+    assert first_chunk.xoff == 0
+    assert first_chunk.yoff == 0
+    assert first_chunk.width <= plan.chunk_size
+    assert first_chunk.height <= plan.chunk_size
+    assert first_chunk.bounds[0] == pytest.approx(plan.bounds[0])
+    assert first_chunk.bounds[3] == pytest.approx(plan.bounds[3])
+
+
+def test_generate_ocean_without_bbox_processes_chunk_outputs(monkeypatch: object) -> None:
+    plan_calls: list[tuple[tuple[float, float, float, float] | None, int, int]] = []
+    processed_chunks: list[tuple[int, int]] = []
+    merged_sources: list[str] = []
     translated: list[tuple[str, str]] = []
-    warp_calls: list[tuple[str, str, object]] = []
-    warp_options_calls: list[dict[str, object]] = []
+
+    plan = ocean.OceanBuildPlan(
+        bounds=ocean.WEB_MERCATOR_WORLD_BOUNDS,
+        pixel_size=satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM),
+        zoom=ocean.DEFAULT_MAX_ZOOM,
+        width=8,
+        height=8,
+        total_pixels=64,
+        chunk_size=8,
+        halo_pixels=2,
+        chunks=(
+            ocean.OceanChunkPlan(
+                row=0,
+                col=0,
+                xoff=0,
+                yoff=0,
+                width=8,
+                height=8,
+                bounds=(0.0, 0.0, 8.0, 8.0),
+                expanded_bounds=(0.0, 0.0, 8.0, 8.0),
+                core_src_win=(0, 0, 8, 8),
+            ),
+        ),
+    )
 
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
+    monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
     monkeypatch.setattr(
-        "ocean.build_gebco_source_vrt",
-        lambda gebco_zip, output_vrt: output_vrt,
+        "ocean.build_ocean_output_plan",
+        lambda bbox, *, max_zoom, chunk_size: (
+            plan_calls.append((bbox, max_zoom, chunk_size)),
+            plan,
+        )[-1],
     )
     monkeypatch.setattr(
-        "ocean.create_gebco_ocean_vrt",
-        lambda source_vrt, output_vrt: output_vrt,
+        "ocean.process_ocean_chunk",
+        lambda **kwargs: processed_chunks.append((kwargs["chunk"].row, kwargs["chunk"].col))
+        or f".temp/chunk_{kwargs['chunk'].row}_{kwargs['chunk'].col}.tif",
     )
     monkeypatch.setattr(
-        "ocean.create_alpha_vrt",
-        lambda source_vrt, output_vrt, **kwargs: output_vrt,
-    )
-    monkeypatch.setattr(
-        "ocean.create_ocean_rgb_tif",
-        lambda depth_vrt, hillshade_tif, output_tif, style: output_tif,
-    )
-    monkeypatch.setattr(
-        "ocean.create_rgb_with_alpha_vrt",
-        lambda rgb_tif, alpha_vrt, output_vrt, **kwargs: output_vrt,
+        "ocean.build_merged_vrt",
+        lambda output_vrt, source_rasters: merged_sources.extend(source_rasters) or output_vrt,
     )
     monkeypatch.setattr(
         "ocean.translate_rgba_vrt",
         lambda rgba_vrt, destination: translated.append((rgba_vrt, destination)) or destination,
-    )
-    monkeypatch.setattr(
-        "ocean.create_hillshade_tif",
-        lambda input_vrt, output_tif, z_factor: (
-            hillshade_calls.append((input_vrt, output_tif, z_factor)),
-            Path(output_tif).write_text("hillshade"),
-            output_tif,
-        )[-1],
-    )
-    monkeypatch.setattr(
-        "ocean.gdal.WarpOptions",
-        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
-    )
-    monkeypatch.setattr(
-        "ocean.gdal.Warp",
-        lambda destination, source, options=None: (
-            warp_calls.append((destination, source, options)),
-            Path(destination).write_text("warped"),
-        )[-1],
     )
 
     artifacts = ocean.generate_ocean_background(
@@ -1318,167 +1367,183 @@ def test_generate_ocean_without_bbox_warps_global_raster(
         bbox=None,
     )
 
-    assert artifacts.masked_vrt.endswith("_masked.vrt")
-    assert artifacts.warped_vrt.endswith("_3857.vrt")
-    assert artifacts.alpha_vrt.endswith("_alpha.vrt")
-    assert artifacts.rgba_vrt.endswith("_rgba.vrt")
-    assert artifacts.hillshade_tif.endswith("ocean_hillshade.tif")
-    assert artifacts.color_tif.endswith("ocean_color.tif")
-    assert artifacts.alpha_tif.endswith("ocean_alpha.tif")
-    assert len(warp_calls) == 1
-    assert warp_calls[0][0] == ocean.build_staged_path(artifacts.warped_vrt)
-    assert warp_calls[0][1] == artifacts.masked_vrt
-    assert warp_options_calls[0]["outputBounds"] == ocean.WEB_MERCATOR_WORLD_BOUNDS
-    assert warp_options_calls[0]["xRes"] == pytest.approx(
-        satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
-    )
-    assert warp_options_calls[0]["yRes"] == pytest.approx(
-        satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
-    )
-    assert warp_options_calls[0]["multithread"] is True
-    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
-    assert hillshade_calls == [(artifacts.warped_vrt, artifacts.hillshade_tif, 5.0)]
+    assert plan_calls == [(None, ocean.DEFAULT_MAX_ZOOM, ocean.DEFAULT_OCEAN_CHUNK_SIZE)]
+    assert processed_chunks == [(0, 0)]
+    assert merged_sources == [".temp/chunk_0_0.tif"]
     assert translated == [(artifacts.rgba_vrt, "ocean.tif")]
+    assert artifacts.masked_vrt.endswith("_masked.vrt")
+    assert artifacts.warped_vrt.endswith("_depth_chunks.vrt")
+    assert artifacts.alpha_tif.endswith("_alpha_chunks.vrt")
+    assert artifacts.hillshade_tif.endswith("_hillshade_chunks.vrt")
+    assert artifacts.color_tif.endswith("_color_chunks.vrt")
+    assert artifacts.rgba_vrt.endswith("_rgba.vrt")
 
 
-def test_generate_ocean_without_bbox_reports_stage_progress(
+def test_generate_ocean_without_bbox_reports_chunk_progress(
     monkeypatch: object, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    plan = ocean.OceanBuildPlan(
+        bounds=ocean.WEB_MERCATOR_WORLD_BOUNDS,
+        pixel_size=satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM),
+        zoom=ocean.DEFAULT_MAX_ZOOM,
+        width=16,
+        height=8,
+        total_pixels=128,
+        chunk_size=8,
+        halo_pixels=2,
+        chunks=(
+            ocean.OceanChunkPlan(
+                row=0,
+                col=0,
+                xoff=0,
+                yoff=0,
+                width=8,
+                height=8,
+                bounds=(0.0, 0.0, 8.0, 8.0),
+                expanded_bounds=(0.0, 0.0, 8.0, 8.0),
+                core_src_win=(0, 0, 8, 8),
+            ),
+            ocean.OceanChunkPlan(
+                row=0,
+                col=1,
+                xoff=8,
+                yoff=0,
+                width=8,
+                height=8,
+                bounds=(8.0, 0.0, 16.0, 8.0),
+                expanded_bounds=(8.0, 0.0, 16.0, 8.0),
+                core_src_win=(0, 0, 8, 8),
+            ),
+        ),
+    )
+
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
     monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
     monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
+    monkeypatch.setattr("ocean.build_ocean_output_plan", lambda bbox, *, max_zoom, chunk_size: plan)
     monkeypatch.setattr(
-        "ocean.create_alpha_vrt",
-        lambda source_vrt, output_vrt, **kwargs: output_vrt,
+        "ocean.process_ocean_chunk",
+        lambda **kwargs: f".temp/chunk_{kwargs['chunk'].row}_{kwargs['chunk'].col}.tif",
     )
-    monkeypatch.setattr(
-        "ocean.create_ocean_rgb_tif",
-        lambda depth_vrt, hillshade_tif, output_tif, style: output_tif,
-    )
-    monkeypatch.setattr(
-        "ocean.create_rgb_with_alpha_vrt",
-        lambda rgb_tif, alpha_vrt, output_vrt, **kwargs: output_vrt,
-    )
+    monkeypatch.setattr("ocean.build_merged_vrt", lambda output_vrt, source_rasters: output_vrt)
     monkeypatch.setattr("ocean.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
-    monkeypatch.setattr("ocean.create_hillshade_tif", lambda input_vrt, output_tif, z_factor: output_tif)
-    monkeypatch.setattr("ocean.gdal.WarpOptions", lambda **kwargs: kwargs)
-    monkeypatch.setattr(
-        "ocean.gdal.Warp",
-        lambda destination, source, options=None: Path(destination).write_text("warped") or destination,
-    )
 
     ocean.generate_ocean_background(
         gebco_zip="gebco.zip",
         destination="ocean.tif",
         bbox=None,
+        parallel=1,
     )
 
     out = capsys.readouterr().out
     assert "Ocean build: global run at z13 -> ocean.tif" in out
-    assert "[3/8] Warping masked ocean to global Web Mercator" in out
-    assert "[8/8] Translating final RGBA GeoTIFF..." in out
+    assert "[3/6] Planning aligned Web Mercator chunks..." in out
+    assert "Ocean target grid: 16x8 px (128 pixels)" in out
+    assert "Processing 2 chunk(s) with 1 worker(s)..." in out
+    assert "Ocean chunk progress: 2/2" in out
+    assert "[6/6] Translating final RGBA GeoTIFF..." in out
     assert "Ocean build complete: ocean.tif" in out
 
 
-def test_generate_ocean_with_bbox_sets_explicit_target_resolution(
-    monkeypatch: object,
-) -> None:
-    warp_options_calls: list[dict[str, object]] = []
-
-    monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        "ocean.build_gebco_source_vrt",
-        lambda gebco_zip, output_vrt: output_vrt,
-    )
-    monkeypatch.setattr(
-        "ocean.create_gebco_ocean_vrt",
-        lambda source_vrt, output_vrt: output_vrt,
-    )
-    monkeypatch.setattr(
-        "ocean.create_alpha_vrt",
-        lambda source_vrt, output_vrt, **kwargs: output_vrt,
-    )
-    monkeypatch.setattr(
-        "ocean.create_ocean_rgb_tif",
-        lambda depth_vrt, hillshade_tif, output_tif, style: output_tif,
-    )
-    monkeypatch.setattr(
-        "ocean.create_rgb_with_alpha_vrt",
-        lambda rgb_tif, alpha_vrt, output_vrt, **kwargs: output_vrt,
-    )
-    monkeypatch.setattr("ocean.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
-    monkeypatch.setattr(
-        "ocean.create_hillshade_tif",
-        lambda input_vrt, output_tif, z_factor: Path(output_tif).write_text("hillshade") or output_tif,
-    )
-    monkeypatch.setattr(
-        "ocean.gdal.WarpOptions",
-        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
-    )
-    monkeypatch.setattr(
-        "ocean.gdal.Warp",
-        lambda destination, source, options=None: Path(destination).write_text("warped"),
-    )
-
+def test_generate_ocean_with_bbox_builds_requested_plan(monkeypatch: object) -> None:
+    plan_calls: list[tuple[tuple[float, float, float, float] | None, int, int]] = []
     bbox = (-4.0, 50.0, -3.0, 51.0)
-    snapped_bounds, pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(bbox)
-    ocean.generate_ocean_background(
-        gebco_zip="gebco.zip",
-        destination="ocean.tif",
-        bbox=bbox,
+    plan = ocean.OceanBuildPlan(
+        bounds=(1.0, 2.0, 3.0, 4.0),
+        pixel_size=19.0,
+        zoom=13,
+        width=1,
+        height=1,
+        total_pixels=1,
+        chunk_size=512,
+        halo_pixels=2,
+        chunks=(
+            ocean.OceanChunkPlan(
+                row=0,
+                col=0,
+                xoff=0,
+                yoff=0,
+                width=1,
+                height=1,
+                bounds=(1.0, 2.0, 3.0, 4.0),
+                expanded_bounds=(1.0, 2.0, 3.0, 4.0),
+                core_src_win=(0, 0, 1, 1),
+            ),
+        ),
     )
-
-    assert warp_options_calls[0]["outputBounds"] == pytest.approx(snapped_bounds)
-    assert "outputBoundsSRS" not in warp_options_calls[0]
-    assert warp_options_calls[0]["xRes"] == pytest.approx(pixel_size)
-    assert warp_options_calls[0]["yRes"] == pytest.approx(pixel_size)
-    assert warp_options_calls[0]["multithread"] is True
-    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
-
-
-def test_generate_ocean_uses_requested_zoom_resolution(monkeypatch: object) -> None:
-    warp_options_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
     monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
     monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
     monkeypatch.setattr(
-        "ocean.create_alpha_vrt",
-        lambda source_vrt, output_vrt, **kwargs: output_vrt,
+        "ocean.build_ocean_output_plan",
+        lambda bbox_arg, *, max_zoom, chunk_size: (
+            plan_calls.append((bbox_arg, max_zoom, chunk_size)),
+            plan,
+        )[-1],
     )
-    monkeypatch.setattr(
-        "ocean.create_ocean_rgb_tif",
-        lambda depth_vrt, hillshade_tif, output_tif, style: output_tif,
-    )
-    monkeypatch.setattr(
-        "ocean.create_rgb_with_alpha_vrt",
-        lambda rgb_tif, alpha_vrt, output_vrt, **kwargs: output_vrt,
-    )
+    monkeypatch.setattr("ocean.process_ocean_chunk", lambda **kwargs: ".temp/chunk_0_0.tif")
+    monkeypatch.setattr("ocean.build_merged_vrt", lambda output_vrt, source_rasters: output_vrt)
     monkeypatch.setattr("ocean.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
-    monkeypatch.setattr(
-        "ocean.create_hillshade_tif",
-        lambda input_vrt, output_tif, z_factor: Path(output_tif).write_text("hillshade") or output_tif,
-    )
-    monkeypatch.setattr(
-        "ocean.gdal.WarpOptions",
-        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
-    )
-    monkeypatch.setattr(
-        "ocean.gdal.Warp",
-        lambda destination, source, options=None: Path(destination).write_text("warped"),
-    )
 
     ocean.generate_ocean_background(
         gebco_zip="gebco.zip",
         destination="ocean.tif",
-        bbox=None,
-        max_zoom=14,
+        bbox=bbox,
+        chunk_size=512,
     )
 
-    assert warp_options_calls[0]["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
-    assert warp_options_calls[0]["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
-    assert warp_options_calls[0]["multithread"] is True
-    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
+    assert plan_calls == [(bbox, ocean.DEFAULT_MAX_ZOOM, 512)]
+
+
+def test_generate_ocean_uses_requested_zoom_in_plan(monkeypatch: object) -> None:
+    plan_calls: list[tuple[tuple[float, float, float, float] | None, int, int]] = []
+    plan = ocean.OceanBuildPlan(
+        bounds=ocean.WEB_MERCATOR_WORLD_BOUNDS,
+        pixel_size=satmaps.tiler.web_mercator_pixel_size(14),
+        zoom=14,
+        width=1,
+        height=1,
+        total_pixels=1,
+        chunk_size=256,
+        halo_pixels=2,
+        chunks=(
+            ocean.OceanChunkPlan(
+                row=0,
+                col=0,
+                xoff=0,
+                yoff=0,
+                width=1,
+                height=1,
+                bounds=(0.0, 0.0, 1.0, 1.0),
+                expanded_bounds=(0.0, 0.0, 1.0, 1.0),
+                core_src_win=(0, 0, 1, 1),
+            ),
+        ),
+    )
+
+    monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
+    monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
+    monkeypatch.setattr(
+        "ocean.build_ocean_output_plan",
+        lambda bbox_arg, *, max_zoom, chunk_size: (
+            plan_calls.append((bbox_arg, max_zoom, chunk_size)),
+            plan,
+        )[-1],
+    )
+    monkeypatch.setattr("ocean.process_ocean_chunk", lambda **kwargs: ".temp/chunk_0_0.tif")
+    monkeypatch.setattr("ocean.build_merged_vrt", lambda output_vrt, source_rasters: output_vrt)
+    monkeypatch.setattr("ocean.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
+
+    ocean.generate_ocean_background(
+        gebco_zip="gebco.zip",
+        destination="ocean.tif",
+        max_zoom=14,
+        chunk_size=256,
+    )
+
+    assert plan_calls == [(None, 14, 256)]
 
 
 def test_warp_to_web_mercator_uses_shared_zoom13_resolution(monkeypatch: object) -> None:
@@ -1572,26 +1637,36 @@ def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:
     vrt_outputs: list[tuple[str, str]] = []
 
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
+    monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
     monkeypatch.setattr(
-        "ocean.build_gebco_source_vrt",
-        lambda gebco_zip, output_vrt: output_vrt,
+        "ocean.build_ocean_output_plan",
+        lambda bbox, *, max_zoom, chunk_size: ocean.OceanBuildPlan(
+            bounds=(0.0, 0.0, 1.0, 1.0),
+            pixel_size=1.0,
+            zoom=13,
+            width=1,
+            height=1,
+            total_pixels=1,
+            chunk_size=chunk_size,
+            halo_pixels=1,
+            chunks=(
+                ocean.OceanChunkPlan(
+                    row=0,
+                    col=0,
+                    xoff=0,
+                    yoff=0,
+                    width=1,
+                    height=1,
+                    bounds=(0.0, 0.0, 1.0, 1.0),
+                    expanded_bounds=(0.0, 0.0, 1.0, 1.0),
+                    core_src_win=(0, 0, 1, 1),
+                ),
+            ),
+        ),
     )
-    monkeypatch.setattr(
-        "ocean.create_gebco_ocean_vrt",
-        lambda source_vrt, output_vrt: output_vrt,
-    )
-    monkeypatch.setattr(
-        "ocean.create_alpha_vrt",
-        lambda source_vrt, output_vrt, **kwargs: output_vrt,
-    )
-    monkeypatch.setattr(
-        "ocean.create_ocean_rgb_tif",
-        lambda depth_vrt, hillshade_tif, output_tif, style: output_tif,
-    )
-    monkeypatch.setattr(
-        "ocean.create_rgb_with_alpha_vrt",
-        lambda rgb_tif, alpha_vrt, output_vrt, **kwargs: output_vrt,
-    )
+    monkeypatch.setattr("ocean.process_ocean_chunk", lambda **kwargs: ".temp/chunk_0_0.tif")
+    monkeypatch.setattr("ocean.build_merged_vrt", lambda output_vrt, source_rasters: output_vrt)
     monkeypatch.setattr(
         "ocean.write_rgba_vrt",
         lambda rgba_vrt, destination: vrt_outputs.append((rgba_vrt, destination)) or destination,
@@ -1599,15 +1674,6 @@ def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:
     monkeypatch.setattr(
         "ocean.translate_rgba_vrt",
         lambda rgba_vrt, destination: (_ for _ in ()).throw(AssertionError("Translate should not be called")),
-    )
-    monkeypatch.setattr(
-        "ocean.create_hillshade_tif",
-        lambda input_vrt, output_tif, z_factor: Path(output_tif).write_text("hillshade") or output_tif,
-    )
-    monkeypatch.setattr("ocean.gdal.WarpOptions", lambda **kwargs: kwargs)
-    monkeypatch.setattr(
-        "ocean.gdal.Warp",
-        lambda destination, source, options=None: Path(destination).write_text("warped"),
     )
 
     artifacts = ocean.generate_ocean_background(
@@ -1633,39 +1699,45 @@ def test_generate_ocean_deletes_heavy_non_output_tifs(tmp_path: Path, monkeypatc
         lambda source_vrt, output_vrt: (Path(output_vrt).write_text("masked"), output_vrt)[1],
     )
     monkeypatch.setattr(
-        "ocean.create_alpha_vrt",
-        lambda source_vrt, output_vrt, **kwargs: (
-            Path(kwargs["alpha_tif"]).write_text("alpha"),
-            Path(output_vrt).write_text("alpha-vrt"),
-            output_vrt,
+        "ocean.build_ocean_output_plan",
+        lambda bbox, *, max_zoom, chunk_size: ocean.OceanBuildPlan(
+            bounds=(0.0, 0.0, 1.0, 1.0),
+            pixel_size=1.0,
+            zoom=13,
+            width=1,
+            height=1,
+            total_pixels=1,
+            chunk_size=chunk_size,
+            halo_pixels=1,
+            chunks=(
+                ocean.OceanChunkPlan(
+                    row=0,
+                    col=0,
+                    xoff=0,
+                    yoff=0,
+                    width=1,
+                    height=1,
+                    bounds=(0.0, 0.0, 1.0, 1.0),
+                    expanded_bounds=(0.0, 0.0, 1.0, 1.0),
+                    core_src_win=(0, 0, 1, 1),
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "ocean.process_ocean_chunk",
+        lambda **kwargs: (
+            Path(temp_dir / "chunk_0_0_rgba.tif").write_text("chunk"),
+            str(temp_dir / "chunk_0_0_rgba.tif"),
         )[-1],
     )
     monkeypatch.setattr(
-        "ocean.create_ocean_rgb_tif",
-        lambda depth_vrt, hillshade_tif, output_tif, style: (
-            Path(output_tif).write_text("color"),
-            output_tif,
-        )[-1],
-    )
-    monkeypatch.setattr(
-        "ocean.create_rgb_with_alpha_vrt",
-        lambda rgb_tif, alpha_vrt, output_vrt, **kwargs: (
-            Path(output_vrt).write_text("rgba"),
-            output_vrt,
-        )[-1],
+        "ocean.build_merged_vrt",
+        lambda output_vrt, source_rasters: (Path(output_vrt).write_text("rgba"), output_vrt)[-1],
     )
     monkeypatch.setattr(
         "ocean.translate_rgba_vrt",
-        lambda rgba_vrt, destination: (Path(destination).write_text("final"), destination)[1],
-    )
-    monkeypatch.setattr(
-        "ocean.create_hillshade_tif",
-        lambda input_vrt, output_tif, z_factor: Path(output_tif).write_text("hillshade") or output_tif,
-    )
-    monkeypatch.setattr("ocean.gdal.WarpOptions", lambda **kwargs: kwargs)
-    monkeypatch.setattr(
-        "ocean.gdal.Warp",
-        lambda destination, source, options=None: Path(destination).write_text("warped"),
+        lambda rgba_vrt, destination: (Path(destination).write_text("final"), destination)[-1],
     )
 
     artifacts = ocean.generate_ocean_background(
@@ -1675,13 +1747,9 @@ def test_generate_ocean_deletes_heavy_non_output_tifs(tmp_path: Path, monkeypatc
     )
 
     assert Path(artifacts.output_tif).exists()
-    assert not Path(artifacts.hillshade_tif).exists()
-    assert not Path(artifacts.color_tif).exists()
-    assert not Path(artifacts.alpha_tif).exists()
+    assert not (temp_dir / "chunk_0_0_rgba.tif").exists()
     assert Path(artifacts.source_vrt).exists()
     assert Path(artifacts.masked_vrt).exists()
-    assert Path(artifacts.warped_vrt).exists()
-    assert Path(artifacts.alpha_vrt).exists()
     assert Path(artifacts.rgba_vrt).exists()
 
 
@@ -1700,42 +1768,45 @@ def test_generate_ocean_vrt_mode_keeps_output_dependent_tifs(
         lambda source_vrt, output_vrt: (Path(output_vrt).write_text("masked"), output_vrt)[1],
     )
     monkeypatch.setattr(
-        "ocean.create_alpha_vrt",
-        lambda source_vrt, output_vrt, **kwargs: (
-            Path(kwargs["alpha_tif"]).write_text("alpha"),
-            Path(output_vrt).write_text("alpha-vrt"),
-            output_vrt,
+        "ocean.build_ocean_output_plan",
+        lambda bbox, *, max_zoom, chunk_size: ocean.OceanBuildPlan(
+            bounds=(0.0, 0.0, 1.0, 1.0),
+            pixel_size=1.0,
+            zoom=13,
+            width=1,
+            height=1,
+            total_pixels=1,
+            chunk_size=chunk_size,
+            halo_pixels=1,
+            chunks=(
+                ocean.OceanChunkPlan(
+                    row=0,
+                    col=0,
+                    xoff=0,
+                    yoff=0,
+                    width=1,
+                    height=1,
+                    bounds=(0.0, 0.0, 1.0, 1.0),
+                    expanded_bounds=(0.0, 0.0, 1.0, 1.0),
+                    core_src_win=(0, 0, 1, 1),
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "ocean.process_ocean_chunk",
+        lambda **kwargs: (
+            Path(temp_dir / "chunk_0_0_rgba.tif").write_text("chunk"),
+            str(temp_dir / "chunk_0_0_rgba.tif"),
         )[-1],
     )
     monkeypatch.setattr(
-        "ocean.create_ocean_rgb_tif",
-        lambda depth_vrt, hillshade_tif, output_tif, style: (
-            Path(output_tif).write_text("color"),
-            output_tif,
-        )[-1],
-    )
-    monkeypatch.setattr(
-        "ocean.create_rgb_with_alpha_vrt",
-        lambda rgb_tif, alpha_vrt, output_vrt, **kwargs: (
-            Path(output_vrt).write_text("rgba"),
-            output_vrt,
-        )[-1],
+        "ocean.build_merged_vrt",
+        lambda output_vrt, source_rasters: (Path(output_vrt).write_text("rgba"), output_vrt)[-1],
     )
     monkeypatch.setattr(
         "ocean.write_rgba_vrt",
-        lambda rgba_vrt, destination: (
-            Path(destination).write_text("final-vrt"),
-            destination,
-        )[-1],
-    )
-    monkeypatch.setattr(
-        "ocean.create_hillshade_tif",
-        lambda input_vrt, output_tif, z_factor: Path(output_tif).write_text("hillshade") or output_tif,
-    )
-    monkeypatch.setattr("ocean.gdal.WarpOptions", lambda **kwargs: kwargs)
-    monkeypatch.setattr(
-        "ocean.gdal.Warp",
-        lambda destination, source, options=None: Path(destination).write_text("warped"),
+        lambda rgba_vrt, destination: (Path(destination).write_text("final-vrt"), destination)[-1],
     )
 
     artifacts = ocean.generate_ocean_background(
@@ -1747,11 +1818,9 @@ def test_generate_ocean_vrt_mode_keeps_output_dependent_tifs(
 
     assert artifacts.output_tif.endswith(".vrt")
     assert Path(artifacts.output_tif).exists()
-    assert not Path(artifacts.hillshade_tif).exists()
-    assert Path(artifacts.color_tif).exists()
-    assert Path(artifacts.alpha_tif).exists()
+    assert Path(temp_dir / "chunk_0_0_rgba.tif").exists()
     assert Path(artifacts.source_vrt).exists()
-    assert Path(artifacts.alpha_vrt).exists()
+    assert Path(artifacts.rgba_vrt).exists()
 
 
 def test_build_ocean_ramp_colors_respects_style_flags() -> None:

@@ -2,6 +2,7 @@
 import argparse
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import copyfile
@@ -61,6 +62,8 @@ MAX_COMPONENT_CLEANUP_PIXELS = 120_000_000
 DEFAULT_MAX_IN_MEMORY_ALPHA_PIXELS = 12_000_000
 DEFAULT_MAX_IN_MEMORY_COLOR_PIXELS = 4_000_000
 DEFAULT_MAX_IN_MEMORY_SIEVE_MASK_PIXELS = 512_000_000
+DEFAULT_OCEAN_CHUNK_SIZE = 4096
+DEFAULT_MAX_FINAL_TRANSLATE_PIXELS = 512_000_000
 TEMPORARY_TILED_GTIFF_OPTIONS = (
     "BIGTIFF=IF_SAFER",
     "TILED=YES",
@@ -98,6 +101,45 @@ class OceanStyleOptions:
     black_slope: float = OCEAN_DEFAULT_BLACK_SLOPE
     depth_min: float = -11000.0
     depth_max: float = 0.0
+
+
+@dataclass(frozen=True)
+class OceanChunkPlan:
+    row: int
+    col: int
+    xoff: int
+    yoff: int
+    width: int
+    height: int
+    bounds: tuple[float, float, float, float]
+    expanded_bounds: tuple[float, float, float, float]
+    core_src_win: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class OceanBuildPlan:
+    bounds: tuple[float, float, float, float]
+    pixel_size: float
+    zoom: int
+    width: int
+    height: int
+    total_pixels: int
+    chunk_size: int
+    halo_pixels: int
+    chunks: tuple[OceanChunkPlan, ...]
+
+
+@dataclass(frozen=True)
+class OceanChunkArtifacts:
+    depth_tif: str
+    alpha_vrt: str
+    alpha_tif: str
+    hillshade_tif: str
+    color_tif: str
+    rgba_vrt: str
+    expanded_rgba_tif: str
+    rgba_tif: str
+    cleanup_mask_tif: Path
 
 
 def max_in_memory_alpha_pixels() -> int:
@@ -140,6 +182,117 @@ def publish_staged_path(staged_path: str, final_path: str) -> str:
     """Atomically publish a staged file under its final name."""
     os.replace(staged_path, final_path)
     return final_path
+
+
+def choose_ocean_parallel_workers(parallel: int | None, chunk_count: int) -> int:
+    """Return the worker count used for chunked ocean processing."""
+    if chunk_count <= 0:
+        return 1
+    if parallel is None:
+        return max(1, min(chunk_count, os.cpu_count() or 1))
+    if parallel <= 0:
+        raise ValueError("parallel must be positive when provided")
+    return min(parallel, chunk_count)
+
+
+def compute_ocean_chunk_halo_pixels(pixel_size: float) -> int:
+    """Return a halo wide enough to minimize chunk-edge cleanup and hillshade seams."""
+    if pixel_size <= 0.0:
+        raise ValueError("pixel_size must be positive")
+    component_radius_pixels = int(np.ceil(np.sqrt(SMALL_OCEAN_MAX_AREA_SQ_M) / pixel_size))
+    return max(1, min(512, component_radius_pixels + 2))
+
+
+def build_ocean_output_plan(
+    bbox: tuple[float, float, float, float] | None,
+    *,
+    max_zoom: int,
+    chunk_size: int = DEFAULT_OCEAN_CHUNK_SIZE,
+) -> OceanBuildPlan:
+    """Plan the aligned final 3857 output grid and its independently processable chunks."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    if bbox is None:
+        bounds = WEB_MERCATOR_WORLD_BOUNDS
+        pixel_size = web_mercator_pixel_size(max_zoom)
+        zoom = max_zoom
+    else:
+        bounds, pixel_size, zoom = snapped_tile_grid_for_bbox(bbox, max_zoom)
+
+    width = max(1, int(round((bounds[2] - bounds[0]) / pixel_size)))
+    height = max(1, int(round((bounds[3] - bounds[1]) / pixel_size)))
+    halo_pixels = compute_ocean_chunk_halo_pixels(pixel_size)
+    total_pixels = width * height
+
+    chunks: list[OceanChunkPlan] = []
+    for row, yoff in enumerate(range(0, height, chunk_size)):
+        chunk_height = min(chunk_size, height - yoff)
+        for col, xoff in enumerate(range(0, width, chunk_size)):
+            chunk_width = min(chunk_size, width - xoff)
+
+            minx = bounds[0] + xoff * pixel_size
+            maxx = minx + chunk_width * pixel_size
+            maxy = bounds[3] - yoff * pixel_size
+            miny = maxy - chunk_height * pixel_size
+
+            expanded_xoff = max(0, xoff - halo_pixels)
+            expanded_yoff = max(0, yoff - halo_pixels)
+            expanded_xend = min(width, xoff + chunk_width + halo_pixels)
+            expanded_yend = min(height, yoff + chunk_height + halo_pixels)
+            expanded_width = expanded_xend - expanded_xoff
+            expanded_height = expanded_yend - expanded_yoff
+
+            expanded_minx = bounds[0] + expanded_xoff * pixel_size
+            expanded_maxx = expanded_minx + expanded_width * pixel_size
+            expanded_maxy = bounds[3] - expanded_yoff * pixel_size
+            expanded_miny = expanded_maxy - expanded_height * pixel_size
+
+            chunks.append(
+                OceanChunkPlan(
+                    row=row,
+                    col=col,
+                    xoff=xoff,
+                    yoff=yoff,
+                    width=chunk_width,
+                    height=chunk_height,
+                    bounds=(minx, miny, maxx, maxy),
+                    expanded_bounds=(expanded_minx, expanded_miny, expanded_maxx, expanded_maxy),
+                    core_src_win=(
+                        xoff - expanded_xoff,
+                        yoff - expanded_yoff,
+                        chunk_width,
+                        chunk_height,
+                    ),
+                )
+            )
+
+    return OceanBuildPlan(
+        bounds=bounds,
+        pixel_size=pixel_size,
+        zoom=zoom,
+        width=width,
+        height=height,
+        total_pixels=total_pixels,
+        chunk_size=chunk_size,
+        halo_pixels=halo_pixels,
+        chunks=tuple(chunks),
+    )
+
+
+def describe_ocean_output_plan(plan: OceanBuildPlan, *, vrt: bool, destination: str) -> None:
+    """Print a compact summary of the planned final grid and merge shape."""
+    print(
+        "Ocean target grid: "
+        f"{plan.width}x{plan.height} px "
+        f"({plan.total_pixels:,} pixels) at ~{plan.pixel_size:.2f} m/px; "
+        f"{len(plan.chunks):,} chunk(s) of up to {plan.chunk_size}px with {plan.halo_pixels}px halo."
+    )
+    if not vrt and plan.total_pixels > DEFAULT_MAX_FINAL_TRANSLATE_PIXELS:
+        print(
+            "Warning: Final GeoTIFF translation may still be very slow for this grid size. "
+            f"Consider rerunning with --vrt or a smaller bbox before writing {destination}."
+        )
 
 
 def build_gebco_source_vrt(gebco_zip: str, output_vrt: str) -> str:
@@ -769,6 +922,34 @@ def translate_rgba_vrt(rgba_vrt: str, destination: str) -> str:
     return destination
 
 
+def crop_raster_to_src_win(
+    source_raster: str,
+    destination: str,
+    src_win: tuple[int, int, int, int],
+) -> str:
+    """Crop a raster window into a tiled GeoTIFF while preserving grid alignment."""
+    destination_dir = os.path.dirname(destination)
+    if destination_dir:
+        os.makedirs(destination_dir, exist_ok=True)
+
+    staged_destination = build_staged_path(destination)
+    remove_if_exists(staged_destination)
+    translated = gdal.Translate(
+        staged_destination,
+        source_raster,
+        options=gdal.TranslateOptions(
+            format="GTiff",
+            srcWin=src_win,
+            creationOptions=list(GTIFF_CREATION_OPTIONS),
+        ),
+    )
+    if translated is None:
+        raise RuntimeError(f"Could not crop raster window into {destination}")
+    translated = None
+    publish_staged_path(staged_destination, destination)
+    return destination
+
+
 def write_rgba_vrt(rgba_vrt: str, destination: str) -> str:
     """Persist the final RGBA VRT to a caller-visible output path."""
     destination_dir = os.path.dirname(destination)
@@ -782,6 +963,148 @@ def write_rgba_vrt(rgba_vrt: str, destination: str) -> str:
     return destination
 
 
+def build_ocean_chunk_artifacts(
+    temp_dir: str,
+    stem: str,
+    unique_id: str,
+    chunk: OceanChunkPlan,
+) -> OceanChunkArtifacts:
+    """Return deterministic intermediate paths for one chunked ocean output."""
+    chunk_stem = f"{stem}_{unique_id}_chunk_{chunk.row:04d}_{chunk.col:04d}"
+    return OceanChunkArtifacts(
+        depth_tif=os.path.join(temp_dir, f"{chunk_stem}_depth.tif"),
+        alpha_vrt=os.path.join(temp_dir, f"{chunk_stem}_alpha.vrt"),
+        alpha_tif=os.path.join(temp_dir, f"{chunk_stem}_alpha.tif"),
+        hillshade_tif=os.path.join(temp_dir, f"{chunk_stem}_hillshade.tif"),
+        color_tif=os.path.join(temp_dir, f"{chunk_stem}_color.tif"),
+        rgba_vrt=os.path.join(temp_dir, f"{chunk_stem}_rgba.vrt"),
+        expanded_rgba_tif=os.path.join(temp_dir, f"{chunk_stem}_rgba_expanded.tif"),
+        rgba_tif=os.path.join(temp_dir, f"{chunk_stem}_rgba.tif"),
+        cleanup_mask_tif=Path(os.path.join(temp_dir, f"{chunk_stem}_alpha_land_mask.tif")),
+    )
+
+
+def materialize_warped_ocean_chunk(
+    source_vrt: str,
+    destination: str,
+    *,
+    bounds: tuple[float, float, float, float],
+    pixel_size: float,
+    resample_alg: str,
+) -> str:
+    """Warp one aligned 3857 ocean chunk directly into a reusable GeoTIFF."""
+    staged_destination = build_staged_path(destination)
+    remove_if_exists(staged_destination)
+    warped = gdal.Warp(
+        staged_destination,
+        source_vrt,
+        options=gdal.WarpOptions(
+            format="GTiff",
+            dstSRS="EPSG:3857",
+            outputBounds=bounds,
+            xRes=pixel_size,
+            yRes=pixel_size,
+            resampleAlg=resample_alg,
+            outputType=gdal.GDT_Float32,
+            multithread=True,
+            warpOptions=["NUM_THREADS=ALL_CPUS"],
+            creationOptions=list(GTIFF_CREATION_OPTIONS),
+        ),
+    )
+    if warped is None:
+        raise RuntimeError(f"Could not materialize warped ocean chunk: {destination}")
+    warped = None
+    publish_staged_path(staged_destination, destination)
+    return destination
+
+
+def build_merged_vrt(output_vrt: str, source_rasters: Sequence[str]) -> str:
+    """Build a VRT that merges aligned raster chunks in deterministic order."""
+    if not source_rasters:
+        raise ValueError("source_rasters must not be empty")
+    staged_output_vrt = build_staged_path(output_vrt)
+    remove_if_exists(staged_output_vrt)
+    merged = gdal.BuildVRT(staged_output_vrt, sorted(source_rasters))
+    if merged is None:
+        raise RuntimeError(f"Could not build merged VRT: {output_vrt}")
+    merged = None
+    publish_staged_path(staged_output_vrt, output_vrt)
+    return output_vrt
+
+
+def process_ocean_chunk(
+    *,
+    masked_vrt: str,
+    temp_dir: str,
+    stem: str,
+    unique_id: str,
+    chunk: OceanChunkPlan,
+    pixel_size: float,
+    resample_alg: str,
+    hillshade_z: float,
+    style: OceanStyleOptions,
+) -> str:
+    """Generate one final RGBA chunk from the masked GEBCO source."""
+    artifacts = build_ocean_chunk_artifacts(temp_dir, stem, unique_id, chunk)
+
+    materialize_warped_ocean_chunk(
+        masked_vrt,
+        artifacts.depth_tif,
+        bounds=chunk.expanded_bounds,
+        pixel_size=pixel_size,
+        resample_alg=resample_alg,
+    )
+    create_alpha_vrt(
+        artifacts.depth_tif,
+        artifacts.alpha_vrt,
+        alpha_tif=artifacts.alpha_tif,
+        cleanup_path=artifacts.cleanup_mask_tif,
+    )
+    create_hillshade_tif(artifacts.depth_tif, artifacts.hillshade_tif, hillshade_z)
+    create_ocean_rgb_tif(artifacts.depth_tif, artifacts.hillshade_tif, artifacts.color_tif, style)
+    create_rgb_with_alpha_vrt(
+        artifacts.color_tif,
+        artifacts.alpha_vrt,
+        artifacts.rgba_vrt,
+        alpha_tif=artifacts.alpha_tif,
+    )
+    translate_rgba_vrt(artifacts.rgba_vrt, artifacts.expanded_rgba_tif)
+
+    if chunk.core_src_win[0] == 0 and chunk.core_src_win[1] == 0:
+        expanded_ds = gdal.Open(artifacts.expanded_rgba_tif)
+        if expanded_ds is None:
+            raise RuntimeError(f"Could not reopen expanded RGBA chunk: {artifacts.expanded_rgba_tif}")
+        whole_chunk = (
+            chunk.core_src_win[2] == expanded_ds.RasterXSize
+            and chunk.core_src_win[3] == expanded_ds.RasterYSize
+        )
+        expanded_ds = None
+    else:
+        whole_chunk = False
+
+    if whole_chunk:
+        os.replace(artifacts.expanded_rgba_tif, artifacts.rgba_tif)
+    else:
+        crop_raster_to_src_win(
+            artifacts.expanded_rgba_tif,
+            artifacts.rgba_tif,
+            chunk.core_src_win,
+        )
+        remove_if_exists(artifacts.expanded_rgba_tif)
+
+    for path in (
+        artifacts.depth_tif,
+        artifacts.alpha_vrt,
+        artifacts.alpha_tif,
+        artifacts.hillshade_tif,
+        artifacts.color_tif,
+        artifacts.rgba_vrt,
+    ):
+        remove_if_exists(path)
+
+    return artifacts.rgba_tif
+
+
 def generate_ocean_background(
     gebco_zip: str,
     destination: str,
@@ -792,6 +1115,8 @@ def generate_ocean_background(
     style: OceanStyleOptions | None = None,
     vrt: bool = False,
     max_zoom: int = DEFAULT_MAX_ZOOM,
+    parallel: int | None = None,
+    chunk_size: int = DEFAULT_OCEAN_CHUNK_SIZE,
 ) -> OceanBackgroundArtifacts:
     """Generate a standalone RGBA ocean background output."""
     if not hasattr(gdal, "DEMProcessing"):
@@ -805,71 +1130,80 @@ def generate_ocean_background(
 
     source_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_source.vrt")
     masked_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_masked.vrt")
-    warped_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_3857.vrt")
+    warped_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_depth_chunks.vrt")
     alpha_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_alpha.vrt")
-    alpha_tif = os.path.join(temp_dir, f"{stem}_alpha.tif")
-    hillshade_tif = os.path.join(temp_dir, f"{stem}_hillshade.tif")
-    color_tif = os.path.join(temp_dir, f"{stem}_color.tif")
+    alpha_tif = os.path.join(temp_dir, f"{stem}_{unique_id}_alpha_chunks.vrt")
+    hillshade_tif = os.path.join(temp_dir, f"{stem}_{unique_id}_hillshade_chunks.vrt")
+    color_tif = os.path.join(temp_dir, f"{stem}_{unique_id}_color_chunks.vrt")
     rgba_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_rgba.vrt")
-    cleanup_mask_tif = Path(os.path.join(temp_dir, f"{stem}_{unique_id}_alpha_land_mask.tif"))
 
-    print("[1/8] Building GEBCO source VRT...")
+    print("[1/6] Building GEBCO source VRT...")
     build_gebco_source_vrt(gebco_zip, source_vrt)
-    print("[2/8] Masking land from GEBCO source...")
+    print("[2/6] Masking land from GEBCO source...")
     create_gebco_ocean_vrt(source_vrt, masked_vrt)
 
     if style is None:
         style = OceanStyleOptions()
 
-    warp_kwargs: dict[str, object] = {
-        "format": "VRT",
-        "dstSRS": "EPSG:3857",
-        "resampleAlg": resample_alg,
-        "multithread": True,
-        "warpOptions": ["NUM_THREADS=ALL_CPUS"],
-    }
-    if bbox is None:
-        pixel_size = web_mercator_pixel_size(max_zoom)
-        print(
-            f"[3/8] Warping masked ocean to global Web Mercator "
-            f"at ~{pixel_size:.2f} m/px..."
-        )
-        warp_kwargs["outputBounds"] = WEB_MERCATOR_WORLD_BOUNDS
-        warp_kwargs["xRes"] = pixel_size
-        warp_kwargs["yRes"] = pixel_size
-    else:
-        snapped_bounds, pixel_size, _zoom = snapped_tile_grid_for_bbox(bbox, max_zoom)
-        print(
-            f"[3/8] Warping masked ocean to bbox-aligned Web Mercator grid "
-            f"at ~{pixel_size:.2f} m/px..."
-        )
-        warp_kwargs["outputBounds"] = snapped_bounds
-        warp_kwargs["xRes"] = pixel_size
-        warp_kwargs["yRes"] = pixel_size
-    warp_options = gdal.WarpOptions(**warp_kwargs)
-    staged_warped_vrt = build_staged_path(warped_vrt)
-    remove_if_exists(staged_warped_vrt)
-    gdal.Warp(staged_warped_vrt, masked_vrt, options=warp_options)
-    publish_staged_path(staged_warped_vrt, warped_vrt)
+    print("[3/6] Planning aligned Web Mercator chunks...")
+    plan = build_ocean_output_plan(bbox, max_zoom=max_zoom, chunk_size=chunk_size)
+    describe_ocean_output_plan(plan, vrt=vrt, destination=destination)
 
-    print("[4/8] Building ocean alpha mask...")
-    create_alpha_vrt(warped_vrt, alpha_vrt, alpha_tif=alpha_tif, cleanup_path=cleanup_mask_tif)
-    print("[5/8] Generating ocean hillshade...")
-    create_hillshade_tif(warped_vrt, hillshade_tif, hillshade_z)
-    print("[6/8] Colorizing ocean raster...")
-    create_ocean_rgb_tif(warped_vrt, hillshade_tif, color_tif, style)
-    print("[7/8] Combining RGB + alpha...")
-    create_rgb_with_alpha_vrt(color_tif, alpha_vrt, rgba_vrt, alpha_tif=alpha_tif)
+    print("[4/6] Processing ocean chunks...")
+    chunk_workers = choose_ocean_parallel_workers(parallel, len(plan.chunks))
+    print(f"Processing {len(plan.chunks):,} chunk(s) with {chunk_workers} worker(s)...")
+
+    chunk_rgba_paths: list[str] = []
+    if chunk_workers == 1:
+        for index, chunk in enumerate(plan.chunks, start=1):
+            chunk_rgba_paths.append(
+                process_ocean_chunk(
+                    masked_vrt=masked_vrt,
+                    temp_dir=temp_dir,
+                    stem=stem,
+                    unique_id=unique_id,
+                    chunk=chunk,
+                    pixel_size=plan.pixel_size,
+                    resample_alg=resample_alg,
+                    hillshade_z=hillshade_z,
+                    style=style,
+                )
+            )
+            print(f"Ocean chunk progress: {index}/{len(plan.chunks)}")
+    else:
+        with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
+            future_to_chunk = {
+                executor.submit(
+                    process_ocean_chunk,
+                    masked_vrt=masked_vrt,
+                    temp_dir=temp_dir,
+                    stem=stem,
+                    unique_id=unique_id,
+                    chunk=chunk,
+                    pixel_size=plan.pixel_size,
+                    resample_alg=resample_alg,
+                    hillshade_z=hillshade_z,
+                    style=style,
+                ): chunk
+                for chunk in plan.chunks
+            }
+            completed = 0
+            for future in as_completed(future_to_chunk):
+                chunk_rgba_paths.append(future.result())
+                completed += 1
+                print(f"Ocean chunk progress: {completed}/{len(plan.chunks)}")
+
+    print("[5/6] Building merged RGBA VRT...")
+    build_merged_vrt(rgba_vrt, chunk_rgba_paths)
     if vrt:
         translate_path = str(Path(destination).with_suffix(".vrt"))
-        print("[8/8] Writing final RGBA VRT...")
+        print("[6/6] Writing final RGBA VRT...")
         write_rgba_vrt(rgba_vrt, translate_path)
         destination = translate_path
-        remove_if_exists(hillshade_tif)
     else:
-        print("[8/8] Translating final RGBA GeoTIFF...")
+        print("[6/6] Translating final RGBA GeoTIFF...")
         translate_rgba_vrt(rgba_vrt, destination)
-        for path in (hillshade_tif, color_tif, alpha_tif):
+        for path in chunk_rgba_paths:
             remove_if_exists(path)
 
     print(f"Ocean build complete: {destination}")
@@ -988,6 +1322,17 @@ def main() -> None:
         action="store_true",
         help="Write the final styled RGBA VRT instead of translating it to a GeoTIFF",
     )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        help="Number of parallel chunk workers for ocean processing",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_OCEAN_CHUNK_SIZE,
+        help="Chunk edge length in output pixels for chunked ocean processing",
+    )
     args = parser.parse_args()
 
     artifacts = generate_ocean_background(
@@ -1015,6 +1360,8 @@ def main() -> None:
         ),
         vrt=args.vrt,
         max_zoom=args.max_zoom,
+        parallel=args.parallel,
+        chunk_size=args.chunk_size,
     )
     print(artifacts.output_tif)
 
