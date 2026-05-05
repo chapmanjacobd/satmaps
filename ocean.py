@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import argparse
+import math
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import copyfile
-from typing import Sequence
+from typing import Callable, Sequence, TypeVar
 from xml.sax.saxutils import escape
 
 import numpy as np
@@ -70,6 +72,99 @@ TEMPORARY_TILED_GTIFF_OPTIONS = (
     "BLOCKXSIZE=512",
     "BLOCKYSIZE=512",
 )
+
+T = TypeVar("T")
+
+
+def format_eta(seconds_remaining: float | None) -> str:
+    """Return a short ETA string for progress logging."""
+    if seconds_remaining is None or not math.isfinite(seconds_remaining):
+        return "ETA: calculating..."
+
+    rounded_seconds = max(0, round(seconds_remaining))
+    hours, remainder = divmod(rounded_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"ETA: {hours}h {minutes}m"
+    if minutes:
+        return f"ETA: {minutes}m {seconds}s"
+    return f"ETA: {seconds}s"
+
+
+class LiveProgressLine:
+    """Render a single in-place progress line without hiding later errors."""
+
+    def __init__(self) -> None:
+        self._active = False
+        self._last_width = 0
+
+    def update(self, message: str) -> None:
+        padded_message = message
+        if len(message) < self._last_width:
+            padded_message += " " * (self._last_width - len(message))
+        else:
+            self._last_width = len(message)
+        print(f"\r{padded_message}", end="", flush=True)
+        self._active = True
+
+    def finish(self) -> None:
+        if not self._active:
+            return
+        print()
+        self._active = False
+        self._last_width = 0
+
+
+def build_step_progress_callback(
+    progress_line: LiveProgressLine,
+    step_label: str,
+    started_at: float,
+) -> Callable[[float], None]:
+    """Return a callback that renders step progress with ETA."""
+
+    def update(progress_fraction: float) -> None:
+        bounded_fraction = min(max(progress_fraction, 0.0), 1.0)
+        elapsed = time.perf_counter() - started_at
+        remaining = None
+        if bounded_fraction > 0.0 and elapsed > 0.0:
+            remaining = elapsed * (1.0 - bounded_fraction) / bounded_fraction
+        progress_line.update(
+            f"{step_label} {bounded_fraction * 100:3.0f}%; {format_eta(remaining)}"
+        )
+
+    return update
+
+
+def run_step_with_eta(
+    step_label: str,
+    operation: Callable[[Callable[[float], None]], T],
+) -> T:
+    """Run a long step with a live ETA line."""
+    progress_line = LiveProgressLine()
+    progress = build_step_progress_callback(progress_line, step_label, time.perf_counter())
+    progress(0.0)
+    try:
+        result = operation(progress)
+    except Exception:
+        progress_line.finish()
+        raise
+    progress(1.0)
+    progress_line.finish()
+    return result
+
+
+def build_gdal_progress_callback(
+    progress: Callable[[float], None] | None,
+) -> Callable[[float, str, object], int] | None:
+    """Adapt a simple 0..1 progress callback to GDAL's callback signature."""
+    if progress is None:
+        return None
+
+    def callback(complete: float, _message: str, _data: object) -> int:
+        progress(complete)
+        return 1
+
+    return callback
 
 
 @dataclass(frozen=True)
@@ -905,7 +1000,12 @@ def remove_if_exists(path: str) -> None:
             os.remove(path)
 
 
-def translate_rgba_vrt(rgba_vrt: str, destination: str) -> str:
+def translate_rgba_vrt(
+    rgba_vrt: str,
+    destination: str,
+    *,
+    progress: Callable[[float], None] | None = None,
+) -> str:
     """Materialize the RGBA VRT as a tiled GeoTIFF."""
     destination_dir = os.path.dirname(destination)
     if destination_dir:
@@ -917,7 +1017,15 @@ def translate_rgba_vrt(rgba_vrt: str, destination: str) -> str:
     )
     staged_destination = build_staged_path(destination)
     remove_if_exists(staged_destination)
-    gdal.Translate(staged_destination, rgba_vrt, options=options)
+    translated = gdal.Translate(
+        staged_destination,
+        rgba_vrt,
+        options=options,
+        callback=build_gdal_progress_callback(progress),
+    )
+    if translated is None:
+        raise RuntimeError(f"Could not materialize RGBA GeoTIFF: {destination}")
+    translated = None
     publish_staged_path(staged_destination, destination)
     return destination
 
@@ -1018,13 +1126,22 @@ def materialize_warped_ocean_chunk(
     return destination
 
 
-def build_merged_vrt(output_vrt: str, source_rasters: Sequence[str]) -> str:
+def build_merged_vrt(
+    output_vrt: str,
+    source_rasters: Sequence[str],
+    *,
+    progress: Callable[[float], None] | None = None,
+) -> str:
     """Build a VRT that merges aligned raster chunks in deterministic order."""
     if not source_rasters:
         raise ValueError("source_rasters must not be empty")
     staged_output_vrt = build_staged_path(output_vrt)
     remove_if_exists(staged_output_vrt)
-    merged = gdal.BuildVRT(staged_output_vrt, sorted(source_rasters))
+    merged = gdal.BuildVRT(
+        staged_output_vrt,
+        sorted(source_rasters),
+        callback=build_gdal_progress_callback(progress),
+    )
     if merged is None:
         raise RuntimeError(f"Could not build merged VRT: {output_vrt}")
     merged = None
@@ -1154,55 +1271,79 @@ def generate_ocean_background(
     print(f"Processing {len(plan.chunks):,} chunk(s) with {chunk_workers} worker(s)...")
 
     chunk_rgba_paths: list[str] = []
-    if chunk_workers == 1:
-        for index, chunk in enumerate(plan.chunks, start=1):
-            chunk_rgba_paths.append(
-                process_ocean_chunk(
-                    masked_vrt=masked_vrt,
-                    temp_dir=temp_dir,
-                    stem=stem,
-                    unique_id=unique_id,
-                    chunk=chunk,
-                    pixel_size=plan.pixel_size,
-                    resample_alg=resample_alg,
-                    hillshade_z=hillshade_z,
-                    style=style,
-                )
-            )
-            print(f"Ocean chunk progress: {index}/{len(plan.chunks)}")
-    else:
-        with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
-            future_to_chunk = {
-                executor.submit(
-                    process_ocean_chunk,
-                    masked_vrt=masked_vrt,
-                    temp_dir=temp_dir,
-                    stem=stem,
-                    unique_id=unique_id,
-                    chunk=chunk,
-                    pixel_size=plan.pixel_size,
-                    resample_alg=resample_alg,
-                    hillshade_z=hillshade_z,
-                    style=style,
-                ): chunk
-                for chunk in plan.chunks
-            }
-            completed = 0
-            for future in as_completed(future_to_chunk):
-                chunk_rgba_paths.append(future.result())
-                completed += 1
-                print(f"Ocean chunk progress: {completed}/{len(plan.chunks)}")
+    chunk_progress_line = LiveProgressLine()
+    chunk_progress_started_at = time.perf_counter()
+    total_chunks = len(plan.chunks)
+    def update_chunk_progress(completed_chunks: int) -> None:
+        remaining = None
+        elapsed = time.perf_counter() - chunk_progress_started_at
+        if completed_chunks > 0 and elapsed > 0.0:
+            remaining = elapsed * (total_chunks - completed_chunks) / completed_chunks
+        percent = round((completed_chunks / total_chunks) * 100) if total_chunks > 0 else 0
+        chunk_progress_line.update(
+            f"Ocean chunk progress: {completed_chunks:,}/{total_chunks:,} ({percent}%); "
+            f"{format_eta(remaining)}"
+        )
 
-    print("[5/6] Building merged RGBA VRT...")
-    build_merged_vrt(rgba_vrt, chunk_rgba_paths)
+    update_chunk_progress(0)
+    try:
+        if chunk_workers == 1:
+            for index, chunk in enumerate(plan.chunks, start=1):
+                chunk_rgba_paths.append(
+                    process_ocean_chunk(
+                        masked_vrt=masked_vrt,
+                        temp_dir=temp_dir,
+                        stem=stem,
+                        unique_id=unique_id,
+                        chunk=chunk,
+                        pixel_size=plan.pixel_size,
+                        resample_alg=resample_alg,
+                        hillshade_z=hillshade_z,
+                        style=style,
+                    )
+                )
+                update_chunk_progress(index)
+        else:
+            with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
+                future_to_chunk = {
+                    executor.submit(
+                        process_ocean_chunk,
+                        masked_vrt=masked_vrt,
+                        temp_dir=temp_dir,
+                        stem=stem,
+                        unique_id=unique_id,
+                        chunk=chunk,
+                        pixel_size=plan.pixel_size,
+                        resample_alg=resample_alg,
+                        hillshade_z=hillshade_z,
+                        style=style,
+                    ): chunk
+                    for chunk in plan.chunks
+                }
+                completed = 0
+                for future in as_completed(future_to_chunk):
+                    chunk_rgba_paths.append(future.result())
+                    completed += 1
+                    update_chunk_progress(completed)
+    except Exception:
+        chunk_progress_line.finish()
+        raise
+    chunk_progress_line.finish()
+
+    run_step_with_eta(
+        "[5/6] Building merged RGBA VRT...",
+        lambda progress: build_merged_vrt(rgba_vrt, chunk_rgba_paths, progress=progress),
+    )
     if vrt:
         translate_path = str(Path(destination).with_suffix(".vrt"))
         print("[6/6] Writing final RGBA VRT...")
         write_rgba_vrt(rgba_vrt, translate_path)
         destination = translate_path
     else:
-        print("[6/6] Translating final RGBA GeoTIFF...")
-        translate_rgba_vrt(rgba_vrt, destination)
+        run_step_with_eta(
+            "[6/6] Translating final RGBA GeoTIFF...",
+            lambda progress: translate_rgba_vrt(rgba_vrt, destination, progress=progress),
+        )
         for path in chunk_rgba_paths:
             remove_if_exists(path)
 

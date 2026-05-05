@@ -1354,11 +1354,19 @@ def test_generate_ocean_without_bbox_processes_chunk_outputs(monkeypatch: object
     )
     monkeypatch.setattr(
         "ocean.build_merged_vrt",
-        lambda output_vrt, source_rasters: merged_sources.extend(source_rasters) or output_vrt,
+        lambda output_vrt, source_rasters, progress=None: (
+            progress and progress(1.0),
+            merged_sources.extend(source_rasters),
+            output_vrt,
+        )[-1],
     )
     monkeypatch.setattr(
         "ocean.translate_rgba_vrt",
-        lambda rgba_vrt, destination: translated.append((rgba_vrt, destination)) or destination,
+        lambda rgba_vrt, destination, progress=None: (
+            progress and progress(1.0),
+            translated.append((rgba_vrt, destination)),
+            destination,
+        )[-1],
     )
 
     artifacts = ocean.generate_ocean_background(
@@ -1425,8 +1433,20 @@ def test_generate_ocean_without_bbox_reports_chunk_progress(
         "ocean.process_ocean_chunk",
         lambda **kwargs: f".temp/chunk_{kwargs['chunk'].row}_{kwargs['chunk'].col}.tif",
     )
-    monkeypatch.setattr("ocean.build_merged_vrt", lambda output_vrt, source_rasters: output_vrt)
-    monkeypatch.setattr("ocean.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
+    monkeypatch.setattr(
+        "ocean.build_merged_vrt",
+        lambda output_vrt, source_rasters, progress=None: (
+            progress and progress(1.0),
+            output_vrt,
+        )[-1],
+    )
+    monkeypatch.setattr(
+        "ocean.translate_rgba_vrt",
+        lambda rgba_vrt, destination, progress=None: (
+            progress and progress(1.0),
+            destination,
+        )[-1],
+    )
 
     ocean.generate_ocean_background(
         gebco_zip="gebco.zip",
@@ -1440,8 +1460,9 @@ def test_generate_ocean_without_bbox_reports_chunk_progress(
     assert "[3/6] Planning aligned Web Mercator chunks..." in out
     assert "Ocean target grid: 16x8 px (128 pixels)" in out
     assert "Processing 2 chunk(s) with 1 worker(s)..." in out
-    assert "Ocean chunk progress: 2/2" in out
-    assert "[6/6] Translating final RGBA GeoTIFF..." in out
+    assert "Ocean chunk progress: 2/2 (100%); ETA: 0s" in out
+    assert "[5/6] Building merged RGBA VRT... 100%; ETA: 0s" in out
+    assert "[6/6] Translating final RGBA GeoTIFF... 100%; ETA: 0s" in out
     assert "Ocean build complete: ocean.tif" in out
 
 
@@ -1483,8 +1504,20 @@ def test_generate_ocean_with_bbox_builds_requested_plan(monkeypatch: object) -> 
         )[-1],
     )
     monkeypatch.setattr("ocean.process_ocean_chunk", lambda **kwargs: ".temp/chunk_0_0.tif")
-    monkeypatch.setattr("ocean.build_merged_vrt", lambda output_vrt, source_rasters: output_vrt)
-    monkeypatch.setattr("ocean.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
+    monkeypatch.setattr(
+        "ocean.build_merged_vrt",
+        lambda output_vrt, source_rasters, progress=None: (
+            progress and progress(1.0),
+            output_vrt,
+        )[-1],
+    )
+    monkeypatch.setattr(
+        "ocean.translate_rgba_vrt",
+        lambda rgba_vrt, destination, progress=None: (
+            progress and progress(1.0),
+            destination,
+        )[-1],
+    )
 
     ocean.generate_ocean_background(
         gebco_zip="gebco.zip",
@@ -1533,8 +1566,20 @@ def test_generate_ocean_uses_requested_zoom_in_plan(monkeypatch: object) -> None
         )[-1],
     )
     monkeypatch.setattr("ocean.process_ocean_chunk", lambda **kwargs: ".temp/chunk_0_0.tif")
-    monkeypatch.setattr("ocean.build_merged_vrt", lambda output_vrt, source_rasters: output_vrt)
-    monkeypatch.setattr("ocean.translate_rgba_vrt", lambda rgba_vrt, destination: destination)
+    monkeypatch.setattr(
+        "ocean.build_merged_vrt",
+        lambda output_vrt, source_rasters, progress=None: (
+            progress and progress(1.0),
+            output_vrt,
+        )[-1],
+    )
+    monkeypatch.setattr(
+        "ocean.translate_rgba_vrt",
+        lambda rgba_vrt, destination, progress=None: (
+            progress and progress(1.0),
+            destination,
+        )[-1],
+    )
 
     ocean.generate_ocean_background(
         gebco_zip="gebco.zip",
@@ -1666,14 +1711,22 @@ def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:
         ),
     )
     monkeypatch.setattr("ocean.process_ocean_chunk", lambda **kwargs: ".temp/chunk_0_0.tif")
-    monkeypatch.setattr("ocean.build_merged_vrt", lambda output_vrt, source_rasters: output_vrt)
+    monkeypatch.setattr(
+        "ocean.build_merged_vrt",
+        lambda output_vrt, source_rasters, progress=None: (
+            progress and progress(1.0),
+            output_vrt,
+        )[-1],
+    )
     monkeypatch.setattr(
         "ocean.write_rgba_vrt",
         lambda rgba_vrt, destination: vrt_outputs.append((rgba_vrt, destination)) or destination,
     )
     monkeypatch.setattr(
         "ocean.translate_rgba_vrt",
-        lambda rgba_vrt, destination: (_ for _ in ()).throw(AssertionError("Translate should not be called")),
+        lambda rgba_vrt, destination, progress=None: (_ for _ in ()).throw(
+            AssertionError("Translate should not be called")
+        ),
     )
 
     artifacts = ocean.generate_ocean_background(
@@ -1733,11 +1786,19 @@ def test_generate_ocean_deletes_heavy_non_output_tifs(tmp_path: Path, monkeypatc
     )
     monkeypatch.setattr(
         "ocean.build_merged_vrt",
-        lambda output_vrt, source_rasters: (Path(output_vrt).write_text("rgba"), output_vrt)[-1],
+        lambda output_vrt, source_rasters, progress=None: (
+            progress and progress(1.0),
+            Path(output_vrt).write_text("rgba"),
+            output_vrt,
+        )[-1],
     )
     monkeypatch.setattr(
         "ocean.translate_rgba_vrt",
-        lambda rgba_vrt, destination: (Path(destination).write_text("final"), destination)[-1],
+        lambda rgba_vrt, destination, progress=None: (
+            progress and progress(1.0),
+            Path(destination).write_text("final"),
+            destination,
+        )[-1],
     )
 
     artifacts = ocean.generate_ocean_background(
@@ -1802,7 +1863,11 @@ def test_generate_ocean_vrt_mode_keeps_output_dependent_tifs(
     )
     monkeypatch.setattr(
         "ocean.build_merged_vrt",
-        lambda output_vrt, source_rasters: (Path(output_vrt).write_text("rgba"), output_vrt)[-1],
+        lambda output_vrt, source_rasters, progress=None: (
+            progress and progress(1.0),
+            Path(output_vrt).write_text("rgba"),
+            output_vrt,
+        )[-1],
     )
     monkeypatch.setattr(
         "ocean.write_rgba_vrt",
@@ -2131,8 +2196,8 @@ def test_main_reports_land_progress(
 
     out = capsys.readouterr().out
     assert "Expanded 1 MGRS tiles into 4 sub-tiles across 1 date(s)." in out
-    assert "Land processing progress: 4/4 (100%); 4 raster(s) ready." in out
-    assert "Building master VRT from 4 raster(s)..." in out
+    assert "Land processing progress: 4/4 (100%); ETA: 0s; 4 raster(s) ready." in out
+    assert "Building master VRT from 4 raster(s)... 100%; ETA: 0s" in out
 
 
 def test_main_passes_ocean_path_to_tile_processing(

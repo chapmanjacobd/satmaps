@@ -261,8 +261,9 @@ def test_populate_s3_cache_reports_progress(
 
     out = capsys.readouterr().out
     assert "Populating S3 folder cache for 2 date(s)..." in out
-    assert "S3 cache progress: 1/2 (50%); listing 2025/07/01..." in out
-    assert "Cached 2 folders for 2025/01/01." in out
+    assert "S3 cache progress: 1/2 (50%); ETA:" in out
+    assert "listing 2025/07/01..." in out
+    assert "S3 cache progress: 2/2 (100%); ETA: 0s; listing 2025/01/01..." in out
     assert "S3 folder cache ready: 2 date(s), 3 folders total." in out
 
 

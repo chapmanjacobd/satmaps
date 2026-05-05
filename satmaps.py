@@ -6,10 +6,11 @@ import math
 import os
 import subprocess
 import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, cast
 
 import mgrs
 from mgrs import core as mgrs_core
@@ -87,6 +88,84 @@ def build_progress_checkpoints(total_steps: int) -> set[int]:
     for percent in range(10, 100, 10):
         checkpoints.add(max(1, math.ceil(total_steps * percent / 100)))
     return checkpoints
+
+
+def format_eta(seconds_remaining: float | None) -> str:
+    """Return a short ETA string for progress logging."""
+    if seconds_remaining is None or not math.isfinite(seconds_remaining):
+        return "ETA: calculating..."
+
+    rounded_seconds = max(0, round(seconds_remaining))
+    hours, remainder = divmod(rounded_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"ETA: {hours}h {minutes}m"
+    if minutes:
+        return f"ETA: {minutes}m {seconds}s"
+    return f"ETA: {seconds}s"
+
+
+class LiveProgressLine:
+    """Render a single in-place progress line."""
+
+    def __init__(self) -> None:
+        self._active = False
+        self._last_width = 0
+
+    def update(self, message: str) -> None:
+        padded_message = message
+        if len(message) < self._last_width:
+            padded_message += " " * (self._last_width - len(message))
+        else:
+            self._last_width = len(message)
+        print(f"\r{padded_message}", end="", flush=True)
+        self._active = True
+
+    def finish(self) -> None:
+        if not self._active:
+            return
+        print()
+        self._active = False
+        self._last_width = 0
+
+
+def update_count_progress(
+    progress_line: LiveProgressLine,
+    label: str,
+    current: int,
+    total: int,
+    started_at: float,
+    detail: str,
+) -> None:
+    """Update a live progress line for count-based work."""
+    remaining = None
+    elapsed = time.perf_counter() - started_at
+    if current > 0 and total > 0 and elapsed > 0.0:
+        remaining = elapsed * (total - current) / current
+    progress_line.update(
+        f"{label} {format_progress(current, total)}; {format_eta(remaining)}; {detail}"
+    )
+
+
+def build_gdal_progress_callback(
+    progress_line: LiveProgressLine,
+    step_label: str,
+    started_at: float,
+) -> Callable[[float, str, object], int]:
+    """Adapt GDAL progress updates to the live progress renderer."""
+
+    def callback(complete: float, _message: str, _data: object) -> int:
+        bounded_complete = min(max(complete, 0.0), 1.0)
+        remaining = None
+        elapsed = time.perf_counter() - started_at
+        if bounded_complete > 0.0 and elapsed > 0.0:
+            remaining = elapsed * (1.0 - bounded_complete) / bounded_complete
+        progress_line.update(
+            f"{step_label} {bounded_complete * 100:3.0f}%; {format_eta(remaining)}"
+        )
+        return 1
+
+    return callback
 
 
 @dataclass(frozen=True)
@@ -407,6 +486,8 @@ def discover_mgrs_tiles_from_ocean_mask(
     total_row_blocks = math.ceil(scan_height / block_y) if block_y > 0 else 0
     completed_row_blocks = 0
     progress_checkpoints = build_progress_checkpoints(total_row_blocks)
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
     print(
         "Ocean mask scan window: "
         f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks."
@@ -465,11 +546,15 @@ def discover_mgrs_tiles_from_ocean_mask(
                     continue
         completed_row_blocks += 1
         if completed_row_blocks in progress_checkpoints:
-            print(
-                "Ocean mask scan progress: "
-                f"{format_progress(completed_row_blocks, total_row_blocks)}; "
-                f"{len(mgrs_tiles)} tiles found so far."
+            update_count_progress(
+                progress_line,
+                "Ocean mask scan progress:",
+                completed_row_blocks,
+                total_row_blocks,
+                started_at,
+                f"{len(mgrs_tiles)} tiles found so far.",
             )
+    progress_line.finish()
     return mgrs_tiles
 
 
@@ -751,16 +836,26 @@ def populate_s3_cache(date_paths: List[str]) -> None:
     """Cache remote folder listings for all-tiles runs."""
     print(f"Populating S3 folder cache for {len(date_paths)} date(s)...")
     total_folders = 0
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
     for index, date_path in enumerate(date_paths, start=1):
         s3_base = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}"
-        print(f"S3 cache progress: {format_progress(index, len(date_paths))}; listing {date_path}...")
+        update_count_progress(
+            progress_line,
+            "S3 cache progress:",
+            index,
+            len(date_paths),
+            started_at,
+            f"listing {date_path}...",
+        )
         dirs = gdal.ReadDir(s3_base)
         if dirs:
             S3_FOLDER_CACHE[date_path] = set(dirs)
             total_folders += len(dirs)
-            print(f"Cached {len(dirs)} folders for {date_path}.")
         else:
+            progress_line.finish()
             print(f"Warning: Could not list folders for {date_path}")
+    progress_line.finish()
     print(
         f"S3 folder cache ready: {len(S3_FOLDER_CACHE)} date(s), "
         f"{total_folders} folders total."
@@ -1608,6 +1703,8 @@ def main() -> None:
                 f"{len(subtiles_to_process)} sub-tiles with {args.parallel} worker(s); "
                 f"{len(completed_subtiles)} already complete."
             )
+            progress_line = LiveProgressLine()
+            started_at = time.perf_counter()
             with ThreadPoolExecutor(max_workers=args.parallel) as executor:
                 future_to_st = {
                     executor.submit(
@@ -1625,14 +1722,18 @@ def main() -> None:
                     completed_subtiles.add(st)
                     if res:
                         processed_tifs.append(res)
-                    print(
-                        "Land processing progress: "
-                        f"{format_progress(len(completed_subtiles), len(subtiles))}; "
-                        f"{len(processed_tifs)} raster(s) ready."
+                    update_count_progress(
+                        progress_line,
+                        "Land processing progress:",
+                        len(completed_subtiles),
+                        len(subtiles),
+                        started_at,
+                        f"{len(processed_tifs)} raster(s) ready.",
                     )
                     write_resume_state(
                         state_file, unique_id, completed_subtiles, processed_tifs, args
                     )
+            progress_line.finish()
         else:
             print("All sub-tiles already processed.")
     else:
@@ -1665,14 +1766,25 @@ def main() -> None:
     staged_master_vrt = build_staged_path(master_vrt)
     pixel_size = tiler.web_mercator_pixel_size(args.max_zoom)
     remove_if_exists(staged_master_vrt)
-    print(f"Building master VRT from {len(processed_tifs)} raster(s)...")
-    gdal.BuildVRT(
-        staged_master_vrt,
-        processed_tifs,
-        resolution="user",
-        xRes=pixel_size,
-        yRes=pixel_size,
+    progress_line = LiveProgressLine()
+    master_vrt_callback = build_gdal_progress_callback(
+        progress_line,
+        f"Building master VRT from {len(processed_tifs)} raster(s)...",
+        time.perf_counter(),
     )
+    master_vrt_callback(0.0, "", None)
+    try:
+        gdal.BuildVRT(
+            staged_master_vrt,
+            processed_tifs,
+            resolution="user",
+            xRes=pixel_size,
+            yRes=pixel_size,
+            callback=master_vrt_callback,
+        )
+        master_vrt_callback(1.0, "", None)
+    finally:
+        progress_line.finish()
     publish_staged_path(staged_master_vrt, master_vrt)
 
     if args.vrt:
