@@ -1196,7 +1196,7 @@ def test_ocean_main_uses_default_positionals(monkeypatch: object) -> None:
     assert called["destination"] == ocean.DEFAULT_OUTPUT
     assert called["bbox"] is None
     assert called["vrt"] is False
-    assert called["parallel"] is None
+    assert called["parallel"] == 16
     assert called["chunk_size"] == ocean.DEFAULT_OCEAN_CHUNK_SIZE
     assert called["style"] == ocean.OceanStyleOptions()
 
