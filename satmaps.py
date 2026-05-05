@@ -1468,11 +1468,11 @@ def main() -> None:
     parser.add_argument(
         "--chunk-zoom",
         type=int,
-        default=4,
+        default=6,
         help="Zoom level to chunk the processing at",
     )
     parser.add_argument(
-        "--parallel", type=int, default=2, help="Number of parallel processes"
+        "--parallel", type=int, default=12, help="Number of parallel processes"
     )
     parser.add_argument("--stats-min", type=float, help="Hardcoded source min")
     parser.add_argument("--stats-max", type=float, help="Hardcoded source max")

@@ -1326,6 +1326,7 @@ def main() -> None:
         "--parallel",
         type=int,
         help="Number of parallel chunk workers for ocean processing",
+        default=16,
     )
     parser.add_argument(
         "--chunk-size",
