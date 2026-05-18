@@ -24,6 +24,7 @@ from satmaps import (
     iter_processing_windows,
     open_date_band_sets,
     parse_bbox,
+    recover_processed_tile_output,
     restore_resume_state,
 )
 
@@ -99,6 +100,28 @@ def test_restore_resume_state_round_trip(
         "processed_tifs": [str(kept_tif)],
     }
     assert "Resuming from state file" in capsys.readouterr().out
+
+
+def test_restore_resume_state_drops_zero_byte_outputs(tmp_path: Path) -> None:
+    state_file = tmp_path / "state.json"
+    empty_tif = tmp_path / "empty.tif"
+    empty_tif.touch()
+
+    state_file.write_text(
+        json.dumps(
+            {
+                "unique_id": "resume-id",
+                "completed_subtiles": ["31TDF_0_0"],
+                "processed_tifs": [str(empty_tif)],
+                "args": {"parallel": 2},
+            }
+        )
+    )
+
+    restored = restore_resume_state(str(state_file))
+
+    assert restored is not None
+    assert restored["processed_tifs"] == []
 
 
 def test_restore_resume_state_returns_none_for_invalid_json(
@@ -185,6 +208,38 @@ def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: objec
 
     assert find_resume_path(str(newer)) == str(newer)
     assert find_resume_path(True) == str(Path(".temp") / "state_new.json")
+
+
+def test_recover_processed_tile_output_rebuilds_from_surviving_utm(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    args = satmaps.argparse.Namespace(output="render.pmtiles", resample_alg="near", max_zoom=13)
+    utm_path = tmp_path / ".temp" / "render_31TDF_0_0_utm.tif"
+    utm_path.write_text("utm")
+
+    warp_calls: list[tuple[str, str, str, int]] = []
+
+    def fake_warp(source: str, destination: str, resample_alg: str, max_zoom: int) -> None:
+        warp_calls.append((source, destination, resample_alg, max_zoom))
+        Path(destination).write_text("warped")
+
+    monkeypatch.setattr(satmaps, "warp_to_web_mercator", fake_warp)
+
+    recovered = recover_processed_tile_output("31TDF_0_0", args)
+
+    assert recovered == ".temp/render_31TDF_0_0_3857.tif"
+    assert warp_calls == [
+        (
+            ".temp/render_31TDF_0_0_utm.tif",
+            ".temp/.temp_render_31TDF_0_0_3857.tif",
+            "near",
+            13,
+        )
+    ]
+    assert Path(recovered).read_text() == "warped"
+    assert not utm_path.exists()
 
 
 @pytest.mark.parametrize("module", [satmaps, ocean, tiler])

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
+import json
 import math
 import os
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from shutil import copyfile
 from typing import Callable, Sequence, TypeVar
@@ -273,8 +274,18 @@ def build_staged_path(path: str) -> str:
     return os.path.join(directory, f".temp_{basename}")
 
 
+def file_has_content(path: str) -> bool:
+    """Return True when a path exists and has non-zero size."""
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
 def publish_staged_path(staged_path: str, final_path: str) -> str:
     """Atomically publish a staged file under its final name."""
+    if not file_has_content(staged_path):
+        raise RuntimeError(f"Refusing to publish empty staged file: {staged_path}")
     os.replace(staged_path, final_path)
     return final_path
 
@@ -1092,6 +1103,51 @@ def build_ocean_chunk_artifacts(
     )
 
 
+def build_ocean_run_token(
+    destination: str,
+    bbox: tuple[float, float, float, float] | None,
+    *,
+    max_zoom: int,
+    chunk_size: int,
+    resample_alg: str,
+    hillshade_z: float,
+    style: OceanStyleOptions,
+) -> str:
+    """Return a stable token so repeated runs can reuse chunk outputs safely."""
+    payload = json.dumps(
+        {
+            "destination": os.path.abspath(destination),
+            "bbox": bbox,
+            "max_zoom": max_zoom,
+            "chunk_size": chunk_size,
+            "resample_alg": resample_alg,
+            "hillshade_z": hillshade_z,
+            "style": asdict(style),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+
+
+def recover_ocean_chunk_outputs(
+    temp_dir: str,
+    stem: str,
+    unique_id: str,
+    chunks: Sequence[OceanChunkPlan],
+) -> tuple[set[tuple[int, int]], list[str]]:
+    """Return reusable chunk RGBA outputs and drop stale zero-byte leftovers."""
+    recovered_keys: set[tuple[int, int]] = set()
+    recovered_paths: list[str] = []
+    for chunk in chunks:
+        rgba_path = build_ocean_chunk_artifacts(temp_dir, stem, unique_id, chunk).rgba_tif
+        if os.path.exists(rgba_path) and not file_has_content(rgba_path):
+            remove_if_exists(rgba_path)
+        if file_has_content(rgba_path):
+            recovered_keys.add((chunk.row, chunk.col))
+            recovered_paths.append(rgba_path)
+    return recovered_keys, recovered_paths
+
+
 def materialize_warped_ocean_chunk(
     source_vrt: str,
     destination: str,
@@ -1241,10 +1297,21 @@ def generate_ocean_background(
 
     os.makedirs(temp_dir, exist_ok=True)
     stem = Path(destination).stem or "ocean"
-    unique_id = uuid.uuid4().hex[:8]
     run_mode = "bbox" if bbox is not None else "global"
     print(f"Ocean build: {run_mode} run at z{max_zoom} -> {destination}")
 
+    if style is None:
+        style = OceanStyleOptions()
+
+    unique_id = build_ocean_run_token(
+        destination,
+        bbox,
+        max_zoom=max_zoom,
+        chunk_size=chunk_size,
+        resample_alg=resample_alg,
+        hillshade_z=hillshade_z,
+        style=style,
+    )
     source_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_source.vrt")
     masked_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_masked.vrt")
     warped_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_depth_chunks.vrt")
@@ -1259,9 +1326,6 @@ def generate_ocean_background(
     print("[2/6] Masking land from GEBCO source...")
     create_gebco_ocean_vrt(source_vrt, masked_vrt)
 
-    if style is None:
-        style = OceanStyleOptions()
-
     print("[3/6] Planning aligned Web Mercator chunks...")
     plan = build_ocean_output_plan(bbox, max_zoom=max_zoom, chunk_size=chunk_size)
     describe_ocean_output_plan(plan, vrt=vrt, destination=destination)
@@ -1270,7 +1334,16 @@ def generate_ocean_background(
     chunk_workers = choose_ocean_parallel_workers(parallel, len(plan.chunks))
     print(f"Processing {len(plan.chunks):,} chunk(s) with {chunk_workers} worker(s)...")
 
-    chunk_rgba_paths: list[str] = []
+    recovered_chunk_keys, recovered_chunk_paths = recover_ocean_chunk_outputs(
+        temp_dir, stem, unique_id, plan.chunks
+    )
+    if recovered_chunk_paths:
+        print(f"Reusing {len(recovered_chunk_paths):,} existing ocean chunk(s).")
+    remaining_chunks = [
+        chunk for chunk in plan.chunks if (chunk.row, chunk.col) not in recovered_chunk_keys
+    ]
+
+    chunk_rgba_paths: list[str] = list(recovered_chunk_paths)
     chunk_progress_line = LiveProgressLine()
     chunk_progress_started_at = time.perf_counter()
     total_chunks = len(plan.chunks)
@@ -1285,10 +1358,11 @@ def generate_ocean_background(
             f"{format_eta(remaining)}"
         )
 
-    update_chunk_progress(0)
+    update_chunk_progress(len(chunk_rgba_paths))
     try:
         if chunk_workers == 1:
-            for index, chunk in enumerate(plan.chunks, start=1):
+            completed = len(chunk_rgba_paths)
+            for chunk in remaining_chunks:
                 chunk_rgba_paths.append(
                     process_ocean_chunk(
                         masked_vrt=masked_vrt,
@@ -1302,7 +1376,8 @@ def generate_ocean_background(
                         style=style,
                     )
                 )
-                update_chunk_progress(index)
+                completed += 1
+                update_chunk_progress(completed)
         else:
             with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
                 future_to_chunk = {
@@ -1318,9 +1393,9 @@ def generate_ocean_background(
                         hillshade_z=hillshade_z,
                         style=style,
                     ): chunk
-                    for chunk in plan.chunks
+                    for chunk in remaining_chunks
                 }
-                completed = 0
+                completed = len(chunk_rgba_paths)
                 for future in as_completed(future_to_chunk):
                     chunk_rgba_paths.append(future.result())
                     completed += 1

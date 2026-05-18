@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import ocean
 import satmaps
+import tiler
 from satmaps import (
     fill_nan_nearest,
     get_tile_paths,
@@ -1100,6 +1101,49 @@ def test_get_bbox_scan_window_returns_none_outside_dataset(tmp_path: Path) -> No
     assert satmaps.get_bbox_scan_window(dataset, (20.0, 20.0, 21.0, 21.0)) is None
 
 
+def test_convert_raster_to_pmtiles_stages_final_output(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    temp_dir = tmp_path / ".temp"
+    temp_dir.mkdir()
+    (temp_dir / "output.mbtiles").write_text("mbtiles")
+    converted: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "satmaps.tiler.run_tiling_simplified",
+        lambda input_raster, output_mbtiles, options: tiler.TilingArtifacts(
+            final_vrt=input_raster,
+            cleanup_paths=[],
+        ),
+    )
+
+    def fake_subprocess_run(command: list[str], check: bool) -> None:
+        assert check is True
+        converted.append(command)
+        Path(command[-1]).write_text("pmtiles")
+
+    monkeypatch.setattr("satmaps.subprocess.run", fake_subprocess_run)
+
+    packaged = satmaps.convert_raster_to_pmtiles(
+        "input.vrt",
+        "output.pmtiles",
+        tile_format="webp",
+        quality=80,
+        resample_alg="lanczos",
+        chunk_zoom=4,
+        parallel=1,
+        blocksize=512,
+        name="Test",
+        description="Test",
+    )
+
+    assert converted == [["pmtiles", "convert", ".temp/output.mbtiles", ".temp_output.pmtiles"]]
+    assert Path("output.pmtiles").read_text() == "pmtiles"
+    assert not Path(".temp_output.pmtiles").exists()
+    assert packaged.temp_mbtiles == ".temp/output.mbtiles"
+
+
 def test_build_hillshade_command_matches_expected_flags(tmp_path: Path) -> None:
     command = ocean.build_hillshade_command(
         str(tmp_path / "in.vrt"),
@@ -1385,6 +1429,90 @@ def test_generate_ocean_without_bbox_processes_chunk_outputs(monkeypatch: object
     assert artifacts.hillshade_tif.endswith("_hillshade_chunks.vrt")
     assert artifacts.color_tif.endswith("_color_chunks.vrt")
     assert artifacts.rgba_vrt.endswith("_rgba.vrt")
+
+
+def test_generate_ocean_reuses_existing_chunk_outputs(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    temp_dir = tmp_path / ".temp"
+    temp_dir.mkdir()
+    plan = ocean.OceanBuildPlan(
+        bounds=ocean.WEB_MERCATOR_WORLD_BOUNDS,
+        pixel_size=satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM),
+        zoom=ocean.DEFAULT_MAX_ZOOM,
+        width=8,
+        height=8,
+        total_pixels=64,
+        chunk_size=8,
+        halo_pixels=2,
+        chunks=(
+            ocean.OceanChunkPlan(
+                row=0,
+                col=0,
+                xoff=0,
+                yoff=0,
+                width=8,
+                height=8,
+                bounds=(0.0, 0.0, 8.0, 8.0),
+                expanded_bounds=(0.0, 0.0, 8.0, 8.0),
+                core_src_win=(0, 0, 8, 8),
+            ),
+        ),
+    )
+    unique_id = ocean.build_ocean_run_token(
+        str(tmp_path / "ocean.tif"),
+        None,
+        max_zoom=ocean.DEFAULT_MAX_ZOOM,
+        chunk_size=ocean.DEFAULT_OCEAN_CHUNK_SIZE,
+        resample_alg="cubicspline",
+        hillshade_z=5.0,
+        style=ocean.OceanStyleOptions(),
+    )
+    existing_chunk = Path(
+        ocean.build_ocean_chunk_artifacts(str(temp_dir), "ocean", unique_id, plan.chunks[0]).rgba_tif
+    )
+    existing_chunk.write_text("chunk")
+
+    monkeypatch.setattr(
+        "ocean.build_gebco_source_vrt",
+        lambda gebco_zip, output_vrt: (Path(output_vrt).write_text("source"), output_vrt)[1],
+    )
+    monkeypatch.setattr(
+        "ocean.create_gebco_ocean_vrt",
+        lambda source_vrt, output_vrt: (Path(output_vrt).write_text("masked"), output_vrt)[1],
+    )
+    monkeypatch.setattr("ocean.build_ocean_output_plan", lambda bbox, *, max_zoom, chunk_size: plan)
+    monkeypatch.setattr(
+        "ocean.process_ocean_chunk",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("chunk should have been reused")),
+    )
+    monkeypatch.setattr(
+        "ocean.build_merged_vrt",
+        lambda output_vrt, source_rasters, progress=None: (
+            progress and progress(1.0),
+            Path(output_vrt).write_text("rgba"),
+            output_vrt,
+        )[-1],
+    )
+    translated: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "ocean.translate_rgba_vrt",
+        lambda rgba_vrt, destination, progress=None: (
+            progress and progress(1.0),
+            translated.append((rgba_vrt, destination)),
+            Path(destination).write_text("final"),
+            destination,
+        )[-1],
+    )
+
+    artifacts = ocean.generate_ocean_background(
+        gebco_zip="gebco.zip",
+        destination=str(tmp_path / "ocean.tif"),
+        temp_dir=str(temp_dir),
+    )
+
+    assert translated == [(artifacts.rgba_vrt, str(tmp_path / "ocean.tif"))]
 
 
 def test_generate_ocean_without_bbox_reports_chunk_progress(
@@ -2510,7 +2638,10 @@ def test_main_bbox_passes_chunk_bounds_to_tiler(
         return satmaps.tiler.TilingArtifacts(final_vrt=input_vrt, cleanup_paths=[])
 
     monkeypatch.setattr("satmaps.tiler.run_tiling_simplified", fake_run_tiling_simplified)
-    monkeypatch.setattr("satmaps.subprocess.run", lambda cmd, check: None)
+    monkeypatch.setattr(
+        "satmaps.subprocess.run",
+        lambda cmd, check: Path(cmd[-1]).write_text("fake pmtiles"),
+    )
 
     main()
 
@@ -2576,7 +2707,10 @@ def test_main_keeps_ocean_after_processing(
         return satmaps.tiler.TilingArtifacts(final_vrt=input_vrt, cleanup_paths=[])
 
     monkeypatch.setattr("satmaps.tiler.run_tiling_simplified", fake_run_tiling_simplified)
-    monkeypatch.setattr("satmaps.subprocess.run", lambda cmd, check: None)
+    monkeypatch.setattr(
+        "satmaps.subprocess.run",
+        lambda cmd, check: Path(cmd[-1]).write_text("fake pmtiles"),
+    )
 
     main()
 

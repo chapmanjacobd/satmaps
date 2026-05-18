@@ -210,7 +210,10 @@ def convert_raster_to_pmtiles(
     tiling_artifacts = tiler.run_tiling_simplified(input_raster, temp_mbtiles, run_options)
 
     print("Converting to PMTiles...")
-    subprocess.run(["pmtiles", "convert", temp_mbtiles, output_path], check=True)
+    staged_output_path = build_staged_path(output_path)
+    remove_if_exists(staged_output_path)
+    subprocess.run(["pmtiles", "convert", temp_mbtiles, staged_output_path], check=True)
+    publish_staged_path(staged_output_path, output_path)
     print(f"Success! {output_path}")
     return PackagedPMTiles(
         temp_mbtiles=temp_mbtiles,
@@ -237,8 +240,18 @@ def build_staged_path(path: str) -> str:
     return os.path.join(directory, f".temp_{basename}")
 
 
+def file_has_content(path: str) -> bool:
+    """Return True when a path exists and has non-zero size."""
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
 def publish_staged_path(staged_path: str, final_path: str) -> str:
     """Atomically publish a staged file under its final name."""
+    if not file_has_content(staged_path):
+        raise RuntimeError(f"Refusing to publish empty staged file: {staged_path}")
     os.replace(staged_path, final_path)
     return final_path
 
@@ -644,7 +657,7 @@ def restore_resume_state(resume_path: str) -> Optional[Dict[str, Any]]:
         return None
 
     completed_subtiles = set(completed_subtiles_raw)
-    processed_tifs = [path for path in processed_tifs_raw if os.path.exists(path)]
+    processed_tifs = [path for path in processed_tifs_raw if file_has_content(path)]
     print(f"Resuming from state file: {resume_path} (unique_id: {unique_id})")
     print(
         f"Already completed {len(completed_subtiles)} sub-tiles, {len(processed_tifs)} TIFs found."
@@ -1404,6 +1417,47 @@ def warp_to_web_mercator(
     gdal.Warp(destination_path, source_path, options=warp_options)
 
 
+def recover_processed_tile_output(
+    mgrs_subtile: str,
+    args: argparse.Namespace,
+) -> Optional[str]:
+    """Reuse a finished temp output or recover one from a surviving UTM intermediate."""
+    temp_utm_path, temp_3857_path = build_processed_tile_paths(mgrs_subtile, args.output)
+    staged_3857_path = build_staged_path(temp_3857_path)
+
+    if os.path.exists(temp_3857_path) and not file_has_content(temp_3857_path):
+        remove_if_exists(temp_3857_path)
+    if file_has_content(temp_3857_path):
+        return temp_3857_path
+
+    if os.path.exists(temp_utm_path) and not file_has_content(temp_utm_path):
+        remove_if_exists(temp_utm_path)
+    if not file_has_content(temp_utm_path):
+        return None
+
+    remove_if_exists(staged_3857_path)
+    warp_to_web_mercator(temp_utm_path, staged_3857_path, args.resample_alg, args.max_zoom)
+    publish_staged_path(staged_3857_path, temp_3857_path)
+    remove_if_exists(temp_utm_path)
+    return temp_3857_path
+
+
+def recover_processed_tile_outputs(
+    subtiles: List[str],
+    args: argparse.Namespace,
+) -> Tuple[Set[str], List[str]]:
+    """Collect reusable Web Mercator temp outputs for the requested sub-tiles."""
+    recovered_subtiles: Set[str] = set()
+    recovered_paths: List[str] = []
+    for mgrs_subtile in subtiles:
+        recovered_path = recover_processed_tile_output(mgrs_subtile, args)
+        if recovered_path is None:
+            continue
+        recovered_subtiles.add(mgrs_subtile)
+        recovered_paths.append(recovered_path)
+    return recovered_subtiles, recovered_paths
+
+
 def process_single_tile(
     mgrs_subtile: str,
     date_paths: List[str],
@@ -1690,6 +1744,17 @@ def main() -> None:
 
     mgrs_bases = discover_mgrs_bases(requested_bbox, gebco_vrt_source)
     subtiles = expand_subtiles(mgrs_bases)
+    recovered_subtiles, recovered_tile_paths = recover_processed_tile_outputs(subtiles, args)
+    if recovered_subtiles:
+        print(f"Reusing {len(recovered_subtiles)} existing temp raster(s).")
+    completed_subtiles &= recovered_subtiles
+    completed_subtiles.update(recovered_subtiles)
+    land_output_paths = {build_processed_tile_paths(st, args.output)[1] for st in subtiles}
+    processed_tifs = recovered_tile_paths + [
+        path
+        for path in processed_tifs
+        if path not in land_output_paths and file_has_content(path)
+    ]
     print(
         f"Expanded {len(mgrs_bases)} MGRS tiles into {len(subtiles)} sub-tiles "
         f"across {len(date_paths)} date(s)."

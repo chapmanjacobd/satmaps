@@ -529,7 +529,7 @@ def process_chunk(args: ChunkTask) -> str:
 
         remove_if_exists(staged_chunk_file)
         gdal.Translate(staged_chunk_file, chunk_source, options=translate_options)
-        os.replace(staged_chunk_file, chunk_file)
+        publish_staged_path(staged_chunk_file, chunk_file)
         return chunk_file
     except Exception as e:
         print(f"Error processing chunk {chunk_file}: {e}")
@@ -549,6 +549,22 @@ def build_staged_path(path: str) -> str:
     """Return the hidden staging path used before atomically publishing a file."""
     directory, basename = os.path.split(path)
     return os.path.join(directory, f".temp_{basename}")
+
+
+def file_has_content(path: str) -> bool:
+    """Return True when a path exists and has non-zero size."""
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def publish_staged_path(staged_path: str, final_path: str) -> str:
+    """Atomically publish a staged file under its final name."""
+    if not file_has_content(staged_path):
+        raise RuntimeError(f"Refusing to publish empty staged file: {staged_path}")
+    os.replace(staged_path, final_path)
+    return final_path
 
 
 def remove_if_exists(path: str) -> None:
@@ -764,6 +780,6 @@ def run_tiling_simplified(
 
     # Finalize metadata again after gdaladdo adds lower zoom tiles.
     finalize_mbtiles_metadata(staged_output_mbtiles)
-    os.replace(staged_output_mbtiles, output_mbtiles)
+    publish_staged_path(staged_output_mbtiles, output_mbtiles)
 
     return TilingArtifacts(final_vrt=input_vrt, cleanup_paths=chunk_files)
