@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
 import subprocess
 import sys
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, cast
@@ -232,6 +232,41 @@ def build_processed_tile_paths(mgrs_subtile: str, output_path: str) -> Tuple[str
         f".temp/{stem}_{mgrs_subtile}_utm.tif",
         f".temp/{stem}_{mgrs_subtile}_3857.tif",
     )
+
+
+def build_land_run_token(
+    args: argparse.Namespace,
+    date_paths: List[str],
+    requested_bbox: Optional[Tuple[float, float, float, float]],
+    gebco_vrt_source: Optional[str],
+) -> str:
+    """Return a stable token so identical land-processing runs reuse temp outputs."""
+    payload = json.dumps(
+        {
+            "output": os.path.abspath(args.output),
+            "date_paths": date_paths,
+            "bbox": requested_bbox,
+            "max_zoom": args.max_zoom,
+            "resample_alg": args.resample_alg,
+            "stats_min": args.stats_min,
+            "stats_max": args.stats_max,
+            "tonemap": args.tonemap,
+            "grade": args.grade,
+            "exposure": args.exposure,
+            "sb": args.sb,
+            "hb": args.hb,
+            "ss": args.ss,
+            "ms": args.ms,
+            "hs": args.hs,
+            "gamma": args.gamma,
+            "sat": args.sat,
+            "db": args.db,
+            "ls": args.ls,
+            "ocean_mask_source": os.path.abspath(gebco_vrt_source) if gebco_vrt_source else None,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
 
 
 def build_staged_path(path: str) -> str:
@@ -621,10 +656,12 @@ def expand_subtiles(mgrs_bases: List[str]) -> List[str]:
     ]
 
 
-def find_resume_path(resume_arg: object) -> Optional[str]:
+def find_resume_path(resume_arg: object, preferred_path: Optional[str] = None) -> Optional[str]:
     """Resolve the explicit or latest state file path for --resume."""
     if isinstance(resume_arg, str) and os.path.exists(resume_arg):
         return resume_arg
+    if preferred_path and os.path.exists(preferred_path):
+        return preferred_path
 
     states = glob.glob(".temp/state_*.json")
     if not states:
@@ -1720,13 +1757,16 @@ def main() -> None:
     setup_gdal_cdse()
     os.makedirs(".temp", exist_ok=True)
 
-    unique_id = uuid.uuid4().hex[:8]
+    requested_bbox = parse_bbox(args.bbox) if args.bbox else None
+    date_paths = [date_path.strip() for date_path in args.date.split(",")]
+    gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
+    unique_id = build_land_run_token(args, date_paths, requested_bbox, gebco_vrt_source)
     state_file = build_state_file_path(unique_id)
     completed_subtiles: Set[str] = set()
     processed_tifs: List[str] = []
 
     if args.resume:
-        resume_path = find_resume_path(args.resume)
+        resume_path = find_resume_path(args.resume, preferred_path=state_file)
         if resume_path:
             resume_state = restore_resume_state(resume_path)
             if resume_state:
@@ -1734,10 +1774,6 @@ def main() -> None:
                 unique_id = cast(str, resume_state["unique_id"])
                 completed_subtiles = cast(Set[str], resume_state["completed_subtiles"])
                 processed_tifs = cast(List[str], resume_state["processed_tifs"])
-
-    requested_bbox = parse_bbox(args.bbox) if args.bbox else None
-    date_paths = [date_path.strip() for date_path in args.date.split(",")]
-    gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
 
     if requested_bbox is None:
         populate_s3_cache(date_paths)

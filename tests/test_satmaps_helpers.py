@@ -16,6 +16,7 @@ from satmaps import (
     build_alpha_block,
     build_fill_allowed_mask,
     build_bbox_geometry,
+    build_land_run_token,
     build_progress_checkpoints,
     expand_subtiles,
     find_resume_path,
@@ -208,6 +209,51 @@ def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: objec
 
     assert find_resume_path(str(newer)) == str(newer)
     assert find_resume_path(True) == str(Path(".temp") / "state_new.json")
+    assert find_resume_path(True, preferred_path=str(older)) == str(older)
+
+
+def test_build_land_run_token_is_stable_for_matching_inputs() -> None:
+    args = satmaps.argparse.Namespace(
+        output="render.pmtiles",
+        max_zoom=13,
+        resample_alg="lanczos",
+        stats_min=0.0,
+        stats_max=10000.0,
+        tonemap=True,
+        grade=True,
+        exposure=1.0,
+        sb=0.3,
+        hb=0.75,
+        ss=1.4,
+        ms=0.9,
+        hs=0.5,
+        gamma=2.6,
+        sat=0.9,
+        db=0.15,
+        ls=0.2,
+    )
+
+    token_a = build_land_run_token(
+        args,
+        ["2025/07/01", "2025/10/01"],
+        (0.0, 0.0, 1.0, 1.0),
+        "ocean.tif",
+    )
+    token_b = build_land_run_token(
+        args,
+        ["2025/07/01", "2025/10/01"],
+        (0.0, 0.0, 1.0, 1.0),
+        "ocean.tif",
+    )
+    token_c = build_land_run_token(
+        args,
+        ["2025/07/01"],
+        (0.0, 0.0, 1.0, 1.0),
+        "ocean.tif",
+    )
+
+    assert token_a == token_b
+    assert token_a != token_c
 
 
 def test_recover_processed_tile_output_rebuilds_from_surviving_utm(
