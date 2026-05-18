@@ -136,12 +136,15 @@ def update_count_progress(
     total: int,
     started_at: float,
     detail: str,
+    completed_before_start: int = 0,
 ) -> None:
     """Update a live progress line for count-based work."""
     remaining = None
     elapsed = time.perf_counter() - started_at
-    if current > 0 and total > 0 and elapsed > 0.0:
-        remaining = elapsed * (total - current) / current
+    eta_total = max(total - completed_before_start, 0)
+    eta_current = min(max(current - completed_before_start, 0), eta_total)
+    if eta_current > 0 and eta_total > 0 and elapsed > 0.0:
+        remaining = elapsed * (eta_total - eta_current) / eta_current
     progress_line.update(
         f"{label} {format_progress(current, total)}; {format_eta(remaining)}; {detail}"
     )
@@ -1799,6 +1802,7 @@ def main() -> None:
     if args.land:
         subtiles_to_process = [st for st in subtiles if st not in completed_subtiles]
         if subtiles_to_process:
+            completed_before_start = len(completed_subtiles)
             print(
                 "Starting land processing for "
                 f"{len(subtiles_to_process)} sub-tiles with {args.parallel} worker(s); "
@@ -1830,6 +1834,7 @@ def main() -> None:
                         len(subtiles),
                         started_at,
                         f"{len(processed_tifs)} raster(s) ready.",
+                        completed_before_start=completed_before_start,
                     )
                     write_resume_state(
                         state_file, unique_id, completed_subtiles, processed_tifs, args

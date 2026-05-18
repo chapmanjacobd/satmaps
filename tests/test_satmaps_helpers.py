@@ -368,6 +368,27 @@ def test_populate_s3_cache_reports_progress(
     assert "S3 folder cache ready: 2 date(s), 3 folders total." in out
 
 
+def test_update_count_progress_bases_eta_on_new_work_after_resume(
+    monkeypatch: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(satmaps.time, "perf_counter", lambda: 100.0)
+    progress_line = satmaps.LiveProgressLine()
+
+    satmaps.update_count_progress(
+        progress_line,
+        "Land processing progress:",
+        7,
+        8,
+        90.0,
+        "7 raster(s) ready.",
+        completed_before_start=6,
+    )
+    progress_line.finish()
+
+    out = capsys.readouterr().out
+    assert "Land processing progress: 7/8 (88%); ETA: 10s; 7 raster(s) ready." in out
+
+
 def test_build_alpha_block_uses_source_mask_without_gebco() -> None:
     source_valid_mask = np.array([[True, False, True]], dtype=bool)
 
