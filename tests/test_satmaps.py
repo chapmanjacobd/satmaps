@@ -1331,6 +1331,31 @@ def test_ocean_main_passes_parallel_chunk_flags(monkeypatch: object) -> None:
     assert called["chunk_size"] == 2048
 
 
+def test_ocean_main_passes_zoom4(monkeypatch: object) -> None:
+    called: dict[str, object] = {}
+
+    def fake_generate_ocean_background(**kwargs):
+        called.update(kwargs)
+        return ocean.OceanBackgroundArtifacts(
+            source_vrt=".temp/source.vrt",
+            masked_vrt=".temp/masked.vrt",
+            warped_vrt=".temp/warped.vrt",
+            alpha_vrt=".temp/alpha.vrt",
+            alpha_tif=".temp/alpha.tif",
+            hillshade_tif=".temp/ocean_hillshade.tif",
+            color_tif=".temp/ocean_color.tif",
+            rgba_vrt=".temp/ocean_rgba.vrt",
+            output_tif="ocean-z4.tif",
+        )
+
+    monkeypatch.setattr(sys, "argv", ["ocean.py", "--max-zoom", "4", "gebco.zip", "ocean-z4.tif"])
+    monkeypatch.setattr("ocean.generate_ocean_background", fake_generate_ocean_background)
+
+    ocean.main()
+
+    assert called["max_zoom"] == 4
+
+
 def test_build_ocean_output_plan_splits_aligned_chunks() -> None:
     bbox = (-4.0, 50.0, -3.0, 51.0)
     plan = ocean.build_ocean_output_plan(bbox, max_zoom=13, chunk_size=1024)
@@ -2601,6 +2626,38 @@ def test_main_builds_master_vrt_with_requested_zoom12_resolution(
     _, kwargs = buildvrt_calls[-1]
     assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(12))
     assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(12))
+
+
+def test_main_builds_master_vrt_with_requested_zoom4_resolution(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    ocean_path = tmp_path / "ocean.tif"
+    ocean_path.write_text("fake ocean")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1", "--max-zoom", "4"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: [])
+    buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_build_vrt(out, src, **kwargs):
+        buildvrt_calls.append((list(src), kwargs))
+        Path(out).write_text("fake vrt")
+
+    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
+
+    main()
+
+    assert buildvrt_calls
+    _, kwargs = buildvrt_calls[-1]
+    assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(4))
+    assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(4))
 
 
 def test_main_bbox_passes_chunk_bounds_to_tiler(
