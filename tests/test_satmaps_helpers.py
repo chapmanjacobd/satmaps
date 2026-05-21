@@ -97,6 +97,8 @@ def test_restore_resume_state_round_trip(
     assert restored == {
         "state_file": str(state_file),
         "unique_id": "resume-id",
+        "strategy": satmaps.LAND_PROCESSING_STRATEGY_SUBTILES,
+        "completed_units": {"31TDF_0_0", "31TDF_1_0"},
         "completed_subtiles": {"31TDF_0_0", "31TDF_1_0"},
         "processed_tifs": [str(kept_tif)],
     }
@@ -123,6 +125,41 @@ def test_restore_resume_state_drops_zero_byte_outputs(tmp_path: Path) -> None:
 
     assert restored is not None
     assert restored["processed_tifs"] == []
+
+
+def test_select_land_processing_strategy_uses_coarse_at_or_below_cutoff() -> None:
+    assert satmaps.select_land_processing_strategy(7) == satmaps.LAND_PROCESSING_STRATEGY_COARSE
+    assert satmaps.select_land_processing_strategy(4) == satmaps.LAND_PROCESSING_STRATEGY_COARSE
+    assert satmaps.select_land_processing_strategy(8) == satmaps.LAND_PROCESSING_STRATEGY_SUBTILES
+    assert (
+        satmaps.select_land_processing_strategy(4, download_only=True)
+        == satmaps.LAND_PROCESSING_STRATEGY_SUBTILES
+    )
+
+
+def test_plan_coarse_work_units_uses_target_zoom_tile_grid(monkeypatch: object) -> None:
+    first_tile = satmaps.tiler.get_web_mercator_bounds(4, 1, 2)
+    second_tile = satmaps.tiler.get_web_mercator_bounds(4, 2, 2)
+
+    def fake_bounds(mgrs_base: str) -> tuple[float, float, float, float]:
+        return {
+            "31TDF": first_tile,
+            "32TLP": second_tile,
+        }[mgrs_base]
+
+    monkeypatch.setattr(satmaps, "build_mgrs_base_mercator_bounds", fake_bounds)
+
+    work_units = satmaps.plan_coarse_work_units(["31TDF", "32TLP"], None, 4)
+
+    assert [unit.unit_id for unit in work_units] == ["coarse_z4_1_2", "coarse_z4_2_2"]
+    assert all(unit.strategy == satmaps.LAND_PROCESSING_STRATEGY_COARSE for unit in work_units)
+    assert all(unit.width == 256 and unit.height == 256 for unit in work_units)
+    assert work_units[0].source_subtiles == (
+        "31TDF_0_0",
+        "31TDF_0_1",
+        "31TDF_1_0",
+        "31TDF_1_1",
+    )
 
 
 def test_restore_resume_state_returns_none_for_invalid_json(

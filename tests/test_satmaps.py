@@ -2353,6 +2353,48 @@ def test_main_reports_land_progress(
     assert "Building master VRT from 4 raster(s)... 100%; ETA: 0s" in out
 
 
+def test_main_low_zoom_uses_coarse_processing_strategy(
+    monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "--vrt", "--parallel", "1", "--date", "2025/07/01", "--max-zoom", "4"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: ["31TDF"])
+    monkeypatch.setattr(
+        "satmaps.build_mgrs_base_mercator_bounds",
+        lambda mgrs_base: satmaps.tiler.get_web_mercator_bounds(4, 1, 2),
+    )
+    monkeypatch.setattr(
+        "satmaps.process_single_tile",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy path should not run")),
+    )
+
+    def fake_process_coarse(work_unit, dates, args, gebco_src=None):
+        path = tmp_path / f"{work_unit.unit_id}.tif"
+        path.write_text("fake tif")
+        return str(path)
+
+    monkeypatch.setattr("satmaps.process_coarse_work_unit", fake_process_coarse)
+    monkeypatch.setattr(
+        "satmaps.gdal.BuildVRT",
+        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+    )
+
+    main()
+
+    out = capsys.readouterr().out
+    assert "Planned 1 coarse land tile(s) from 1 MGRS tiles across 1 date(s)." in out
+    assert "Starting coarse tile processing for 1 coarse tile(s) with 1 worker(s);" in out
+    assert "Land processing progress: 1/1 (100%); ETA: 0s; 1 raster(s) ready." in out
+
+
 def test_main_passes_ocean_path_to_tile_processing(
     monkeypatch: object, tmp_path: Path
 ) -> None:
