@@ -26,6 +26,7 @@ from tiler import (
     parse_bbox_string,
     snap_bounds_to_pixel_grid,
     web_mercator_pixel_size,
+    web_mercator_pixel_size_for_tile_size,
 )
 
 gdal.UseExceptions()
@@ -793,9 +794,11 @@ def colorize_ocean_depths(depths: np.ndarray, style: OceanStyleOptions) -> np.nd
 def snapped_tile_grid_for_bbox(
     bbox: tuple[float, float, float, float],
     max_zoom: int = DEFAULT_MAX_ZOOM,
+    *,
+    tile_size: int = 256,
 ) -> tuple[tuple[float, float, float, float], float, int]:
     """Snap a bbox outward to the target Web Mercator tile pixel grid."""
-    pixel_size = web_mercator_pixel_size(max_zoom)
+    pixel_size = web_mercator_pixel_size_for_tile_size(max_zoom, tile_size)
     zoom = max_zoom
     mercator_bounds = lonlat_bbox_to_mercator_bounds(*bbox)
     snapped_bounds = snap_bounds_to_pixel_grid(mercator_bounds, pixel_size)

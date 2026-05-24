@@ -160,6 +160,12 @@ def test_web_mercator_pixel_size_accepts_requested_zoom() -> None:
     )
 
 
+def test_web_mercator_pixel_size_for_tile_size_adjusts_for_512px_tiles() -> None:
+    assert satmaps.tiler.web_mercator_pixel_size_for_tile_size(7, 512) == pytest.approx(
+        satmaps.tiler.web_mercator_pixel_size(8)
+    )
+
+
 def test_compute_in_memory_pixel_limit_uses_available_memory_and_cap(
     monkeypatch: object,
 ) -> None:
@@ -1023,6 +1029,7 @@ def test_prepare_ocean_background_publishes_staged_tif_when_warping(
         "output.pmtiles",
         "lanczos",
         13,
+        256,
     )
 
     assert prepared == ".temp/output_ocean_bbox.tif"
@@ -1064,6 +1071,7 @@ def test_prepare_ocean_background_crops_aligned_mercator_source_without_warp(
         "output.pmtiles",
         "lanczos",
         13,
+        256,
     )
 
     assert prepared == ".temp/output_ocean_bbox.tif"
@@ -1753,7 +1761,7 @@ def test_warp_to_web_mercator_uses_shared_zoom13_resolution(monkeypatch: object)
     )
     monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: None)
 
-    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 13)
+    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 13, 256)
 
     assert warp_options_calls[0]["dstSRS"] == "EPSG:3857"
     assert warp_options_calls[0]["xRes"] == pytest.approx(
@@ -1776,13 +1784,29 @@ def test_warp_to_web_mercator_respects_requested_zoom(monkeypatch: object) -> No
     )
     monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: None)
 
-    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 14)
+    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 14, 256)
 
     assert warp_options_calls[0]["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
     assert warp_options_calls[0]["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
     assert warp_options_calls[0]["targetAlignedPixels"] is True
     assert warp_options_calls[0]["multithread"] is True
     assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
+
+
+def test_warp_to_web_mercator_respects_blocksize(monkeypatch: object) -> None:
+    warp_options_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "satmaps.gdal.WarpOptions",
+        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: None)
+
+    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 13, 512)
+
+    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(13, 512)
+    assert warp_options_calls[0]["xRes"] == pytest.approx(expected)
+    assert warp_options_calls[0]["yRes"] == pytest.approx(expected)
 
 
 def test_warp_to_web_mercator_aligns_adjacent_tiles_to_shared_pixel_grid(
@@ -1806,7 +1830,7 @@ def test_warp_to_web_mercator_aligns_adjacent_tiles_to_shared_pixel_grid(
         dataset = None
 
         warped_path = tmp_path / f"tile_{index}_3857.tif"
-        satmaps.warp_to_web_mercator(str(source_path), str(warped_path), "lanczos", 13)
+        satmaps.warp_to_web_mercator(str(source_path), str(warped_path), "lanczos", 13, 256)
         warped_dataset = gdal.Open(str(warped_path))
         assert warped_dataset is not None
         warped_datasets.append(warped_dataset)
@@ -1826,7 +1850,7 @@ def test_warp_to_web_mercator_removes_existing_destination(monkeypatch: object) 
     monkeypatch.setattr("satmaps.gdal.WarpOptions", lambda **kwargs: kwargs)
     monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: None)
 
-    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 14)
+    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 14, 256)
 
     assert removed == ["output.tif"]
 
@@ -2108,6 +2132,7 @@ def test_process_single_tile_full_pipeline(monkeypatch: object, tmp_path: Path) 
         ls=0.7,
         resample_alg="bilinear",
         max_zoom=13,
+        blocksize=256,
         output="render.pmtiles",
     )
 
@@ -2191,6 +2216,7 @@ def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path
         ls=0.7,
         resample_alg="near",
         max_zoom=13,
+        blocksize=256,
         output="render.pmtiles",
     )
 
@@ -2272,6 +2298,7 @@ def test_process_single_tile_with_rgba_ocean_alpha_mask(
         ls=0.7,
         resample_alg="near",
         max_zoom=13,
+        blocksize=256,
         output="render.pmtiles",
     )
 
@@ -2353,7 +2380,7 @@ def test_main_reports_land_progress(
     assert "Building master VRT from 4 raster(s)... 100%; ETA: 0s" in out
 
 
-def test_main_low_zoom_uses_coarse_processing_strategy(
+def test_main_low_zoom_uses_subtile_processing_strategy(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -2367,21 +2394,15 @@ def test_main_low_zoom_uses_coarse_processing_strategy(
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
     monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src: ["31TDF"])
-    monkeypatch.setattr(
-        "satmaps.build_mgrs_base_mercator_bounds",
-        lambda mgrs_base: satmaps.tiler.get_web_mercator_bounds(4, 1, 2),
-    )
-    monkeypatch.setattr(
-        "satmaps.process_single_tile",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy path should not run")),
-    )
+    processed_tiles: list[str] = []
 
-    def fake_process_coarse(work_unit, dates, args, gebco_src=None):
-        path = tmp_path / f"{work_unit.unit_id}.tif"
+    def fake_process_single_tile(tile_id, dates, args, gebco_src=None):
+        processed_tiles.append(tile_id)
+        path = tmp_path / f"{tile_id}.tif"
         path.write_text("fake tif")
         return str(path)
 
-    monkeypatch.setattr("satmaps.process_coarse_work_unit", fake_process_coarse)
+    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
     monkeypatch.setattr(
         "satmaps.gdal.BuildVRT",
         lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
@@ -2390,9 +2411,10 @@ def test_main_low_zoom_uses_coarse_processing_strategy(
     main()
 
     out = capsys.readouterr().out
-    assert "Planned 1 coarse land tile(s) from 1 MGRS tiles across 1 date(s)." in out
-    assert "Starting coarse tile processing for 1 coarse tile(s) with 1 worker(s);" in out
-    assert "Land processing progress: 1/1 (100%); ETA: 0s; 1 raster(s) ready." in out
+    assert processed_tiles == ["31TDF_0_0", "31TDF_0_1", "31TDF_1_0", "31TDF_1_1"]
+    assert "Expanded 1 MGRS tiles into 4 sub-tiles across 1 date(s)." in out
+    assert "Starting sub-tile processing for 4 sub-tile(s) with 1 worker(s);" in out
+    assert "Land processing progress: 4/4 (100%); ETA: 0s; 4 raster(s) ready." in out
 
 
 def test_main_passes_ocean_path_to_tile_processing(
@@ -2534,7 +2556,8 @@ def test_main_bbox_uses_standalone_ocean(monkeypatch: object, tmp_path: Path) ->
     assert buildvrt_sources[-1][0] != "ocean.tif"
     assert Path(buildvrt_sources[-1][0]).name == "output_ocean_bbox.tif"
     snapped_bounds, pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(
-        (0.0, 0.0, 1.0, 1.0)
+        (0.0, 0.0, 1.0, 1.0),
+        tile_size=512,
     )
     assert warp_options_calls[0]["outputBounds"] == pytest.approx(snapped_bounds)
     assert warp_options_calls[0]["xRes"] == pytest.approx(pixel_size)
@@ -2570,8 +2593,12 @@ def test_main_builds_master_vrt_with_shared_zoom13_resolution(
     assert buildvrt_calls
     _, kwargs = buildvrt_calls[-1]
     assert kwargs["resolution"] == "user"
-    assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM))
-    assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM))
+    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(
+        ocean.DEFAULT_MAX_ZOOM,
+        512,
+    )
+    assert kwargs["xRes"] == pytest.approx(expected)
+    assert kwargs["yRes"] == pytest.approx(expected)
 
 
 def test_main_builds_master_vrt_with_requested_zoom14_resolution(
@@ -2602,8 +2629,9 @@ def test_main_builds_master_vrt_with_requested_zoom14_resolution(
 
     assert buildvrt_calls
     _, kwargs = buildvrt_calls[-1]
-    assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
-    assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
+    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(14, 512)
+    assert kwargs["xRes"] == pytest.approx(expected)
+    assert kwargs["yRes"] == pytest.approx(expected)
 
 
 def test_main_builds_master_vrt_with_requested_zoom11_resolution(
@@ -2634,8 +2662,9 @@ def test_main_builds_master_vrt_with_requested_zoom11_resolution(
 
     assert buildvrt_calls
     _, kwargs = buildvrt_calls[-1]
-    assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(11))
-    assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(11))
+    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(11, 512)
+    assert kwargs["xRes"] == pytest.approx(expected)
+    assert kwargs["yRes"] == pytest.approx(expected)
 
 
 def test_main_builds_master_vrt_with_requested_zoom12_resolution(
@@ -2666,8 +2695,9 @@ def test_main_builds_master_vrt_with_requested_zoom12_resolution(
 
     assert buildvrt_calls
     _, kwargs = buildvrt_calls[-1]
-    assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(12))
-    assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(12))
+    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(12, 512)
+    assert kwargs["xRes"] == pytest.approx(expected)
+    assert kwargs["yRes"] == pytest.approx(expected)
 
 
 def test_main_builds_master_vrt_with_requested_zoom4_resolution(
@@ -2698,8 +2728,9 @@ def test_main_builds_master_vrt_with_requested_zoom4_resolution(
 
     assert buildvrt_calls
     _, kwargs = buildvrt_calls[-1]
-    assert kwargs["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(4))
-    assert kwargs["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(4))
+    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(4, 512)
+    assert kwargs["xRes"] == pytest.approx(expected)
+    assert kwargs["yRes"] == pytest.approx(expected)
 
 
 def test_main_bbox_passes_chunk_bounds_to_tiler(

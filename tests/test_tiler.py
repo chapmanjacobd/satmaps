@@ -22,6 +22,8 @@ from tiler import (
     merge_mbtiles,
     run_tiling_simplified,
     te_to_src_win,
+    web_mercator_pixel_size,
+    web_mercator_pixel_size_for_tile_size,
 )
 
 
@@ -58,6 +60,15 @@ def test_lonlat_bbox_to_mercator_bounds_matches_chunk_tile() -> None:
     tile_bounds = get_web_mercator_bounds(4, 8, 7)
     bbox_bounds = lonlat_bbox_to_mercator_bounds(0.0, 0.0, 22.5, 21.943045533438177)
     np.testing.assert_allclose(bbox_bounds, tile_bounds, atol=1e-6)
+
+
+def test_web_mercator_pixel_size_for_tile_size_scales_with_tile_width() -> None:
+    assert web_mercator_pixel_size_for_tile_size(7, 256) == pytest.approx(
+        web_mercator_pixel_size(7)
+    )
+    assert web_mercator_pixel_size_for_tile_size(7, 512) == pytest.approx(
+        web_mercator_pixel_size(8)
+    )
 
 
 def test_merge_mbtiles_merges_all_attached_tile_tables(tmp_path: Path) -> None:
@@ -404,6 +415,49 @@ def test_run_tiling_simplified_builds_lower_zoom_levels(
     assert min(zooms) < max(zooms)
     assert metadata["minzoom"] == str(min(zooms))
     assert metadata["maxzoom"] == str(max(zooms))
+
+
+@pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")
+def test_run_tiling_simplified_uses_nominal_zoom_with_512_tiles(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    input_path = tmp_path / "input.tif"
+    bounds = get_web_mercator_bounds(7, 10, 20)
+    pixel_size = web_mercator_pixel_size_for_tile_size(7, 512)
+    dataset = gdal.GetDriverByName("GTiff").Create(str(input_path), 512, 512, 3, gdal.GDT_Byte)
+    assert dataset is not None
+    dataset.SetGeoTransform((bounds[0], pixel_size, 0.0, bounds[3], 0.0, -pixel_size))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset.SetProjection(srs.ExportToWkt())
+    for band_index in range(1, 4):
+        dataset.GetRasterBand(band_index).Fill(128)
+    dataset = None
+
+    output_mbtiles = tmp_path / "output.mbtiles"
+    run_tiling_simplified(
+        str(input_path),
+        str(output_mbtiles),
+        {
+            "format": "png",
+            "quality": 75,
+            "resample_alg": "bilinear",
+            "chunk_zoom": 7,
+            "processes": 1,
+            "blocksize": 512,
+            "name": "Test",
+            "description": "Test",
+        },
+    )
+
+    conn = sqlite3.connect(output_mbtiles)
+    maxzoom = int(conn.execute("SELECT value FROM metadata WHERE name = 'maxzoom'").fetchone()[0])
+    conn.close()
+
+    assert maxzoom == 7
 
 
 @pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")

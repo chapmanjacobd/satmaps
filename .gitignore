@@ -5,6 +5,7 @@
 *.db
 *.mbtiles-journal
 *.xml
+*.json
 /cache
 __pycache__
 /.temp

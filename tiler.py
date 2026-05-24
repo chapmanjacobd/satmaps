@@ -331,6 +331,13 @@ def web_mercator_pixel_size(zoom: int) -> float:
     return float((WEB_MERCATOR_LIMIT * 2) / (256 * (2**zoom)))
 
 
+def web_mercator_pixel_size_for_tile_size(zoom: int, tile_size: int) -> float:
+    """Return the meters-per-pixel needed for a nominal XYZ zoom and raster tile size."""
+    if tile_size <= 0:
+        raise ValueError("tile_size must be positive")
+    return float((WEB_MERCATOR_LIMIT * 2) / (tile_size * (2**zoom)))
+
+
 def snap_bounds_to_pixel_grid(bounds: TEBounds, pixel_size: float) -> TEBounds:
     """Expand bounds (minx, miny, maxx, maxy) outward to the global Web Mercator pixel grid."""
     if pixel_size <= 0.0:

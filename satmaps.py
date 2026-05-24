@@ -8,7 +8,6 @@ import os
 import subprocess
 import sys
 import time
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, cast
@@ -37,42 +36,16 @@ SENTINEL_NODATA = -32768
 PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
-LOW_ZOOM_COARSE_CUTOFF = 7
-LAND_PROCESSING_STRATEGY_SUBTILES = "subtiles"
-LAND_PROCESSING_STRATEGY_COARSE = "coarse"
-
-
-def build_web_mercator_output_srs() -> osr.SpatialReference:
-    """Return a Web Mercator spatial reference with traditional axis order."""
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(3857)
-    if hasattr(srs, "SetAxisMappingStrategy"):
-        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    return srs
-
-
-WEB_MERCATOR_OUTPUT_SRS = build_web_mercator_output_srs()
-
-
 @dataclass(frozen=True)
 class LandWorkUnit:
     unit_id: str
-    strategy: str
     source_subtiles: tuple[str, ...]
-    output_bounds: tuple[float, float, float, float] | None = None
-    width: int | None = None
-    height: int | None = None
 
 
 @dataclass(frozen=True)
 class LandProcessingPlan:
-    strategy: str
     mgrs_bases: tuple[str, ...]
     work_units: tuple[LandWorkUnit, ...]
-
-
-MGRS_BASE_BOUNDS_CACHE: Dict[str, Tuple[float, float, float, float]] = {}
-
 
 def max_in_memory_write_pixels() -> int:
     """Return the live pixel budget for whole-window RGB(A) writes."""
@@ -279,96 +252,11 @@ def build_work_unit_output_path(work_unit: LandWorkUnit, output_path: str) -> st
     return f".temp/{stem}_{work_unit.unit_id}_3857.tif"
 
 
-def select_land_processing_strategy(
-    max_zoom: int,
-    *,
-    download_only: bool = False,
-) -> str:
-    """Choose the processing strategy for the current run."""
-    if not download_only and max_zoom <= LOW_ZOOM_COARSE_CUTOFF:
-        return LAND_PROCESSING_STRATEGY_COARSE
-    return LAND_PROCESSING_STRATEGY_SUBTILES
-
-
-def get_processing_strategy_label(strategy: str) -> str:
-    """Return a short human-readable label for progress and logs."""
-    if strategy == LAND_PROCESSING_STRATEGY_COARSE:
-        return "coarse tile"
-    return "sub-tile"
-
-
 def describe_land_processing_plan(plan: LandProcessingPlan, num_dates: int) -> str:
     """Return the summary line printed before land processing starts."""
-    if plan.strategy == LAND_PROCESSING_STRATEGY_COARSE:
-        return (
-            f"Planned {len(plan.work_units)} coarse land tile(s) from {len(plan.mgrs_bases)} "
-            f"MGRS tiles across {num_dates} date(s)."
-        )
     return (
         f"Expanded {len(plan.mgrs_bases)} MGRS tiles into {len(plan.work_units)} sub-tiles "
         f"across {num_dates} date(s)."
-    )
-
-
-def build_requested_output_bounds(
-    requested_bbox: Optional[Tuple[float, float, float, float]],
-    max_zoom: int,
-) -> tuple[float, float, float, float]:
-    """Return the aligned 3857 bounds for the requested output area."""
-    if requested_bbox is None:
-        return ocean.WEB_MERCATOR_WORLD_BOUNDS
-    snapped_bounds, _pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(requested_bbox, max_zoom)
-    return snapped_bounds
-
-
-def build_mgrs_base_mercator_bounds(mgrs_base: str) -> Tuple[float, float, float, float]:
-    """Return the Web Mercator bounds for one 100 km MGRS tile."""
-    cached = MGRS_BASE_BOUNDS_CACHE.get(mgrs_base)
-    if cached is not None:
-        return cached
-
-    converter = mgrs.MGRS()
-    corner_codes = (
-        f"{mgrs_base}0000000000",
-        f"{mgrs_base}9999900000",
-        f"{mgrs_base}9999999999",
-        f"{mgrs_base}0000099999",
-    )
-    xs: list[float] = []
-    ys: list[float] = []
-    for code in corner_codes:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r'.*Convert_MGRS_To_Geodetic.*Latitude Warning.*',
-                category=RuntimeWarning,
-            )
-            lat, lon = converter.toLatLon(code)
-        x, y = tiler.lonlat_to_3857(lon, lat)
-        xs.append(x)
-        ys.append(y)
-
-    bounds = (min(xs), min(ys), max(xs), max(ys))
-    MGRS_BASE_BOUNDS_CACHE[mgrs_base] = bounds
-    return bounds
-
-
-def build_mercator_tile_grid(
-    bounds: Tuple[float, float, float, float],
-    width: int,
-    height: int,
-) -> "TileGrid":
-    """Return a 3857 tile grid description for one coarse output window."""
-    if width <= 0 or height <= 0:
-        raise ValueError("width and height must be positive")
-    minx, miny, maxx, maxy = bounds
-    pixel_width = (maxx - minx) / width
-    pixel_height = (maxy - miny) / height
-    return TileGrid(
-        projection=WEB_MERCATOR_OUTPUT_SRS.ExportToWkt(),
-        geotransform=(minx, pixel_width, 0.0, maxy, 0.0, -pixel_height),
-        width=width,
-        height=height,
     )
 
 
@@ -377,85 +265,10 @@ def plan_subtile_work_units(mgrs_bases: List[str]) -> tuple[LandWorkUnit, ...]:
     return tuple(
         LandWorkUnit(
             unit_id=subtile,
-            strategy=LAND_PROCESSING_STRATEGY_SUBTILES,
             source_subtiles=(subtile,),
         )
         for subtile in expand_subtiles(mgrs_bases)
     )
-
-
-def plan_coarse_work_units(
-    mgrs_bases: List[str],
-    requested_bbox: Optional[Tuple[float, float, float, float]],
-    max_zoom: int,
-) -> tuple[LandWorkUnit, ...]:
-    """Plan low-zoom coarse 3857 output windows aligned to the target tile grid."""
-    active_bounds = build_requested_output_bounds(requested_bbox, max_zoom)
-    pixel_size = tiler.web_mercator_pixel_size(max_zoom)
-    unit_bases: Dict[Tuple[int, int], Set[str]] = {}
-    unit_bounds: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {}
-
-    for mgrs_base in mgrs_bases:
-        mgrs_bounds = build_mgrs_base_mercator_bounds(mgrs_base)
-        clipped_mgrs_bounds = tiler.intersect_te_bounds(mgrs_bounds, active_bounds)
-        if clipped_mgrs_bounds is None:
-            continue
-
-        tx_min, ty_min, tx_max, ty_max = tiler.get_chunk_tile_range(clipped_mgrs_bounds, max_zoom)
-        for ty in range(ty_min, ty_max + 1):
-            for tx in range(tx_min, tx_max + 1):
-                tile_bounds = tiler.get_web_mercator_bounds(max_zoom, tx, ty)
-                output_bounds = tiler.intersect_te_bounds(tile_bounds, active_bounds)
-                if output_bounds is None:
-                    continue
-                if tiler.intersect_te_bounds(mgrs_bounds, output_bounds) is None:
-                    continue
-                unit_bases.setdefault((tx, ty), set()).add(mgrs_base)
-                unit_bounds[(tx, ty)] = output_bounds
-
-    work_units: list[LandWorkUnit] = []
-    for tx_ty in sorted(unit_bases):
-        output_bounds = unit_bounds[tx_ty]
-        width = max(1, int(round((output_bounds[2] - output_bounds[0]) / pixel_size)))
-        height = max(1, int(round((output_bounds[3] - output_bounds[1]) / pixel_size)))
-        source_subtiles = tuple(
-            f"{mgrs_base}_{x}_{y}"
-            for mgrs_base in sorted(unit_bases[tx_ty])
-            for x, y in SUBTILE_OFFSETS
-        )
-        tx, ty = tx_ty
-        work_units.append(
-            LandWorkUnit(
-                unit_id=f"coarse_z{max_zoom}_{tx}_{ty}",
-                strategy=LAND_PROCESSING_STRATEGY_COARSE,
-                source_subtiles=source_subtiles,
-                output_bounds=output_bounds,
-                width=width,
-                height=height,
-            )
-        )
-    return tuple(work_units)
-
-
-def build_land_processing_plan(
-    mgrs_bases: List[str],
-    requested_bbox: Optional[Tuple[float, float, float, float]],
-    *,
-    max_zoom: int,
-    download_only: bool = False,
-) -> LandProcessingPlan:
-    """Return the strategy and work units for this land-processing run."""
-    strategy = select_land_processing_strategy(max_zoom, download_only=download_only)
-    if strategy == LAND_PROCESSING_STRATEGY_COARSE:
-        work_units = plan_coarse_work_units(mgrs_bases, requested_bbox, max_zoom)
-    else:
-        work_units = plan_subtile_work_units(mgrs_bases)
-    return LandProcessingPlan(
-        strategy=strategy,
-        mgrs_bases=tuple(mgrs_bases),
-        work_units=work_units,
-    )
-
 
 def build_land_run_token(
     args: argparse.Namespace,
@@ -900,17 +713,14 @@ def restore_resume_state(resume_path: str) -> Optional[Dict[str, Any]]:
         if not isinstance(state, dict):
             raise ValueError("state file must contain a JSON object")
         unique_id = state["unique_id"]
-        completed_units_raw = state.get("completed_units", state["completed_subtiles"])
+        completed_units_raw = state["completed_units"]
         processed_tifs_raw = state["processed_tifs"]
-        strategy = state.get("strategy", LAND_PROCESSING_STRATEGY_SUBTILES)
         if not isinstance(unique_id, str):
             raise ValueError("unique_id must be a string")
         if not isinstance(completed_units_raw, list):
             raise ValueError("completed_units must be a list")
         if not isinstance(processed_tifs_raw, list):
             raise ValueError("processed_tifs must be a list")
-        if not isinstance(strategy, str):
-            raise ValueError("strategy must be a string")
         if not all(isinstance(unit_id, str) for unit_id in completed_units_raw):
             raise ValueError("completed_units entries must be strings")
         if not all(isinstance(path, str) for path in processed_tifs_raw):
@@ -923,15 +733,13 @@ def restore_resume_state(resume_path: str) -> Optional[Dict[str, Any]]:
     processed_tifs = [path for path in processed_tifs_raw if file_has_content(path)]
     print(f"Resuming from state file: {resume_path} (unique_id: {unique_id})")
     print(
-        f"Already completed {len(completed_units)} {get_processing_strategy_label(strategy)}(s), "
+        f"Already completed {len(completed_units)} sub-tile(s), "
         f"{len(processed_tifs)} TIFs found."
     )
     return {
         "state_file": resume_path,
         "unique_id": unique_id,
-        "strategy": strategy,
         "completed_units": completed_units,
-        "completed_subtiles": completed_units,
         "processed_tifs": processed_tifs,
     }
 
@@ -965,6 +773,7 @@ def prepare_ocean_background_for_output(
     output_path: str,
     resample_alg: str,
     max_zoom: int,
+    blocksize: int,
 ) -> Optional[str]:
     """Prepare the ocean background used in the final 3857 composite."""
     if not os.path.exists(ocean_background_path):
@@ -972,7 +781,11 @@ def prepare_ocean_background_for_output(
     if requested_bbox is None:
         return ocean_background_path
 
-    snapped_bounds, pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(requested_bbox, max_zoom)
+    snapped_bounds, pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(
+        requested_bbox,
+        max_zoom,
+        tile_size=blocksize,
+    )
     prepared_ocean_path = build_prepared_ocean_path(output_path)
     staged_ocean_path = build_staged_path(prepared_ocean_path)
     remove_if_exists(staged_ocean_path)
@@ -1375,7 +1188,6 @@ def write_resume_state(
     completed_units: Set[str],
     processed_tifs: List[str],
     args: argparse.Namespace,
-    strategy: str,
 ) -> None:
     """Persist resume state atomically so interrupted writes do not corrupt the JSON file."""
     temp_state_file = f"{state_file}.tmp"
@@ -1383,9 +1195,7 @@ def write_resume_state(
         json.dump(
             {
                 "unique_id": unique_id,
-                "strategy": strategy,
                 "completed_units": list(completed_units),
-                "completed_subtiles": list(completed_units),
                 "processed_tifs": processed_tifs,
                 "args": vars(args),
             },
@@ -1667,11 +1477,15 @@ def tone_mapped_byte_block(
 
 
 def warp_to_web_mercator(
-    source_path: str, destination_path: str, resample_alg: str, max_zoom: int
+    source_path: str,
+    destination_path: str,
+    resample_alg: str,
+    max_zoom: int,
+    blocksize: int,
 ) -> None:
     """Warp the temporary UTM GeoTIFF into the final EPSG:3857 intermediate."""
     remove_if_exists(destination_path)
-    pixel_size = tiler.web_mercator_pixel_size(max_zoom)
+    pixel_size = tiler.web_mercator_pixel_size_for_tile_size(max_zoom, blocksize)
     warp_options = gdal.WarpOptions(
         format="GTiff",
         dstSRS="EPSG:3857",
@@ -1684,183 +1498,6 @@ def warp_to_web_mercator(
         creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "TILED=YES", "BIGTIFF=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512"],
     )
     gdal.Warp(destination_path, source_path, options=warp_options)
-
-
-def warp_band_paths_to_grid(
-    source_paths: List[str],
-    output_bounds: Tuple[float, float, float, float],
-    width: int,
-    height: int,
-    resample_alg: str,
-) -> np.ndarray:
-    """Warp one date/color set directly onto a coarse 3857 output grid."""
-    if not source_paths:
-        return np.full((height, width), np.nan, dtype=np.float32)
-
-    warped = gdal.Warp(
-        "",
-        source_paths,
-        options=gdal.WarpOptions(
-            format="MEM",
-            dstSRS="EPSG:3857",
-            outputBounds=output_bounds,
-            width=width,
-            height=height,
-            resampleAlg=resample_alg,
-            srcNodata=SENTINEL_NODATA,
-            dstNodata=SENTINEL_NODATA,
-            workingType=gdal.GDT_Float32,
-            outputType=gdal.GDT_Float32,
-            multithread=True,
-            warpOptions=["NUM_THREADS=ALL_CPUS"],
-        ),
-    )
-    if warped is None:
-        raise RuntimeError("Could not warp source bands onto the coarse output grid")
-    array = cast(np.ndarray, warped.GetRasterBand(1).ReadAsArray()).astype(np.float32)
-    array[array == SENTINEL_NODATA] = np.nan
-    warped = None
-    return array
-
-
-def process_coarse_work_unit(
-    work_unit: LandWorkUnit,
-    date_paths: List[str],
-    args: argparse.Namespace,
-    gebco_src: Optional[str] = None,
-) -> Optional[str]:
-    """Render one low-zoom coarse output window directly in EPSG:3857."""
-    if work_unit.output_bounds is None or work_unit.width is None or work_unit.height is None:
-        raise ValueError("coarse work units require explicit bounds and dimensions")
-
-    folders_by_date: Dict[str, List[str]] = {date_path: [] for date_path in date_paths}
-    for source_subtile in work_unit.source_subtiles:
-        for folder_name, date_path in list_mosaic_folders_for_tile(source_subtile, date_paths, args.cache):
-            folders_by_date.setdefault(date_path, []).append(folder_name)
-
-    if args.download:
-        print(
-            f"Downloading coarse tile {work_unit.unit_id} from "
-            f"{len(work_unit.source_subtiles)} source sub-tiles..."
-        )
-        for date_path, folder_names in folders_by_date.items():
-            for folder_name in sorted(set(folder_names)):
-                get_tile_paths(folder_name, date_path, args.cache, download=True)
-        return None
-
-    available_dates = {
-        date_path: sorted(set(folder_names))
-        for date_path, folder_names in folders_by_date.items()
-        if folder_names
-    }
-    if not available_dates:
-        return None
-
-    print(
-        f"Processing coarse tile {work_unit.unit_id} across {len(available_dates)} date(s) "
-        f"from {len(work_unit.source_subtiles)} source sub-tiles..."
-    )
-
-    tile_grid = build_mercator_tile_grid(work_unit.output_bounds, work_unit.width, work_unit.height)
-    ocean_mask = open_gebco_mask(gebco_src, tile_grid, work_unit.unit_id)
-    averaged = np.full((3, work_unit.height, work_unit.width), np.nan, dtype=np.float32)
-    summed = np.zeros_like(averaged)
-    valid_counts = np.zeros((work_unit.height, work_unit.width), dtype=np.uint16)
-    valid_source_mask = np.zeros((work_unit.height, work_unit.width), dtype=bool)
-
-    try:
-        for date_path, folder_names in available_dates.items():
-            rgb_arrays = []
-            for _band_id, color_name in RGB_BANDS:
-                color_paths = [
-                    get_tile_paths(folder_name, date_path, args.cache, download=False)[color_name]
-                    for folder_name in folder_names
-                ]
-                rgb_arrays.append(
-                    warp_band_paths_to_grid(
-                        color_paths,
-                        work_unit.output_bounds,
-                        work_unit.width,
-                        work_unit.height,
-                        args.resample_alg,
-                    )
-                )
-            date_rgb = np.stack(rgb_arrays).astype(np.float32, copy=False)
-            complete_rgb_mask = np.all(np.isfinite(date_rgb), axis=0)
-            if not np.any(complete_rgb_mask):
-                continue
-            valid_source_mask |= complete_rgb_mask
-            valid_counts[complete_rgb_mask] += 1
-            for band_index in range(3):
-                np.add(
-                    summed[band_index],
-                    date_rgb[band_index],
-                    out=summed[band_index],
-                    where=complete_rgb_mask,
-                )
-
-        for band_index in range(3):
-            np.divide(
-                summed[band_index],
-                valid_counts,
-                out=averaged[band_index],
-                where=valid_source_mask,
-            )
-
-        fill_allowed_mask: Optional[np.ndarray] = None
-        alpha_mask = build_alpha_block(None, valid_source_mask)
-        if ocean_mask is not None:
-            alpha_block = ocean_mask.alpha_band.ReadAsArray(
-                0, 0, work_unit.width, work_unit.height
-            ).astype(np.float32)
-            mask_nodata = ocean_mask.alpha_band.GetNoDataValue()
-            coverage_block = (
-                np.ones(alpha_block.shape, dtype=bool)
-                if mask_nodata is None
-                else alpha_block != mask_nodata
-            )
-            fill_allowed_mask = build_fill_allowed_mask(
-                alpha_block,
-                coverage_block,
-                nodata_value=mask_nodata,
-            )
-            seam_fill_mask = coverage_block & ~fill_allowed_mask & binary_dilation(
-                valid_source_mask,
-                structure=np.ones((3, 3), dtype=bool),
-            )
-            fill_allowed_mask = fill_allowed_mask | seam_fill_mask
-            alpha_mask = build_alpha_block(
-                alpha_block,
-                valid_source_mask,
-                coverage_block,
-                fill_allowed_mask,
-            )
-
-        averaged = fill_missing_pixels(averaged, valid_source_mask, fill_allowed_mask)
-        if not np.any(np.isfinite(averaged)):
-            return None
-
-        temp_output_path = build_work_unit_output_path(work_unit, args.output)
-        staged_output_path = build_staged_path(temp_output_path)
-        remove_if_exists(staged_output_path)
-        processing_window = ProcessingWindow(0, 0, work_unit.width, work_unit.height)
-        dataset, color_bands, alpha_band = create_output_dataset(staged_output_path, tile_grid)
-        write_processed_blocks(
-            averaged,
-            alpha_mask,
-            processing_window,
-            args,
-            color_bands,
-            alpha_band,
-        )
-        dataset.FlushCache()
-        dataset = None
-        publish_staged_path(staged_output_path, temp_output_path)
-        print(f"Finished coarse tile {work_unit.unit_id}: {temp_output_path}")
-        return temp_output_path
-    finally:
-        ocean_mask = None
-        remove_if_exists(build_staged_path(build_work_unit_output_path(work_unit, args.output)))
 
 
 def recover_processed_tile_output(
@@ -1882,7 +1519,13 @@ def recover_processed_tile_output(
         return None
 
     remove_if_exists(staged_3857_path)
-    warp_to_web_mercator(temp_utm_path, staged_3857_path, args.resample_alg, args.max_zoom)
+    warp_to_web_mercator(
+        temp_utm_path,
+        staged_3857_path,
+        args.resample_alg,
+        args.max_zoom,
+        args.blocksize,
+    )
     publish_staged_path(staged_3857_path, temp_3857_path)
     remove_if_exists(temp_utm_path)
     return temp_3857_path
@@ -1912,14 +1555,7 @@ def recover_processed_work_outputs(
     recovered_units: Set[str] = set()
     recovered_paths: List[str] = []
     for work_unit in work_units:
-        if work_unit.strategy == LAND_PROCESSING_STRATEGY_SUBTILES:
-            recovered_path = recover_processed_tile_output(work_unit.unit_id, args)
-        else:
-            recovered_path = build_work_unit_output_path(work_unit, args.output)
-            if os.path.exists(recovered_path) and not file_has_content(recovered_path):
-                remove_if_exists(recovered_path)
-            if not file_has_content(recovered_path):
-                recovered_path = None
+        recovered_path = recover_processed_tile_output(work_unit.unit_id, args)
         if recovered_path is None:
             continue
         recovered_units.add(work_unit.unit_id)
@@ -1934,8 +1570,6 @@ def process_land_work_unit(
     gebco_src: Optional[str] = None,
 ) -> Optional[str]:
     """Dispatch one land-processing work unit to the appropriate strategy."""
-    if work_unit.strategy == LAND_PROCESSING_STRATEGY_COARSE:
-        return process_coarse_work_unit(work_unit, date_paths, args, gebco_src)
     return process_single_tile(work_unit.unit_id, date_paths, args, gebco_src)
 
 
@@ -1998,7 +1632,13 @@ def process_single_tile(
         ds_out = None
 
         publish_staged_path(staged_utm_path, temp_utm_path)
-        warp_to_web_mercator(temp_utm_path, staged_3857_path, args.resample_alg, args.max_zoom)
+        warp_to_web_mercator(
+            temp_utm_path,
+            staged_3857_path,
+            args.resample_alg,
+            args.max_zoom,
+            args.blocksize,
+        )
         publish_staged_path(staged_3857_path, temp_3857_path)
         os.remove(temp_utm_path)
         print(f"Finished tile {mgrs_subtile}: {temp_3857_path}")
@@ -2026,11 +1666,9 @@ def calculate_estimates(args: argparse.Namespace) -> None:
         populate_s3_cache(date_paths)
 
     mgrs_bases = discover_mgrs_bases(requested_bbox, gebco_vrt_source)
-    plan = build_land_processing_plan(
-        mgrs_bases,
-        requested_bbox,
-        max_zoom=args.max_zoom,
-        download_only=args.download,
+    plan = LandProcessingPlan(
+        mgrs_bases=tuple(mgrs_bases),
+        work_units=plan_subtile_work_units(mgrs_bases),
     )
 
     num_mgrs = len(plan.mgrs_bases)
@@ -2040,34 +1678,21 @@ def calculate_estimates(args: argparse.Namespace) -> None:
 
     # Rough network estimate based on 600MB per subtile-date (3 source bands).
     network_gb = (total_tile_dates * 600) / 1024
-    ram_gb = args.parallel * (3 if plan.strategy == LAND_PROCESSING_STRATEGY_COARSE else 8)
+    ram_gb = args.parallel * 8
 
-    if plan.strategy == LAND_PROCESSING_STRATEGY_COARSE:
-        total_seconds = (total_tile_dates * 5 / max(args.parallel, 1)) + (
-            num_work_units * 8 / max(args.parallel, 1)
-        )
-        total_seconds += num_work_units
-        disk_peak_gb = (total_tile_dates * 60 + num_work_units * 4 + 100) / 1024
-        disk_end_gb = (num_work_units * 2) / 1024
-    else:
-        total_seconds = (total_tile_dates * 15 / max(args.parallel, 1)) + (
-            num_work_units * 30 / max(args.parallel, 1)
-        )
-        total_seconds += num_work_units * 2
-        disk_peak_gb = (total_tile_dates * 60 + num_work_units * 50 + 100) / 1024
-        disk_end_gb = (num_work_units * 40) / 1024
+    total_seconds = (total_tile_dates * 15 / max(args.parallel, 1)) + (
+        num_work_units * 30 / max(args.parallel, 1)
+    )
+    total_seconds += num_work_units * 2
+    disk_peak_gb = (total_tile_dates * 60 + num_work_units * 50 + 100) / 1024
+    disk_end_gb = (num_work_units * 40) / 1024
 
     hours = int(total_seconds // 3600)
     minutes = int((total_seconds % 3600) // 60)
 
     print("--- Processing Estimates ---")
-    print(f"Strategy:           {plan.strategy}")
     print(f"MGRS Tiles (100km): {num_mgrs}")
-    if plan.strategy == LAND_PROCESSING_STRATEGY_COARSE:
-        print(f"Coarse work units:   {num_work_units}")
-        print(f"Source sub-tiles:    {len(unique_source_subtiles)}")
-    else:
-        print(f"MGRS Sub-tiles (4x): {num_work_units}")
+    print(f"MGRS Sub-tiles (4x): {num_work_units}")
     print(f"Date(s):            {num_dates} ({', '.join(date_paths)})")
     print(f"Total tile-dates:   {total_tile_dates} (3 bands each)")
     print("---------------------------")
@@ -2212,7 +1837,6 @@ def main() -> None:
     requested_bbox = parse_bbox(args.bbox) if args.bbox else None
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
-    strategy = select_land_processing_strategy(args.max_zoom, download_only=args.download)
     unique_id = build_land_run_token(args, date_paths, requested_bbox, gebco_vrt_source)
     state_file = build_state_file_path(unique_id)
     completed_units: Set[str] = set()
@@ -2223,30 +1847,18 @@ def main() -> None:
         if resume_path:
             resume_state = restore_resume_state(resume_path)
             if resume_state:
-                resume_strategy = cast(
-                    str,
-                    resume_state.get("strategy", LAND_PROCESSING_STRATEGY_SUBTILES),
-                )
-                if resume_strategy != strategy:
-                    print(
-                        f"Warning: Ignoring resume state for strategy {resume_strategy}; "
-                        f"current run uses {strategy}."
-                    )
-                else:
-                    state_file = cast(str, resume_state["state_file"])
-                    unique_id = cast(str, resume_state["unique_id"])
-                    completed_units = cast(Set[str], resume_state["completed_units"])
-                    processed_tifs = cast(List[str], resume_state["processed_tifs"])
+                state_file = cast(str, resume_state["state_file"])
+                unique_id = cast(str, resume_state["unique_id"])
+                completed_units = cast(Set[str], resume_state["completed_units"])
+                processed_tifs = cast(List[str], resume_state["processed_tifs"])
 
     if requested_bbox is None:
         populate_s3_cache(date_paths)
 
     mgrs_bases = discover_mgrs_bases(requested_bbox, gebco_vrt_source)
-    plan = build_land_processing_plan(
-        mgrs_bases,
-        requested_bbox,
-        max_zoom=args.max_zoom,
-        download_only=args.download,
+    plan = LandProcessingPlan(
+        mgrs_bases=tuple(mgrs_bases),
+        work_units=plan_subtile_work_units(mgrs_bases),
     )
     recovered_units, recovered_tile_paths = recover_processed_work_outputs(plan.work_units, args)
     if recovered_units:
@@ -2270,8 +1882,8 @@ def main() -> None:
         if work_units_to_process:
             completed_before_start = len(completed_units)
             print(
-                f"Starting {get_processing_strategy_label(plan.strategy)} processing for "
-                f"{len(work_units_to_process)} {get_processing_strategy_label(plan.strategy)}(s) "
+                f"Starting sub-tile processing for "
+                f"{len(work_units_to_process)} sub-tile(s) "
                 f"with {args.parallel} worker(s); {len(completed_units)} already complete."
             )
             progress_line = LiveProgressLine()
@@ -2308,11 +1920,10 @@ def main() -> None:
                         completed_units,
                         processed_tifs,
                         args,
-                        plan.strategy,
                     )
             progress_line.finish()
         else:
-            print(f"All {get_processing_strategy_label(plan.strategy)}s already processed.")
+            print("All sub-tiles already processed.")
     else:
         print("Skipping land tile processing (--no-land).")
 
@@ -2327,6 +1938,7 @@ def main() -> None:
         args.output,
         args.resample_alg,
         args.max_zoom,
+        args.blocksize,
     )
     if prepared_ocean_background:
         print(f"Using ocean background: {prepared_ocean_background}")
@@ -2341,7 +1953,10 @@ def main() -> None:
 
     master_vrt = build_master_vrt_path(args.output, unique_id)
     staged_master_vrt = build_staged_path(master_vrt)
-    pixel_size = tiler.web_mercator_pixel_size(args.max_zoom)
+    pixel_size = tiler.web_mercator_pixel_size_for_tile_size(
+        args.max_zoom,
+        args.blocksize,
+    )
     remove_if_exists(staged_master_vrt)
     progress_line = LiveProgressLine()
     master_vrt_callback = build_gdal_progress_callback(

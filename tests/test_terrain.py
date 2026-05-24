@@ -24,9 +24,11 @@ def test_generate_terrain_pmtiles_uses_terrarium_tiling(
 
     monkeypatch.setattr(terrain.ocean, "build_gebco_source_vrt", fake_build_gebco_source_vrt)
     monkeypatch.setattr(terrain.gdal, "WarpOptions", lambda **kwargs: kwargs)
+    warp_calls: list[dict[str, object]] = []
 
     def fake_warp(destination: str, source: str, options=None):
-        del source, options
+        del source
+        warp_calls.append(options)
         Path(destination).write_text("warped")
         return gdal.GetDriverByName("MEM").Create("", 1, 1, 1, gdal.GDT_Float32)
 
@@ -107,6 +109,9 @@ def test_generate_terrain_pmtiles_uses_terrarium_tiling(
         "requested_bbox": (-1.0, -2.0, 3.0, 4.0),
         "tiling_options": {"elevation_encoding": "terrarium"},
     }
+    expected_pixel_size = tiler.web_mercator_pixel_size_for_tile_size(14, 256)
+    assert warp_calls[0]["xRes"] == expected_pixel_size
+    assert warp_calls[0]["yRes"] == expected_pixel_size
     assert list(temp_dir.glob("*_source.vrt")) == []
     assert list(temp_dir.glob("*_3857.vrt")) == []
     assert not (temp_dir / "terrain.mbtiles").exists()

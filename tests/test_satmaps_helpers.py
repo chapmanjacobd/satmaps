@@ -86,7 +86,7 @@ def test_restore_resume_state_round_trip(
         json.dumps(
             {
                 "unique_id": "resume-id",
-                "completed_subtiles": ["31TDF_0_0", "31TDF_1_0"],
+                "completed_units": ["31TDF_0_0", "31TDF_1_0"],
                 "processed_tifs": [str(kept_tif), str(tmp_path / "missing.tif")],
                 "args": {"parallel": 2},
             }
@@ -97,9 +97,7 @@ def test_restore_resume_state_round_trip(
     assert restored == {
         "state_file": str(state_file),
         "unique_id": "resume-id",
-        "strategy": satmaps.LAND_PROCESSING_STRATEGY_SUBTILES,
         "completed_units": {"31TDF_0_0", "31TDF_1_0"},
-        "completed_subtiles": {"31TDF_0_0", "31TDF_1_0"},
         "processed_tifs": [str(kept_tif)],
     }
     assert "Resuming from state file" in capsys.readouterr().out
@@ -114,7 +112,7 @@ def test_restore_resume_state_drops_zero_byte_outputs(tmp_path: Path) -> None:
         json.dumps(
             {
                 "unique_id": "resume-id",
-                "completed_subtiles": ["31TDF_0_0"],
+                "completed_units": ["31TDF_0_0"],
                 "processed_tifs": [str(empty_tif)],
                 "args": {"parallel": 2},
             }
@@ -127,39 +125,15 @@ def test_restore_resume_state_drops_zero_byte_outputs(tmp_path: Path) -> None:
     assert restored["processed_tifs"] == []
 
 
-def test_select_land_processing_strategy_uses_coarse_at_or_below_cutoff() -> None:
-    assert satmaps.select_land_processing_strategy(7) == satmaps.LAND_PROCESSING_STRATEGY_COARSE
-    assert satmaps.select_land_processing_strategy(4) == satmaps.LAND_PROCESSING_STRATEGY_COARSE
-    assert satmaps.select_land_processing_strategy(8) == satmaps.LAND_PROCESSING_STRATEGY_SUBTILES
-    assert (
-        satmaps.select_land_processing_strategy(4, download_only=True)
-        == satmaps.LAND_PROCESSING_STRATEGY_SUBTILES
-    )
+def test_plan_subtile_work_units_expands_subtiles() -> None:
+    work_units = satmaps.plan_subtile_work_units(["31TDF"])
 
-
-def test_plan_coarse_work_units_uses_target_zoom_tile_grid(monkeypatch: object) -> None:
-    first_tile = satmaps.tiler.get_web_mercator_bounds(4, 1, 2)
-    second_tile = satmaps.tiler.get_web_mercator_bounds(4, 2, 2)
-
-    def fake_bounds(mgrs_base: str) -> tuple[float, float, float, float]:
-        return {
-            "31TDF": first_tile,
-            "32TLP": second_tile,
-        }[mgrs_base]
-
-    monkeypatch.setattr(satmaps, "build_mgrs_base_mercator_bounds", fake_bounds)
-
-    work_units = satmaps.plan_coarse_work_units(["31TDF", "32TLP"], None, 4)
-
-    assert [unit.unit_id for unit in work_units] == ["coarse_z4_1_2", "coarse_z4_2_2"]
-    assert all(unit.strategy == satmaps.LAND_PROCESSING_STRATEGY_COARSE for unit in work_units)
-    assert all(unit.width == 256 and unit.height == 256 for unit in work_units)
-    assert work_units[0].source_subtiles == (
+    assert [unit.unit_id for unit in work_units] == [
         "31TDF_0_0",
         "31TDF_0_1",
         "31TDF_1_0",
         "31TDF_1_1",
-    )
+    ]
 
 
 def test_restore_resume_state_returns_none_for_invalid_json(
@@ -253,6 +227,7 @@ def test_build_land_run_token_is_stable_for_matching_inputs() -> None:
     args = satmaps.argparse.Namespace(
         output="render.pmtiles",
         max_zoom=13,
+        blocksize=256,
         resample_alg="lanczos",
         stats_min=0.0,
         stats_max=10000.0,
@@ -298,14 +273,21 @@ def test_recover_processed_tile_output_rebuilds_from_surviving_utm(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
-    args = satmaps.argparse.Namespace(output="render.pmtiles", resample_alg="near", max_zoom=13)
+    args = satmaps.argparse.Namespace(
+        output="render.pmtiles",
+        resample_alg="near",
+        max_zoom=13,
+        blocksize=256,
+    )
     utm_path = tmp_path / ".temp" / "render_31TDF_0_0_utm.tif"
     utm_path.write_text("utm")
 
-    warp_calls: list[tuple[str, str, str, int]] = []
+    warp_calls: list[tuple[str, str, str, int, int]] = []
 
-    def fake_warp(source: str, destination: str, resample_alg: str, max_zoom: int) -> None:
-        warp_calls.append((source, destination, resample_alg, max_zoom))
+    def fake_warp(
+        source: str, destination: str, resample_alg: str, max_zoom: int, blocksize: int
+    ) -> None:
+        warp_calls.append((source, destination, resample_alg, max_zoom, blocksize))
         Path(destination).write_text("warped")
 
     monkeypatch.setattr(satmaps, "warp_to_web_mercator", fake_warp)
@@ -319,6 +301,7 @@ def test_recover_processed_tile_output_rebuilds_from_surviving_utm(
             ".temp/.temp_render_31TDF_0_0_3857.tif",
             "near",
             13,
+            256,
         )
     ]
     assert Path(recovered).read_text() == "warped"

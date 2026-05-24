@@ -46,10 +46,14 @@ def generate_terrain_pmtiles(
     }
     if bbox is None:
         warp_kwargs["outputBounds"] = ocean.WEB_MERCATOR_WORLD_BOUNDS
-        warp_kwargs["xRes"] = tiler.web_mercator_pixel_size(max_zoom)
-        warp_kwargs["yRes"] = tiler.web_mercator_pixel_size(max_zoom)
+        warp_kwargs["xRes"] = tiler.web_mercator_pixel_size_for_tile_size(max_zoom, blocksize)
+        warp_kwargs["yRes"] = tiler.web_mercator_pixel_size_for_tile_size(max_zoom, blocksize)
     else:
-        snapped_bounds, pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(bbox, max_zoom)
+        snapped_bounds, pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(
+            bbox,
+            max_zoom,
+            tile_size=blocksize,
+        )
         warp_kwargs["outputBounds"] = snapped_bounds
         warp_kwargs["xRes"] = pixel_size
         warp_kwargs["yRes"] = pixel_size
