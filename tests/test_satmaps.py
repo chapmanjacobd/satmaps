@@ -2082,7 +2082,9 @@ def test_build_ocean_ramp_colors_respects_style_flags() -> None:
     assert np.all((ungraded_colors >= 0.0) & (ungraded_colors <= 1.0))
 
 
-def test_process_single_tile_full_pipeline(monkeypatch: object, tmp_path: Path) -> None:
+def test_process_single_tile_full_pipeline(
+    monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
 
@@ -2148,6 +2150,9 @@ def test_process_single_tile_full_pipeline(monkeypatch: object, tmp_path: Path) 
     # Check projection is 3857
     srs = osr.SpatialReference(ds.GetProjection())
     assert srs.GetAttrValue("AUTHORITY", 1) == "3857"
+    out = capsys.readouterr().out
+    assert "Processing tile 31TDF_0_0" not in out
+    assert "Finished tile 31TDF_0_0" not in out
 
 
 def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path) -> None:

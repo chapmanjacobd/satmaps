@@ -409,6 +409,39 @@ def test_update_count_progress_bases_eta_on_new_work_after_resume(
     assert "Land processing progress: 7/8 (88%); ETA: 10s; 7 raster(s) ready." in out
 
 
+def test_update_count_progress_dampens_late_eta_increases(
+    monkeypatch: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    perf_counter_values = iter([101.0, 106.0])
+    monkeypatch.setattr(satmaps.time, "perf_counter", lambda: next(perf_counter_values))
+    progress_line = satmaps.LiveProgressLine()
+    eta_smoother = satmaps.EtaSmoother()
+
+    satmaps.update_count_progress(
+        progress_line,
+        "Land processing progress:",
+        1,
+        4,
+        100.0,
+        "1 raster(s) ready.",
+        eta_smoother=eta_smoother,
+    )
+    satmaps.update_count_progress(
+        progress_line,
+        "Land processing progress:",
+        2,
+        4,
+        100.0,
+        "2 raster(s) ready.",
+        eta_smoother=eta_smoother,
+    )
+    progress_line.finish()
+
+    out = capsys.readouterr().out
+    assert "Land processing progress: 1/4 (25%); ETA: 3s; 1 raster(s) ready." in out
+    assert "Land processing progress: 2/4 (50%); ETA: 2s; 2 raster(s) ready." in out
+
+
 def test_build_alpha_block_uses_source_mask_without_gebco() -> None:
     source_valid_mask = np.array([[True, False, True]], dtype=bool)
 

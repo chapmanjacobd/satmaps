@@ -47,6 +47,42 @@ class LandProcessingPlan:
     mgrs_bases: tuple[str, ...]
     work_units: tuple[LandWorkUnit, ...]
 
+
+@dataclass
+class EtaSmoother:
+    """Keep ETA updates responsive without letting late slowdowns dominate the display."""
+
+    previous_eta_seconds: float | None = None
+    previous_timestamp: float | None = None
+    increase_damping: float = 0.25
+
+    def smooth(self, seconds_remaining: float | None, now: float) -> float | None:
+        """Return a damped ETA that still reacts to real slowdowns."""
+        if seconds_remaining is None or not math.isfinite(seconds_remaining):
+            self.previous_eta_seconds = None
+            self.previous_timestamp = now
+            return None
+
+        bounded_eta = max(0.0, seconds_remaining)
+        if self.previous_eta_seconds is None or self.previous_timestamp is None:
+            self.previous_eta_seconds = bounded_eta
+            self.previous_timestamp = now
+            return bounded_eta
+
+        elapsed_since_update = max(0.0, now - self.previous_timestamp)
+        expected_eta = max(self.previous_eta_seconds - elapsed_since_update, 0.0)
+        if bounded_eta <= expected_eta:
+            smoothed_eta = bounded_eta
+        else:
+            smoothed_eta = expected_eta + (
+                (bounded_eta - expected_eta) * self.increase_damping
+            )
+
+        self.previous_eta_seconds = smoothed_eta
+        self.previous_timestamp = now
+        return smoothed_eta
+
+
 def max_in_memory_write_pixels() -> int:
     """Return the live pixel budget for whole-window RGB(A) writes."""
     return tiler.compute_in_memory_pixel_limit(
@@ -146,14 +182,18 @@ def update_count_progress(
     started_at: float,
     detail: str,
     completed_before_start: int = 0,
+    eta_smoother: EtaSmoother | None = None,
 ) -> None:
     """Update a live progress line for count-based work."""
     remaining = None
-    elapsed = time.perf_counter() - started_at
+    now = time.perf_counter()
+    elapsed = now - started_at
     eta_total = max(total - completed_before_start, 0)
     eta_current = min(max(current - completed_before_start, 0), eta_total)
     if eta_current > 0 and eta_total > 0 and elapsed > 0.0:
         remaining = elapsed * (eta_total - eta_current) / eta_current
+    if eta_smoother is not None:
+        remaining = eta_smoother.smooth(remaining, now)
     progress_line.update(
         f"{label} {format_progress(current, total)}; {format_eta(remaining)}; {detail}"
     )
@@ -165,13 +205,16 @@ def build_gdal_progress_callback(
     started_at: float,
 ) -> Callable[[float, str, object], int]:
     """Adapt GDAL progress updates to the live progress renderer."""
+    eta_smoother = EtaSmoother()
 
     def callback(complete: float, _message: str, _data: object) -> int:
         bounded_complete = min(max(complete, 0.0), 1.0)
         remaining = None
-        elapsed = time.perf_counter() - started_at
+        now = time.perf_counter()
+        elapsed = now - started_at
         if bounded_complete > 0.0 and elapsed > 0.0:
             remaining = elapsed * (1.0 - bounded_complete) / bounded_complete
+        remaining = eta_smoother.smooth(remaining, now)
         progress_line.update(
             f"{step_label} {bounded_complete * 100:3.0f}%; {format_eta(remaining)}"
         )
@@ -1605,7 +1648,6 @@ def process_single_tile(
 
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
     try:
-        print(f"Processing tile {mgrs_subtile} across {len(folders)} date(s)...")
         date_band_sets = open_date_band_sets(folders, args.cache)
         averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
             date_band_sets,
@@ -1641,7 +1683,6 @@ def process_single_tile(
         )
         publish_staged_path(staged_3857_path, temp_3857_path)
         os.remove(temp_utm_path)
-        print(f"Finished tile {mgrs_subtile}: {temp_3857_path}")
         return temp_3857_path
     finally:
         for bands, datasets in date_band_sets:
@@ -1881,6 +1922,7 @@ def main() -> None:
         ]
         if work_units_to_process:
             completed_before_start = len(completed_units)
+            eta_smoother = EtaSmoother()
             print(
                 f"Starting sub-tile processing for "
                 f"{len(work_units_to_process)} sub-tile(s) "
@@ -1913,6 +1955,7 @@ def main() -> None:
                         started_at,
                         f"{len(processed_tifs)} raster(s) ready.",
                         completed_before_start=completed_before_start,
+                        eta_smoother=eta_smoother,
                     )
                     write_resume_state(
                         state_file,
