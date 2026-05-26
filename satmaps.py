@@ -755,7 +755,7 @@ def discover_mgrs_tiles_from_ocean_mask(
     end_block_x = (scan_xoff + scan_width - 1) // block_x
 
     completed_row_blocks = 0
-    progress_checkpoints = build_progress_checkpoints(total_row_blocks)
+    completed_read_windows = 0
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
 
@@ -764,24 +764,25 @@ def discover_mgrs_tiles_from_ocean_mask(
         f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks "
         f"covering {total_covered_blocks} blocks via {total_read_windows} read windows."
     )
-    progress_checkpoints_sorted = sorted(progress_checkpoints)
-    next_checkpoint_index = 0
-
     def report_scan_progress() -> None:
-        nonlocal next_checkpoint_index
-        while (
-            next_checkpoint_index < len(progress_checkpoints_sorted)
-            and completed_row_blocks >= progress_checkpoints_sorted[next_checkpoint_index]
-        ):
+        if total_read_windows > 0:
             update_count_progress(
                 progress_line,
                 "Ocean mask scan progress:",
-                completed_row_blocks,
-                total_row_blocks,
+                completed_read_windows,
+                total_read_windows,
                 started_at,
-                f"{len(mgrs_tiles)} tiles found so far.",
+                f"row blocks {min(completed_row_blocks + 1, total_row_blocks)}/{total_row_blocks}; {len(mgrs_tiles)} tiles found so far.",
             )
-            next_checkpoint_index += 1
+            return
+        update_count_progress(
+            progress_line,
+            "Ocean mask scan progress:",
+            completed_row_blocks,
+            total_row_blocks,
+            started_at,
+            f"{len(mgrs_tiles)} tiles found so far.",
+        )
 
     read_width = max(block_x * OCEAN_MASK_SCAN_READ_BLOCKS, block_x)
     process_width = max(block_x * OCEAN_MASK_SCAN_PROCESS_BLOCKS, block_x)
@@ -816,8 +817,9 @@ def discover_mgrs_tiles_from_ocean_mask(
                     None,
                 )
                 mgrs_tiles.update(found_tiles)
+            completed_read_windows += 1
+            report_scan_progress()
         completed_row_blocks += 1
-        report_scan_progress()
     progress_line.finish()
     if candidate_tiles is not None:
         mgrs_tiles.intersection_update(candidate_tiles)

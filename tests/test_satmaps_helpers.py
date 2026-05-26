@@ -678,6 +678,7 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
     fake_band = FakeBand()
     fake_ds = FakeDataset(fake_band)
     transform_builds = 0
+    progress_updates: list[tuple[int, int, str]] = []
 
     monkeypatch.setattr(satmaps.gdal, "Open", lambda path: fake_ds)
     monkeypatch.setattr(satmaps, "get_ocean_mask_band_index", lambda ds: 1)
@@ -696,6 +697,11 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
         "process_ocean_mask_window",
         lambda data, xoff, yoff, scan_window, geotransform, nodata, to_wgs84, mgrs_converter, bbox, candidate_tiles: {"04QFJ", "04QFK", "04QFL"},
     )
+    monkeypatch.setattr(
+        satmaps,
+        "update_count_progress",
+        lambda progress_line, label, current, total, started_at, detail, completed_before_start=0, eta_smoother=None: progress_updates.append((current, total, detail)),
+    )
 
     assert satmaps.discover_mgrs_tiles_from_ocean_mask(
         "fake-ocean-mask.tif",
@@ -708,6 +714,12 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
         (0, 30, 80, 10),
     ]
     assert transform_builds == 1
+    assert progress_updates == [
+        (1, 4, "row blocks 1/4; 3 tiles found so far."),
+        (2, 4, "row blocks 2/4; 3 tiles found so far."),
+        (3, 4, "row blocks 3/4; 3 tiles found so far."),
+        (4, 4, "row blocks 4/4; 3 tiles found so far."),
+    ]
 
 
 def test_build_alpha_block_masks_out_pixels_outside_ocean_render() -> None:
