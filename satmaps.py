@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -288,6 +289,12 @@ def build_work_unit_output_path(work_unit: LandWorkUnit, output_path: str) -> st
     return f".temp/{stem}_{work_unit.unit_id}_3857.tif"
 
 
+def build_tile_prefetch_cache_dir(mgrs_subtile: str, output_path: str) -> str:
+    """Return the tile-scoped cache directory used for one worker's prefetched inputs."""
+    stem = temp_basename_from_output(output_path)
+    return f".temp/{stem}_{mgrs_subtile}_prefetch"
+
+
 def describe_land_processing_plan(plan: LandProcessingPlan, num_dates: int) -> str:
     """Return the summary line printed before land processing starts."""
     return (
@@ -497,6 +504,8 @@ def get_tile_paths(
     date_path: str,
     cache_dir: Optional[str] = None,
     download: bool = False,
+    *,
+    quiet: bool = False,
 ) -> Dict[str, str]:
     """Construct local or S3 paths for RGB bands. Only downloads if 'download' is True."""
     cache_prefix = "_".join(folder_name.split("_")[4:])
@@ -522,7 +531,8 @@ def get_tile_paths(
         if download and local_path:
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             s3_path = f"{base_s3}/{band_id}.tif"
-            print(f"Downloading {s3_path} to {local_path}...")
+            if not quiet:
+                print(f"Downloading {s3_path} to {local_path}...")
             src_ds = gdal.Open(s3_path)
             if src_ds is None:
                 raise RuntimeError(f"Could not open {s3_path}")
@@ -1426,6 +1436,22 @@ def collect_ocean_mask_slabs(
     )
 
 
+def prefetch_tile_bands_locally(
+    folders: List[Tuple[str, str]],
+    cache_dir: str,
+) -> None:
+    """Download all RGB inputs needed by one worker into a tile-scoped cache."""
+    for folder_name, date_path in folders:
+        get_tile_paths(folder_name, date_path, cache_dir, download=True, quiet=True)
+
+
+def cleanup_prefetched_tile_bands(cache_dir: Optional[str]) -> None:
+    """Remove the tile-scoped cache after a worker finishes processing."""
+    if cache_dir is None:
+        return
+    shutil.rmtree(cache_dir, ignore_errors=True)
+
+
 def open_date_band_sets(
     folders: List[Tuple[str, str]], cache_dir: str
 ) -> List[Tuple[List[gdal.Band], List[gdal.Dataset]]]:
@@ -1871,22 +1897,26 @@ def process_single_tile(
             get_tile_paths(folder_name, date_path, args.cache, download=True)
         return None
 
+    prefetch_cache_dir = build_tile_prefetch_cache_dir(mgrs_subtile, args.output)
     first_folder, first_date = folders[0]
-    paths = get_tile_paths(first_folder, first_date, args.cache, download=False)
-    tile_grid = load_tile_grid(paths["red"])
-
-    ocean_mask = open_gebco_mask(gebco_src, tile_grid, mgrs_subtile)
-    processing_window = ProcessingWindow(0, 0, tile_grid.width, tile_grid.height)
-    mask_slabs: Optional[dict[int, OceanMaskSlab]] = None
-    if ocean_mask is not None:
-        collected = collect_ocean_mask_slabs(ocean_mask, tile_grid)
-        if collected is None:
-            return None
-        processing_window, mask_slabs = collected
-
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
+    ocean_mask: Optional[OceanMaskWarp] = None
+    fill_allowed_mask: Optional[np.ndarray] = None
     try:
-        date_band_sets = open_date_band_sets(folders, args.cache)
+        prefetch_tile_bands_locally(folders, prefetch_cache_dir)
+        paths = get_tile_paths(first_folder, first_date, prefetch_cache_dir, download=False)
+        tile_grid = load_tile_grid(paths["red"])
+
+        ocean_mask = open_gebco_mask(gebco_src, tile_grid, mgrs_subtile)
+        processing_window = ProcessingWindow(0, 0, tile_grid.width, tile_grid.height)
+        mask_slabs: Optional[dict[int, OceanMaskSlab]] = None
+        if ocean_mask is not None:
+            collected = collect_ocean_mask_slabs(ocean_mask, tile_grid)
+            if collected is None:
+                return None
+            processing_window, mask_slabs = collected
+
+        date_band_sets = open_date_band_sets(folders, prefetch_cache_dir)
         averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
             date_band_sets,
             processing_window,
@@ -1929,6 +1959,7 @@ def process_single_tile(
         date_band_sets.clear()
         ocean_mask = None
         fill_allowed_mask = None
+        cleanup_prefetched_tile_bands(prefetch_cache_dir)
         remove_if_exists(build_staged_path(build_processed_tile_paths(mgrs_subtile, args.output)[0]))
         remove_if_exists(build_staged_path(build_processed_tile_paths(mgrs_subtile, args.output)[1]))
 

@@ -2138,7 +2138,7 @@ def test_process_single_tile_full_pipeline(
     )
 
     # Create fake input TIFs
-    def fake_get_tile_paths(folder, date, cache, download=False):
+    def fake_get_tile_paths(folder, date, cache, download=False, quiet=False):
         p = {}
         for b in ["red", "green", "blue"]:
             path = tmp_path / f"{b}.tif"
@@ -2209,7 +2209,7 @@ def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path
         ],
     )
 
-    def fake_get_tile_paths(folder, date, cache, download=False):
+    def fake_get_tile_paths(folder, date, cache, download=False, quiet=False):
         p = {}
         for b in ["red", "green", "blue"]:
             path = tmp_path / f"{b}.tif"
@@ -2291,7 +2291,7 @@ def test_process_single_tile_with_rgba_ocean_alpha_mask(
         ],
     )
 
-    def fake_get_tile_paths(folder, date, cache, download=False):
+    def fake_get_tile_paths(folder, date, cache, download=False, quiet=False):
         p = {}
         for b in ["red", "green", "blue"]:
             path = tmp_path / f"{b}.tif"
@@ -2356,6 +2356,234 @@ def test_process_single_tile_with_rgba_ocean_alpha_mask(
     alpha = out_ds.GetRasterBand(4).ReadAsArray()
     assert np.any(alpha == 255)
     assert np.any(alpha == 0)
+
+
+def test_process_single_tile_prefetches_all_requested_dates_and_cleans_up(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    raster_size = 100
+    pixel_size = 100.0
+    band_requests: list[tuple[str, str, bool, bool]] = []
+    prefetched_cache_dir: Path | None = None
+
+    monkeypatch.setattr(
+        "satmaps.list_mosaic_folders_for_tile",
+        lambda tile, dates, cache: [
+            ("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01"),
+            ("Sentinel-2_mosaic_2025_Q4_31TDF_0_0", "2025/10/01"),
+        ],
+    )
+
+    source_paths: dict[str, dict[str, str]] = {}
+    for date in ["2025/07/01", "2025/10/01"]:
+        source_paths[date] = {}
+        for band_name in ["red", "green", "blue"]:
+            path = tmp_path / f"source_{date.replace('/', '-')}_{band_name}.tif"
+            driver = gdal.GetDriverByName("GTiff")
+            ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
+            ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
+            srs = osr.SpatialReference()
+            srs.ImportFromEPSG(32631)
+            ds.SetProjection(srs.ExportToWkt())
+            ds.GetRasterBand(1).Fill(1000)
+            ds = None
+            source_paths[date][band_name] = str(path)
+
+    def fake_get_tile_paths(folder, date, cache, download=False, quiet=False):
+        nonlocal prefetched_cache_dir
+        band_requests.append((str(cache), date, download, quiet))
+        cache_path = Path(cache) if cache is not None else None
+        if download and cache_path is not None:
+            prefetched_cache_dir = cache_path
+        paths = {}
+        for band_name in ["red", "green", "blue"]:
+            if cache_path is not None:
+                cache_prefix = "_".join(folder.split("_")[4:])
+                band_id = {"red": "B04", "green": "B03", "blue": "B02"}[band_name]
+                path = cache_path / date.replace("/", "-") / f"{cache_prefix}_{band_id}.tif"
+                if download:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    driver = gdal.GetDriverByName("GTiff")
+                    ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
+                    ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
+                    srs = osr.SpatialReference()
+                    srs.ImportFromEPSG(32631)
+                    ds.SetProjection(srs.ExportToWkt())
+                    ds.GetRasterBand(1).Fill(1000)
+                    ds = None
+                if path.exists():
+                    paths[band_name] = str(path)
+                    continue
+            paths[band_name] = source_paths[date][band_name]
+        return paths
+
+    monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
+
+    ocean_path = tmp_path / "ocean_rgba.tif"
+    ocean_ds = gdal.GetDriverByName("GTiff").Create(
+        str(ocean_path), raster_size, raster_size, 4, gdal.GDT_Byte
+    )
+    ocean_ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32631)
+    ocean_ds.SetProjection(srs.ExportToWkt())
+    alpha_values = np.full((raster_size, raster_size), 255, dtype=np.uint8)
+    alpha_values[:30, :] = 0
+    ocean_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    ocean_ds.GetRasterBand(4).WriteArray(alpha_values)
+    ocean_ds = None
+
+    args = argparse.Namespace(
+        cache=".cache",
+        download=False,
+        stats_min=0,
+        stats_max=10000,
+        tonemap=True,
+        grade=True,
+        sb=0.3,
+        hb=0.75,
+        ss=1.4,
+        ms=0.9,
+        hs=0.5,
+        exposure=1.0,
+        gamma=1.0,
+        sat=0.9,
+        db=0.7,
+        ls=0.7,
+        resample_alg="near",
+        max_zoom=13,
+        blocksize=256,
+        output="render.pmtiles",
+    )
+
+    out_path = process_single_tile(
+        "31TDF_0_0",
+        ["2025/07/01", "2025/10/01"],
+        args,
+        str(ocean_path),
+    )
+
+    assert out_path is not None
+    assert [download for _cache, _date, download, _quiet in band_requests] == [
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert [date for _cache, date, download, _quiet in band_requests if download] == [
+        "2025/07/01",
+        "2025/10/01",
+    ]
+    assert prefetched_cache_dir is not None
+    assert not prefetched_cache_dir.exists()
+
+
+def test_process_single_tile_prefetches_even_for_mostly_ocean_tile(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    raster_size = 100
+    pixel_size = 100.0
+    band_requests: list[tuple[str, bool, bool]] = []
+    prefetched_cache_dir: Path | None = None
+
+    monkeypatch.setattr(
+        "satmaps.list_mosaic_folders_for_tile",
+        lambda tile, dates, cache: [
+            ("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")
+        ],
+    )
+
+    source_paths = {}
+    for band_name in ["red", "green", "blue"]:
+        path = tmp_path / f"source_{band_name}.tif"
+        driver = gdal.GetDriverByName("GTiff")
+        ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
+        ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(32631)
+        ds.SetProjection(srs.ExportToWkt())
+        ds.GetRasterBand(1).Fill(1000)
+        ds = None
+        source_paths[band_name] = str(path)
+
+    def fake_get_tile_paths(folder, date, cache, download=False, quiet=False):
+        nonlocal prefetched_cache_dir
+        band_requests.append((str(cache), download, quiet))
+        cache_path = Path(cache) if cache is not None else None
+        if download and cache_path is not None:
+            prefetched_cache_dir = cache_path
+        paths = {}
+        for band_name in ["red", "green", "blue"]:
+            if cache_path is not None:
+                cache_prefix = "_".join(folder.split("_")[4:])
+                band_id = {"red": "B04", "green": "B03", "blue": "B02"}[band_name]
+                path = cache_path / date.replace("/", "-") / f"{cache_prefix}_{band_id}.tif"
+                if download:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    driver = gdal.GetDriverByName("GTiff")
+                    ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
+                    ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
+                    srs = osr.SpatialReference()
+                    srs.ImportFromEPSG(32631)
+                    ds.SetProjection(srs.ExportToWkt())
+                    ds.GetRasterBand(1).Fill(1000)
+                    ds = None
+                if path.exists():
+                    paths[band_name] = str(path)
+                    continue
+            paths[band_name] = source_paths[band_name]
+        return paths
+
+    monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
+
+    ocean_path = tmp_path / "ocean_rgba.tif"
+    ocean_ds = gdal.GetDriverByName("GTiff").Create(
+        str(ocean_path), raster_size, raster_size, 4, gdal.GDT_Byte
+    )
+    ocean_ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32631)
+    ocean_ds.SetProjection(srs.ExportToWkt())
+    alpha_values = np.full((raster_size, raster_size), 255, dtype=np.uint8)
+    alpha_values[:10, :] = 0
+    ocean_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    ocean_ds.GetRasterBand(4).WriteArray(alpha_values)
+    ocean_ds = None
+
+    args = argparse.Namespace(
+        cache=".cache",
+        download=False,
+        stats_min=0,
+        stats_max=10000,
+        tonemap=True,
+        grade=True,
+        sb=0.3,
+        hb=0.75,
+        ss=1.4,
+        ms=0.9,
+        hs=0.5,
+        exposure=1.0,
+        gamma=1.0,
+        sat=0.9,
+        db=0.7,
+        ls=0.7,
+        resample_alg="near",
+        max_zoom=13,
+        blocksize=256,
+        output="render.pmtiles",
+    )
+
+    out_path = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(ocean_path))
+
+    assert out_path is not None
+    assert [download for _cache, download, _quiet in band_requests] == [True, False, False]
+    assert prefetched_cache_dir is not None
+    assert not prefetched_cache_dir.exists()
 
 
 def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
