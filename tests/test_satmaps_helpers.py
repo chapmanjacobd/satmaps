@@ -677,10 +677,20 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
 
     fake_band = FakeBand()
     fake_ds = FakeDataset(fake_band)
+    transform_builds = 0
 
     monkeypatch.setattr(satmaps.gdal, "Open", lambda path: fake_ds)
     monkeypatch.setattr(satmaps, "get_ocean_mask_band_index", lambda ds: 1)
-    monkeypatch.setattr(satmaps, "build_dataset_to_wgs84_transform", lambda ds: None)
+    def fake_build_dataset_to_wgs84_transform(ds: object) -> None:
+        nonlocal transform_builds
+        transform_builds += 1
+        return None
+
+    monkeypatch.setattr(
+        satmaps,
+        "build_dataset_to_wgs84_transform",
+        fake_build_dataset_to_wgs84_transform,
+    )
     monkeypatch.setattr(
         satmaps,
         "process_ocean_mask_window",
@@ -697,6 +707,7 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
         (0, 20, 80, 10),
         (0, 30, 80, 10),
     ]
+    assert transform_builds == 1
 
 
 def test_build_alpha_block_masks_out_pixels_outside_ocean_render() -> None:

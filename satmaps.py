@@ -712,86 +712,6 @@ def process_ocean_mask_window(
     return mgrs_tiles
 
 
-def scan_ocean_mask_block_rows(
-    ocean_mask_src: str,
-    band_index: int,
-    scan_window: Tuple[int, int, int, int],
-    block_rows: Sequence[Tuple[int, List[Tuple[int, int]]]],
-    bbox: Optional[Tuple[float, float, float, float]] = None,
-    candidate_tiles: Optional[Set[str]] = None,
-    dataset: Optional[gdal.Dataset] = None,
-) -> Set[str]:
-    """Scan a subset of mask block rows and return intersecting MGRS tiles."""
-    ds = dataset
-    owns_dataset = False
-    if ds is None:
-        ds = gdal.Open(ocean_mask_src)
-        owns_dataset = True
-    if ds is None:
-        raise RuntimeError(f"Could not reopen ocean mask source: {ocean_mask_src}")
-
-    try:
-        band = ds.GetRasterBand(band_index)
-        if band is None:
-            raise RuntimeError(
-                f"Could not reopen ocean mask band {band_index} from: {ocean_mask_src}"
-            )
-
-        nodata = band.GetNoDataValue()
-        to_wgs84 = build_dataset_to_wgs84_transform(ds)
-        geotransform = ds.GetGeoTransform()
-        block_x, block_y = band.GetBlockSize()
-
-        mgrs_tiles: Set[str] = set()
-        remaining_candidate_tiles = set(candidate_tiles) if candidate_tiles is not None else None
-        m = mgrs.MGRS()
-        read_width = max(block_x * OCEAN_MASK_SCAN_READ_BLOCKS, block_x)
-        process_width = max(block_x * OCEAN_MASK_SCAN_PROCESS_BLOCKS, block_x)
-        for block_row, block_intervals in block_rows:
-            block_yoff = block_row * block_y
-            block_height = min(block_y, ds.RasterYSize - block_yoff)
-            for start_block_x, end_block_x in block_intervals:
-                interval_xoff = start_block_x * block_x
-                interval_max_x = min((end_block_x + 1) * block_x, ds.RasterXSize)
-                for read_xoff in range(interval_xoff, interval_max_x, read_width):
-                    read_chunk_width = min(read_width, interval_max_x - read_xoff)
-                    read_data = band.ReadAsArray(
-                        read_xoff,
-                        block_yoff,
-                        read_chunk_width,
-                        block_height,
-                    )
-                    if read_data is None:
-                        continue
-                    read_data = np.asarray(read_data)
-                    for process_offset in range(0, read_chunk_width, process_width):
-                        process_chunk_width = min(
-                            process_width, read_chunk_width - process_offset
-                        )
-                        found_tiles = process_ocean_mask_window(
-                            read_data[:, process_offset : process_offset + process_chunk_width],
-                            read_xoff + process_offset,
-                            block_yoff,
-                            scan_window,
-                            geotransform,
-                            nodata,
-                            to_wgs84,
-                            m,
-                            bbox,
-                            remaining_candidate_tiles,
-                        )
-                        mgrs_tiles.update(found_tiles)
-                        if remaining_candidate_tiles is not None:
-                            remaining_candidate_tiles.difference_update(found_tiles)
-                            if not remaining_candidate_tiles:
-                                return mgrs_tiles
-
-        return mgrs_tiles
-    finally:
-        if owns_dataset:
-            ds = None
-
-
 def discover_mgrs_tiles_from_ocean_mask(
     ocean_mask_src: str,
     bbox: Optional[Tuple[float, float, float, float]] = None,
@@ -809,6 +729,10 @@ def discover_mgrs_tiles_from_ocean_mask(
     band = ds.GetRasterBand(band_index)
     mgrs_tiles: Set[str] = set()
     block_x, block_y = band.GetBlockSize()
+    nodata = band.GetNoDataValue()
+    to_wgs84 = build_dataset_to_wgs84_transform(ds)
+    geotransform = ds.GetGeoTransform()
+    m = mgrs.MGRS()
     scan_window = get_bbox_scan_window(ds, bbox)
     if scan_window is None:
         return set()
@@ -827,18 +751,8 @@ def discover_mgrs_tiles_from_ocean_mask(
         if block_x > 0 and block_y > 0
         else 0
     )
-    block_rows = [
-        (
-            yoff // block_y,
-            [
-                (
-                    scan_xoff // block_x,
-                    (scan_xoff + scan_width - 1) // block_x,
-                )
-            ],
-        )
-        for yoff in range(scan_yoff, scan_yoff + scan_height, block_y)
-    ]
+    start_block_x = scan_xoff // block_x
+    end_block_x = (scan_xoff + scan_width - 1) // block_x
 
     completed_row_blocks = 0
     progress_checkpoints = build_progress_checkpoints(total_row_blocks)
@@ -869,16 +783,39 @@ def discover_mgrs_tiles_from_ocean_mask(
             )
             next_checkpoint_index += 1
 
-    for block_row_entry in block_rows:
-        found_tiles = scan_ocean_mask_block_rows(
-            ocean_mask_src,
-            band_index,
-            scan_window,
-            [block_row_entry],
-            bbox=bbox,
-            dataset=ds,
-        )
-        mgrs_tiles.update(found_tiles)
+    read_width = max(block_x * OCEAN_MASK_SCAN_READ_BLOCKS, block_x)
+    process_width = max(block_x * OCEAN_MASK_SCAN_PROCESS_BLOCKS, block_x)
+    for block_yoff in range(scan_yoff, scan_yoff + scan_height, block_y):
+        block_height = min(block_y, ds.RasterYSize - block_yoff)
+        for read_xoff in range(start_block_x * block_x, min((end_block_x + 1) * block_x, ds.RasterXSize), read_width):
+            read_chunk_width = min(
+                read_width,
+                min((end_block_x + 1) * block_x, ds.RasterXSize) - read_xoff,
+            )
+            read_data = band.ReadAsArray(
+                read_xoff,
+                block_yoff,
+                read_chunk_width,
+                block_height,
+            )
+            if read_data is None:
+                continue
+            read_data = np.asarray(read_data)
+            for process_offset in range(0, read_chunk_width, process_width):
+                process_chunk_width = min(process_width, read_chunk_width - process_offset)
+                found_tiles = process_ocean_mask_window(
+                    read_data[:, process_offset : process_offset + process_chunk_width],
+                    read_xoff + process_offset,
+                    block_yoff,
+                    scan_window,
+                    geotransform,
+                    nodata,
+                    to_wgs84,
+                    m,
+                    bbox,
+                    None,
+                )
+                mgrs_tiles.update(found_tiles)
         completed_row_blocks += 1
         report_scan_progress()
     progress_line.finish()
