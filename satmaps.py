@@ -8,9 +8,10 @@ import os
 import subprocess
 import sys
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, cast
 
 import mgrs
 from mgrs import core as mgrs_core
@@ -35,6 +36,8 @@ SUBTILE_OFFSETS = ((0, 0), (0, 1), (1, 0), (1, 1))
 SENTINEL_NODATA = -32768
 PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
+OCEAN_MASK_SCAN_READ_BLOCKS = 16
+OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
 @dataclass(frozen=True)
 class LandWorkUnit:
@@ -601,9 +604,16 @@ def get_mgrs_tile_bounds(mgrs_tile: str) -> Optional[Tuple[float, float, float, 
     """Return a lon/lat bbox for a 100 km MGRS tile."""
     m_converter = mgrs.MGRS()
     try:
-        min_lat, min_lon = m_converter.toLatLon(mgrs_tile)
-        max_lat, max_lon = m_converter.toLatLon(f"{mgrs_tile}9999999999")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            min_lat, min_lon = m_converter.toLatLon(mgrs_tile)
+            max_lat, max_lon = m_converter.toLatLon(f"{mgrs_tile}9999999999")
     except mgrs_core.MGRSError:
+        return None
+    if not all(
+        math.isfinite(value)
+        for value in (float(min_lat), float(min_lon), float(max_lat), float(max_lon))
+    ):
         return None
     return (
         min(float(min_lon), float(max_lon)),
@@ -677,6 +687,175 @@ def build_candidate_block_spans(
     }
 
 
+def process_ocean_mask_window(
+    data: np.ndarray,
+    xoff: int,
+    yoff: int,
+    scan_window: Tuple[int, int, int, int],
+    geotransform: Sequence[float],
+    nodata: Optional[float],
+    to_wgs84: Optional[osr.CoordinateTransformation],
+    mgrs_converter: mgrs.MGRS,
+    bbox: Optional[Tuple[float, float, float, float]],
+    candidate_tiles: Optional[Set[str]],
+) -> Set[str]:
+    """Classify one in-memory mask window into intersecting MGRS tiles."""
+    scan_xoff, scan_yoff, scan_width, scan_height = scan_window
+    width = data.shape[1]
+    height = data.shape[0]
+
+    if candidate_tiles is None:
+        clipped_xoff = max(xoff, scan_xoff)
+        clipped_yoff = max(yoff, scan_yoff)
+        clipped_max_x = min(xoff + width, scan_xoff + scan_width)
+        clipped_max_y = min(yoff + height, scan_yoff + scan_height)
+        data = data[
+            clipped_yoff - yoff : clipped_max_y - yoff,
+            clipped_xoff - xoff : clipped_max_x - xoff,
+        ]
+        xoff = clipped_xoff
+        yoff = clipped_yoff
+        width = clipped_max_x - clipped_xoff
+        height = clipped_max_y - clipped_yoff
+        if width <= 0 or height <= 0:
+            return set()
+    elif width <= 0 or height <= 0:
+        return set()
+
+    fill_allowed_mask = build_fill_allowed_mask(data, nodata_value=nodata)
+    if not np.any(fill_allowed_mask):
+        return set()
+
+    rows, cols = np.nonzero(fill_allowed_mask)
+    pixel_x = xoff + cols.astype(np.float64) + 0.5
+    pixel_y = yoff + rows.astype(np.float64) + 0.5
+    xs = (
+        geotransform[0]
+        + pixel_x * geotransform[1]
+        + pixel_y * geotransform[2]
+    )
+    ys = (
+        geotransform[3]
+        + pixel_x * geotransform[4]
+        + pixel_y * geotransform[5]
+    )
+
+    if to_wgs84 is None:
+        lons = xs
+        lats = ys
+    else:
+        transformed_points = to_wgs84.TransformPoints(
+            list(zip(xs.tolist(), ys.tolist(), strict=False))
+        )
+        lons = np.array([point[0] for point in transformed_points], dtype=np.float64)
+        lats = np.array([point[1] for point in transformed_points], dtype=np.float64)
+
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        in_bbox = (
+            (lons >= min_lon)
+            & (lons <= max_lon)
+            & (lats >= min_lat)
+            & (lats <= max_lat)
+        )
+        if not np.any(in_bbox):
+            return set()
+        lons = lons[in_bbox]
+        lats = lats[in_bbox]
+
+    mgrs_tiles: Set[str] = set()
+    for lon, lat in zip(lons, lats, strict=False):
+        try:
+            tile = mgrs_converter.toMGRS(float(lat), float(lon), MGRSPrecision=0)
+            tile_str = tile.decode() if isinstance(tile, bytes) else tile
+            if candidate_tiles is not None and tile_str not in candidate_tiles:
+                continue
+            mgrs_tiles.add(tile_str)
+        except mgrs_core.MGRSError:
+            continue
+    return mgrs_tiles
+
+
+def scan_ocean_mask_block_rows(
+    ocean_mask_src: str,
+    band_index: int,
+    scan_window: Tuple[int, int, int, int],
+    block_rows: Sequence[Tuple[int, List[Tuple[int, int]]]],
+    bbox: Optional[Tuple[float, float, float, float]] = None,
+    candidate_tiles: Optional[Set[str]] = None,
+    dataset: Optional[gdal.Dataset] = None,
+) -> Set[str]:
+    """Scan a subset of mask block rows and return intersecting MGRS tiles."""
+    ds = dataset
+    owns_dataset = False
+    if ds is None:
+        ds = gdal.Open(ocean_mask_src)
+        owns_dataset = True
+    if ds is None:
+        raise RuntimeError(f"Could not reopen ocean mask source: {ocean_mask_src}")
+
+    try:
+        band = ds.GetRasterBand(band_index)
+        if band is None:
+            raise RuntimeError(
+                f"Could not reopen ocean mask band {band_index} from: {ocean_mask_src}"
+            )
+
+        nodata = band.GetNoDataValue()
+        to_wgs84 = build_dataset_to_wgs84_transform(ds)
+        geotransform = ds.GetGeoTransform()
+        block_x, block_y = band.GetBlockSize()
+
+        mgrs_tiles: Set[str] = set()
+        remaining_candidate_tiles = set(candidate_tiles) if candidate_tiles is not None else None
+        m = mgrs.MGRS()
+        read_width = max(block_x * OCEAN_MASK_SCAN_READ_BLOCKS, block_x)
+        process_width = max(block_x * OCEAN_MASK_SCAN_PROCESS_BLOCKS, block_x)
+        for block_row, block_intervals in block_rows:
+            block_yoff = block_row * block_y
+            block_height = min(block_y, ds.RasterYSize - block_yoff)
+            for start_block_x, end_block_x in block_intervals:
+                interval_xoff = start_block_x * block_x
+                interval_max_x = min((end_block_x + 1) * block_x, ds.RasterXSize)
+                for read_xoff in range(interval_xoff, interval_max_x, read_width):
+                    read_chunk_width = min(read_width, interval_max_x - read_xoff)
+                    read_data = band.ReadAsArray(
+                        read_xoff,
+                        block_yoff,
+                        read_chunk_width,
+                        block_height,
+                    )
+                    if read_data is None:
+                        continue
+                    read_data = np.asarray(read_data)
+                    for process_offset in range(0, read_chunk_width, process_width):
+                        process_chunk_width = min(
+                            process_width, read_chunk_width - process_offset
+                        )
+                        found_tiles = process_ocean_mask_window(
+                            read_data[:, process_offset : process_offset + process_chunk_width],
+                            read_xoff + process_offset,
+                            block_yoff,
+                            scan_window,
+                            geotransform,
+                            nodata,
+                            to_wgs84,
+                            m,
+                            bbox,
+                            remaining_candidate_tiles,
+                        )
+                        mgrs_tiles.update(found_tiles)
+                        if remaining_candidate_tiles is not None:
+                            remaining_candidate_tiles.difference_update(found_tiles)
+                            if not remaining_candidate_tiles:
+                                return mgrs_tiles
+
+        return mgrs_tiles
+    finally:
+        if owns_dataset:
+            ds = None
+
+
 def discover_mgrs_tiles_from_ocean_mask(
     ocean_mask_src: str,
     bbox: Optional[Tuple[float, float, float, float]] = None,
@@ -692,19 +871,12 @@ def discover_mgrs_tiles_from_ocean_mask(
         return set()
 
     band = ds.GetRasterBand(band_index)
-    nodata = band.GetNoDataValue()
     mgrs_tiles: Set[str] = set()
-    m = mgrs.MGRS()
-    to_wgs84 = build_dataset_to_wgs84_transform(ds)
-    geotransform = ds.GetGeoTransform()
     block_x, block_y = band.GetBlockSize()
     scan_window = get_bbox_scan_window(ds, bbox)
     if scan_window is None:
         return set()
     scan_xoff, scan_yoff, scan_width, scan_height = scan_window
-    min_lon = min_lat = max_lon = max_lat = None
-    if bbox is not None:
-        min_lon, min_lat, max_lon, max_lat = bbox
 
     candidate_tiles = set(candidate_mgrs_tiles) if candidate_mgrs_tiles else None
     candidate_block_spans = (
@@ -722,10 +894,22 @@ def discover_mgrs_tiles_from_ocean_mask(
         if block_y > 0
         else 0
     )
-    total_block_reads = (
+    read_block_span = max(OCEAN_MASK_SCAN_READ_BLOCKS, 1)
+    total_covered_blocks = (
         sum(end - start + 1 for intervals in candidate_block_spans.values() for start, end in intervals)
         if candidate_block_spans is not None
         else math.ceil(scan_width / block_x) * total_row_blocks
+        if block_x > 0 and block_y > 0
+        else 0
+    )
+    total_read_windows = (
+        sum(
+            math.ceil((end - start + 1) / read_block_span)
+            for intervals in candidate_block_spans.values()
+            for start, end in intervals
+        )
+        if candidate_block_spans is not None
+        else math.ceil(math.ceil(scan_width / block_x) / read_block_span) * total_row_blocks
         if block_x > 0 and block_y > 0
         else 0
     )
@@ -733,11 +917,6 @@ def discover_mgrs_tiles_from_ocean_mask(
     progress_checkpoints = build_progress_checkpoints(total_row_blocks)
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
-    print(
-        "Ocean mask scan window: "
-        f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks "
-        f"and {total_block_reads} block reads."
-    )
 
     if candidate_block_spans is not None:
         block_rows = sorted(candidate_block_spans.items())
@@ -755,90 +934,20 @@ def discover_mgrs_tiles_from_ocean_mask(
             for yoff in range(scan_yoff, scan_yoff + scan_height, block_y)
         ]
 
-    for block_row, block_intervals in block_rows:
-        block_yoff = block_row * block_y
-        block_height = min(block_y, ds.RasterYSize - block_yoff)
-        for start_block_x, end_block_x in block_intervals:
-            for block_x_index in range(start_block_x, end_block_x + 1):
-                block_xoff = block_x_index * block_x
-                block_width = min(block_x, ds.RasterXSize - block_xoff)
-                data = band.ReadAsArray(block_xoff, block_yoff, block_width, block_height)
-                if data is None:
-                    continue
-                data = np.asarray(data)
-                xoff = block_xoff
-                yoff = block_yoff
-                width = block_width
-                height = block_height
-                if candidate_block_spans is None:
-                    clipped_xoff = max(xoff, scan_xoff)
-                    clipped_yoff = max(yoff, scan_yoff)
-                    clipped_max_x = min(xoff + width, scan_xoff + scan_width)
-                    clipped_max_y = min(yoff + height, scan_yoff + scan_height)
-                    data = data[
-                        clipped_yoff - yoff : clipped_max_y - yoff,
-                        clipped_xoff - xoff : clipped_max_x - xoff,
-                    ]
-                    xoff = clipped_xoff
-                    yoff = clipped_yoff
-                    width = clipped_max_x - clipped_xoff
-                    height = clipped_max_y - clipped_yoff
-                    if width <= 0 or height <= 0:
-                        continue
-                elif width <= 0 or height <= 0:
-                    continue
+    print(
+        "Ocean mask scan window: "
+        f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks "
+        f"covering {total_covered_blocks} blocks via {total_read_windows} read windows."
+    )
+    progress_checkpoints_sorted = sorted(progress_checkpoints)
+    next_checkpoint_index = 0
 
-                fill_allowed_mask = build_fill_allowed_mask(data, nodata_value=nodata)
-                if not np.any(fill_allowed_mask):
-                    continue
-
-                rows, cols = np.nonzero(fill_allowed_mask)
-                pixel_x = xoff + cols.astype(np.float64) + 0.5
-                pixel_y = yoff + rows.astype(np.float64) + 0.5
-                xs = (
-                    geotransform[0]
-                    + pixel_x * geotransform[1]
-                    + pixel_y * geotransform[2]
-                )
-                ys = (
-                    geotransform[3]
-                    + pixel_x * geotransform[4]
-                    + pixel_y * geotransform[5]
-                )
-
-                if to_wgs84 is None:
-                    lons = xs
-                    lats = ys
-                else:
-                    transformed_points = to_wgs84.TransformPoints(
-                        list(zip(xs.tolist(), ys.tolist(), strict=False))
-                    )
-                    lons = np.array([point[0] for point in transformed_points], dtype=np.float64)
-                    lats = np.array([point[1] for point in transformed_points], dtype=np.float64)
-
-                if bbox is not None:
-                    in_bbox = (
-                        (lons >= min_lon)
-                        & (lons <= max_lon)
-                        & (lats >= min_lat)
-                        & (lats <= max_lat)
-                    )
-                    if not np.any(in_bbox):
-                        continue
-                    lons = lons[in_bbox]
-                    lats = lats[in_bbox]
-
-                for lon, lat in zip(lons, lats, strict=False):
-                    try:
-                        tile = m.toMGRS(float(lat), float(lon), MGRSPrecision=0)
-                        tile_str = tile.decode() if isinstance(tile, bytes) else tile
-                        if candidate_tiles is not None and tile_str not in candidate_tiles:
-                            continue
-                        mgrs_tiles.add(tile_str)
-                    except mgrs_core.MGRSError:
-                        continue
-        completed_row_blocks += 1
-        if completed_row_blocks in progress_checkpoints:
+    def report_scan_progress() -> None:
+        nonlocal next_checkpoint_index
+        while (
+            next_checkpoint_index < len(progress_checkpoints_sorted)
+            and completed_row_blocks >= progress_checkpoints_sorted[next_checkpoint_index]
+        ):
             update_count_progress(
                 progress_line,
                 "Ocean mask scan progress:",
@@ -847,6 +956,28 @@ def discover_mgrs_tiles_from_ocean_mask(
                 started_at,
                 f"{len(mgrs_tiles)} tiles found so far.",
             )
+            next_checkpoint_index += 1
+
+    remaining_candidate_tiles = set(candidate_tiles) if candidate_tiles is not None else None
+    for block_row_entry in block_rows:
+        found_tiles = scan_ocean_mask_block_rows(
+            ocean_mask_src,
+            band_index,
+            scan_window,
+            [block_row_entry],
+            bbox=bbox,
+            candidate_tiles=remaining_candidate_tiles,
+            dataset=ds,
+        )
+        mgrs_tiles.update(found_tiles)
+        if remaining_candidate_tiles is not None:
+            remaining_candidate_tiles.difference_update(found_tiles)
+            if not remaining_candidate_tiles:
+                completed_row_blocks = total_row_blocks
+                report_scan_progress()
+                break
+        completed_row_blocks += 1
+        report_scan_progress()
     progress_line.finish()
     return mgrs_tiles
 

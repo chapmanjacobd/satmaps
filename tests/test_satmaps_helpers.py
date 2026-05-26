@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -203,6 +204,27 @@ def test_discover_mgrs_bases_intersects_all_tiles_s3_cache_with_mask(monkeypatch
 
 def test_get_mgrs_tile_bounds_returns_known_bbox() -> None:
     assert satmaps.get_mgrs_tile_bounds("04QFJ") == pytest.approx(QFJ_TILE_BOUNDS)
+
+
+def test_get_mgrs_tile_bounds_suppresses_mgrs_runtime_warnings(monkeypatch: object) -> None:
+    class FakeMGRS:
+        def toLatLon(self, code: str) -> tuple[float, float]:
+            warnings.warn(
+                'Warning in "Convert_MGRS_To_Geodetic": Latitude Warning',
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            if code == "31NGJ":
+                return (10.0, 20.0)
+            return (11.0, 21.0)
+
+    monkeypatch.setattr(satmaps.mgrs, "MGRS", FakeMGRS)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert satmaps.get_mgrs_tile_bounds("31NGJ") == pytest.approx((20.0, 10.0, 21.0, 11.0))
+
+    assert caught == []
 
 
 def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: object) -> None:
@@ -558,6 +580,37 @@ def test_discover_mgrs_tiles_from_projected_ocean_mask_misses_zigzag_hawaii_tile
     tmp_path: Path,
 ) -> None:
     ocean_mask_path = tmp_path / "ocean-mask-zigzag-3857.tif"
+    land_patch = np.full((320, 480), 255, dtype=np.uint8)
+    for y in range(land_patch.shape[0]):
+        center_x = int((0.25 + 0.5 * np.sin(y / 22.0)) * land_patch.shape[1])
+        land_patch[y, max(0, center_x - 8) : min(land_patch.shape[1], center_x + 9)] = 0
+    build_projected_ocean_mask(
+        ocean_mask_path,
+        land_patch,
+        bounds=WIDE_HAWAII_BOUNDS,
+    )
+
+    assert satmaps.discover_mgrs_tiles_from_ocean_mask(
+        str(ocean_mask_path),
+        bbox=WIDE_HAWAII_BOUNDS,
+    ) == {
+        "04QFJ",
+        "04QFK",
+        "04QGJ",
+        "04QGK",
+        "04QHJ",
+        "04QHK",
+        "05QJD",
+        "05QJE",
+        "05QKD",
+        "05QKE",
+    }
+
+
+def test_discover_mgrs_tiles_from_projected_ocean_mask_uses_batched_reads(
+    tmp_path: Path,
+) -> None:
+    ocean_mask_path = tmp_path / "ocean-mask-parallel-3857.tif"
     land_patch = np.full((320, 480), 255, dtype=np.uint8)
     for y in range(land_patch.shape[0]):
         center_x = int((0.25 + 0.5 * np.sin(y / 22.0)) * land_patch.shape[1])
