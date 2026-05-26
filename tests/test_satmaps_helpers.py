@@ -638,6 +638,80 @@ def test_discover_mgrs_tiles_from_projected_ocean_mask_uses_batched_reads(
     }
 
 
+def test_discover_mgrs_tiles_from_ocean_mask_stops_after_first_land_per_candidate(
+    monkeypatch: object,
+) -> None:
+    class FakeBand:
+        def __init__(self) -> None:
+            self.read_calls: list[tuple[int, int, int, int]] = []
+
+        def GetNoDataValue(self) -> None:
+            return None
+
+        def GetBlockSize(self) -> tuple[int, int]:
+            return (10, 10)
+
+        def ReadAsArray(
+            self,
+            xoff: int,
+            yoff: int,
+            width: int,
+            height: int,
+        ) -> np.ndarray:
+            self.read_calls.append((xoff, yoff, width, height))
+            return np.zeros((height, width), dtype=np.uint8)
+
+    class FakeDataset:
+        RasterXSize = 80
+        RasterYSize = 40
+
+        def __init__(self, band: FakeBand) -> None:
+            self.band = band
+
+        def GetRasterBand(self, band_index: int) -> FakeBand:
+            assert band_index == 1
+            return self.band
+
+        def GetGeoTransform(self) -> tuple[float, float, float, float, float, float]:
+            return (0.0, 1.0, 0.0, 0.0, 0.0, -1.0)
+
+    fake_band = FakeBand()
+    fake_ds = FakeDataset(fake_band)
+    tile_bounds = {
+        "04QFJ": (0.0, 0.0, 1.0, 1.0),
+        "04QFK": (1.0, 0.0, 2.0, 1.0),
+    }
+    scan_windows = {
+        None: (0, 0, 80, 40),
+        tile_bounds["04QFJ"]: (0, 0, 40, 40),
+        tile_bounds["04QFK"]: (40, 0, 40, 40),
+    }
+
+    monkeypatch.setattr(satmaps.gdal, "Open", lambda path: fake_ds)
+    monkeypatch.setattr(satmaps, "get_ocean_mask_band_index", lambda ds: 1)
+    monkeypatch.setattr(satmaps, "build_dataset_to_wgs84_transform", lambda ds: None)
+    monkeypatch.setattr(satmaps, "get_mgrs_tile_bounds", lambda mgrs_tile: tile_bounds[mgrs_tile])
+    monkeypatch.setattr(
+        satmaps,
+        "get_bbox_scan_window",
+        lambda dataset, bbox: scan_windows[bbox],
+    )
+    monkeypatch.setattr(
+        satmaps,
+        "process_ocean_mask_window",
+        lambda data, xoff, yoff, scan_window, geotransform, nodata, to_wgs84, mgrs_converter, bbox, candidate_tiles: set(candidate_tiles),
+    )
+
+    assert satmaps.discover_mgrs_tiles_from_ocean_mask(
+        "fake-ocean-mask.tif",
+        candidate_mgrs_tiles={"04QFJ", "04QFK"},
+    ) == {"04QFJ", "04QFK"}
+    assert fake_band.read_calls == [
+        (0, 0, 40, 10),
+        (40, 0, 40, 10),
+    ]
+
+
 def test_build_alpha_block_masks_out_pixels_outside_ocean_render() -> None:
     np.testing.assert_array_equal(
         build_alpha_block(

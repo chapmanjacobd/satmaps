@@ -687,6 +687,37 @@ def build_candidate_block_spans(
     }
 
 
+def build_candidate_tile_block_rows(
+    dataset: gdal.Dataset,
+    scan_window: Tuple[int, int, int, int],
+    candidate_mgrs_tiles: Set[str],
+    block_x: int,
+    block_y: int,
+) -> Dict[str, List[Tuple[int, List[Tuple[int, int]]]]]:
+    """Map each candidate tile to the block rows needed to scan its clipped mask window."""
+    tile_block_rows: Dict[str, List[Tuple[int, List[Tuple[int, int]]]]] = {}
+    for mgrs_tile in sorted(candidate_mgrs_tiles):
+        tile_bounds = get_mgrs_tile_bounds(mgrs_tile)
+        if tile_bounds is None:
+            continue
+        tile_window = get_bbox_scan_window(dataset, tile_bounds)
+        if tile_window is None:
+            continue
+        clipped_window = intersect_src_windows(scan_window, tile_window)
+        if clipped_window is None:
+            continue
+        xoff, yoff, width, height = clipped_window
+        start_block_x = xoff // block_x
+        end_block_x = (xoff + width - 1) // block_x
+        start_block_y = yoff // block_y
+        end_block_y = (yoff + height - 1) // block_y
+        tile_block_rows[mgrs_tile] = [
+            (block_row, [(start_block_x, end_block_x)])
+            for block_row in range(start_block_y, end_block_y + 1)
+        ]
+    return tile_block_rows
+
+
 def process_ocean_mask_window(
     data: np.ndarray,
     xoff: int,
@@ -784,8 +815,8 @@ def scan_ocean_mask_block_rows(
     bbox: Optional[Tuple[float, float, float, float]] = None,
     candidate_tiles: Optional[Set[str]] = None,
     dataset: Optional[gdal.Dataset] = None,
-) -> Set[str]:
-    """Scan a subset of mask block rows and return intersecting MGRS tiles."""
+) -> Tuple[Set[str], int]:
+    """Scan a subset of mask block rows and return intersecting MGRS tiles and rows scanned."""
     ds = dataset
     owns_dataset = False
     if ds is None:
@@ -811,6 +842,7 @@ def scan_ocean_mask_block_rows(
         m = mgrs.MGRS()
         read_width = max(block_x * OCEAN_MASK_SCAN_READ_BLOCKS, block_x)
         process_width = max(block_x * OCEAN_MASK_SCAN_PROCESS_BLOCKS, block_x)
+        rows_scanned = 0
         for block_row, block_intervals in block_rows:
             block_yoff = block_row * block_y
             block_height = min(block_y, ds.RasterYSize - block_yoff)
@@ -848,9 +880,10 @@ def scan_ocean_mask_block_rows(
                         if remaining_candidate_tiles is not None:
                             remaining_candidate_tiles.difference_update(found_tiles)
                             if not remaining_candidate_tiles:
-                                return mgrs_tiles
+                                return mgrs_tiles, rows_scanned + 1
+            rows_scanned += 1
 
-        return mgrs_tiles
+        return mgrs_tiles, rows_scanned
     finally:
         if owns_dataset:
             ds = None
@@ -879,48 +912,41 @@ def discover_mgrs_tiles_from_ocean_mask(
     scan_xoff, scan_yoff, scan_width, scan_height = scan_window
 
     candidate_tiles = set(candidate_mgrs_tiles) if candidate_mgrs_tiles else None
-    candidate_block_spans = (
-        build_candidate_block_spans(ds, scan_window, candidate_tiles, block_x, block_y)
+    candidate_tile_block_rows = (
+        build_candidate_tile_block_rows(ds, scan_window, candidate_tiles, block_x, block_y)
         if candidate_tiles
         else None
     )
-    if candidate_tiles is not None and not candidate_block_spans:
+    if candidate_tiles is not None and not candidate_tile_block_rows:
         return set()
 
-    total_row_blocks = (
-        len(candidate_block_spans)
-        if candidate_block_spans is not None
-        else math.ceil(scan_height / block_y)
-        if block_y > 0
-        else 0
-    )
     read_block_span = max(OCEAN_MASK_SCAN_READ_BLOCKS, 1)
-    total_covered_blocks = (
-        sum(end - start + 1 for intervals in candidate_block_spans.values() for start, end in intervals)
-        if candidate_block_spans is not None
-        else math.ceil(scan_width / block_x) * total_row_blocks
-        if block_x > 0 and block_y > 0
-        else 0
-    )
-    total_read_windows = (
-        sum(
-            math.ceil((end - start + 1) / read_block_span)
-            for intervals in candidate_block_spans.values()
+    if candidate_tile_block_rows is not None:
+        total_row_blocks = sum(len(block_rows) for block_rows in candidate_tile_block_rows.values())
+        total_covered_blocks = sum(
+            end - start + 1
+            for block_rows in candidate_tile_block_rows.values()
+            for _, intervals in block_rows
             for start, end in intervals
         )
-        if candidate_block_spans is not None
-        else math.ceil(math.ceil(scan_width / block_x) / read_block_span) * total_row_blocks
-        if block_x > 0 and block_y > 0
-        else 0
-    )
-    completed_row_blocks = 0
-    progress_checkpoints = build_progress_checkpoints(total_row_blocks)
-    progress_line = LiveProgressLine()
-    started_at = time.perf_counter()
-
-    if candidate_block_spans is not None:
-        block_rows = sorted(candidate_block_spans.items())
+        total_read_windows = sum(
+            math.ceil((end - start + 1) / read_block_span)
+            for block_rows in candidate_tile_block_rows.values()
+            for _, intervals in block_rows
+            for start, end in intervals
+        )
     else:
+        total_row_blocks = math.ceil(scan_height / block_y) if block_y > 0 else 0
+        total_covered_blocks = (
+            math.ceil(scan_width / block_x) * total_row_blocks
+            if block_x > 0 and block_y > 0
+            else 0
+        )
+        total_read_windows = (
+            math.ceil(math.ceil(scan_width / block_x) / read_block_span) * total_row_blocks
+            if block_x > 0 and block_y > 0
+            else 0
+        )
         block_rows = [
             (
                 yoff // block_y,
@@ -934,10 +960,20 @@ def discover_mgrs_tiles_from_ocean_mask(
             for yoff in range(scan_yoff, scan_yoff + scan_height, block_y)
         ]
 
+    completed_row_blocks = 0
+    progress_checkpoints = build_progress_checkpoints(total_row_blocks)
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
+
     print(
         "Ocean mask scan window: "
         f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks "
-        f"covering {total_covered_blocks} blocks via {total_read_windows} read windows."
+        f"covering {total_covered_blocks} blocks via {total_read_windows} read windows"
+        + (
+            f" in {len(candidate_tile_block_rows)} candidate tile windows."
+            if candidate_tile_block_rows is not None
+            else "."
+        )
     )
     progress_checkpoints_sorted = sorted(progress_checkpoints)
     next_checkpoint_index = 0
@@ -958,26 +994,41 @@ def discover_mgrs_tiles_from_ocean_mask(
             )
             next_checkpoint_index += 1
 
-    remaining_candidate_tiles = set(candidate_tiles) if candidate_tiles is not None else None
-    for block_row_entry in block_rows:
-        found_tiles = scan_ocean_mask_block_rows(
-            ocean_mask_src,
-            band_index,
-            scan_window,
-            [block_row_entry],
-            bbox=bbox,
-            candidate_tiles=remaining_candidate_tiles,
-            dataset=ds,
-        )
-        mgrs_tiles.update(found_tiles)
-        if remaining_candidate_tiles is not None:
-            remaining_candidate_tiles.difference_update(found_tiles)
-            if not remaining_candidate_tiles:
-                completed_row_blocks = total_row_blocks
-                report_scan_progress()
-                break
-        completed_row_blocks += 1
-        report_scan_progress()
+    if candidate_tile_block_rows is not None:
+        for mgrs_tile, tile_block_rows in candidate_tile_block_rows.items():
+            found_tiles, scanned_row_count = scan_ocean_mask_block_rows(
+                ocean_mask_src,
+                band_index,
+                scan_window,
+                tile_block_rows,
+                bbox=bbox,
+                candidate_tiles={mgrs_tile},
+                dataset=ds,
+            )
+            mgrs_tiles.update(found_tiles)
+            completed_row_blocks += scanned_row_count
+            report_scan_progress()
+    else:
+        remaining_candidate_tiles = set(candidate_tiles) if candidate_tiles is not None else None
+        for block_row_entry in block_rows:
+            found_tiles, scanned_row_count = scan_ocean_mask_block_rows(
+                ocean_mask_src,
+                band_index,
+                scan_window,
+                [block_row_entry],
+                bbox=bbox,
+                candidate_tiles=remaining_candidate_tiles,
+                dataset=ds,
+            )
+            mgrs_tiles.update(found_tiles)
+            if remaining_candidate_tiles is not None:
+                remaining_candidate_tiles.difference_update(found_tiles)
+                if not remaining_candidate_tiles:
+                    completed_row_blocks = total_row_blocks
+                    report_scan_progress()
+                    break
+            completed_row_blocks += scanned_row_count
+            report_scan_progress()
     progress_line.finish()
     return mgrs_tiles
 
