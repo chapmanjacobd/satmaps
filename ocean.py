@@ -78,12 +78,25 @@ TEMPORARY_TILED_GTIFF_OPTIONS = (
 T = TypeVar("T")
 
 
-def format_eta(seconds_remaining: float | None) -> str:
+def format_eta(
+    seconds_remaining: float | None,
+    *,
+    elapsed_seconds: float | None = None,
+) -> str:
     """Return a short ETA string for progress logging."""
     if seconds_remaining is None or not math.isfinite(seconds_remaining):
         return "ETA: calculating..."
 
     rounded_seconds = max(0, round(seconds_remaining))
+    if rounded_seconds == 0 and elapsed_seconds is not None and math.isfinite(elapsed_seconds):
+        rounded_elapsed = max(0, round(elapsed_seconds))
+        hours, remainder = divmod(rounded_elapsed, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"Elapsed: {hours}h {minutes}m"
+        if minutes:
+            return f"Elapsed: {minutes}m {seconds}s"
+        return f"Elapsed: {seconds}s"
     hours, remainder = divmod(rounded_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     if hours:
@@ -131,7 +144,8 @@ def build_step_progress_callback(
         if bounded_fraction > 0.0 and elapsed > 0.0:
             remaining = elapsed * (1.0 - bounded_fraction) / bounded_fraction
         progress_line.update(
-            f"{step_label} {bounded_fraction * 100:3.0f}%; {format_eta(remaining)}"
+            f"{step_label} {bounded_fraction * 100:3.0f}%; "
+            f"{format_eta(remaining, elapsed_seconds=elapsed)}"
         )
 
     return update
@@ -1358,7 +1372,7 @@ def generate_ocean_background(
         percent = round((completed_chunks / total_chunks) * 100) if total_chunks > 0 else 0
         chunk_progress_line.update(
             f"Ocean chunk progress: {completed_chunks:,}/{total_chunks:,} ({percent}%); "
-            f"{format_eta(remaining)}"
+            f"{format_eta(remaining, elapsed_seconds=elapsed)}"
         )
 
     update_chunk_progress(len(chunk_rgba_paths))

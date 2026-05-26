@@ -159,28 +159,33 @@ def test_parse_bbox_parses_numbers_and_exits_on_invalid_input(
 def test_discover_mgrs_bases_uses_bbox_clipped_ocean_mask_when_available(
     monkeypatch: object,
 ) -> None:
-    calls: list[tuple[str, tuple[float, float, float, float] | None]] = []
+    calls: list[tuple[str, tuple[float, float, float, float] | None, set[str] | None]] = []
 
     def fake_discover(
         ocean_mask_src: str,
         bbox: tuple[float, float, float, float] | None = None,
+        candidate_mgrs_tiles: set[str] | None = None,
     ) -> set[str]:
-        calls.append((ocean_mask_src, bbox))
+        calls.append((ocean_mask_src, bbox, candidate_mgrs_tiles))
         return {"05QFJ", "04QFJ"}
 
     monkeypatch.setattr("satmaps.discover_mgrs_tiles_from_ocean_mask", fake_discover)
+    monkeypatch.setattr(
+        "satmaps.discover_mgrs_tiles_in_bbox",
+        lambda min_lon, min_lat, max_lon, max_lat: ["04QFJ", "05QFJ", "31TDF"],
+    )
 
     assert satmaps.discover_mgrs_bases((-158.0, 20.8, -157.0, 21.7), "gebco.vrt") == [
         "04QFJ",
         "05QFJ",
     ]
-    assert calls == [("gebco.vrt", (-158.0, 20.8, -157.0, 21.7))]
+    assert calls == [("gebco.vrt", (-158.0, 20.8, -157.0, 21.7), {"04QFJ", "05QFJ", "31TDF"})]
 
 
 def test_discover_mgrs_bases_intersects_all_tiles_s3_cache_with_mask(monkeypatch: object) -> None:
     monkeypatch.setattr(
         "satmaps.discover_mgrs_tiles_from_ocean_mask",
-        lambda ocean_mask_src, bbox=None: {"04QFJ", "99ZZZ"},
+        lambda ocean_mask_src, bbox=None, candidate_mgrs_tiles=None: {"04QFJ", "99ZZZ"},
     )
     monkeypatch.setattr(
         satmaps,
@@ -194,6 +199,10 @@ def test_discover_mgrs_bases_intersects_all_tiles_s3_cache_with_mask(monkeypatch
     )
 
     assert satmaps.discover_mgrs_bases(None, "gebco.vrt") == ["04QFJ"]
+
+
+def test_get_mgrs_tile_bounds_returns_known_bbox() -> None:
+    assert satmaps.get_mgrs_tile_bounds("04QFJ") == pytest.approx(QFJ_TILE_BOUNDS)
 
 
 def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: object) -> None:
@@ -382,9 +391,10 @@ def test_populate_s3_cache_reports_progress(
 
     out = capsys.readouterr().out
     assert "Populating S3 folder cache for 2 date(s)..." in out
-    assert "S3 cache progress: 1/2 (50%); ETA:" in out
+    assert "S3 cache progress: 1/2 (50%);" in out
     assert "listing 2025/07/01..." in out
-    assert "S3 cache progress: 2/2 (100%); ETA: 0s; listing 2025/01/01..." in out
+    assert "S3 cache progress: 2/2 (100%); Elapsed:" in out
+    assert "listing 2025/01/01..." in out
     assert "S3 folder cache ready: 2 date(s), 3 folders total." in out
 
 

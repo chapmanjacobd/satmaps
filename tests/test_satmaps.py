@@ -1621,9 +1621,9 @@ def test_generate_ocean_without_bbox_reports_chunk_progress(
     assert "[3/6] Planning aligned Web Mercator chunks..." in out
     assert "Ocean target grid: 16x8 px (128 pixels)" in out
     assert "Processing 2 chunk(s) with 1 worker(s)..." in out
-    assert "Ocean chunk progress: 2/2 (100%); ETA: 0s" in out
-    assert "[5/6] Building merged RGBA VRT... 100%; ETA: 0s" in out
-    assert "[6/6] Translating final RGBA GeoTIFF... 100%; ETA: 0s" in out
+    assert "Ocean chunk progress: 2/2 (100%); Elapsed:" in out
+    assert "[5/6] Building merged RGBA VRT... 100%; Elapsed:" in out
+    assert "[6/6] Translating final RGBA GeoTIFF... 100%; Elapsed:" in out
     assert "Ocean build complete: ocean.tif" in out
 
 
@@ -2381,8 +2381,9 @@ def test_main_reports_land_progress(
 
     out = capsys.readouterr().out
     assert "Expanded 1 MGRS tiles into 4 sub-tiles across 1 date(s)." in out
-    assert "Land processing progress: 4/4 (100%); ETA: 0s; 4 raster(s) ready." in out
-    assert "Building master VRT from 4 raster(s)... 100%; ETA: 0s" in out
+    assert "Land processing progress: 4/4 (100%); Elapsed:" in out
+    assert "4 raster(s) ready." in out
+    assert "Building master VRT from 4 raster(s)... 100%; Elapsed:" in out
 
 
 def test_main_low_zoom_uses_subtile_processing_strategy(
@@ -2419,7 +2420,8 @@ def test_main_low_zoom_uses_subtile_processing_strategy(
     assert processed_tiles == ["31TDF_0_0", "31TDF_0_1", "31TDF_1_0", "31TDF_1_1"]
     assert "Expanded 1 MGRS tiles into 4 sub-tiles across 1 date(s)." in out
     assert "Starting sub-tile processing for 4 sub-tile(s) with 1 worker(s);" in out
-    assert "Land processing progress: 4/4 (100%); ETA: 0s; 4 raster(s) ready." in out
+    assert "Land processing progress: 4/4 (100%); Elapsed:" in out
+    assert "4 raster(s) ready." in out
 
 
 def test_main_passes_ocean_path_to_tile_processing(

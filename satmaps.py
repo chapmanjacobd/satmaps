@@ -135,12 +135,25 @@ def build_progress_checkpoints(total_steps: int) -> set[int]:
     return checkpoints
 
 
-def format_eta(seconds_remaining: float | None) -> str:
+def format_eta(
+    seconds_remaining: float | None,
+    *,
+    elapsed_seconds: float | None = None,
+) -> str:
     """Return a short ETA string for progress logging."""
     if seconds_remaining is None or not math.isfinite(seconds_remaining):
         return "ETA: calculating..."
 
     rounded_seconds = max(0, round(seconds_remaining))
+    if rounded_seconds == 0 and elapsed_seconds is not None and math.isfinite(elapsed_seconds):
+        rounded_elapsed = max(0, round(elapsed_seconds))
+        hours, remainder = divmod(rounded_elapsed, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"Elapsed: {hours}h {minutes}m"
+        if minutes:
+            return f"Elapsed: {minutes}m {seconds}s"
+        return f"Elapsed: {seconds}s"
     hours, remainder = divmod(rounded_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     if hours:
@@ -195,7 +208,8 @@ def update_count_progress(
     if eta_smoother is not None:
         remaining = eta_smoother.smooth(remaining, now)
     progress_line.update(
-        f"{label} {format_progress(current, total)}; {format_eta(remaining)}; {detail}"
+        f"{label} {format_progress(current, total)}; "
+        f"{format_eta(remaining, elapsed_seconds=elapsed)}; {detail}"
     )
 
 
@@ -216,7 +230,8 @@ def build_gdal_progress_callback(
             remaining = elapsed * (1.0 - bounded_complete) / bounded_complete
         remaining = eta_smoother.smooth(remaining, now)
         progress_line.update(
-            f"{step_label} {bounded_complete * 100:3.0f}%; {format_eta(remaining)}"
+            f"{step_label} {bounded_complete * 100:3.0f}%; "
+            f"{format_eta(remaining, elapsed_seconds=elapsed)}"
         )
         return 1
 
@@ -582,9 +597,90 @@ def build_bbox_geometry(
     return polygon
 
 
+def get_mgrs_tile_bounds(mgrs_tile: str) -> Optional[Tuple[float, float, float, float]]:
+    """Return a lon/lat bbox for a 100 km MGRS tile."""
+    m_converter = mgrs.MGRS()
+    try:
+        min_lat, min_lon = m_converter.toLatLon(mgrs_tile)
+        max_lat, max_lon = m_converter.toLatLon(f"{mgrs_tile}9999999999")
+    except mgrs_core.MGRSError:
+        return None
+    return (
+        min(float(min_lon), float(max_lon)),
+        min(float(min_lat), float(max_lat)),
+        max(float(min_lon), float(max_lon)),
+        max(float(min_lat), float(max_lat)),
+    )
+
+
+def intersect_src_windows(
+    left: Tuple[int, int, int, int],
+    right: Tuple[int, int, int, int],
+) -> Optional[Tuple[int, int, int, int]]:
+    """Return the overlapping source window shared by two pixel-space windows."""
+    left_xoff, left_yoff, left_width, left_height = left
+    right_xoff, right_yoff, right_width, right_height = right
+    xoff = max(left_xoff, right_xoff)
+    yoff = max(left_yoff, right_yoff)
+    max_x = min(left_xoff + left_width, right_xoff + right_width)
+    max_y = min(left_yoff + left_height, right_yoff + right_height)
+    width = max_x - xoff
+    height = max_y - yoff
+    if width <= 0 or height <= 0:
+        return None
+    return xoff, yoff, width, height
+
+
+def merge_block_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Merge overlapping or adjacent block-index intervals."""
+    if not intervals:
+        return []
+    merged: List[Tuple[int, int]] = []
+    for start, end in sorted(intervals):
+        if not merged or start > merged[-1][1] + 1:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def build_candidate_block_spans(
+    dataset: gdal.Dataset,
+    scan_window: Tuple[int, int, int, int],
+    candidate_mgrs_tiles: Set[str],
+    block_x: int,
+    block_y: int,
+) -> Dict[int, List[Tuple[int, int]]]:
+    """Map each block row to the x-block intervals touched by candidate tiles."""
+    row_spans: Dict[int, List[Tuple[int, int]]] = {}
+    for mgrs_tile in candidate_mgrs_tiles:
+        tile_bounds = get_mgrs_tile_bounds(mgrs_tile)
+        if tile_bounds is None:
+            continue
+        tile_window = get_bbox_scan_window(dataset, tile_bounds)
+        if tile_window is None:
+            continue
+        clipped_window = intersect_src_windows(scan_window, tile_window)
+        if clipped_window is None:
+            continue
+        xoff, yoff, width, height = clipped_window
+        start_block_x = xoff // block_x
+        end_block_x = (xoff + width - 1) // block_x
+        start_block_y = yoff // block_y
+        end_block_y = (yoff + height - 1) // block_y
+        for block_row in range(start_block_y, end_block_y + 1):
+            row_spans.setdefault(block_row, []).append((start_block_x, end_block_x))
+
+    return {
+        block_row: merge_block_intervals(intervals)
+        for block_row, intervals in row_spans.items()
+    }
+
+
 def discover_mgrs_tiles_from_ocean_mask(
     ocean_mask_src: str,
     bbox: Optional[Tuple[float, float, float, float]] = None,
+    candidate_mgrs_tiles: Optional[Set[str]] = None,
 ) -> Set[str]:
     """Discover MGRS tiles that contain land or shallow water using an existing ocean mask."""
     ds = gdal.Open(ocean_mask_src)
@@ -610,67 +706,137 @@ def discover_mgrs_tiles_from_ocean_mask(
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
 
-    total_row_blocks = math.ceil(scan_height / block_y) if block_y > 0 else 0
+    candidate_tiles = set(candidate_mgrs_tiles) if candidate_mgrs_tiles else None
+    candidate_block_spans = (
+        build_candidate_block_spans(ds, scan_window, candidate_tiles, block_x, block_y)
+        if candidate_tiles
+        else None
+    )
+    if candidate_tiles is not None and not candidate_block_spans:
+        return set()
+
+    total_row_blocks = (
+        len(candidate_block_spans)
+        if candidate_block_spans is not None
+        else math.ceil(scan_height / block_y)
+        if block_y > 0
+        else 0
+    )
+    total_block_reads = (
+        sum(end - start + 1 for intervals in candidate_block_spans.values() for start, end in intervals)
+        if candidate_block_spans is not None
+        else math.ceil(scan_width / block_x) * total_row_blocks
+        if block_x > 0 and block_y > 0
+        else 0
+    )
     completed_row_blocks = 0
     progress_checkpoints = build_progress_checkpoints(total_row_blocks)
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
     print(
         "Ocean mask scan window: "
-        f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks."
+        f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks "
+        f"and {total_block_reads} block reads."
     )
 
-    for yoff in range(scan_yoff, scan_yoff + scan_height, block_y):
-        height = min(block_y, scan_yoff + scan_height - yoff)
-        for xoff in range(scan_xoff, scan_xoff + scan_width, block_x):
-            width = min(block_x, scan_xoff + scan_width - xoff)
-            data = band.ReadAsArray(xoff, yoff, width, height).astype(np.float32)
-            fill_allowed_mask = build_fill_allowed_mask(data, nodata_value=nodata)
-            if not np.any(fill_allowed_mask):
-                continue
-
-            rows, cols = np.nonzero(fill_allowed_mask)
-            pixel_x = xoff + cols.astype(np.float64) + 0.5
-            pixel_y = yoff + rows.astype(np.float64) + 0.5
-            xs = (
-                geotransform[0]
-                + pixel_x * geotransform[1]
-                + pixel_y * geotransform[2]
+    if candidate_block_spans is not None:
+        block_rows = sorted(candidate_block_spans.items())
+    else:
+        block_rows = [
+            (
+                yoff // block_y,
+                [
+                    (
+                        scan_xoff // block_x,
+                        (scan_xoff + scan_width - 1) // block_x,
+                    )
+                ],
             )
-            ys = (
-                geotransform[3]
-                + pixel_x * geotransform[4]
-                + pixel_y * geotransform[5]
-            )
+            for yoff in range(scan_yoff, scan_yoff + scan_height, block_y)
+        ]
 
-            if to_wgs84 is None:
-                lons = xs
-                lats = ys
-            else:
-                transformed_points = to_wgs84.TransformPoints(
-                    list(zip(xs.tolist(), ys.tolist(), strict=False))
-                )
-                lons = np.array([point[0] for point in transformed_points], dtype=np.float64)
-                lats = np.array([point[1] for point in transformed_points], dtype=np.float64)
-
-            if bbox is not None:
-                in_bbox = (
-                    (lons >= min_lon)
-                    & (lons <= max_lon)
-                    & (lats >= min_lat)
-                    & (lats <= max_lat)
-                )
-                if not np.any(in_bbox):
+    for block_row, block_intervals in block_rows:
+        block_yoff = block_row * block_y
+        block_height = min(block_y, ds.RasterYSize - block_yoff)
+        for start_block_x, end_block_x in block_intervals:
+            for block_x_index in range(start_block_x, end_block_x + 1):
+                block_xoff = block_x_index * block_x
+                block_width = min(block_x, ds.RasterXSize - block_xoff)
+                data = band.ReadAsArray(block_xoff, block_yoff, block_width, block_height)
+                if data is None:
                     continue
-                lons = lons[in_bbox]
-                lats = lats[in_bbox]
-
-            for lon, lat in zip(lons, lats, strict=False):
-                try:
-                    tile = m.toMGRS(float(lat), float(lon), MGRSPrecision=0)
-                    mgrs_tiles.add(tile.decode() if isinstance(tile, bytes) else tile)
-                except mgrs_core.MGRSError:
+                data = np.asarray(data)
+                xoff = block_xoff
+                yoff = block_yoff
+                width = block_width
+                height = block_height
+                if candidate_block_spans is None:
+                    clipped_xoff = max(xoff, scan_xoff)
+                    clipped_yoff = max(yoff, scan_yoff)
+                    clipped_max_x = min(xoff + width, scan_xoff + scan_width)
+                    clipped_max_y = min(yoff + height, scan_yoff + scan_height)
+                    data = data[
+                        clipped_yoff - yoff : clipped_max_y - yoff,
+                        clipped_xoff - xoff : clipped_max_x - xoff,
+                    ]
+                    xoff = clipped_xoff
+                    yoff = clipped_yoff
+                    width = clipped_max_x - clipped_xoff
+                    height = clipped_max_y - clipped_yoff
+                    if width <= 0 or height <= 0:
+                        continue
+                elif width <= 0 or height <= 0:
                     continue
+
+                fill_allowed_mask = build_fill_allowed_mask(data, nodata_value=nodata)
+                if not np.any(fill_allowed_mask):
+                    continue
+
+                rows, cols = np.nonzero(fill_allowed_mask)
+                pixel_x = xoff + cols.astype(np.float64) + 0.5
+                pixel_y = yoff + rows.astype(np.float64) + 0.5
+                xs = (
+                    geotransform[0]
+                    + pixel_x * geotransform[1]
+                    + pixel_y * geotransform[2]
+                )
+                ys = (
+                    geotransform[3]
+                    + pixel_x * geotransform[4]
+                    + pixel_y * geotransform[5]
+                )
+
+                if to_wgs84 is None:
+                    lons = xs
+                    lats = ys
+                else:
+                    transformed_points = to_wgs84.TransformPoints(
+                        list(zip(xs.tolist(), ys.tolist(), strict=False))
+                    )
+                    lons = np.array([point[0] for point in transformed_points], dtype=np.float64)
+                    lats = np.array([point[1] for point in transformed_points], dtype=np.float64)
+
+                if bbox is not None:
+                    in_bbox = (
+                        (lons >= min_lon)
+                        & (lons <= max_lon)
+                        & (lats >= min_lat)
+                        & (lats <= max_lat)
+                    )
+                    if not np.any(in_bbox):
+                        continue
+                    lons = lons[in_bbox]
+                    lats = lats[in_bbox]
+
+                for lon, lat in zip(lons, lats, strict=False):
+                    try:
+                        tile = m.toMGRS(float(lat), float(lon), MGRSPrecision=0)
+                        tile_str = tile.decode() if isinstance(tile, bytes) else tile
+                        if candidate_tiles is not None and tile_str not in candidate_tiles:
+                            continue
+                        mgrs_tiles.add(tile_str)
+                    except mgrs_core.MGRSError:
+                        continue
         completed_row_blocks += 1
         if completed_row_blocks in progress_checkpoints:
             update_count_progress(
@@ -693,7 +859,17 @@ def discover_mgrs_bases(
     if bbox is not None:
         if gebco_vrt_source:
             print("Scanning ocean mask for land tiles within bbox...")
-            mgrs_bases = sorted(list(discover_mgrs_tiles_from_ocean_mask(gebco_vrt_source, bbox=bbox)))
+            min_lon, min_lat, max_lon, max_lat = bbox
+            bbox_candidates = set(discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat))
+            mgrs_bases = sorted(
+                list(
+                    discover_mgrs_tiles_from_ocean_mask(
+                        gebco_vrt_source,
+                        bbox=bbox,
+                        candidate_mgrs_tiles=bbox_candidates,
+                    )
+                )
+            )
             print(f"Discovered {len(mgrs_bases)} MGRS tiles with land/shallow water inside bbox.")
         else:
             min_lon, min_lat, max_lon, max_lat = bbox
@@ -715,7 +891,10 @@ def discover_mgrs_bases(
 
     if gebco_vrt_source:
         print("Scanning ocean mask for land tiles...")
-        land_mgrs = discover_mgrs_tiles_from_ocean_mask(gebco_vrt_source)
+        land_mgrs = discover_mgrs_tiles_from_ocean_mask(
+            gebco_vrt_source,
+            candidate_mgrs_tiles=s3_mgrs_set,
+        )
         # Intersection: only tiles that both have land/shallow-water and exist in S3
         mgrs_bases = sorted(list(land_mgrs.intersection(s3_mgrs_set)))
         print(f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water after S3 intersection.")
