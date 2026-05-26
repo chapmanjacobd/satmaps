@@ -207,6 +207,53 @@ def test_runtime_memory_limits_scale_above_defaults(monkeypatch: object) -> None
     assert ocean.max_in_memory_sieve_mask_pixels() > ocean.DEFAULT_MAX_IN_MEMORY_SIEVE_MASK_PIXELS
 
 
+def test_should_prefetch_tile_bands_fast_paths_skip_land_percentage_calc(
+    monkeypatch: object,
+) -> None:
+    tile_grid = satmaps.TileGrid(
+        projection="EPSG:32631",
+        geotransform=(0.0, 1.0, 0.0, 0.0, 0.0, -1.0),
+        width=10,
+        height=10,
+    )
+
+    def fail(*args, **kwargs):
+        raise AssertionError("land percentage should not be calculated")
+
+    monkeypatch.setattr(satmaps, "estimate_subtile_land_percentage", fail)
+
+    assert satmaps.should_prefetch_tile_bands(100.0, None, tile_grid)
+    assert not satmaps.should_prefetch_tile_bands(0.0, None, tile_grid)
+
+
+def test_should_prefetch_tile_bands_uses_land_percentage_threshold() -> None:
+    tile_grid = satmaps.TileGrid(
+        projection="EPSG:32631",
+        geotransform=(0.0, 1.0, 0.0, 0.0, 0.0, -1.0),
+        width=10,
+        height=10,
+    )
+    mask_slabs = {
+        0: satmaps.OceanMaskSlab(
+            xoff=0,
+            yoff=0,
+            width=10,
+            height=10,
+            alpha_block=np.zeros((10, 10), dtype=np.float32),
+            coverage_block=np.ones((10, 10), dtype=bool),
+            fill_allowed_block=np.vstack(
+                (
+                    np.ones((3, 10), dtype=bool),
+                    np.zeros((7, 10), dtype=bool),
+                )
+            ),
+        )
+    }
+
+    assert satmaps.should_prefetch_tile_bands(20.0, mask_slabs, tile_grid)
+    assert not satmaps.should_prefetch_tile_bands(40.0, mask_slabs, tile_grid)
+
+
 def test_snapped_tile_grid_for_bbox_expands_to_tile_pixel_grid() -> None:
     bbox = (-4.0, 50.0, -3.0, 51.0)
 
@@ -2438,6 +2485,7 @@ def test_process_single_tile_prefetches_all_requested_dates_and_cleans_up(
     args = argparse.Namespace(
         cache=".cache",
         download=False,
+        prefetch_if_land=100.0,
         stats_min=0,
         stats_max=10000,
         tonemap=True,
@@ -2467,9 +2515,9 @@ def test_process_single_tile_prefetches_all_requested_dates_and_cleans_up(
 
     assert out_path is not None
     assert [download for _cache, _date, download, _quiet in band_requests] == [
-        True,
-        True,
         False,
+        True,
+        True,
         False,
         False,
     ]
@@ -2481,7 +2529,7 @@ def test_process_single_tile_prefetches_all_requested_dates_and_cleans_up(
     assert not prefetched_cache_dir.exists()
 
 
-def test_process_single_tile_prefetches_even_for_mostly_ocean_tile(
+def test_process_single_tile_skips_prefetch_when_land_percentage_below_threshold(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -2558,6 +2606,7 @@ def test_process_single_tile_prefetches_even_for_mostly_ocean_tile(
     args = argparse.Namespace(
         cache=".cache",
         download=False,
+        prefetch_if_land=20.0,
         stats_min=0,
         stats_max=10000,
         tonemap=True,
@@ -2581,9 +2630,8 @@ def test_process_single_tile_prefetches_even_for_mostly_ocean_tile(
     out_path = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(ocean_path))
 
     assert out_path is not None
-    assert [download for _cache, download, _quiet in band_requests] == [True, False, False]
-    assert prefetched_cache_dir is not None
-    assert not prefetched_cache_dir.exists()
+    assert [download for _cache, download, _quiet in band_requests] == [False, False]
+    assert prefetched_cache_dir is None
 
 
 def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:

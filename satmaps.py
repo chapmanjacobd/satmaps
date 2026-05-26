@@ -38,6 +38,7 @@ SENTINEL_NODATA = -32768
 PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
 OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
+DEFAULT_PREFETCH_IF_LAND = 100.0
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
 @dataclass(frozen=True)
 class LandWorkUnit:
@@ -293,6 +294,21 @@ def build_tile_prefetch_cache_dir(mgrs_subtile: str, output_path: str) -> str:
     """Return the tile-scoped cache directory used for one worker's prefetched inputs."""
     stem = temp_basename_from_output(output_path)
     return f".temp/{stem}_{mgrs_subtile}_prefetch"
+
+
+def parse_prefetch_if_land(value: str) -> float:
+    """Parse a land-percentage threshold for conditional RGB prefetching."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid prefetch-if-land percentage: {value}"
+        ) from exc
+    if parsed < 0.0 or parsed > 100.0:
+        raise argparse.ArgumentTypeError(
+            f"prefetch-if-land percentage must be between 0 and 100: {value}"
+        )
+    return parsed
 
 
 def describe_land_processing_plan(plan: LandProcessingPlan, num_dates: int) -> str:
@@ -1452,6 +1468,42 @@ def cleanup_prefetched_tile_bands(cache_dir: Optional[str]) -> None:
     shutil.rmtree(cache_dir, ignore_errors=True)
 
 
+def estimate_subtile_land_percentage(
+    mask_slabs: Optional[dict[int, OceanMaskSlab]],
+    tile_grid: TileGrid,
+) -> Optional[float]:
+    """Estimate land coverage percentage from the already warped ocean-mask slabs."""
+    if mask_slabs is None:
+        return None
+
+    total_pixels = tile_grid.width * tile_grid.height
+    if total_pixels <= 0:
+        return 0.0
+
+    land_pixels = sum(
+        int(np.count_nonzero(slab.fill_allowed_block))
+        for slab in mask_slabs.values()
+    )
+    return (land_pixels * 100.0) / total_pixels
+
+
+def should_prefetch_tile_bands(
+    prefetch_if_land: float,
+    mask_slabs: Optional[dict[int, OceanMaskSlab]],
+    tile_grid: TileGrid,
+) -> bool:
+    """Return whether this worker should prefetch its date RGB bands."""
+    if prefetch_if_land >= 100.0:
+        return True
+    if prefetch_if_land <= 0.0:
+        return False
+
+    land_percentage = estimate_subtile_land_percentage(mask_slabs, tile_grid)
+    if land_percentage is None:
+        return True
+    return land_percentage >= prefetch_if_land
+
+
 def open_date_band_sets(
     folders: List[Tuple[str, str]], cache_dir: str
 ) -> List[Tuple[List[gdal.Band], List[gdal.Dataset]]]:
@@ -1903,8 +1955,7 @@ def process_single_tile(
     ocean_mask: Optional[OceanMaskWarp] = None
     fill_allowed_mask: Optional[np.ndarray] = None
     try:
-        prefetch_tile_bands_locally(folders, prefetch_cache_dir)
-        paths = get_tile_paths(first_folder, first_date, prefetch_cache_dir, download=False)
+        paths = get_tile_paths(first_folder, first_date, args.cache, download=False)
         tile_grid = load_tile_grid(paths["red"])
 
         ocean_mask = open_gebco_mask(gebco_src, tile_grid, mgrs_subtile)
@@ -1916,7 +1967,15 @@ def process_single_tile(
                 return None
             processing_window, mask_slabs = collected
 
-        date_band_sets = open_date_band_sets(folders, prefetch_cache_dir)
+        prefetch_if_land = float(
+            getattr(args, "prefetch_if_land", DEFAULT_PREFETCH_IF_LAND)
+        )
+        band_cache_dir = args.cache
+        if should_prefetch_tile_bands(prefetch_if_land, mask_slabs, tile_grid):
+            prefetch_tile_bands_locally(folders, prefetch_cache_dir)
+            band_cache_dir = prefetch_cache_dir
+
+        date_band_sets = open_date_band_sets(folders, band_cache_dir)
         averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
             date_band_sets,
             processing_window,
@@ -2109,6 +2168,16 @@ def main() -> None:
 
     parser.add_argument("--blocksize", type=int, default=512)
     parser.add_argument("--cache", default=".cache", help="Cache directory")
+    parser.add_argument(
+        "--prefetch-if-land",
+        type=parse_prefetch_if_land,
+        default=DEFAULT_PREFETCH_IF_LAND,
+        help=(
+            "Prefetch RGB bands when land coverage is at least this percent. "
+            "100 always prefetches without computing land percentage; "
+            "0 never prefetches and also skips land-percentage calculation."
+        ),
+    )
     parser.add_argument(
         "--ocean-background",
         default="ocean.tif",
