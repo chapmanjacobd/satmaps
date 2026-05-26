@@ -48,6 +48,65 @@ def test_get_tile_paths_returns_s3_paths(monkeypatch: object) -> None:
     )
 
 
+def test_run_with_vsis3_retry_uses_exponential_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    attempts = 0
+
+    monkeypatch.setattr(satmaps.time, "sleep", sleeps.append)
+
+    def flaky_operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 4:
+            raise RuntimeError("HTTP response code: 503")
+        return "ok"
+
+    result = satmaps.run_with_vsis3_retry(
+        flaky_operation,
+        description="list /vsis3/example",
+        max_retries=5,
+        initial_delay_seconds=1.0,
+        max_wait_seconds=6 * 60 * 60,
+    )
+
+    assert result == "ok"
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_run_with_vsis3_retry_caps_total_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(satmaps.time, "sleep", sleeps.append)
+
+    with pytest.raises(
+        RuntimeError,
+        match="after 4 attempts over 6s via GDAL /vsis3 retries",
+    ):
+        satmaps.run_with_vsis3_retry(
+            lambda: (_ for _ in ()).throw(RuntimeError("failed to connect")),
+            description="open /vsis3/example",
+            max_retries=10,
+            initial_delay_seconds=1.0,
+            max_wait_seconds=6.0,
+        )
+
+    assert sleeps == [1.0, 2.0, 3.0]
+
+
+def test_setup_gdal_cdse_configures_vsis3_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    config: dict[str, str] = {}
+
+    def record_config(name: str, value: str) -> None:
+        config[name] = value
+
+    monkeypatch.setattr(satmaps.gdal, "SetConfigOption", record_config)
+
+    satmaps.setup_gdal_cdse()
+
+    assert config["GDAL_HTTP_MAX_RETRY"] == str(satmaps.GDAL_VSIS3_MAX_RETRIES)
+    assert config["GDAL_HTTP_RETRY_DELAY"] == "1"
+    assert config["GDAL_HTTP_RETRY_CODES"] == "429,500,502,503,504"
+
+
 def test_fill_nan_nearest_fills_from_nearest_valid_pixel() -> None:
     arr = np.array(
         [
