@@ -552,9 +552,7 @@ def get_tile_paths(
             src_ds = gdal.Open(s3_path)
             if src_ds is None:
                 raise RuntimeError(f"Could not open {s3_path}")
-            gdal.GetDriverByName("GTiff").CreateCopy(
-                local_path, src_ds, callback=gdal.TermProgress_nocb
-            )
+            gdal.GetDriverByName("GTiff").CreateCopy(local_path, src_ds, callback=None)
             paths[color_name] = local_path
             continue
 
