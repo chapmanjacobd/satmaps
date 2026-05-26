@@ -137,6 +137,49 @@ def test_plan_subtile_work_units_expands_subtiles() -> None:
     ]
 
 
+def test_plan_subtile_work_units_filters_to_available_subtiles() -> None:
+    work_units = satmaps.plan_subtile_work_units(
+        ["31TDF"],
+        {"31TDF_0_1", "31TDF_1_0"},
+    )
+
+    assert [unit.unit_id for unit in work_units] == [
+        "31TDF_0_1",
+        "31TDF_1_0",
+    ]
+
+
+def test_discover_mgrs_bases_reuses_saved_land_mgrs_list(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    land_mgrs_list_path = satmaps.build_land_mgrs_list_path()
+    satmaps.save_land_mgrs_list(
+        land_mgrs_list_path,
+        {"04QFJ", "05QFJ"},
+        bbox=None,
+        ocean_mask_source="gebco.vrt",
+    )
+    monkeypatch.setattr(
+        satmaps,
+        "S3_FOLDER_CACHE",
+        {
+            "2025/07/01": {
+                "Sentinel-2_mosaic_2025_Q3_04QFJ_0_0",
+                "Sentinel-2_mosaic_2025_Q3_31TDF_0_0",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "satmaps.discover_mgrs_tiles_from_ocean_mask",
+        lambda ocean_mask_src, bbox=None, candidate_mgrs_tiles=None: (_ for _ in ()).throw(
+            AssertionError("expected cached land MGRS list to skip ocean scan")
+        ),
+    )
+
+    assert satmaps.discover_mgrs_bases(None, "gebco.vrt", land_mgrs_list_path) == ["04QFJ"]
+
+
 def test_restore_resume_state_returns_none_for_invalid_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
