@@ -11,7 +11,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, TypeVar, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, cast
 
 import mgrs
 from mgrs import core as mgrs_core
@@ -38,27 +38,6 @@ PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
 OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
-GDAL_VSIS3_INITIAL_BACKOFF_SECONDS = 1.0
-GDAL_VSIS3_MAX_RETRIES = 15
-GDAL_VSIS3_MAX_WAIT_SECONDS = 6 * 60 * 60
-GDAL_VSIS3_TRANSIENT_ERROR_MARKERS = (
-    "timed out",
-    "timeout",
-    "temporarily unavailable",
-    "connection reset",
-    "connection timed out",
-    "failed to connect",
-    "could not resolve host",
-    "recv failure",
-    "send failure",
-    "ssl",
-    "http response code: 429",
-    "http response code: 500",
-    "http response code: 502",
-    "http response code: 503",
-    "http response code: 504",
-)
-T = TypeVar("T")
 @dataclass(frozen=True)
 class LandWorkUnit:
     unit_id: str
@@ -466,96 +445,7 @@ def setup_gdal_cdse() -> None:
     gdal.SetConfigOption("GDAL_CACHEMAX", "1024")
     gdal.SetConfigOption("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
     gdal.SetConfigOption("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
-    gdal.SetConfigOption("GDAL_HTTP_MAX_RETRY", str(GDAL_VSIS3_MAX_RETRIES))
-    gdal.SetConfigOption("GDAL_HTTP_RETRY_DELAY", str(int(GDAL_VSIS3_INITIAL_BACKOFF_SECONDS)))
-    gdal.SetConfigOption("GDAL_HTTP_RETRY_CODES", "429,500,502,503,504")
-
-
-def is_vsis3_path(path: str) -> bool:
-    """Return True when a path uses GDAL's /vsis3 virtual filesystem."""
-    return path.startswith("/vsis3/")
-
-
-def is_retryable_vsis3_error(error: RuntimeError) -> bool:
-    """Return True when a /vsis3 runtime error looks transient."""
-    message = str(error).lower()
-    return any(marker in message for marker in GDAL_VSIS3_TRANSIENT_ERROR_MARKERS)
-
-
-def run_with_vsis3_retry(
-    operation: Callable[[], T | None],
-    *,
-    description: str,
-    retry_on_none: bool = False,
-    max_retries: int = GDAL_VSIS3_MAX_RETRIES,
-    initial_delay_seconds: float = GDAL_VSIS3_INITIAL_BACKOFF_SECONDS,
-    max_wait_seconds: float = GDAL_VSIS3_MAX_WAIT_SECONDS,
-) -> T:
-    """Retry transient /vsis3 failures with exponential backoff up to a total wait budget."""
-    if max_retries < 0:
-        raise ValueError("max_retries must be non-negative")
-    if initial_delay_seconds <= 0:
-        raise ValueError("initial_delay_seconds must be positive")
-    if max_wait_seconds <= 0:
-        raise ValueError("max_wait_seconds must be positive")
-
-    retries_used = 0
-    total_sleep_seconds = 0.0
-    delay_seconds = initial_delay_seconds
-    retry_error: RuntimeError | None = None
-
-    while True:
-        try:
-            result = operation()
-        except RuntimeError as error:
-            if not is_retryable_vsis3_error(error):
-                raise
-            retry_error = error
-        else:
-            if result is not None:
-                return result
-            if not retry_on_none:
-                return cast(T, result)
-            retry_error = RuntimeError(f"GDAL returned no result while {description}")
-
-        if retries_used >= max_retries or total_sleep_seconds >= max_wait_seconds:
-            raise RuntimeError(
-                f"Failed to {description} after {retries_used + 1} attempts over "
-                f"{tiler.format_retry_delay(total_sleep_seconds)} via GDAL /vsis3 retries"
-            ) from retry_error
-
-        sleep_seconds = min(delay_seconds, max_wait_seconds - total_sleep_seconds)
-        if sleep_seconds <= 0:
-            raise RuntimeError(
-                f"Failed to {description} after {retries_used + 1} attempts over "
-                f"{tiler.format_retry_delay(total_sleep_seconds)} via GDAL /vsis3 retries"
-            ) from retry_error
-
-        retries_used += 1
-        print(
-            f"GDAL /vsis3 transient error while {description}; retrying in "
-            f"{tiler.format_retry_delay(sleep_seconds)} "
-            f"(attempt {retries_used + 1}/{max_retries + 1})"
-        )
-        time.sleep(sleep_seconds)
-        total_sleep_seconds += sleep_seconds
-        delay_seconds *= 2
-
-
-def open_raster_dataset(path: str, *, description: str) -> gdal.Dataset:
-    """Open a raster dataset, retrying transient /vsis3 failures when applicable."""
-    if not is_vsis3_path(path):
-        dataset = gdal.Open(path)
-        if dataset is None:
-            raise RuntimeError(f"Could not open {description}: {path}")
-        return dataset
-
-    dataset = run_with_vsis3_retry(
-        lambda: gdal.Open(path),
-        description=description,
-        retry_on_none=True,
-    )
-    return dataset
+    gdal.SetConfigOption("GDAL_HTTP_MAX_RETRY", "5")
 
 
 # Global cache for S3 folder listings to avoid per-tile discovery overhead
@@ -594,10 +484,7 @@ def list_mosaic_folders_for_tile(
             # Fallback when the shared S3 cache was not pre-populated: check this folder directly.
             s3_path = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder}"
             try:
-                if run_with_vsis3_retry(
-                    lambda: gdal.ReadDir(s3_path),
-                    description=f"list {s3_path}",
-                ):
+                if gdal.ReadDir(s3_path):
                     found.append((folder, date_path))
             except RuntimeError as exc:
                 print(f"Warning: Could not inspect remote folder {s3_path}: {exc}")
@@ -636,25 +523,12 @@ def get_tile_paths(
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             s3_path = f"{base_s3}/{band_id}.tif"
             print(f"Downloading {s3_path} to {local_path}...")
-            staged_local_path = tiler.build_staged_path(local_path)
-
-            def copy_remote_tile() -> bool:
-                tiler.remove_if_exists(staged_local_path)
-                src_ds = open_raster_dataset(s3_path, description=f"open {s3_path}")
-                copied = gdal.GetDriverByName("GTiff").CreateCopy(
-                    staged_local_path, src_ds, callback=gdal.TermProgress_nocb
-                )
-                src_ds = None
-                if copied is None:
-                    raise RuntimeError(f"GDAL returned no result while copying {s3_path}")
-                copied = None
-                return True
-
-            run_with_vsis3_retry(
-                copy_remote_tile,
-                description=f"copy {s3_path} to {local_path}",
+            src_ds = gdal.Open(s3_path)
+            if src_ds is None:
+                raise RuntimeError(f"Could not open {s3_path}")
+            gdal.GetDriverByName("GTiff").CreateCopy(
+                local_path, src_ds, callback=gdal.TermProgress_nocb
             )
-            tiler.publish_staged_path(staged_local_path, local_path)
             paths[color_name] = local_path
             continue
 
@@ -1347,16 +1221,7 @@ def populate_s3_cache(date_paths: List[str]) -> None:
             started_at,
             f"listing {date_path}...",
         )
-        try:
-            dirs = run_with_vsis3_retry(
-                lambda: gdal.ReadDir(s3_base),
-                description=f"list {s3_base}",
-                retry_on_none=True,
-            )
-        except RuntimeError as exc:
-            progress_line.finish()
-            print(f"Warning: Could not list folders for {date_path}: {exc}")
-            continue
+        dirs = gdal.ReadDir(s3_base)
         if dirs:
             S3_FOLDER_CACHE[date_path] = set(dirs)
             total_folders += len(dirs)
@@ -1409,7 +1274,7 @@ def fill_nan_nearest(
 
 def load_tile_grid(red_path: str) -> TileGrid:
     """Read the common raster grid metadata from the red band."""
-    dataset = open_raster_dataset(red_path, description=f"open raster grid {red_path}")
+    dataset = gdal.Open(red_path)
     tile_grid = TileGrid(
         projection=dataset.GetProjection(),
         geotransform=dataset.GetGeoTransform(),
@@ -1430,10 +1295,9 @@ def open_gebco_mask(
         return None
 
     try:
-        gebco_ds = open_raster_dataset(
-            gebco_src,
-            description=f"open GEBCO source {gebco_src}",
-        )
+        gebco_ds = gdal.Open(gebco_src)
+        if gebco_ds is None:
+            raise RuntimeError(f"Could not open GEBCO source: {gebco_src}")
         band_index = get_ocean_mask_band_index(gebco_ds)
         if band_index is None:
             raise RuntimeError(f"Could not find a usable mask band in: {gebco_src}")
@@ -1574,10 +1438,7 @@ def open_date_band_sets(
             bands: List[gdal.Band] = []
             for band_id, color_name in RGB_BANDS:
                 try:
-                    dataset = open_raster_dataset(
-                        paths[color_name],
-                        description=f"open {color_name} band {band_id} for {folder_name} ({date_path})",
-                    )
+                    dataset = gdal.Open(paths[color_name])
                 except RuntimeError as exc:
                     raise RuntimeError(
                         f"Could not open {color_name} band {band_id} for {folder_name} ({date_path}): {exc}"
