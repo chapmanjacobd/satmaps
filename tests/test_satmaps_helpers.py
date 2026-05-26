@@ -441,13 +441,12 @@ def test_update_count_progress_bases_eta_on_new_work_after_resume(
     assert "Land processing progress: 7/8 (88%); ETA: 10s; 7 raster(s) ready." in out
 
 
-def test_update_count_progress_dampens_late_eta_increases(
+def test_update_count_progress_uses_live_eta(
     monkeypatch: object, capsys: pytest.CaptureFixture[str]
 ) -> None:
     perf_counter_values = iter([101.0, 106.0])
     monkeypatch.setattr(satmaps.time, "perf_counter", lambda: next(perf_counter_values))
     progress_line = satmaps.LiveProgressLine()
-    eta_smoother = satmaps.EtaSmoother()
 
     satmaps.update_count_progress(
         progress_line,
@@ -456,7 +455,6 @@ def test_update_count_progress_dampens_late_eta_increases(
         4,
         100.0,
         "1 raster(s) ready.",
-        eta_smoother=eta_smoother,
     )
     satmaps.update_count_progress(
         progress_line,
@@ -465,13 +463,12 @@ def test_update_count_progress_dampens_late_eta_increases(
         4,
         100.0,
         "2 raster(s) ready.",
-        eta_smoother=eta_smoother,
     )
     progress_line.finish()
 
     out = capsys.readouterr().out
     assert "Land processing progress: 1/4 (25%); ETA: 3s; 1 raster(s) ready." in out
-    assert "Land processing progress: 2/4 (50%); ETA: 2s; 2 raster(s) ready." in out
+    assert "Land processing progress: 2/4 (50%); ETA: 6s; 2 raster(s) ready." in out
 
 
 def test_build_alpha_block_uses_source_mask_without_gebco() -> None:
@@ -682,6 +679,8 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
 
     monkeypatch.setattr(satmaps.gdal, "Open", lambda path: fake_ds)
     monkeypatch.setattr(satmaps, "get_ocean_mask_band_index", lambda ds: 1)
+    monkeypatch.setattr(satmaps, "get_bbox_scan_window", lambda ds, bbox: (7, 0, 53, 40))
+
     def fake_build_dataset_to_wgs84_transform(ds: object) -> None:
         nonlocal transform_builds
         transform_builds += 1
@@ -700,7 +699,7 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
     monkeypatch.setattr(
         satmaps,
         "update_count_progress",
-        lambda progress_line, label, current, total, started_at, detail, completed_before_start=0, eta_smoother=None: progress_updates.append((current, total, detail)),
+        lambda progress_line, label, current, total, started_at, detail, completed_before_start=0: progress_updates.append((current, total, detail)),
     )
 
     assert satmaps.discover_mgrs_tiles_from_ocean_mask(
@@ -708,10 +707,10 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
         candidate_mgrs_tiles={"04QFJ", "04QFK"},
     ) == {"04QFJ", "04QFK"}
     assert fake_band.read_calls == [
-        (0, 0, 80, 10),
-        (0, 10, 80, 10),
-        (0, 20, 80, 10),
-        (0, 30, 80, 10),
+        (7, 0, 53, 10),
+        (7, 10, 53, 10),
+        (7, 20, 53, 10),
+        (7, 30, 53, 10),
     ]
     assert transform_builds == 1
     assert progress_updates == [

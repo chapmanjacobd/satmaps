@@ -36,7 +36,6 @@ SUBTILE_OFFSETS = ((0, 0), (0, 1), (1, 0), (1, 1))
 SENTINEL_NODATA = -32768
 PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
-OCEAN_MASK_SCAN_READ_BLOCKS = 16
 OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
 GDAL_VSIS3_INITIAL_BACKOFF_SECONDS = 1.0
@@ -70,41 +69,6 @@ class LandWorkUnit:
 class LandProcessingPlan:
     mgrs_bases: tuple[str, ...]
     work_units: tuple[LandWorkUnit, ...]
-
-
-@dataclass
-class EtaSmoother:
-    """Keep ETA updates responsive without letting late slowdowns dominate the display."""
-
-    previous_eta_seconds: float | None = None
-    previous_timestamp: float | None = None
-    increase_damping: float = 0.25
-
-    def smooth(self, seconds_remaining: float | None, now: float) -> float | None:
-        """Return a damped ETA that still reacts to real slowdowns."""
-        if seconds_remaining is None or not math.isfinite(seconds_remaining):
-            self.previous_eta_seconds = None
-            self.previous_timestamp = now
-            return None
-
-        bounded_eta = max(0.0, seconds_remaining)
-        if self.previous_eta_seconds is None or self.previous_timestamp is None:
-            self.previous_eta_seconds = bounded_eta
-            self.previous_timestamp = now
-            return bounded_eta
-
-        elapsed_since_update = max(0.0, now - self.previous_timestamp)
-        expected_eta = max(self.previous_eta_seconds - elapsed_since_update, 0.0)
-        if bounded_eta <= expected_eta:
-            smoothed_eta = bounded_eta
-        else:
-            smoothed_eta = expected_eta + (
-                (bounded_eta - expected_eta) * self.increase_damping
-            )
-
-        self.previous_eta_seconds = smoothed_eta
-        self.previous_timestamp = now
-        return smoothed_eta
 
 
 def max_in_memory_write_pixels() -> int:
@@ -219,7 +183,6 @@ def update_count_progress(
     started_at: float,
     detail: str,
     completed_before_start: int = 0,
-    eta_smoother: EtaSmoother | None = None,
 ) -> None:
     """Update a live progress line for count-based work."""
     remaining = None
@@ -229,8 +192,6 @@ def update_count_progress(
     eta_current = min(max(current - completed_before_start, 0), eta_total)
     if eta_current > 0 and eta_total > 0 and elapsed > 0.0:
         remaining = elapsed * (eta_total - eta_current) / eta_current
-    if eta_smoother is not None:
-        remaining = eta_smoother.smooth(remaining, now)
     progress_line.update(
         f"{label} {format_progress(current, total)}; "
         f"{format_eta(remaining, elapsed_seconds=elapsed)}; {detail}"
@@ -243,16 +204,12 @@ def build_gdal_progress_callback(
     started_at: float,
 ) -> Callable[[float, str, object], int]:
     """Adapt GDAL progress updates to the live progress renderer."""
-    eta_smoother = EtaSmoother()
-
     def callback(complete: float, _message: str, _data: object) -> int:
         bounded_complete = min(max(complete, 0.0), 1.0)
         remaining = None
-        now = time.perf_counter()
-        elapsed = now - started_at
+        elapsed = time.perf_counter() - started_at
         if bounded_complete > 0.0 and elapsed > 0.0:
             remaining = elapsed * (1.0 - bounded_complete) / bounded_complete
-        remaining = eta_smoother.smooth(remaining, now)
         progress_line.update(
             f"{step_label} {bounded_complete * 100:3.0f}%; "
             f"{format_eta(remaining, elapsed_seconds=elapsed)}"
@@ -855,6 +812,8 @@ def discover_mgrs_tiles_from_ocean_mask(
     band = ds.GetRasterBand(band_index)
     mgrs_tiles: Set[str] = set()
     block_x, block_y = band.GetBlockSize()
+    row_block_height = max(block_y, 1)
+    process_block_width = max(block_x, 1)
     nodata = band.GetNoDataValue()
     to_wgs84 = build_dataset_to_wgs84_transform(ds)
     geotransform = ds.GetGeoTransform()
@@ -865,74 +824,38 @@ def discover_mgrs_tiles_from_ocean_mask(
     scan_xoff, scan_yoff, scan_width, scan_height = scan_window
 
     candidate_tiles = set(candidate_mgrs_tiles) if candidate_mgrs_tiles else None
-    read_block_span = max(OCEAN_MASK_SCAN_READ_BLOCKS, 1)
-    total_row_blocks = math.ceil(scan_height / block_y) if block_y > 0 else 0
+    total_row_blocks = math.ceil(scan_height / row_block_height) if scan_height > 0 else 0
     total_covered_blocks = (
-        math.ceil(scan_width / block_x) * total_row_blocks
-        if block_x > 0 and block_y > 0
+        math.ceil(scan_width / process_block_width) * total_row_blocks
+        if scan_width > 0
         else 0
     )
-    total_read_windows = (
-        math.ceil(math.ceil(scan_width / block_x) / read_block_span) * total_row_blocks
-        if block_x > 0 and block_y > 0
-        else 0
-    )
-    start_block_x = scan_xoff // block_x
-    end_block_x = (scan_xoff + scan_width - 1) // block_x
 
     completed_row_blocks = 0
-    completed_read_windows = 0
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
 
     print(
         "Ocean mask scan window: "
         f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks "
-        f"covering {total_covered_blocks} blocks via {total_read_windows} read windows."
+        f"covering {total_covered_blocks} blocks via {total_row_blocks} sequential reads."
     )
-    def report_scan_progress() -> None:
-        if total_read_windows > 0:
-            update_count_progress(
-                progress_line,
-                "Ocean mask scan progress:",
-                completed_read_windows,
-                total_read_windows,
-                started_at,
-                f"row blocks {min(completed_row_blocks + 1, total_row_blocks)}/{total_row_blocks}; {len(mgrs_tiles)} tiles found so far.",
-            )
-            return
-        update_count_progress(
-            progress_line,
-            "Ocean mask scan progress:",
-            completed_row_blocks,
-            total_row_blocks,
-            started_at,
-            f"{len(mgrs_tiles)} tiles found so far.",
+    process_width = max(process_block_width * OCEAN_MASK_SCAN_PROCESS_BLOCKS, process_block_width)
+    for block_yoff in range(scan_yoff, scan_yoff + scan_height, row_block_height):
+        block_height = min(row_block_height, ds.RasterYSize - block_yoff)
+        read_data = band.ReadAsArray(
+            scan_xoff,
+            block_yoff,
+            scan_width,
+            block_height,
         )
-
-    read_width = max(block_x * OCEAN_MASK_SCAN_READ_BLOCKS, block_x)
-    process_width = max(block_x * OCEAN_MASK_SCAN_PROCESS_BLOCKS, block_x)
-    for block_yoff in range(scan_yoff, scan_yoff + scan_height, block_y):
-        block_height = min(block_y, ds.RasterYSize - block_yoff)
-        for read_xoff in range(start_block_x * block_x, min((end_block_x + 1) * block_x, ds.RasterXSize), read_width):
-            read_chunk_width = min(
-                read_width,
-                min((end_block_x + 1) * block_x, ds.RasterXSize) - read_xoff,
-            )
-            read_data = band.ReadAsArray(
-                read_xoff,
-                block_yoff,
-                read_chunk_width,
-                block_height,
-            )
-            if read_data is None:
-                continue
+        if read_data is not None:
             read_data = np.asarray(read_data)
-            for process_offset in range(0, read_chunk_width, process_width):
-                process_chunk_width = min(process_width, read_chunk_width - process_offset)
+            for process_offset in range(0, scan_width, process_width):
+                process_chunk_width = min(process_width, scan_width - process_offset)
                 found_tiles = process_ocean_mask_window(
                     read_data[:, process_offset : process_offset + process_chunk_width],
-                    read_xoff + process_offset,
+                    scan_xoff + process_offset,
                     block_yoff,
                     scan_window,
                     geotransform,
@@ -943,9 +866,15 @@ def discover_mgrs_tiles_from_ocean_mask(
                     None,
                 )
                 mgrs_tiles.update(found_tiles)
-            completed_read_windows += 1
-            report_scan_progress()
         completed_row_blocks += 1
+        update_count_progress(
+            progress_line,
+            "Ocean mask scan progress:",
+            completed_row_blocks,
+            total_row_blocks,
+            started_at,
+            f"row blocks {completed_row_blocks}/{total_row_blocks}; {len(mgrs_tiles)} tiles found so far.",
+        )
     progress_line.finish()
     if candidate_tiles is not None:
         mgrs_tiles.intersection_update(candidate_tiles)
@@ -2215,7 +2144,6 @@ def main() -> None:
         ]
         if work_units_to_process:
             completed_before_start = len(completed_units)
-            eta_smoother = EtaSmoother()
             print(
                 f"Starting sub-tile processing for "
                 f"{len(work_units_to_process)} sub-tile(s) "
@@ -2248,7 +2176,6 @@ def main() -> None:
                         started_at,
                         f"{len(processed_tifs)} raster(s) ready.",
                         completed_before_start=completed_before_start,
-                        eta_smoother=eta_smoother,
                     )
                     write_resume_state(
                         state_file,
