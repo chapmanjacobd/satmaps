@@ -638,7 +638,7 @@ def test_discover_mgrs_tiles_from_projected_ocean_mask_uses_batched_reads(
     }
 
 
-def test_discover_mgrs_tiles_from_ocean_mask_stops_after_first_land_per_candidate(
+def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
     monkeypatch: object,
 ) -> None:
     class FakeBand:
@@ -677,29 +677,14 @@ def test_discover_mgrs_tiles_from_ocean_mask_stops_after_first_land_per_candidat
 
     fake_band = FakeBand()
     fake_ds = FakeDataset(fake_band)
-    tile_bounds = {
-        "04QFJ": (0.0, 0.0, 1.0, 1.0),
-        "04QFK": (1.0, 0.0, 2.0, 1.0),
-    }
-    scan_windows = {
-        None: (0, 0, 80, 40),
-        tile_bounds["04QFJ"]: (0, 0, 40, 40),
-        tile_bounds["04QFK"]: (40, 0, 40, 40),
-    }
 
     monkeypatch.setattr(satmaps.gdal, "Open", lambda path: fake_ds)
     monkeypatch.setattr(satmaps, "get_ocean_mask_band_index", lambda ds: 1)
     monkeypatch.setattr(satmaps, "build_dataset_to_wgs84_transform", lambda ds: None)
-    monkeypatch.setattr(satmaps, "get_mgrs_tile_bounds", lambda mgrs_tile: tile_bounds[mgrs_tile])
-    monkeypatch.setattr(
-        satmaps,
-        "get_bbox_scan_window",
-        lambda dataset, bbox: scan_windows[bbox],
-    )
     monkeypatch.setattr(
         satmaps,
         "process_ocean_mask_window",
-        lambda data, xoff, yoff, scan_window, geotransform, nodata, to_wgs84, mgrs_converter, bbox, candidate_tiles: set(candidate_tiles),
+        lambda data, xoff, yoff, scan_window, geotransform, nodata, to_wgs84, mgrs_converter, bbox, candidate_tiles: {"04QFJ", "04QFK", "04QFL"},
     )
 
     assert satmaps.discover_mgrs_tiles_from_ocean_mask(
@@ -707,8 +692,10 @@ def test_discover_mgrs_tiles_from_ocean_mask_stops_after_first_land_per_candidat
         candidate_mgrs_tiles={"04QFJ", "04QFK"},
     ) == {"04QFJ", "04QFK"}
     assert fake_band.read_calls == [
-        (0, 0, 40, 10),
-        (40, 0, 40, 10),
+        (0, 0, 80, 10),
+        (0, 10, 80, 10),
+        (0, 20, 80, 10),
+        (0, 30, 80, 10),
     ]
 
 
