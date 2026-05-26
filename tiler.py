@@ -6,7 +6,7 @@ import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 from osgeo import gdal
@@ -64,12 +64,6 @@ LUMA_RED = 0.2126
 LUMA_GREEN = 0.7152
 LUMA_BLUE = 0.0722
 DEFAULT_MEMORY_RESERVE_BYTES = 1 << 30
-SQLITE_LOCK_BUSY_TIMEOUT_MS = 1000
-SQLITE_LOCK_INITIAL_BACKOFF_SECONDS = 1.0
-SQLITE_LOCK_MAX_RETRIES = 15
-SQLITE_LOCK_MAX_WAIT_SECONDS = 6 * 60 * 60
-
-T = TypeVar("T")
 
 
 def get_available_memory_bytes() -> int:
@@ -589,74 +583,6 @@ def remove_if_exists(path: str) -> None:
             os.remove(path)
 
 
-def format_retry_delay(seconds: float) -> str:
-    """Format a retry delay or elapsed duration for logs."""
-    rounded_seconds = max(0, math.ceil(seconds))
-    hours, remainder = divmod(rounded_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"
-
-
-def is_sqlite_lock_error(error: sqlite3.OperationalError) -> bool:
-    """Return True when an OperationalError reports lock contention."""
-    message = str(error).lower()
-    return "locked" in message or "busy" in message
-
-
-def run_with_sqlite_lock_retry(
-    operation: Callable[[], T],
-    *,
-    description: str,
-    max_retries: int = SQLITE_LOCK_MAX_RETRIES,
-    initial_delay_seconds: float = SQLITE_LOCK_INITIAL_BACKOFF_SECONDS,
-    max_wait_seconds: float = SQLITE_LOCK_MAX_WAIT_SECONDS,
-) -> T:
-    """Retry SQLite lock failures with exponential backoff up to a total wait budget."""
-    if max_retries < 0:
-        raise ValueError("max_retries must be non-negative")
-    if initial_delay_seconds <= 0:
-        raise ValueError("initial_delay_seconds must be positive")
-    if max_wait_seconds <= 0:
-        raise ValueError("max_wait_seconds must be positive")
-
-    retries_used = 0
-    total_sleep_seconds = 0.0
-    delay_seconds = initial_delay_seconds
-
-    while True:
-        try:
-            return operation()
-        except sqlite3.OperationalError as error:
-            if not is_sqlite_lock_error(error):
-                raise
-
-            if retries_used >= max_retries or total_sleep_seconds >= max_wait_seconds:
-                raise RuntimeError(
-                    f"Failed to {description} after {retries_used + 1} attempts over "
-                    f"{format_retry_delay(total_sleep_seconds)} due to SQLite locks"
-                ) from error
-
-            sleep_seconds = min(delay_seconds, max_wait_seconds - total_sleep_seconds)
-            if sleep_seconds <= 0:
-                raise RuntimeError(
-                    f"Failed to {description} after {retries_used + 1} attempts over "
-                    f"{format_retry_delay(total_sleep_seconds)} due to SQLite locks"
-                ) from error
-
-            retries_used += 1
-            print(
-                f"SQLite lock while {description}; retrying in {format_retry_delay(sleep_seconds)} "
-                f"(attempt {retries_used + 1}/{max_retries + 1})"
-            )
-            time.sleep(sleep_seconds)
-            total_sleep_seconds += sleep_seconds
-            delay_seconds *= 2
-
-
 def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     """Merge multiple MBTiles chunks into a single file."""
     if not input_mbtiles:
@@ -672,7 +598,7 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     shutil.copyfile(input_mbtiles[0], output_mbtiles)
 
     conn = sqlite3.connect(output_mbtiles)
-    conn.execute(f"PRAGMA busy_timeout = {SQLITE_LOCK_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA busy_timeout = 30000")  # 30 seconds
     cursor = conn.cursor()
     cursor.execute("PRAGMA synchronous = OFF")
     cursor.execute("PRAGMA journal_mode = MEMORY")
@@ -683,55 +609,52 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
 
     for i, db_path in enumerate(input_mbtiles[1:]):
         alias = f"chunk_{i}"
+
+        # Retry logic for ATTACH in case of locks
         attached = False
-        try:
-            run_with_sqlite_lock_retry(
-                lambda: cursor.execute(f"ATTACH DATABASE '{db_path}' AS {alias}"),
-                description=f"attach {db_path}",
+        for retry in range(5):
+            try:
+                cursor.execute(f"ATTACH DATABASE '{db_path}' AS {alias}")
+                attached = True
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower():
+                    time.sleep(0.5)
+                else:
+                    raise RuntimeError(f"Failed to attach {db_path}: {e}") from e
+
+        if not attached:
+            raise RuntimeError(
+                f"Failed to attach {db_path} after retries due to database locks"
             )
-        except sqlite3.OperationalError as error:
-            raise RuntimeError(f"Failed to attach {db_path}: {error}") from error
-        attached = True
 
         try:
             # Check which tables exist in the source chunk
-            run_with_sqlite_lock_retry(
-                lambda: cursor.execute(
-                    f"SELECT name FROM {alias}.sqlite_master WHERE type='table' AND name='map'"
-                ),
-                description=f"inspect schema for {db_path}",
+            cursor.execute(
+                f"SELECT name FROM {alias}.sqlite_master WHERE type='table' AND name='map'"
             )
             source_has_map = cursor.fetchone() is not None
 
-            def merge_chunk() -> None:
-                if output_has_map and source_has_map:
-                    cursor.execute(f"INSERT OR IGNORE INTO map SELECT * FROM {alias}.map")
-                    cursor.execute(
-                        f"INSERT OR IGNORE INTO images SELECT * FROM {alias}.images"
-                    )
-                else:
-                    # Fallback to inserting into the 'tiles' view/table
-                    # Note: This might not work if 'tiles' is a view without an INSTEAD OF trigger,
-                    # but most chunks should have the same schema.
-                    cursor.execute(
-                        f"INSERT OR IGNORE INTO tiles SELECT * FROM {alias}.tiles"
-                    )
-                conn.commit()
-
-            run_with_sqlite_lock_retry(
-                merge_chunk,
-                description=f"merge {db_path} into {output_mbtiles}",
-            )
-        except sqlite3.OperationalError as error:
+            if output_has_map and source_has_map:
+                cursor.execute(f"INSERT OR IGNORE INTO map SELECT * FROM {alias}.map")
+                cursor.execute(
+                    f"INSERT OR IGNORE INTO images SELECT * FROM {alias}.images"
+                )
+            else:
+                # Fallback to inserting into the 'tiles' view/table
+                # Note: This might not work if 'tiles' is a view without an INSTEAD OF trigger,
+                # but most chunks should have the same schema.
+                cursor.execute(
+                    f"INSERT OR IGNORE INTO tiles SELECT * FROM {alias}.tiles"
+                )
+            conn.commit()
+        except sqlite3.OperationalError as e:
             # If inserting into tiles failed and we have no map table, it's a real error
-            print(f"Warning: Error merging {db_path}: {error}")
+            print(f"Warning: Error merging {db_path}: {e}")
         finally:
             if attached:
                 try:
-                    run_with_sqlite_lock_retry(
-                        lambda: cursor.execute(f"DETACH DATABASE {alias}"),
-                        description=f"detach {db_path}",
-                    )
+                    cursor.execute(f"DETACH DATABASE {alias}")
                 except sqlite3.OperationalError:
                     pass
                 try:

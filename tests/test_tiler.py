@@ -118,65 +118,6 @@ def test_merge_mbtiles_merges_all_attached_tile_tables(tmp_path: Path) -> None:
     ]
 
 
-def test_run_with_sqlite_lock_retry_uses_exponential_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
-    sleeps: list[float] = []
-    attempts = 0
-
-    monkeypatch.setattr(tiler_module.time, "sleep", sleeps.append)
-
-    def flaky_operation() -> str:
-        nonlocal attempts
-        attempts += 1
-        if attempts < 4:
-            raise sqlite3.OperationalError("database is locked")
-        return "merged"
-
-    result = tiler_module.run_with_sqlite_lock_retry(
-        flaky_operation,
-        description="merge chunk",
-        max_retries=5,
-        initial_delay_seconds=1.0,
-        max_wait_seconds=6 * 60 * 60,
-    )
-
-    assert result == "merged"
-    assert sleeps == [1.0, 2.0, 4.0]
-
-
-def test_run_with_sqlite_lock_retry_caps_total_wait(monkeypatch: pytest.MonkeyPatch) -> None:
-    sleeps: list[float] = []
-    monkeypatch.setattr(tiler_module.time, "sleep", sleeps.append)
-
-    def always_locked() -> None:
-        raise sqlite3.OperationalError("database is locked")
-
-    with pytest.raises(RuntimeError, match="after 4 attempts over 6s due to SQLite locks"):
-        tiler_module.run_with_sqlite_lock_retry(
-            always_locked,
-            description="attach chunk",
-            max_retries=10,
-            initial_delay_seconds=1.0,
-            max_wait_seconds=6.0,
-        )
-
-    assert sleeps == [1.0, 2.0, 3.0]
-
-
-def test_run_with_sqlite_lock_retry_does_not_retry_non_lock_errors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sleeps: list[float] = []
-    monkeypatch.setattr(tiler_module.time, "sleep", sleeps.append)
-
-    with pytest.raises(sqlite3.OperationalError, match="no such table"):
-        tiler_module.run_with_sqlite_lock_retry(
-            lambda: (_ for _ in ()).throw(sqlite3.OperationalError("no such table")),
-            description="inspect schema",
-        )
-
-    assert sleeps == []
-
-
 def test_apply_soft_knee_numpy_basics() -> None:
     arr = np.array([0.0, 0.2, 0.5, 0.8, 1.0], dtype=np.float32)
     toned = apply_soft_knee_numpy(
