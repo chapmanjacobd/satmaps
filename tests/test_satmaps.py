@@ -2962,6 +2962,73 @@ def test_main_keeps_ocean_after_processing(
     assert master_vrts[0].exists()
 
 
+def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "satmaps.py",
+            "--refresh-land-mgrs-list",
+            "--bbox",
+            "-158.0,20.8,-157.0,21.7",
+        ],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.resolve_ocean_mask_source", lambda ocean_background: "gebco.vrt")
+    monkeypatch.setattr(
+        "satmaps.discover_mgrs_tiles_in_bbox",
+        lambda min_lon, min_lat, max_lon, max_lat: ["04QFJ", "05QFJ"],
+    )
+    monkeypatch.setattr(
+        "satmaps.discover_mgrs_tiles_from_ocean_mask",
+        lambda ocean_mask_src, bbox=None, candidate_mgrs_tiles=None: {"05QFJ"},
+    )
+    monkeypatch.setattr(
+        "satmaps.prepare_ocean_background_for_output",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("expected --refresh-land-mgrs-list to exit before rendering")
+        ),
+    )
+
+    main()
+
+    assert satmaps.load_saved_land_mgrs_list(
+        satmaps.build_land_mgrs_list_path(),
+        bbox=(-158.0, 20.8, -157.0, 21.7),
+        ocean_mask_source="gebco.vrt",
+    ) == {"05QFJ"}
+    assert list(tmp_path.glob(".temp/master_*.vrt")) == []
+
+
+def test_main_refresh_land_mgrs_list_requires_mask_source(
+    monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "--refresh-land-mgrs-list"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.resolve_ocean_mask_source", lambda ocean_background: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+
+    with pytest.raises(SystemExit, match="1"):
+        main()
+
+    assert (
+        "Error: --refresh-land-mgrs-list requires an ocean background with a usable mask band."
+        in capsys.readouterr().out
+    )
+
+
 @pytest.mark.parametrize(
     ("extra_args", "expect_land_tif_during_pmtiles", "expect_land_tif_after_main"),
     [

@@ -930,16 +930,22 @@ def discover_mgrs_bases(
     bbox: Optional[Tuple[float, float, float, float]],
     gebco_vrt_source: Optional[str],
     land_mgrs_list_path: Optional[str] = None,
+    *,
+    force_refresh: bool = False,
 ) -> List[str]:
     """Resolve the requested MGRS tile list from bbox or the default all-tiles flow."""
     if bbox is not None:
         if gebco_vrt_source:
-            land_mgrs = load_saved_land_mgrs_list(
-                land_mgrs_list_path,
-                bbox=bbox,
-                ocean_mask_source=gebco_vrt_source,
-            )
+            land_mgrs = None
+            if not force_refresh:
+                land_mgrs = load_saved_land_mgrs_list(
+                    land_mgrs_list_path,
+                    bbox=bbox,
+                    ocean_mask_source=gebco_vrt_source,
+                )
             if land_mgrs is None:
+                if force_refresh:
+                    print(f"Force regenerating land MGRS list at {land_mgrs_list_path}...")
                 print("Scanning ocean mask for land tiles within bbox...")
                 min_lon, min_lat, max_lon, max_lat = bbox
                 bbox_candidates = set(discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat))
@@ -975,12 +981,16 @@ def discover_mgrs_bases(
         sys.exit(1)
 
     if gebco_vrt_source:
-        land_mgrs = load_saved_land_mgrs_list(
-            land_mgrs_list_path,
-            bbox=None,
-            ocean_mask_source=gebco_vrt_source,
-        )
+        land_mgrs = None
+        if not force_refresh:
+            land_mgrs = load_saved_land_mgrs_list(
+                land_mgrs_list_path,
+                bbox=None,
+                ocean_mask_source=gebco_vrt_source,
+            )
         if land_mgrs is None:
+            if force_refresh:
+                print(f"Force regenerating land MGRS list at {land_mgrs_list_path}...")
             print("Scanning ocean mask for land tiles...")
             land_mgrs = discover_mgrs_tiles_from_ocean_mask(
                 gebco_vrt_source,
@@ -2246,6 +2256,11 @@ def main() -> None:
         action="store_true",
         help="Delete intermediate land GeoTIFFs after packaging PMTiles",
     )
+    parser.add_argument(
+        "--refresh-land-mgrs-list",
+        action="store_true",
+        help="Force regenerate .temp/land_mgrs.list for the current ocean-mask inputs and exit",
+    )
     args = parser.parse_args()
 
     if args.estimate:
@@ -2259,6 +2274,24 @@ def main() -> None:
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
     land_mgrs_list_path = build_land_mgrs_list_path()
+    if args.refresh_land_mgrs_list and gebco_vrt_source is None:
+        print(
+            "Error: --refresh-land-mgrs-list requires an ocean background with a usable mask band."
+        )
+        sys.exit(1)
+
+    if requested_bbox is None:
+        populate_s3_cache(date_paths)
+
+    if args.refresh_land_mgrs_list:
+        discover_mgrs_bases(
+            requested_bbox,
+            gebco_vrt_source,
+            land_mgrs_list_path,
+            force_refresh=True,
+        )
+        return
+
     unique_id = build_land_run_token(args, date_paths, requested_bbox, gebco_vrt_source)
     state_file = build_state_file_path(unique_id)
     completed_units: Set[str] = set()
@@ -2273,9 +2306,6 @@ def main() -> None:
                 unique_id = cast(str, resume_state["unique_id"])
                 completed_units = cast(Set[str], resume_state["completed_units"])
                 processed_tifs = cast(List[str], resume_state["processed_tifs"])
-
-    if requested_bbox is None:
-        populate_s3_cache(date_paths)
 
     mgrs_bases = discover_mgrs_bases(
         requested_bbox,

@@ -245,6 +245,47 @@ def test_discover_mgrs_bases_intersects_all_tiles_s3_cache_with_mask(monkeypatch
     assert satmaps.discover_mgrs_bases(None, "gebco.vrt") == ["04QFJ"]
 
 
+def test_discover_mgrs_bases_force_refreshes_saved_land_mgrs_list(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    land_mgrs_list_path = satmaps.build_land_mgrs_list_path()
+    satmaps.save_land_mgrs_list(
+        land_mgrs_list_path,
+        {"04QFJ"},
+        bbox=(-158.0, 20.8, -157.0, 21.7),
+        ocean_mask_source="gebco.vrt",
+    )
+    calls: list[tuple[str, tuple[float, float, float, float] | None, set[str] | None]] = []
+
+    def fake_discover(
+        ocean_mask_src: str,
+        bbox: tuple[float, float, float, float] | None = None,
+        candidate_mgrs_tiles: set[str] | None = None,
+    ) -> set[str]:
+        calls.append((ocean_mask_src, bbox, candidate_mgrs_tiles))
+        return {"05QFJ"}
+
+    monkeypatch.setattr("satmaps.discover_mgrs_tiles_from_ocean_mask", fake_discover)
+    monkeypatch.setattr(
+        "satmaps.discover_mgrs_tiles_in_bbox",
+        lambda min_lon, min_lat, max_lon, max_lat: ["04QFJ", "05QFJ"],
+    )
+
+    assert satmaps.discover_mgrs_bases(
+        (-158.0, 20.8, -157.0, 21.7),
+        "gebco.vrt",
+        land_mgrs_list_path,
+        force_refresh=True,
+    ) == ["05QFJ"]
+    assert calls == [("gebco.vrt", (-158.0, 20.8, -157.0, 21.7), {"04QFJ", "05QFJ"})]
+    assert satmaps.load_saved_land_mgrs_list(
+        land_mgrs_list_path,
+        bbox=(-158.0, 20.8, -157.0, 21.7),
+        ocean_mask_source="gebco.vrt",
+    ) == {"05QFJ"}
+
+
 def test_get_mgrs_tile_bounds_returns_known_bbox() -> None:
     assert satmaps.get_mgrs_tile_bounds("04QFJ") == pytest.approx(QFJ_TILE_BOUNDS)
 
