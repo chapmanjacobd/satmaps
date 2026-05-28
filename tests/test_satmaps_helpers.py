@@ -719,7 +719,7 @@ def test_discover_mgrs_tiles_from_projected_ocean_mask_uses_batched_reads(
     }
 
 
-def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_windows(
+def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_row_blocks(
     monkeypatch: object,
 ) -> None:
     class FakeBand:
@@ -769,11 +769,11 @@ def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_windows(
     monkeypatch.setattr(satmaps, "get_bbox_scan_window", lambda ds, bbox: (7, 0, 53, 40))
     monkeypatch.setattr(
         satmaps,
-        "get_mgrs_tile_bounds",
-        lambda mgrs_tile: {
-            "04QFJ": (7.0, -10.0, 17.0, 0.0),
-            "04QFK": (7.0, -20.0, 17.0, -10.0),
-        }.get(mgrs_tile),
+        "build_candidate_ocean_mask_scan_envelopes",
+        lambda dataset, candidate_tiles, bbox=None: [
+            (7.0, 17.0, -10.0, 0.0),
+            (7.0, 17.0, -20.0, -10.0),
+        ],
     )
 
     def fake_build_dataset_to_wgs84_transform(ds: object) -> None:
@@ -791,7 +791,11 @@ def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_windows(
         "process_ocean_mask_window",
         lambda data, xoff, yoff, scan_window, geotransform, nodata, to_wgs84, mgrs_converter, bbox, candidate_tiles: set()
         if candidate_tiles is None
-        else set(candidate_tiles),
+        else {"04QFJ"}
+        if yoff == 0
+        else {"04QFK"}
+        if yoff == 10
+        else set(),
     )
     monkeypatch.setattr(
         satmaps,
@@ -804,13 +808,13 @@ def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_windows(
         candidate_mgrs_tiles={"04QFJ", "04QFK"},
     ) == {"04QFJ", "04QFK"}
     assert fake_band.read_calls == [
-        (7, 0, 10, 10),
-        (7, 10, 10, 10),
+        (7, 0, 53, 10),
+        (7, 10, 53, 10),
     ]
     assert transform_builds == 1
     assert progress_updates == [
-        (1, 2, "candidate windows 1/2; 1 tiles found so far."),
-        (2, 2, "candidate windows 2/2; 2 tiles found so far."),
+        (1, 2, "candidate row blocks 1/2; 1 tiles found so far."),
+        (2, 2, "candidate row blocks 2/2; 2 tiles found so far."),
     ]
 
 
