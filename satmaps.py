@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set,
 import mgrs
 from mgrs import core as mgrs_core
 import numpy as np
+import land_mgrs_utils
 import ocean
 from scipy.ndimage import binary_dilation, distance_transform_edt
 from osgeo import gdal, ogr, osr
@@ -85,7 +86,7 @@ def build_temp_mbtiles_path(output_path: str) -> str:
 
 def build_land_mgrs_list_path() -> str:
     """Return the cached land-MGRS list path used to skip repeat ocean scans."""
-    return ".temp/land_mgrs.list"
+    return "land_mgrs.list"
 
 
 def format_progress(current: int, total: int) -> str:
@@ -848,144 +849,14 @@ def discover_mgrs_tiles_from_ocean_mask(
     bbox: Optional[Tuple[float, float, float, float]] = None,
     candidate_mgrs_tiles: Optional[Set[str]] = None,
 ) -> Set[str]:
-    """Discover MGRS tiles that contain land or shallow water using an existing ocean mask."""
-    ds = gdal.Open(ocean_mask_src)
-    if ds is None:
-        return set()
-
-    band_index = get_ocean_mask_band_index(ds)
-    if band_index is None:
-        return set()
-
-    band = ds.GetRasterBand(band_index)
-    mgrs_tiles: Set[str] = set()
-    block_x, block_y = band.GetBlockSize()
-    row_block_height = max(block_y, 1)
-    process_block_width = max(block_x, 1)
-    nodata = band.GetNoDataValue()
-    to_wgs84 = build_dataset_to_wgs84_transform(ds)
-    geotransform = ds.GetGeoTransform()
-    m = mgrs.MGRS()
-    scan_window = get_bbox_scan_window(ds, bbox)
-    if scan_window is None:
-        return set()
-    scan_xoff, scan_yoff, scan_width, scan_height = scan_window
-
-    candidate_tiles = set(candidate_mgrs_tiles) if candidate_mgrs_tiles else None
-    total_row_blocks = math.ceil(scan_height / row_block_height) if scan_height > 0 else 0
-    total_covered_blocks = (
-        math.ceil(scan_width / process_block_width) * total_row_blocks
-        if scan_width > 0
-        else 0
+    """Discover MGRS tiles that contain land or shallow water from alpha-mask or GEBCO depth sources."""
+    return land_mgrs_utils.discover_mgrs_tiles_from_ocean_mask(
+        ocean_mask_src,
+        bbox=bbox,
+        candidate_mgrs_tiles=candidate_mgrs_tiles,
+        progress_factory=LiveProgressLine,
+        update_count_progress_fn=update_count_progress,
     )
-
-    completed_row_blocks = 0
-    progress_line = LiveProgressLine()
-    started_at = time.perf_counter()
-
-    if candidate_tiles is not None:
-        candidate_scan_envelopes = build_candidate_ocean_mask_scan_envelopes(
-            ds,
-            candidate_tiles,
-            bbox=bbox,
-        )
-        candidate_row_blocks: List[Tuple[int, int]] = []
-        for block_yoff in range(scan_yoff, scan_yoff + scan_height, row_block_height):
-            block_height = min(row_block_height, ds.RasterYSize - block_yoff)
-            block_src_win = (scan_xoff, block_yoff, scan_width, block_height)
-            block_envelope = source_window_envelope(geotransform, block_src_win)
-            if any(
-                envelopes_overlap(block_envelope, candidate_envelope)
-                for candidate_envelope in candidate_scan_envelopes
-            ):
-                candidate_row_blocks.append((block_yoff, block_height))
-
-        print(
-            "Ocean mask scan window: "
-            f"{scan_width}x{scan_height} px across {len(candidate_row_blocks)} candidate row blocks "
-            f"via {len(candidate_row_blocks)} targeted sequential reads."
-        )
-        process_width = max(process_block_width * OCEAN_MASK_SCAN_PROCESS_BLOCKS, process_block_width)
-        for completed_candidates, (block_yoff, block_height) in enumerate(
-            candidate_row_blocks,
-            start=1,
-        ):
-            read_data = band.ReadAsArray(
-                scan_xoff,
-                block_yoff,
-                scan_width,
-                block_height,
-            )
-            if read_data is not None:
-                read_data = np.asarray(read_data)
-                for process_offset in range(0, scan_width, process_width):
-                    process_chunk_width = min(process_width, scan_width - process_offset)
-                    found_tiles = process_ocean_mask_window(
-                        read_data[:, process_offset : process_offset + process_chunk_width],
-                        scan_xoff + process_offset,
-                        block_yoff,
-                        scan_window,
-                        geotransform,
-                        nodata,
-                        to_wgs84,
-                        m,
-                        bbox,
-                        candidate_tiles,
-                    )
-                    mgrs_tiles.update(found_tiles)
-            update_count_progress(
-                progress_line,
-                "Ocean mask scan progress:",
-                completed_candidates,
-                len(candidate_row_blocks),
-                started_at,
-                f"candidate row blocks {completed_candidates}/{len(candidate_row_blocks)}; {len(mgrs_tiles)} tiles found so far.",
-            )
-    else:
-        print(
-            "Ocean mask scan window: "
-            f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks "
-            f"covering {total_covered_blocks} blocks via {total_row_blocks} sequential reads."
-        )
-        process_width = max(process_block_width * OCEAN_MASK_SCAN_PROCESS_BLOCKS, process_block_width)
-        for block_yoff in range(scan_yoff, scan_yoff + scan_height, row_block_height):
-            block_height = min(row_block_height, ds.RasterYSize - block_yoff)
-            read_data = band.ReadAsArray(
-                scan_xoff,
-                block_yoff,
-                scan_width,
-                block_height,
-            )
-            if read_data is not None:
-                read_data = np.asarray(read_data)
-                for process_offset in range(0, scan_width, process_width):
-                    process_chunk_width = min(process_width, scan_width - process_offset)
-                    found_tiles = process_ocean_mask_window(
-                        read_data[:, process_offset : process_offset + process_chunk_width],
-                        scan_xoff + process_offset,
-                        block_yoff,
-                        scan_window,
-                        geotransform,
-                        nodata,
-                        to_wgs84,
-                        m,
-                        bbox,
-                        None,
-                    )
-                    mgrs_tiles.update(found_tiles)
-            completed_row_blocks += 1
-            update_count_progress(
-                progress_line,
-                "Ocean mask scan progress:",
-                completed_row_blocks,
-                total_row_blocks,
-                started_at,
-                f"row blocks {completed_row_blocks}/{total_row_blocks}; {len(mgrs_tiles)} tiles found so far.",
-            )
-    progress_line.finish()
-    if candidate_tiles is not None:
-        mgrs_tiles.intersection_update(candidate_tiles)
-    return mgrs_tiles
 
 
 def discover_mgrs_bases(
@@ -997,6 +868,8 @@ def discover_mgrs_bases(
 ) -> List[str]:
     """Resolve the requested MGRS tile list from bbox or the default all-tiles flow."""
     if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        bbox_candidates = set(discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat))
         if gebco_vrt_source:
             land_mgrs = None
             if not force_refresh:
@@ -1005,12 +878,18 @@ def discover_mgrs_bases(
                     bbox=bbox,
                     ocean_mask_source=gebco_vrt_source,
                 )
+                if land_mgrs is None:
+                    global_land_mgrs = load_saved_land_mgrs_list(
+                        land_mgrs_list_path,
+                        bbox=None,
+                        ocean_mask_source=gebco_vrt_source,
+                    )
+                    if global_land_mgrs is not None:
+                        land_mgrs = global_land_mgrs.intersection(bbox_candidates)
             if land_mgrs is None:
                 if force_refresh:
                     print(f"Force regenerating land MGRS list at {land_mgrs_list_path}...")
-                print("Scanning ocean mask for land tiles within bbox...")
-                min_lon, min_lat, max_lon, max_lat = bbox
-                bbox_candidates = set(discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat))
+                print("Scanning GEBCO for land tiles within bbox...")
                 land_mgrs = discover_mgrs_tiles_from_ocean_mask(
                     gebco_vrt_source,
                     bbox=bbox,
@@ -1022,11 +901,10 @@ def discover_mgrs_bases(
                     bbox=bbox,
                     ocean_mask_source=gebco_vrt_source,
                 )
-            mgrs_bases = sorted(list(land_mgrs))
+            mgrs_bases = sorted(list(land_mgrs.intersection(bbox_candidates)))
             print(f"Discovered {len(mgrs_bases)} MGRS tiles with land/shallow water inside bbox.")
         else:
-            min_lon, min_lat, max_lon, max_lat = bbox
-            mgrs_bases = discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat)
+            mgrs_bases = sorted(list(bbox_candidates))
             print(f"Discovered {len(mgrs_bases)} MGRS tiles in bbox.")
         return mgrs_bases
 
@@ -1038,7 +916,7 @@ def discover_mgrs_bases(
             if len(parts) >= 5:
                 s3_mgrs_set.add(parts[4])
 
-    if not s3_mgrs_set:
+    if not s3_mgrs_set and not (gebco_vrt_source and force_refresh):
         print("Error: non-bbox discovery found no tiles in the S3 cache.")
         sys.exit(1)
 
@@ -1053,10 +931,10 @@ def discover_mgrs_bases(
         if land_mgrs is None:
             if force_refresh:
                 print(f"Force regenerating land MGRS list at {land_mgrs_list_path}...")
-            print("Scanning ocean mask for land tiles...")
+            print("Scanning GEBCO for land tiles...")
             land_mgrs = discover_mgrs_tiles_from_ocean_mask(
                 gebco_vrt_source,
-                candidate_mgrs_tiles=s3_mgrs_set,
+                candidate_mgrs_tiles=s3_mgrs_set if s3_mgrs_set else None,
             )
             save_land_mgrs_list(
                 land_mgrs_list_path,
@@ -1064,9 +942,15 @@ def discover_mgrs_bases(
                 bbox=None,
                 ocean_mask_source=gebco_vrt_source,
             )
-        # Intersection: only tiles that both have land/shallow-water and exist in S3
-        mgrs_bases = sorted(list(land_mgrs.intersection(s3_mgrs_set)))
-        print(f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water after S3 intersection.")
+        if s3_mgrs_set:
+            # Intersection: only tiles that both have land/shallow-water and exist in S3.
+            mgrs_bases = sorted(list(land_mgrs.intersection(s3_mgrs_set)))
+            print(
+                f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water after S3 intersection."
+            )
+        else:
+            mgrs_bases = sorted(list(land_mgrs))
+            print(f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water from GEBCO.")
     else:
         mgrs_bases = sorted(list(s3_mgrs_set))
         print(f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found from S3 cache (no ocean mask provided).")
@@ -1101,11 +985,15 @@ def build_land_mgrs_cache_metadata(
     ocean_mask_source: Optional[str],
 ) -> Dict[str, object]:
     """Return the metadata used to validate a cached land-MGRS list."""
+    if ocean_mask_source is None:
+        normalized_source: Optional[str] = None
+    elif os.path.basename(ocean_mask_source) == ocean.DEFAULT_GEBCO_ZIP:
+        normalized_source = ocean.DEFAULT_GEBCO_ZIP
+    else:
+        normalized_source = os.path.abspath(ocean_mask_source)
     return {
         "bbox": list(bbox) if bbox is not None else None,
-        "ocean_mask_source": (
-            os.path.abspath(ocean_mask_source) if ocean_mask_source is not None else None
-        ),
+        "ocean_mask_source": normalized_source,
     }
 
 
@@ -1163,7 +1051,9 @@ def save_land_mgrs_list(
     if land_mgrs_list_path is None:
         return
 
-    os.makedirs(os.path.dirname(land_mgrs_list_path), exist_ok=True)
+    parent_dir = os.path.dirname(land_mgrs_list_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     temp_path = f"{land_mgrs_list_path}.tmp"
     metadata = build_land_mgrs_cache_metadata(bbox, ocean_mask_source)
     with open(temp_path, "w") as f:
@@ -1234,6 +1124,13 @@ def resolve_ocean_mask_source(ocean_background: str) -> Optional[str]:
 
     dataset = None
     return ocean_background
+
+
+def resolve_land_mgrs_source() -> Optional[str]:
+    """Resolve the GEBCO source used for land/shallow-water MGRS discovery."""
+    if os.path.exists(ocean.DEFAULT_GEBCO_ZIP):
+        return ocean.DEFAULT_GEBCO_ZIP
+    return None
 
 
 def prepare_ocean_background_for_output(
@@ -2191,7 +2088,7 @@ def calculate_estimates(args: argparse.Namespace) -> None:
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     num_dates = len(date_paths)
 
-    gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
+    gebco_vrt_source = resolve_land_mgrs_source()
     land_mgrs_list_path = build_land_mgrs_list_path()
 
     if requested_bbox is None:
@@ -2382,7 +2279,7 @@ def main() -> None:
     parser.add_argument(
         "--refresh-land-mgrs-list",
         action="store_true",
-        help="Force regenerate .temp/land_mgrs.list for the current ocean-mask inputs and exit",
+        help=f"Force regenerate {build_land_mgrs_list_path()} from {ocean.DEFAULT_GEBCO_ZIP} and exit",
     )
     args = parser.parse_args()
 
@@ -2396,24 +2293,25 @@ def main() -> None:
     requested_bbox = parse_bbox(args.bbox) if args.bbox else None
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
+    land_mgrs_source = resolve_land_mgrs_source()
     land_mgrs_list_path = build_land_mgrs_list_path()
-    if args.refresh_land_mgrs_list and gebco_vrt_source is None:
+    if args.refresh_land_mgrs_list and land_mgrs_source is None:
         print(
-            "Error: --refresh-land-mgrs-list requires an ocean background with a usable mask band."
+            f"Error: --refresh-land-mgrs-list requires {ocean.DEFAULT_GEBCO_ZIP} in the current directory."
         )
         sys.exit(1)
-
-    if requested_bbox is None:
-        populate_s3_cache(date_paths)
 
     if args.refresh_land_mgrs_list:
         discover_mgrs_bases(
             requested_bbox,
-            gebco_vrt_source,
+            land_mgrs_source,
             land_mgrs_list_path,
             force_refresh=True,
         )
         return
+
+    if requested_bbox is None:
+        populate_s3_cache(date_paths)
 
     unique_id = build_land_run_token(args, date_paths, requested_bbox, gebco_vrt_source)
     state_file = build_state_file_path(unique_id)
@@ -2432,7 +2330,7 @@ def main() -> None:
 
     mgrs_bases = discover_mgrs_bases(
         requested_bbox,
-        gebco_vrt_source,
+        land_mgrs_source,
         land_mgrs_list_path,
     )
     plan = LandProcessingPlan(

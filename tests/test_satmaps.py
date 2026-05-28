@@ -3196,7 +3196,7 @@ def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
         ],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.resolve_ocean_mask_source", lambda ocean_background: "gebco.vrt")
+    monkeypatch.setattr("satmaps.resolve_land_mgrs_source", lambda: ocean.DEFAULT_GEBCO_ZIP)
     monkeypatch.setattr(
         "satmaps.discover_mgrs_tiles_in_bbox",
         lambda min_lon, min_lat, max_lon, max_lat: ["04QFJ", "05QFJ"],
@@ -3217,7 +3217,7 @@ def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
     assert satmaps.load_saved_land_mgrs_list(
         satmaps.build_land_mgrs_list_path(),
         bbox=(-158.0, 20.8, -157.0, 21.7),
-        ocean_mask_source="gebco.vrt",
+        ocean_mask_source=ocean.DEFAULT_GEBCO_ZIP,
     ) == {"05QFJ"}
     assert list(tmp_path.glob(".temp/master_*.vrt")) == []
 
@@ -3234,14 +3234,14 @@ def test_main_refresh_land_mgrs_list_requires_mask_source(
         ["satmaps.py", "--refresh-land-mgrs-list"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.resolve_ocean_mask_source", lambda ocean_background: None)
+    monkeypatch.setattr("satmaps.resolve_land_mgrs_source", lambda: None)
     monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
 
     with pytest.raises(SystemExit, match="1"):
         main()
 
     assert (
-        "Error: --refresh-land-mgrs-list requires an ocean background with a usable mask band."
+        f"Error: --refresh-land-mgrs-list requires {ocean.DEFAULT_GEBCO_ZIP} in the current directory."
         in capsys.readouterr().out
     )
 

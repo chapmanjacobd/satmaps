@@ -11,6 +11,7 @@ from osgeo import gdal, osr
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import ocean
+import land_mgrs_utils
 import satmaps
 import tiler
 from satmaps import (
@@ -605,6 +606,17 @@ def test_build_fill_allowed_mask_excludes_nodata_pixels() -> None:
     )
 
 
+def test_build_discovery_fill_allowed_mask_depth_mode_uses_shallow_cutoff() -> None:
+    np.testing.assert_array_equal(
+        land_mgrs_utils.build_discovery_fill_allowed_mask(
+            np.array([[-200.0, -50.0, -20.0, 10.0, -32767.0]], dtype=np.float32),
+            nodata=-32767.0,
+            depth_mode=True,
+        ),
+        np.array([[False, True, True, True, False]], dtype=bool),
+    )
+
+
 def test_build_bbox_geometry_reprojects_bbox_to_dataset_srs() -> None:
     web_mercator = osr.SpatialReference()
     web_mercator.ImportFromEPSG(3857)
@@ -764,11 +776,11 @@ def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_row_blocks(
     transform_builds = 0
     progress_updates: list[tuple[int, int, str]] = []
 
-    monkeypatch.setattr(satmaps.gdal, "Open", lambda path: fake_ds)
-    monkeypatch.setattr(satmaps, "get_ocean_mask_band_index", lambda ds: 1)
-    monkeypatch.setattr(satmaps, "get_bbox_scan_window", lambda ds, bbox: (7, 0, 53, 40))
+    monkeypatch.setattr(land_mgrs_utils.gdal, "Open", lambda path: fake_ds)
+    monkeypatch.setattr(land_mgrs_utils, "get_ocean_mask_band_index", lambda ds: 1)
+    monkeypatch.setattr(land_mgrs_utils, "get_bbox_scan_window", lambda ds, bbox: (7, 0, 53, 40))
     monkeypatch.setattr(
-        satmaps,
+        land_mgrs_utils,
         "build_candidate_ocean_mask_scan_envelopes",
         lambda dataset, candidate_tiles, bbox=None: [
             (7.0, 17.0, -10.0, 0.0),
@@ -782,14 +794,14 @@ def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_row_blocks(
         return None
 
     monkeypatch.setattr(
-        satmaps,
+        land_mgrs_utils,
         "build_dataset_to_wgs84_transform",
         fake_build_dataset_to_wgs84_transform,
     )
     monkeypatch.setattr(
-        satmaps,
+        land_mgrs_utils,
         "process_ocean_mask_window",
-        lambda data, xoff, yoff, scan_window, geotransform, nodata, to_wgs84, mgrs_converter, bbox, candidate_tiles: set()
+        lambda data, xoff, yoff, scan_window, geotransform, nodata, to_wgs84, mgrs_converter, bbox, candidate_tiles, depth_mode=False: set()
         if candidate_tiles is None
         else {"04QFJ"}
         if yoff == 0

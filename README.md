@@ -124,6 +124,7 @@ satmaps --estimate
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
 - `--download`: Download source tiles into the cache and exit without building output tiles.
 - `--resume [STATE_FILE]`: Resume a previous run from a saved `.temp/state_*.json`; without a path, the most recent state file is used.
+- `--refresh-land-mgrs-list`: Rebuild `land_mgrs.list` in the repository root from `gebco_2025_sub_ice_topo_geotiff.zip` using the shared shallow-water cutoff (`-50m`) and exit.
 - `--estimate`: Print estimated time, RAM, disk, and network usage, then exit.
 - `--vrt`: Generate the final VRT and exit (useful for inspection in QGIS).
 
