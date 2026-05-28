@@ -2143,11 +2143,12 @@ def main() -> None:
     land_mgrs_module.add_land_mgrs_cli_args(parser)
     args = parser.parse_args()
 
+    setup_gdal_cdse()
+
     if args.estimate:
         calculate_estimates(args)
         return
 
-    setup_gdal_cdse()
     os.makedirs(".temp", exist_ok=True)
 
     requested_bbox = parse_bbox(args.bbox) if args.bbox else None
