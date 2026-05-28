@@ -3198,12 +3198,14 @@ def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     monkeypatch.setattr("satmaps.resolve_land_mgrs_source", lambda: ocean.DEFAULT_GEBCO_ZIP)
     monkeypatch.setattr(
-        "satmaps.discover_mgrs_tiles_in_bbox",
-        lambda min_lon, min_lat, max_lon, max_lat: ["04QFJ", "05QFJ"],
-    )
-    monkeypatch.setattr(
-        "satmaps.discover_mgrs_tiles_from_ocean_mask",
-        lambda ocean_mask_src, bbox=None, candidate_mgrs_tiles=None: {"05QFJ"},
+        "land_mgrs.generate_land_mgrs_list",
+        lambda gebco_zip, destination, bbox=None, force_refresh=False: satmaps.save_land_mgrs_list(
+            destination,
+            {"05QFJ"},
+            bbox=bbox,
+            ocean_mask_source=gebco_zip,
+        )
+        or destination,
     )
     monkeypatch.setattr(
         "satmaps.prepare_ocean_background_for_output",

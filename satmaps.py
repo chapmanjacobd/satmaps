@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set,
 import mgrs
 from mgrs import core as mgrs_core
 import numpy as np
-import land_mgrs_utils
+import land_mgrs as land_mgrs_module
 import ocean
 from scipy.ndimage import binary_dilation, distance_transform_edt
 from osgeo import gdal, ogr, osr
@@ -86,7 +86,7 @@ def build_temp_mbtiles_path(output_path: str) -> str:
 
 def build_land_mgrs_list_path() -> str:
     """Return the cached land-MGRS list path used to skip repeat ocean scans."""
-    return "land_mgrs.list"
+    return land_mgrs_module.build_land_mgrs_list_path()
 
 
 def format_progress(current: int, total: int) -> str:
@@ -850,7 +850,7 @@ def discover_mgrs_tiles_from_ocean_mask(
     candidate_mgrs_tiles: Optional[Set[str]] = None,
 ) -> Set[str]:
     """Discover MGRS tiles that contain land or shallow water from alpha-mask or GEBCO depth sources."""
-    return land_mgrs_utils.discover_mgrs_tiles_from_ocean_mask(
+    return land_mgrs_module.discover_mgrs_tiles_from_ocean_mask(
         ocean_mask_src,
         bbox=bbox,
         candidate_mgrs_tiles=candidate_mgrs_tiles,
@@ -861,101 +861,21 @@ def discover_mgrs_tiles_from_ocean_mask(
 
 def discover_mgrs_bases(
     bbox: Optional[Tuple[float, float, float, float]],
-    gebco_vrt_source: Optional[str],
+    land_mgrs_source: Optional[str],
     land_mgrs_list_path: Optional[str] = None,
     *,
     force_refresh: bool = False,
 ) -> List[str]:
     """Resolve the requested MGRS tile list from bbox or the default all-tiles flow."""
-    if bbox is not None:
-        min_lon, min_lat, max_lon, max_lat = bbox
-        bbox_candidates = set(discover_mgrs_tiles_in_bbox(min_lon, min_lat, max_lon, max_lat))
-        if gebco_vrt_source:
-            land_mgrs = None
-            if not force_refresh:
-                land_mgrs = load_saved_land_mgrs_list(
-                    land_mgrs_list_path,
-                    bbox=bbox,
-                    ocean_mask_source=gebco_vrt_source,
-                )
-                if land_mgrs is None:
-                    global_land_mgrs = load_saved_land_mgrs_list(
-                        land_mgrs_list_path,
-                        bbox=None,
-                        ocean_mask_source=gebco_vrt_source,
-                    )
-                    if global_land_mgrs is not None:
-                        land_mgrs = global_land_mgrs.intersection(bbox_candidates)
-            if land_mgrs is None:
-                if force_refresh:
-                    print(f"Force regenerating land MGRS list at {land_mgrs_list_path}...")
-                print("Scanning GEBCO for land tiles within bbox...")
-                land_mgrs = discover_mgrs_tiles_from_ocean_mask(
-                    gebco_vrt_source,
-                    bbox=bbox,
-                    candidate_mgrs_tiles=bbox_candidates,
-                )
-                save_land_mgrs_list(
-                    land_mgrs_list_path,
-                    land_mgrs,
-                    bbox=bbox,
-                    ocean_mask_source=gebco_vrt_source,
-                )
-            mgrs_bases = sorted(list(land_mgrs.intersection(bbox_candidates)))
-            print(f"Discovered {len(mgrs_bases)} MGRS tiles with land/shallow water inside bbox.")
-        else:
-            mgrs_bases = sorted(list(bbox_candidates))
-            print(f"Discovered {len(mgrs_bases)} MGRS tiles in bbox.")
-        return mgrs_bases
-
-    # Extract unique MGRS tile IDs from the S3 folder cache for the default all-tiles flow.
-    s3_mgrs_set: Set[str] = set()
-    for folders in S3_FOLDER_CACHE.values():
-        for folder in folders:
-            parts = folder.split("_")
-            if len(parts) >= 5:
-                s3_mgrs_set.add(parts[4])
-
-    if not s3_mgrs_set and not (gebco_vrt_source and force_refresh):
-        print("Error: non-bbox discovery found no tiles in the S3 cache.")
-        sys.exit(1)
-
-    if gebco_vrt_source:
-        land_mgrs = None
-        if not force_refresh:
-            land_mgrs = load_saved_land_mgrs_list(
-                land_mgrs_list_path,
-                bbox=None,
-                ocean_mask_source=gebco_vrt_source,
-            )
-        if land_mgrs is None:
-            if force_refresh:
-                print(f"Force regenerating land MGRS list at {land_mgrs_list_path}...")
-            print("Scanning GEBCO for land tiles...")
-            land_mgrs = discover_mgrs_tiles_from_ocean_mask(
-                gebco_vrt_source,
-                candidate_mgrs_tiles=s3_mgrs_set if s3_mgrs_set else None,
-            )
-            save_land_mgrs_list(
-                land_mgrs_list_path,
-                land_mgrs,
-                bbox=None,
-                ocean_mask_source=gebco_vrt_source,
-            )
-        if s3_mgrs_set:
-            # Intersection: only tiles that both have land/shallow-water and exist in S3.
-            mgrs_bases = sorted(list(land_mgrs.intersection(s3_mgrs_set)))
-            print(
-                f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water after S3 intersection."
-            )
-        else:
-            mgrs_bases = sorted(list(land_mgrs))
-            print(f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water from GEBCO.")
-    else:
-        mgrs_bases = sorted(list(s3_mgrs_set))
-        print(f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found from S3 cache (no ocean mask provided).")
-
-    return mgrs_bases
+    return land_mgrs_module.discover_mgrs_bases(
+        bbox,
+        land_mgrs_source,
+        land_mgrs_list_path,
+        force_refresh=force_refresh,
+        s3_folder_cache=S3_FOLDER_CACHE,
+        discover_mgrs_tiles_in_bbox_fn=discover_mgrs_tiles_in_bbox,
+        discover_mgrs_tiles_from_ocean_mask_fn=discover_mgrs_tiles_from_ocean_mask,
+    )
 
 
 def expand_subtiles(mgrs_bases: List[str]) -> List[str]:
@@ -980,64 +900,18 @@ def find_resume_path(resume_arg: object, preferred_path: Optional[str] = None) -
     return max(states, key=os.path.getmtime)
 
 
-def build_land_mgrs_cache_metadata(
-    bbox: Optional[Tuple[float, float, float, float]],
-    ocean_mask_source: Optional[str],
-) -> Dict[str, object]:
-    """Return the metadata used to validate a cached land-MGRS list."""
-    if ocean_mask_source is None:
-        normalized_source: Optional[str] = None
-    elif os.path.basename(ocean_mask_source) == ocean.DEFAULT_GEBCO_ZIP:
-        normalized_source = ocean.DEFAULT_GEBCO_ZIP
-    else:
-        normalized_source = os.path.abspath(ocean_mask_source)
-    return {
-        "bbox": list(bbox) if bbox is not None else None,
-        "ocean_mask_source": normalized_source,
-    }
-
-
 def load_saved_land_mgrs_list(
     land_mgrs_list_path: Optional[str],
     *,
     bbox: Optional[Tuple[float, float, float, float]],
     ocean_mask_source: Optional[str],
 ) -> Optional[Set[str]]:
-    """Load a cached land-MGRS list when it matches the current scan inputs."""
-    if land_mgrs_list_path is None or not file_has_content(land_mgrs_list_path):
-        return None
-
-    expected_metadata = build_land_mgrs_cache_metadata(bbox, ocean_mask_source)
-    try:
-        with open(land_mgrs_list_path, "r") as f:
-            lines = [line.strip() for line in f]
-    except OSError as exc:
-        print(f"Warning: Could not read land MGRS list {land_mgrs_list_path}: {exc}")
-        return None
-
-    if not lines:
-        return None
-
-    header_prefix = "# satmaps-land-mgrs "
-    if not lines[0].startswith(header_prefix):
-        return None
-
-    try:
-        cached_metadata = json.loads(lines[0][len(header_prefix) :])
-    except json.JSONDecodeError as exc:
-        print(f"Warning: Could not parse land MGRS list metadata {land_mgrs_list_path}: {exc}")
-        return None
-
-    if cached_metadata != expected_metadata:
-        return None
-
-    land_mgrs = {
-        line
-        for line in lines[1:]
-        if line and not line.startswith("#")
-    }
-    print(f"Reusing land MGRS list from {land_mgrs_list_path}.")
-    return land_mgrs
+    """Load a cached land-MGRS list via the shared land-MGRS helper module."""
+    return land_mgrs_module.load_saved_land_mgrs_list(
+        land_mgrs_list_path,
+        bbox=bbox,
+        ocean_mask_source=ocean_mask_source,
+    )
 
 
 def save_land_mgrs_list(
@@ -1047,21 +921,13 @@ def save_land_mgrs_list(
     bbox: Optional[Tuple[float, float, float, float]],
     ocean_mask_source: Optional[str],
 ) -> None:
-    """Persist the scanned land-MGRS list so later runs can skip the ocean scan."""
-    if land_mgrs_list_path is None:
-        return
-
-    parent_dir = os.path.dirname(land_mgrs_list_path)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
-    temp_path = f"{land_mgrs_list_path}.tmp"
-    metadata = build_land_mgrs_cache_metadata(bbox, ocean_mask_source)
-    with open(temp_path, "w") as f:
-        f.write(f"# satmaps-land-mgrs {json.dumps(metadata, sort_keys=True)}\n")
-        for mgrs_tile in sorted(land_mgrs):
-            f.write(f"{mgrs_tile}\n")
-    os.replace(temp_path, land_mgrs_list_path)
-    print(f"Saved land MGRS list to {land_mgrs_list_path}.")
+    """Persist the scanned land-MGRS list via the shared land-MGRS helper module."""
+    land_mgrs_module.save_land_mgrs_list(
+        land_mgrs_list_path,
+        land_mgrs,
+        bbox=bbox,
+        ocean_mask_source=ocean_mask_source,
+    )
 
 
 def restore_resume_state(resume_path: str) -> Optional[Dict[str, Any]]:
@@ -1128,9 +994,7 @@ def resolve_ocean_mask_source(ocean_background: str) -> Optional[str]:
 
 def resolve_land_mgrs_source() -> Optional[str]:
     """Resolve the GEBCO source used for land/shallow-water MGRS discovery."""
-    if os.path.exists(ocean.DEFAULT_GEBCO_ZIP):
-        return ocean.DEFAULT_GEBCO_ZIP
-    return None
+    return land_mgrs_module.resolve_land_mgrs_source()
 
 
 def prepare_ocean_background_for_output(
@@ -2276,11 +2140,7 @@ def main() -> None:
         action="store_true",
         help="Delete intermediate land GeoTIFFs after packaging PMTiles",
     )
-    parser.add_argument(
-        "--refresh-land-mgrs-list",
-        action="store_true",
-        help=f"Force regenerate {build_land_mgrs_list_path()} from {ocean.DEFAULT_GEBCO_ZIP} and exit",
-    )
+    land_mgrs_module.add_land_mgrs_cli_args(parser)
     args = parser.parse_args()
 
     if args.estimate:
@@ -2295,19 +2155,12 @@ def main() -> None:
     gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
     land_mgrs_source = resolve_land_mgrs_source()
     land_mgrs_list_path = build_land_mgrs_list_path()
-    if args.refresh_land_mgrs_list and land_mgrs_source is None:
-        print(
-            f"Error: --refresh-land-mgrs-list requires {ocean.DEFAULT_GEBCO_ZIP} in the current directory."
-        )
-        sys.exit(1)
-
-    if args.refresh_land_mgrs_list:
-        discover_mgrs_bases(
-            requested_bbox,
-            land_mgrs_source,
-            land_mgrs_list_path,
-            force_refresh=True,
-        )
+    if land_mgrs_module.handle_land_mgrs_refresh(
+        args,
+        requested_bbox,
+        land_mgrs_source=land_mgrs_source,
+        land_mgrs_list_path=land_mgrs_list_path,
+    ):
         return
 
     if requested_bbox is None:

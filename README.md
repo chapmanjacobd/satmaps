@@ -9,6 +9,7 @@ This repository provides tools to fetch, process, and package Sentinel-2 mosaic 
 ## Core Components
 
 - `satmaps.py`: The primary engine. Handles GDAL S3 configuration, multi-date mosaicking, reprojection to Web Mercator (EPSG:3857), and PMTiles generation. Uses a NumPy-based pipeline for tone mapping and grading.
+- `land_mgrs.py`: Builds and refreshes the reusable `land_mgrs.list` cache from GEBCO so `satmaps` can skip repeat land-tile discovery scans.
 - `ocean.py`: Builds a standalone styled Web Mercator ocean background from GEBCO, with both global and bbox exports targeting a shared configurable Web Mercator output resolution (default zoom 13).
 - `terrain.py`: Builds Terrarium-encoded Web Mercator PMTiles from GEBCO elevation data for `raster-dem` terrain sources.
 - `tuner_ui.py`: A Flask-based interactive web interface to fine-tune tone mapping parameters (exposure, contrast, saturation) in real-time on sample data.
@@ -46,7 +47,21 @@ satmaps-tuner
 ```
 Visit `http://localhost:5001` to adjust exposure, soft-knee curves, and saturation. Note: Requires some data in `.cache/2025-07-01` (e.g., from a small `satmaps` run).
 
-### 2. Generate the Ocean Background
+### 2. Prepare `land_mgrs.list`
+
+Generate the reusable land-tile cache before a bbox run, or anytime `land_mgrs.list` is missing:
+
+```bash
+# Global land/shallow-water cache reused by default all-tiles runs
+land-mgrs
+
+# BBox-specific cache reused by matching satmaps --bbox runs
+land-mgrs --bbox -161,18,-154,23
+```
+
+`land-mgrs` defaults to `gebco_2025_sub_ice_topo_geotiff.zip` and writes `land_mgrs.list` in the current working directory. Re-run it with `--refresh` to force a fresh scan, or pass a different GEBCO zip/output path as positional arguments.
+
+### 3. Generate the Ocean Background
 
 Build the standalone styled ocean background and reuse it as an ocean base layer:
 
@@ -66,7 +81,7 @@ ocean --vrt
 
 The first positional argument is the GEBCO zip path if you need something other than `gebco_2025_sub_ice_topo_geotiff.zip`, and the optional second positional argument is the output path (default: `ocean.tif`, or `ocean.vrt` when `--vrt` is used). Standalone ocean outputs default to Web Mercator zoom 13 (~19.11 m/px at the equator), but can target coarser runs such as zoom 4 for much smaller outputs.
 
-### 3. Generate Terrain PMTiles
+### 4. Generate Terrain PMTiles
 
 Build Terrarium-encoded terrain PMTiles directly from GEBCO:
 
@@ -80,12 +95,16 @@ terrain --bbox -161,18,-154,23 --max-zoom 14 gebco_2025_sub_ice_topo_geotiff.zip
 
 `terrain` keeps the raw GEBCO elevations, including bathymetry, and encodes them as Terrarium PNG tiles suitable for MapLibre `raster-dem` sources such as maps.black.
 
-### 4. Generate Imagery PMTiles
+### 5. Generate Imagery PMTiles
 
 Generate PMTiles for either a bbox subset or the default all-tiles run:
 
 ```bash
+# If land_mgrs.list is missing, build it once before imagery generation
+land-mgrs
+
 # BBox render using either a full-coverage or bbox-matched standalone ocean background
+land-mgrs --bbox -161,18,-154,23
 satmaps --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii.pmtiles
 
 # Lower-data global run using a coarser ocean background and imagery zoom
@@ -98,7 +117,7 @@ make hawaii
 satmaps --ocean-background ocean.tif -o all-tiles.pmtiles
 ```
 
-### 5. Estimate Resources
+### 6. Estimate Resources
 
 Before an all-tiles run, estimate the time and storage required:
 
@@ -124,9 +143,16 @@ satmaps --estimate
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
 - `--download`: Download source tiles into the cache and exit without building output tiles.
 - `--resume [STATE_FILE]`: Resume a previous run from a saved `.temp/state_*.json`; without a path, the most recent state file is used.
-- `--refresh-land-mgrs-list`: Rebuild `land_mgrs.list` in the repository root from `gebco_2025_sub_ice_topo_geotiff.zip` using the shared shallow-water cutoff (`-50m`) and exit.
+- `--refresh-land-mgrs-list`: Rebuild `land_mgrs.list` in the repository root from `gebco_2025_sub_ice_topo_geotiff.zip` using the same generator as `land-mgrs --refresh`, then exit.
 - `--estimate`: Print estimated time, RAM, disk, and network usage, then exit.
 - `--vrt`: Generate the final VRT and exit (useful for inspection in QGIS).
+
+### `land-mgrs` Options
+
+- `--bbox`: Generate a bbox-scoped `land_mgrs.list` for a matching `satmaps --bbox` run.
+- `--refresh`: Force regeneration even when an existing matching `land_mgrs.list` is already present.
+- First positional argument: Optional GEBCO zip path (default: `gebco_2025_sub_ice_topo_geotiff.zip`).
+- Second positional argument: Optional output list path (default: `land_mgrs.list`).
 
 ### Ocean Background Options
 

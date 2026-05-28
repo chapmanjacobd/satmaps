@@ -11,7 +11,7 @@ from osgeo import gdal, osr
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import ocean
-import land_mgrs_utils
+import land_mgrs
 import satmaps
 import tiler
 from satmaps import (
@@ -150,7 +150,7 @@ def test_plan_subtile_work_units_filters_to_available_subtiles() -> None:
     ]
 
 
-def test_discover_mgrs_bases_reuses_saved_land_mgrs_list(
+def test_discover_mgrs_bases_reuses_saved_land_mgrs_list_ignoring_source_metadata(
     tmp_path: Path, monkeypatch: object
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -178,7 +178,7 @@ def test_discover_mgrs_bases_reuses_saved_land_mgrs_list(
         ),
     )
 
-    assert satmaps.discover_mgrs_bases(None, "gebco.vrt", land_mgrs_list_path) == ["04QFJ"]
+    assert satmaps.discover_mgrs_bases(None, "different-gebco.vrt", land_mgrs_list_path) == ["04QFJ"]
 
 
 def test_restore_resume_state_returns_none_for_invalid_json(
@@ -244,6 +244,42 @@ def test_discover_mgrs_bases_intersects_all_tiles_s3_cache_with_mask(monkeypatch
     )
 
     assert satmaps.discover_mgrs_bases(None, "gebco.vrt") == ["04QFJ"]
+
+
+def test_discover_mgrs_bases_ignores_bbox_scoped_cache_for_all_tiles(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    land_mgrs_list_path = satmaps.build_land_mgrs_list_path()
+    satmaps.save_land_mgrs_list(
+        land_mgrs_list_path,
+        {"04QFJ"},
+        bbox=(-158.0, 20.8, -157.0, 21.7),
+        ocean_mask_source="gebco.vrt",
+    )
+    calls: list[tuple[str, tuple[float, float, float, float] | None, set[str] | None]] = []
+
+    def fake_discover(
+        ocean_mask_src: str,
+        bbox: tuple[float, float, float, float] | None = None,
+        candidate_mgrs_tiles: set[str] | None = None,
+    ) -> set[str]:
+        calls.append((ocean_mask_src, bbox, candidate_mgrs_tiles))
+        return {"31TDF"}
+
+    monkeypatch.setattr("satmaps.discover_mgrs_tiles_from_ocean_mask", fake_discover)
+    monkeypatch.setattr(
+        satmaps,
+        "S3_FOLDER_CACHE",
+        {
+            "2025/07/01": {
+                "Sentinel-2_mosaic_2025_Q3_31TDF_0_0",
+            }
+        },
+    )
+
+    assert satmaps.discover_mgrs_bases(None, "gebco.vrt", land_mgrs_list_path) == ["31TDF"]
+    assert calls == [("gebco.vrt", None, {"31TDF"})]
 
 
 def test_discover_mgrs_bases_force_refreshes_saved_land_mgrs_list(
@@ -608,7 +644,7 @@ def test_build_fill_allowed_mask_excludes_nodata_pixels() -> None:
 
 def test_build_discovery_fill_allowed_mask_depth_mode_uses_shallow_cutoff() -> None:
     np.testing.assert_array_equal(
-        land_mgrs_utils.build_discovery_fill_allowed_mask(
+        land_mgrs.build_discovery_fill_allowed_mask(
             np.array([[-200.0, -50.0, -20.0, 10.0, -32767.0]], dtype=np.float32),
             nodata=-32767.0,
             depth_mode=True,
@@ -776,11 +812,11 @@ def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_row_blocks(
     transform_builds = 0
     progress_updates: list[tuple[int, int, str]] = []
 
-    monkeypatch.setattr(land_mgrs_utils.gdal, "Open", lambda path: fake_ds)
-    monkeypatch.setattr(land_mgrs_utils, "get_ocean_mask_band_index", lambda ds: 1)
-    monkeypatch.setattr(land_mgrs_utils, "get_bbox_scan_window", lambda ds, bbox: (7, 0, 53, 40))
+    monkeypatch.setattr(land_mgrs.gdal, "Open", lambda path: fake_ds)
+    monkeypatch.setattr(land_mgrs, "get_ocean_mask_band_index", lambda ds: 1)
+    monkeypatch.setattr(land_mgrs, "get_bbox_scan_window", lambda ds, bbox: (7, 0, 53, 40))
     monkeypatch.setattr(
-        land_mgrs_utils,
+        land_mgrs,
         "build_candidate_ocean_mask_scan_envelopes",
         lambda dataset, candidate_tiles, bbox=None: [
             (7.0, 17.0, -10.0, 0.0),
@@ -794,12 +830,12 @@ def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_row_blocks(
         return None
 
     monkeypatch.setattr(
-        land_mgrs_utils,
+        land_mgrs,
         "build_dataset_to_wgs84_transform",
         fake_build_dataset_to_wgs84_transform,
     )
     monkeypatch.setattr(
-        land_mgrs_utils,
+        land_mgrs,
         "process_ocean_mask_window",
         lambda data, xoff, yoff, scan_window, geotransform, nodata, to_wgs84, mgrs_converter, bbox, candidate_tiles, depth_mode=False: set()
         if candidate_tiles is None
@@ -828,6 +864,48 @@ def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_row_blocks(
         (1, 2, "candidate row blocks 1/2; 1 tiles found so far."),
         (2, 2, "candidate row blocks 2/2; 2 tiles found so far."),
     ]
+
+
+def test_land_mgrs_main_parses_bbox_and_prints_output(
+    monkeypatch: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[tuple[str, str, tuple[float, float, float, float] | None, bool]] = []
+
+    def fake_generate(
+        gebco_zip: str,
+        destination: str,
+        *,
+        bbox: tuple[float, float, float, float] | None = None,
+        force_refresh: bool = False,
+    ) -> str:
+        calls.append((gebco_zip, destination, bbox, force_refresh))
+        return destination
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "land_mgrs.py",
+            "--bbox",
+            "-158.0,20.8,-157.0,21.7",
+            "--refresh",
+            "custom-gebco.zip",
+            "custom-land.list",
+        ],
+    )
+    monkeypatch.setattr(land_mgrs, "generate_land_mgrs_list", fake_generate)
+
+    land_mgrs.main()
+
+    assert calls == [
+        (
+            "custom-gebco.zip",
+            "custom-land.list",
+            (-158.0, 20.8, -157.0, 21.7),
+            True,
+        )
+    ]
+    assert capsys.readouterr().out.strip() == "custom-land.list"
 
 
 def test_build_alpha_block_masks_out_pixels_outside_ocean_render() -> None:
