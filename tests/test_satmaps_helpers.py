@@ -719,7 +719,7 @@ def test_discover_mgrs_tiles_from_projected_ocean_mask_uses_batched_reads(
     }
 
 
-def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
+def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_windows(
     monkeypatch: object,
 ) -> None:
     class FakeBand:
@@ -756,6 +756,9 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
         def GetGeoTransform(self) -> tuple[float, float, float, float, float, float]:
             return (0.0, 1.0, 0.0, 0.0, 0.0, -1.0)
 
+        def GetSpatialRef(self) -> None:
+            return None
+
     fake_band = FakeBand()
     fake_ds = FakeDataset(fake_band)
     transform_builds = 0
@@ -764,6 +767,14 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
     monkeypatch.setattr(satmaps.gdal, "Open", lambda path: fake_ds)
     monkeypatch.setattr(satmaps, "get_ocean_mask_band_index", lambda ds: 1)
     monkeypatch.setattr(satmaps, "get_bbox_scan_window", lambda ds, bbox: (7, 0, 53, 40))
+    monkeypatch.setattr(
+        satmaps,
+        "get_mgrs_tile_bounds",
+        lambda mgrs_tile: {
+            "04QFJ": (7.0, -10.0, 17.0, 0.0),
+            "04QFK": (7.0, -20.0, 17.0, -10.0),
+        }.get(mgrs_tile),
+    )
 
     def fake_build_dataset_to_wgs84_transform(ds: object) -> None:
         nonlocal transform_builds
@@ -778,7 +789,9 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
     monkeypatch.setattr(
         satmaps,
         "process_ocean_mask_window",
-        lambda data, xoff, yoff, scan_window, geotransform, nodata, to_wgs84, mgrs_converter, bbox, candidate_tiles: {"04QFJ", "04QFK", "04QFL"},
+        lambda data, xoff, yoff, scan_window, geotransform, nodata, to_wgs84, mgrs_converter, bbox, candidate_tiles: set()
+        if candidate_tiles is None
+        else set(candidate_tiles),
     )
     monkeypatch.setattr(
         satmaps,
@@ -791,17 +804,13 @@ def test_discover_mgrs_tiles_from_ocean_mask_filters_candidates_after_full_scan(
         candidate_mgrs_tiles={"04QFJ", "04QFK"},
     ) == {"04QFJ", "04QFK"}
     assert fake_band.read_calls == [
-        (7, 0, 53, 10),
-        (7, 10, 53, 10),
-        (7, 20, 53, 10),
-        (7, 30, 53, 10),
+        (7, 0, 10, 10),
+        (7, 10, 10, 10),
     ]
     assert transform_builds == 1
     assert progress_updates == [
-        (1, 4, "row blocks 1/4; 3 tiles found so far."),
-        (2, 4, "row blocks 2/4; 3 tiles found so far."),
-        (3, 4, "row blocks 3/4; 3 tiles found so far."),
-        (4, 4, "row blocks 4/4; 3 tiles found so far."),
+        (1, 2, "candidate windows 1/2; 1 tiles found so far."),
+        (2, 2, "candidate windows 2/2; 2 tiles found so far."),
     ]
 
 

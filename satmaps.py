@@ -738,6 +738,46 @@ def process_ocean_mask_window(
     return mgrs_tiles
 
 
+def intersect_bounds(
+    first: Tuple[float, float, float, float],
+    second: Tuple[float, float, float, float],
+) -> Optional[Tuple[float, float, float, float]]:
+    """Return the overlapping bbox between two lon/lat bounds."""
+    min_lon = max(first[0], second[0])
+    min_lat = max(first[1], second[1])
+    max_lon = min(first[2], second[2])
+    max_lat = min(first[3], second[3])
+    if min_lon >= max_lon or min_lat >= max_lat:
+        return None
+    return (min_lon, min_lat, max_lon, max_lat)
+
+
+def build_candidate_ocean_mask_scan_windows(
+    dataset: gdal.Dataset,
+    candidate_tiles: Set[str],
+    bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> List[Tuple[str, Tuple[int, int, int, int], Tuple[float, float, float, float]]]:
+    """Build targeted source windows for already-known candidate MGRS tiles."""
+    dataset_srs = dataset.GetSpatialRef()
+    scan_windows: List[Tuple[str, Tuple[int, int, int, int], Tuple[float, float, float, float]]] = []
+
+    for mgrs_tile in sorted(candidate_tiles):
+        tile_bounds = get_mgrs_tile_bounds(mgrs_tile)
+        if tile_bounds is None:
+            continue
+        clipped_bounds = tile_bounds if bbox is None else intersect_bounds(tile_bounds, bbox)
+        if clipped_bounds is None:
+            continue
+        tile_geometry = build_bbox_geometry(clipped_bounds, dataset_srs)
+        min_x, max_x, min_y, max_y = tile_geometry.GetEnvelope()
+        src_win = tiler.te_to_src_win(dataset, (min_x, min_y, max_x, max_y))
+        if src_win[2] <= 0 or src_win[3] <= 0:
+            continue
+        scan_windows.append((mgrs_tile, src_win, clipped_bounds))
+
+    return scan_windows
+
+
 def discover_mgrs_tiles_from_ocean_mask(
     ocean_mask_src: str,
     bbox: Optional[Tuple[float, float, float, float]] = None,
@@ -778,46 +818,86 @@ def discover_mgrs_tiles_from_ocean_mask(
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
 
-    print(
-        "Ocean mask scan window: "
-        f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks "
-        f"covering {total_covered_blocks} blocks via {total_row_blocks} sequential reads."
-    )
-    process_width = max(process_block_width * OCEAN_MASK_SCAN_PROCESS_BLOCKS, process_block_width)
-    for block_yoff in range(scan_yoff, scan_yoff + scan_height, row_block_height):
-        block_height = min(row_block_height, ds.RasterYSize - block_yoff)
-        read_data = band.ReadAsArray(
-            scan_xoff,
-            block_yoff,
-            scan_width,
-            block_height,
+    if candidate_tiles is not None:
+        candidate_scan_windows = build_candidate_ocean_mask_scan_windows(
+            ds,
+            candidate_tiles,
+            bbox=bbox,
         )
-        if read_data is not None:
-            read_data = np.asarray(read_data)
-            for process_offset in range(0, scan_width, process_width):
-                process_chunk_width = min(process_width, scan_width - process_offset)
+        print(
+            "Ocean mask scan window: "
+            f"{scan_width}x{scan_height} px across {len(candidate_scan_windows)} candidate windows "
+            f"via {len(candidate_scan_windows)} targeted reads."
+        )
+        for completed_candidates, (mgrs_tile, src_win, clipped_bounds) in enumerate(
+            candidate_scan_windows,
+            start=1,
+        ):
+            xoff, yoff, width, height = src_win
+            read_data = band.ReadAsArray(xoff, yoff, width, height)
+            if read_data is not None:
                 found_tiles = process_ocean_mask_window(
-                    read_data[:, process_offset : process_offset + process_chunk_width],
-                    scan_xoff + process_offset,
-                    block_yoff,
-                    scan_window,
+                    np.asarray(read_data),
+                    xoff,
+                    yoff,
+                    src_win,
                     geotransform,
                     nodata,
                     to_wgs84,
                     m,
-                    bbox,
-                    None,
+                    clipped_bounds,
+                    {mgrs_tile},
                 )
                 mgrs_tiles.update(found_tiles)
-        completed_row_blocks += 1
-        update_count_progress(
-            progress_line,
-            "Ocean mask scan progress:",
-            completed_row_blocks,
-            total_row_blocks,
-            started_at,
-            f"row blocks {completed_row_blocks}/{total_row_blocks}; {len(mgrs_tiles)} tiles found so far.",
+            update_count_progress(
+                progress_line,
+                "Ocean mask scan progress:",
+                completed_candidates,
+                len(candidate_scan_windows),
+                started_at,
+                f"candidate windows {completed_candidates}/{len(candidate_scan_windows)}; {len(mgrs_tiles)} tiles found so far.",
+            )
+    else:
+        print(
+            "Ocean mask scan window: "
+            f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks "
+            f"covering {total_covered_blocks} blocks via {total_row_blocks} sequential reads."
         )
+        process_width = max(process_block_width * OCEAN_MASK_SCAN_PROCESS_BLOCKS, process_block_width)
+        for block_yoff in range(scan_yoff, scan_yoff + scan_height, row_block_height):
+            block_height = min(row_block_height, ds.RasterYSize - block_yoff)
+            read_data = band.ReadAsArray(
+                scan_xoff,
+                block_yoff,
+                scan_width,
+                block_height,
+            )
+            if read_data is not None:
+                read_data = np.asarray(read_data)
+                for process_offset in range(0, scan_width, process_width):
+                    process_chunk_width = min(process_width, scan_width - process_offset)
+                    found_tiles = process_ocean_mask_window(
+                        read_data[:, process_offset : process_offset + process_chunk_width],
+                        scan_xoff + process_offset,
+                        block_yoff,
+                        scan_window,
+                        geotransform,
+                        nodata,
+                        to_wgs84,
+                        m,
+                        bbox,
+                        None,
+                    )
+                    mgrs_tiles.update(found_tiles)
+            completed_row_blocks += 1
+            update_count_progress(
+                progress_line,
+                "Ocean mask scan progress:",
+                completed_row_blocks,
+                total_row_blocks,
+                started_at,
+                f"row blocks {completed_row_blocks}/{total_row_blocks}; {len(mgrs_tiles)} tiles found so far.",
+            )
     progress_line.finish()
     if candidate_tiles is not None:
         mgrs_tiles.intersection_update(candidate_tiles)
