@@ -1299,25 +1299,6 @@ def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
     assert temp_mbtiles == ".temp/output.mbtiles"
 
 
-def test_build_hillshade_command_matches_expected_flags(tmp_path: Path) -> None:
-    command = ocean.build_hillshade_command(
-        str(tmp_path / "in.vrt"),
-        str(tmp_path / "out.tif"),
-        z_factor=5.0,
-    )
-
-    assert command[:7] == [
-        "gdaldem",
-        "hillshade",
-        str(tmp_path / "in.vrt"),
-        str(tmp_path / "out.tif"),
-        "-multidirectional",
-        "-z",
-        "5.0",
-    ]
-    assert "BIGTIFF=YES" in command
-    assert "COMPRESS=ZSTD" in command
-
 
 def test_create_hillshade_tif_uses_gdal_demprocessing(monkeypatch: object, tmp_path: Path) -> None:
     dem_processing_calls: list[tuple[str, str, str, object]] = []

@@ -1,7 +1,6 @@
 import json
 import os
 import sys
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +9,7 @@ from osgeo import gdal, osr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import common
 import ocean
 import land_mgrs
 import satmaps
@@ -19,7 +19,6 @@ from satmaps import (
     build_fill_allowed_mask,
     build_bbox_geometry,
     build_land_run_token,
-    build_progress_checkpoints,
     expand_subtiles,
     find_resume_path,
     format_progress,
@@ -323,31 +322,6 @@ def test_discover_mgrs_bases_force_refreshes_saved_land_mgrs_list(
     ) == {"05QFJ"}
 
 
-def test_get_mgrs_tile_bounds_returns_known_bbox() -> None:
-    assert satmaps.get_mgrs_tile_bounds("04QFJ") == pytest.approx(QFJ_TILE_BOUNDS)
-
-
-def test_get_mgrs_tile_bounds_suppresses_mgrs_runtime_warnings(monkeypatch: object) -> None:
-    class FakeMGRS:
-        def toLatLon(self, code: str) -> tuple[float, float]:
-            warnings.warn(
-                'Warning in "Convert_MGRS_To_Geodetic": Latitude Warning',
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            if code == "31NGJ":
-                return (10.0, 20.0)
-            return (11.0, 21.0)
-
-    monkeypatch.setattr(satmaps.mgrs, "MGRS", FakeMGRS)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        assert satmaps.get_mgrs_tile_bounds("31NGJ") == pytest.approx((20.0, 10.0, 21.0, 11.0))
-
-    assert caught == []
-
-
 def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: object) -> None:
     assert expand_subtiles(["31TDF", "32TLP"]) == [
         "31TDF_0_0",
@@ -461,36 +435,50 @@ def test_recover_processed_tile_output_rebuilds_from_surviving_utm(
     assert not utm_path.exists()
 
 
-@pytest.mark.parametrize("module", [satmaps, ocean, tiler])
-def test_remove_if_exists_prefers_gdal_unlink(monkeypatch: object, module: object) -> None:
+def test_helper_modules_reexport_common_helpers() -> None:
+    assert satmaps.build_staged_path is common.build_staged_path
+    assert satmaps.publish_staged_path is common.publish_staged_path
+    assert satmaps.remove_if_exists is common.remove_if_exists
+    assert satmaps.format_eta is common.format_eta
+    assert satmaps.LiveProgressLine is common.LiveProgressLine
+    assert ocean.build_staged_path is common.build_staged_path
+    assert ocean.publish_staged_path is common.publish_staged_path
+    assert ocean.remove_if_exists is common.remove_if_exists
+    assert ocean.format_eta is common.format_eta
+    assert ocean.LiveProgressLine is common.LiveProgressLine
+    assert tiler.build_staged_path is common.build_staged_path
+    assert tiler.publish_staged_path is common.publish_staged_path
+    assert tiler.remove_if_exists is common.remove_if_exists
+
+
+def test_remove_if_exists_prefers_gdal_unlink(monkeypatch: object) -> None:
     calls: list[str] = []
 
-    monkeypatch.setattr(module.os.path, "exists", lambda path: True)
-    monkeypatch.setattr(module.gdal, "Unlink", lambda path: calls.append(path))
+    monkeypatch.setattr(common.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(common.gdal, "Unlink", lambda path: calls.append(path))
     monkeypatch.setattr(
-        module.os,
+        common.os,
         "remove",
         lambda path: (_ for _ in ()).throw(AssertionError("unexpected os.remove fallback")),
     )
 
-    module.remove_if_exists("output.tif")
+    common.remove_if_exists("output.tif")
 
     assert calls == ["output.tif"]
 
 
-@pytest.mark.parametrize("module", [satmaps, ocean, tiler])
-def test_remove_if_exists_falls_back_to_os_remove(monkeypatch: object, module: object) -> None:
+def test_remove_if_exists_falls_back_to_os_remove(monkeypatch: object) -> None:
     calls: list[str] = []
 
-    monkeypatch.setattr(module.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(common.os.path, "exists", lambda path: True)
 
     def fail_unlink(path: str) -> None:
         raise RuntimeError("unlink failed")
 
-    monkeypatch.setattr(module.gdal, "Unlink", fail_unlink)
-    monkeypatch.setattr(module.os, "remove", lambda path: calls.append(path))
+    monkeypatch.setattr(common.gdal, "Unlink", fail_unlink)
+    monkeypatch.setattr(common.os, "remove", lambda path: calls.append(path))
 
-    module.remove_if_exists("output.tif")
+    common.remove_if_exists("output.tif")
 
     assert calls == ["output.tif"]
 
@@ -510,11 +498,8 @@ def test_iter_processing_windows_uses_full_width_row_slabs() -> None:
     ]
 
 
-def test_format_progress_and_checkpoints_cover_long_runs() -> None:
+def test_format_progress_covers_long_runs() -> None:
     assert format_progress(3, 12) == "3/12 (25%)"
-    assert build_progress_checkpoints(0) == set()
-    assert build_progress_checkpoints(5) == {5}
-    assert build_progress_checkpoints(12) == {2, 3, 4, 5, 6, 8, 9, 10, 11, 12}
 
 
 def test_populate_s3_cache_reports_progress(

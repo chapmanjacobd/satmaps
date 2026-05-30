@@ -3,6 +3,7 @@ import argparse
 import os
 import uuid
 
+from common import build_staged_path, publish_staged_path, remove_if_exists
 from osgeo import gdal
 
 import ocean
@@ -58,8 +59,8 @@ def generate_terrain_pmtiles(
         warp_kwargs["xRes"] = pixel_size
         warp_kwargs["yRes"] = pixel_size
 
-    staged_warped_vrt = ocean.build_staged_path(warped_vrt)
-    ocean.remove_if_exists(staged_warped_vrt)
+    staged_warped_vrt = build_staged_path(warped_vrt)
+    remove_if_exists(staged_warped_vrt)
     warped_ds = gdal.Warp(
         staged_warped_vrt,
         source_vrt,
@@ -68,7 +69,7 @@ def generate_terrain_pmtiles(
     if warped_ds is None:
         raise RuntimeError(f"Could not warp GEBCO terrain into Web Mercator: {warped_vrt}")
     warped_ds = None
-    ocean.publish_staged_path(staged_warped_vrt, warped_vrt)
+    publish_staged_path(staged_warped_vrt, warped_vrt)
 
     packaged_tiles = satmaps.convert_raster_to_pmtiles(
         warped_vrt,
@@ -91,7 +92,7 @@ def generate_terrain_pmtiles(
         packaged_tiles.temp_mbtiles,
         *packaged_tiles.tiling_artifacts.cleanup_paths,
     ]:
-        ocean.remove_if_exists(path)
+        remove_if_exists(path)
 
     return destination
 

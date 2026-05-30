@@ -3,7 +3,6 @@ import argparse
 import glob
 import hashlib
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -17,6 +16,14 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set,
 import mgrs
 from mgrs import core as mgrs_core
 import numpy as np
+from common import (
+    LiveProgressLine,
+    build_staged_path,
+    file_has_content,
+    format_eta,
+    publish_staged_path,
+    remove_if_exists,
+)
 import land_mgrs as land_mgrs_module
 import ocean
 from scipy.ndimage import binary_dilation, distance_transform_edt
@@ -122,70 +129,6 @@ def format_progress(current: int, total: int) -> str:
     bounded_current = min(max(current, 0), total)
     percent = round((bounded_current / total) * 100)
     return f"{bounded_current}/{total} ({percent}%)"
-
-
-def build_progress_checkpoints(total_steps: int) -> set[int]:
-    """Return coarse progress checkpoints that keep long runs chatty but not noisy."""
-    if total_steps <= 0:
-        return set()
-    checkpoints = {total_steps}
-    if total_steps < 10:
-        return checkpoints
-    for percent in range(10, 100, 10):
-        checkpoints.add(max(1, math.ceil(total_steps * percent / 100)))
-    return checkpoints
-
-
-def format_eta(
-    seconds_remaining: float | None,
-    *,
-    elapsed_seconds: float | None = None,
-) -> str:
-    """Return a short ETA string for progress logging."""
-    if seconds_remaining is None or not math.isfinite(seconds_remaining):
-        return "ETA: calculating..."
-
-    rounded_seconds = max(0, round(seconds_remaining))
-    if rounded_seconds == 0 and elapsed_seconds is not None and math.isfinite(elapsed_seconds):
-        rounded_elapsed = max(0, round(elapsed_seconds))
-        hours, remainder = divmod(rounded_elapsed, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        if hours:
-            return f"Elapsed: {hours}h {minutes}m"
-        if minutes:
-            return f"Elapsed: {minutes}m {seconds}s"
-        return f"Elapsed: {seconds}s"
-    hours, remainder = divmod(rounded_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"ETA: {hours}h {minutes}m"
-    if minutes:
-        return f"ETA: {minutes}m {seconds}s"
-    return f"ETA: {seconds}s"
-
-
-class LiveProgressLine:
-    """Render a single in-place progress line."""
-
-    def __init__(self) -> None:
-        self._active = False
-        self._last_width = 0
-
-    def update(self, message: str) -> None:
-        padded_message = message
-        if len(message) < self._last_width:
-            padded_message += " " * (self._last_width - len(message))
-        else:
-            self._last_width = len(message)
-        print(f"\r{padded_message}", end="", flush=True)
-        self._active = True
-
-    def finish(self) -> None:
-        if not self._active:
-            return
-        print()
-        self._active = False
-        self._last_width = 0
 
 
 def update_count_progress(
@@ -472,37 +415,6 @@ def build_land_run_token(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
 
 
-def build_staged_path(path: str) -> str:
-    """Return the hidden staging path used before atomically publishing a file."""
-    directory, basename = os.path.split(path)
-    return os.path.join(directory, f".temp_{basename}")
-
-
-def file_has_content(path: str) -> bool:
-    """Return True when a path exists and has non-zero size."""
-    try:
-        return os.path.isfile(path) and os.path.getsize(path) > 0
-    except OSError:
-        return False
-
-
-def publish_staged_path(staged_path: str, final_path: str) -> str:
-    """Atomically publish a staged file under its final name."""
-    if not file_has_content(staged_path):
-        raise RuntimeError(f"Refusing to publish empty staged file: {staged_path}")
-    os.replace(staged_path, final_path)
-    return final_path
-
-
-def remove_if_exists(path: str) -> None:
-    """Delete a file if it exists."""
-    if os.path.exists(path):
-        try:
-            gdal.Unlink(path)
-        except RuntimeError:
-            os.remove(path)
-
-
 @dataclass(frozen=True)
 class TileGrid:
     projection: str
@@ -707,118 +619,6 @@ def build_bbox_geometry(
     return polygon
 
 
-def get_mgrs_tile_bounds(mgrs_tile: str) -> Optional[Tuple[float, float, float, float]]:
-    """Return a lon/lat bbox for a 100 km MGRS tile."""
-    m_converter = mgrs.MGRS()
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            min_lat, min_lon = m_converter.toLatLon(mgrs_tile)
-            max_lat, max_lon = m_converter.toLatLon(f"{mgrs_tile}9999999999")
-    except mgrs_core.MGRSError:
-        return None
-    if not all(
-        math.isfinite(value)
-        for value in (float(min_lat), float(min_lon), float(max_lat), float(max_lon))
-    ):
-        return None
-    return (
-        min(float(min_lon), float(max_lon)),
-        min(float(min_lat), float(max_lat)),
-        max(float(min_lon), float(max_lon)),
-        max(float(min_lat), float(max_lat)),
-    )
-
-
-def process_ocean_mask_window(
-    data: np.ndarray,
-    xoff: int,
-    yoff: int,
-    scan_window: Tuple[int, int, int, int],
-    geotransform: Sequence[float],
-    nodata: Optional[float],
-    to_wgs84: Optional[osr.CoordinateTransformation],
-    mgrs_converter: mgrs.MGRS,
-    bbox: Optional[Tuple[float, float, float, float]],
-    candidate_tiles: Optional[Set[str]],
-) -> Set[str]:
-    """Classify one in-memory mask window into intersecting MGRS tiles."""
-    scan_xoff, scan_yoff, scan_width, scan_height = scan_window
-    width = data.shape[1]
-    height = data.shape[0]
-
-    if candidate_tiles is None:
-        clipped_xoff = max(xoff, scan_xoff)
-        clipped_yoff = max(yoff, scan_yoff)
-        clipped_max_x = min(xoff + width, scan_xoff + scan_width)
-        clipped_max_y = min(yoff + height, scan_yoff + scan_height)
-        data = data[
-            clipped_yoff - yoff : clipped_max_y - yoff,
-            clipped_xoff - xoff : clipped_max_x - xoff,
-        ]
-        xoff = clipped_xoff
-        yoff = clipped_yoff
-        width = clipped_max_x - clipped_xoff
-        height = clipped_max_y - clipped_yoff
-        if width <= 0 or height <= 0:
-            return set()
-    elif width <= 0 or height <= 0:
-        return set()
-
-    fill_allowed_mask = build_fill_allowed_mask(data, nodata_value=nodata)
-    if not np.any(fill_allowed_mask):
-        return set()
-
-    rows, cols = np.nonzero(fill_allowed_mask)
-    pixel_x = xoff + cols.astype(np.float64) + 0.5
-    pixel_y = yoff + rows.astype(np.float64) + 0.5
-    xs = (
-        geotransform[0]
-        + pixel_x * geotransform[1]
-        + pixel_y * geotransform[2]
-    )
-    ys = (
-        geotransform[3]
-        + pixel_x * geotransform[4]
-        + pixel_y * geotransform[5]
-    )
-
-    if to_wgs84 is None:
-        lons = xs
-        lats = ys
-    else:
-        transformed_points = to_wgs84.TransformPoints(
-            list(zip(xs.tolist(), ys.tolist(), strict=False))
-        )
-        lons = np.array([point[0] for point in transformed_points], dtype=np.float64)
-        lats = np.array([point[1] for point in transformed_points], dtype=np.float64)
-
-    if bbox is not None:
-        min_lon, min_lat, max_lon, max_lat = bbox
-        in_bbox = (
-            (lons >= min_lon)
-            & (lons <= max_lon)
-            & (lats >= min_lat)
-            & (lats <= max_lat)
-        )
-        if not np.any(in_bbox):
-            return set()
-        lons = lons[in_bbox]
-        lats = lats[in_bbox]
-
-    mgrs_tiles: Set[str] = set()
-    for lon, lat in zip(lons, lats, strict=False):
-        try:
-            tile = mgrs_converter.toMGRS(float(lat), float(lon), MGRSPrecision=0)
-            tile_str = tile.decode() if isinstance(tile, bytes) else tile
-            if candidate_tiles is not None and tile_str not in candidate_tiles:
-                continue
-            mgrs_tiles.add(tile_str)
-        except mgrs_core.MGRSError:
-            continue
-    return mgrs_tiles
-
-
 def build_mgrs_tile_geometry(
     mgrs_tile: str,
     target_srs: Optional[osr.SpatialReference] = None,
@@ -857,71 +657,6 @@ def build_mgrs_tile_geometry(
             polygon.Transform(osr.CoordinateTransformation(wgs84_srs, dataset_srs))
 
     return polygon
-
-
-def build_candidate_ocean_mask_scan_envelopes(
-    dataset: gdal.Dataset,
-    candidate_tiles: Set[str],
-    bbox: Optional[Tuple[float, float, float, float]] = None,
-) -> List[Tuple[float, float, float, float]]:
-    """Build candidate tile envelopes in dataset coordinates for block prefiltering."""
-    dataset_srs = dataset.GetSpatialRef()
-    bbox_geometry = build_bbox_geometry(bbox, dataset_srs) if bbox is not None else None
-    scan_envelopes: List[Tuple[float, float, float, float]] = []
-
-    for mgrs_tile in sorted(candidate_tiles):
-        tile_geometry = build_mgrs_tile_geometry(mgrs_tile, dataset_srs)
-        if tile_geometry is None:
-            continue
-        if bbox_geometry is not None:
-            if not tile_geometry.Intersects(bbox_geometry):
-                continue
-            tile_geometry = tile_geometry.Intersection(bbox_geometry)
-            if tile_geometry is None or tile_geometry.IsEmpty():
-                continue
-        min_x, max_x, min_y, max_y = tile_geometry.GetEnvelope()
-        if min_x >= max_x or min_y >= max_y:
-            continue
-        scan_envelopes.append((min_x, max_x, min_y, max_y))
-
-    return scan_envelopes
-
-
-def source_window_envelope(
-    geotransform: Sequence[float],
-    src_win: Tuple[int, int, int, int],
-) -> Tuple[float, float, float, float]:
-    """Return the dataset-space envelope for a source pixel window."""
-    xoff, yoff, width, height = src_win
-    pixel_corners = (
-        (float(xoff), float(yoff)),
-        (float(xoff + width), float(yoff)),
-        (float(xoff + width), float(yoff + height)),
-        (float(xoff), float(yoff + height)),
-    )
-    world_corners = [
-        (
-            geotransform[0] + pixel_x * geotransform[1] + pixel_y * geotransform[2],
-            geotransform[3] + pixel_x * geotransform[4] + pixel_y * geotransform[5],
-        )
-        for pixel_x, pixel_y in pixel_corners
-    ]
-    xs = [point[0] for point in world_corners]
-    ys = [point[1] for point in world_corners]
-    return min(xs), max(xs), min(ys), max(ys)
-
-
-def envelopes_overlap(
-    first: Tuple[float, float, float, float],
-    second: Tuple[float, float, float, float],
-) -> bool:
-    """Return True when two (min_x, max_x, min_y, max_y) envelopes overlap."""
-    return not (
-        first[1] <= second[0]
-        or first[0] >= second[1]
-        or first[3] <= second[2]
-        or first[2] >= second[3]
-    )
 
 
 def discover_mgrs_tiles_from_ocean_mask(
@@ -1182,26 +917,6 @@ def get_ocean_mask_band_index(dataset: gdal.Dataset) -> Optional[int]:
             return band_index
 
     return None
-
-
-def build_dataset_to_wgs84_transform(dataset: gdal.Dataset) -> Optional[osr.CoordinateTransformation]:
-    """Build a dataset-to-lon/lat transform when the raster is not already in WGS84."""
-    dataset_srs = dataset.GetSpatialRef()
-    if dataset_srs is None:
-        return None
-
-    dataset_srs = dataset_srs.Clone()
-    wgs84_srs = osr.SpatialReference()
-    wgs84_srs.ImportFromEPSG(4326)
-
-    if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
-        wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-
-    if dataset_srs.IsSameGeogCS(wgs84_srs) and dataset_srs.IsGeographic():
-        return None
-
-    return osr.CoordinateTransformation(dataset_srs, wgs84_srs)
 
 
 def get_bbox_scan_window(
@@ -1921,22 +1636,6 @@ def recover_processed_tile_output(
     publish_staged_path(staged_3857_path, temp_3857_path)
     remove_if_exists(temp_utm_path)
     return temp_3857_path
-
-
-def recover_processed_tile_outputs(
-    subtiles: List[str],
-    args: argparse.Namespace,
-) -> Tuple[Set[str], List[str]]:
-    """Collect reusable Web Mercator temp outputs for the requested sub-tiles."""
-    recovered_subtiles: Set[str] = set()
-    recovered_paths: List[str] = []
-    for mgrs_subtile in subtiles:
-        recovered_path = recover_processed_tile_output(mgrs_subtile, args)
-        if recovered_path is None:
-            continue
-        recovered_subtiles.add(mgrs_subtile)
-        recovered_paths.append(recovered_path)
-    return recovered_subtiles, recovered_paths
 
 
 def recover_processed_work_outputs(

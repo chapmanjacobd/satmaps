@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
+from common import build_staged_path, file_has_content, publish_staged_path, remove_if_exists
 from osgeo import gdal
 from PIL import Image
 
@@ -854,37 +855,6 @@ def process_chunk(args: ChunkTask) -> str:
         if os.path.exists(temp_chunk_rgb):
             os.remove(temp_chunk_rgb)
         remove_if_exists(staged_chunk_file)
-
-
-def build_staged_path(path: str) -> str:
-    """Return the hidden staging path used before atomically publishing a file."""
-    directory, basename = os.path.split(path)
-    return os.path.join(directory, f".temp_{basename}")
-
-
-def file_has_content(path: str) -> bool:
-    """Return True when a path exists and has non-zero size."""
-    try:
-        return os.path.isfile(path) and os.path.getsize(path) > 0
-    except OSError:
-        return False
-
-
-def publish_staged_path(staged_path: str, final_path: str) -> str:
-    """Atomically publish a staged file under its final name."""
-    if not file_has_content(staged_path):
-        raise RuntimeError(f"Refusing to publish empty staged file: {staged_path}")
-    os.replace(staged_path, final_path)
-    return final_path
-
-
-def remove_if_exists(path: str) -> None:
-    """Delete a file if it exists."""
-    if os.path.exists(path):
-        try:
-            gdal.Unlink(path)
-        except RuntimeError:
-            os.remove(path)
 
 
 def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:

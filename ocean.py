@@ -2,7 +2,6 @@
 import argparse
 import hashlib
 import json
-import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,7 +12,15 @@ from typing import Callable, Sequence, TypeVar
 from xml.sax.saxutils import escape
 
 import numpy as np
-from osgeo import gdal, ogr
+from common import (
+    LiveProgressLine,
+    build_staged_path,
+    file_has_content,
+    format_eta,
+    publish_staged_path,
+    remove_if_exists,
+)
+from osgeo import gdal
 from scipy.ndimage import label
 
 from tiler import (
@@ -76,58 +83,6 @@ TEMPORARY_TILED_GTIFF_OPTIONS = (
 )
 
 T = TypeVar("T")
-
-
-def format_eta(
-    seconds_remaining: float | None,
-    *,
-    elapsed_seconds: float | None = None,
-) -> str:
-    """Return a short ETA string for progress logging."""
-    if seconds_remaining is None or not math.isfinite(seconds_remaining):
-        return "ETA: calculating..."
-
-    rounded_seconds = max(0, round(seconds_remaining))
-    if rounded_seconds == 0 and elapsed_seconds is not None and math.isfinite(elapsed_seconds):
-        rounded_elapsed = max(0, round(elapsed_seconds))
-        hours, remainder = divmod(rounded_elapsed, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        if hours:
-            return f"Elapsed: {hours}h {minutes}m"
-        if minutes:
-            return f"Elapsed: {minutes}m {seconds}s"
-        return f"Elapsed: {seconds}s"
-    hours, remainder = divmod(rounded_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"ETA: {hours}h {minutes}m"
-    if minutes:
-        return f"ETA: {minutes}m {seconds}s"
-    return f"ETA: {seconds}s"
-
-
-class LiveProgressLine:
-    """Render a single in-place progress line without hiding later errors."""
-
-    def __init__(self) -> None:
-        self._active = False
-        self._last_width = 0
-
-    def update(self, message: str) -> None:
-        padded_message = message
-        if len(message) < self._last_width:
-            padded_message += " " * (self._last_width - len(message))
-        else:
-            self._last_width = len(message)
-        print(f"\r{padded_message}", end="", flush=True)
-        self._active = True
-
-    def finish(self) -> None:
-        if not self._active:
-            return
-        print()
-        self._active = False
-        self._last_width = 0
 
 
 def build_step_progress_callback(
@@ -281,28 +236,6 @@ def max_in_memory_sieve_mask_pixels() -> int:
         fallback_pixels=DEFAULT_MAX_IN_MEMORY_SIEVE_MASK_PIXELS,
         max_pixels=1_500_000_000,
     )
-
-
-def build_staged_path(path: str) -> str:
-    """Return the hidden staging path used before atomically publishing a file."""
-    directory, basename = os.path.split(path)
-    return os.path.join(directory, f".temp_{basename}")
-
-
-def file_has_content(path: str) -> bool:
-    """Return True when a path exists and has non-zero size."""
-    try:
-        return os.path.isfile(path) and os.path.getsize(path) > 0
-    except OSError:
-        return False
-
-
-def publish_staged_path(staged_path: str, final_path: str) -> str:
-    """Atomically publish a staged file under its final name."""
-    if not file_has_content(staged_path):
-        raise RuntimeError(f"Refusing to publish empty staged file: {staged_path}")
-    os.replace(staged_path, final_path)
-    return final_path
 
 
 def choose_ocean_parallel_workers(parallel: int | None, chunk_count: int) -> int:
@@ -694,75 +627,6 @@ def create_sieve_cleanup_mask_dataset(
     return land_mask_ds, staged_cleanup_mask
 
 
-def remove_small_enclosed_ocean_regions_vector(
-    alpha_dataset: gdal.Dataset,
-    alpha_band: gdal.Band,
-    geotransform: Sequence[float],
-    max_area_sq_m: float,
-    vector_path: Path,
-) -> None:
-    """Remove small enclosed ocean polygons without loading the whole mask into memory."""
-    vector_driver = ogr.GetDriverByName("GPKG")
-    if vector_driver is None:
-        raise RuntimeError("Could not load OGR GPKG driver for ocean mask cleanup")
-    if vector_path.exists():
-        vector_driver.DeleteDataSource(str(vector_path))
-
-    vector_ds = vector_driver.CreateDataSource(str(vector_path))
-    if vector_ds is None:
-        raise RuntimeError(f"Could not create temporary vector dataset: {vector_path}")
-
-    spatial_ref = alpha_dataset.GetSpatialRef()
-    raw_layer = vector_ds.CreateLayer("raw_ocean", srs=spatial_ref, geom_type=ogr.wkbPolygon)
-    kept_layer = vector_ds.CreateLayer("kept_ocean", srs=spatial_ref, geom_type=ogr.wkbPolygon)
-    for layer in (raw_layer, kept_layer):
-        if layer is None:
-            raise RuntimeError(f"Could not create cleanup layer in {vector_path}")
-    value_field = ogr.FieldDefn("value", ogr.OFTInteger)
-    if raw_layer.CreateField(value_field) != 0:
-        raise RuntimeError(f"Could not create polygon value field in {vector_path}")
-
-    polygonize_result = gdal.Polygonize(alpha_band, None, raw_layer, 0, [], callback=None)
-    if polygonize_result != 0:
-        raise RuntimeError("Could not polygonize ocean alpha mask")
-
-    xsize = alpha_dataset.RasterXSize
-    ysize = alpha_dataset.RasterYSize
-    min_x = geotransform[0]
-    max_y = geotransform[3]
-    max_x = geotransform[0] + geotransform[1] * xsize + geotransform[2] * ysize
-    min_y = geotransform[3] + geotransform[4] * xsize + geotransform[5] * ysize
-    edge_tolerance = max(abs(geotransform[1]), abs(geotransform[5]))
-    kept_definition = kept_layer.GetLayerDefn()
-
-    for feature in raw_layer:
-        if feature.GetFieldAsInteger(0) != 255:
-            continue
-        geometry = feature.GetGeometryRef()
-        if geometry is None:
-            continue
-        envelope = geometry.GetEnvelope()
-        touches_edge = (
-            envelope[0] <= min_x + edge_tolerance
-            or envelope[1] >= max_x - edge_tolerance
-            or envelope[2] <= min_y + edge_tolerance
-            or envelope[3] >= max_y - edge_tolerance
-        )
-        if touches_edge or geometry.GetArea() >= max_area_sq_m:
-            kept_feature = ogr.Feature(kept_definition)
-            kept_feature.SetGeometry(geometry.Clone())
-            if kept_layer.CreateFeature(kept_feature) != 0:
-                raise RuntimeError(f"Could not write kept ocean feature into {vector_path}")
-            kept_feature = None
-
-    alpha_band.Fill(0)
-    rasterize_result = gdal.RasterizeLayer(alpha_dataset, [1], kept_layer, burn_values=[255])
-    if rasterize_result != 0:
-        raise RuntimeError("Could not rasterize cleaned ocean alpha mask")
-    alpha_band.FlushCache()
-    vector_ds = None
-
-
 def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
     """Return the styled MAKO depth ramp as float32 RGB triples in [0, 1]."""
     mako_colors = np.array([c[1:] for c in MAKO_RAMP], dtype=np.float32) / 255.0
@@ -817,27 +681,6 @@ def snapped_tile_grid_for_bbox(
     mercator_bounds = lonlat_bbox_to_mercator_bounds(*bbox)
     snapped_bounds = snap_bounds_to_pixel_grid(mercator_bounds, pixel_size)
     return snapped_bounds, pixel_size, zoom
-
-
-def build_hillshade_command(
-    input_vrt: str,
-    output_tif: str,
-    z_factor: float,
-    creation_options: Sequence[str] = GTIFF_CREATION_OPTIONS,
-) -> list[str]:
-    """Build the gdaldem hillshade command line."""
-    command = [
-        "gdaldem",
-        "hillshade",
-        input_vrt,
-        output_tif,
-        "-multidirectional",
-        "-z",
-        str(z_factor),
-    ]
-    for option in creation_options:
-        command.extend(["-co", option])
-    return command
 
 
 def create_hillshade_tif(
@@ -1017,16 +860,6 @@ def create_rgb_with_alpha_vrt(
 
     publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
-
-
-def remove_if_exists(path: str) -> None:
-    """Delete a file if it exists."""
-    if os.path.exists(path):
-        try:
-            gdal.Unlink(path)
-        except RuntimeError:
-            os.remove(path)
-
 
 def translate_rgba_vrt(
     rgba_vrt: str,
