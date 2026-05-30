@@ -20,6 +20,7 @@ from tiler import (
     intersect_te_bounds,
     lonlat_bbox_to_mercator_bounds,
     merge_mbtiles,
+    render_dataset_tile,
     run_tiling_simplified,
     te_to_src_win,
     web_mercator_pixel_size,
@@ -180,6 +181,51 @@ def test_te_to_src_win_converts_bounds_to_pixel_window(tmp_path: Path) -> None:
 
     opened = gdal.Open(str(input_path))
     assert te_to_src_win(opened, (20.0, 40.0, 50.0, 90.0)) == (2, 1, 3, 5)
+
+
+def test_render_dataset_tile_pads_partial_overlap_without_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    input_path = tmp_path / "partial_overlap.tif"
+
+    dataset = gdal.GetDriverByName("GTiff").Create(str(input_path), 100, 100, 4, gdal.GDT_Byte)
+    dataset.SetGeoTransform((0.0, 1.0, 0.0, 100.0, 0.0, -1.0))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset.SetProjection(srs.ExportToWkt())
+    for band_index, value in enumerate((25, 50, 75, 255), start=1):
+        dataset.GetRasterBand(band_index).Fill(value)
+    dataset.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    dataset = None
+
+    opened = gdal.Open(str(input_path))
+    assert opened is not None
+
+    requested_bounds = (-50.0, -50.0, 150.0, 150.0)
+
+    rendered = render_dataset_tile(
+        opened,
+        requested_bounds,
+        tile_size=512,
+        resample_alg="bilinear",
+    )
+
+    assert rendered.shape == (4, 512, 512)
+    np.testing.assert_array_equal(rendered[:, :128, :], 0)
+    np.testing.assert_array_equal(rendered[:, 384:, :], 0)
+    np.testing.assert_array_equal(rendered[:, :, :128], 0)
+    np.testing.assert_array_equal(rendered[:, :, 384:], 0)
+
+    overlap = rendered[:, 128:384, 128:384]
+    expected = np.broadcast_to(
+        np.array([25, 50, 75, 255], dtype=np.uint8)[:, np.newaxis, np.newaxis],
+        overlap.shape,
+    )
+    np.testing.assert_array_equal(overlap, expected)
+
+    captured = capsys.readouterr()
+    assert "partially outside source raster extent" not in captured.err
+    assert "partially outside source raster extent" not in captured.out
 
 
 def test_run_tiling_simplified_creates_mbtiles(
