@@ -1240,6 +1240,65 @@ def test_convert_raster_to_pmtiles_cleans_inputs_after_mbtiles_before_pmtiles(
     assert converted == [["pmtiles", "convert", ".temp/output.mbtiles", ".temp_output.pmtiles"]]
 
 
+def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    (tmp_path / "tiles").mkdir()
+    build_calls: list[dict[str, object]] = []
+    overview_calls: list[tuple[str, str]] = []
+    converted: list[list[str]] = []
+
+    def fake_build_mbtiles_from_webp_tree(input_dir: str, output_mbtiles: str, **kwargs: object) -> int:
+        build_calls.append(
+            {
+                "input_dir": input_dir,
+                "output_mbtiles": output_mbtiles,
+                **kwargs,
+            }
+        )
+        Path(output_mbtiles).write_text("mbtiles")
+        return 1
+
+    def fake_build_mbtiles_overviews(mbtiles_path: str, resample_alg: str) -> None:
+        overview_calls.append((mbtiles_path, resample_alg))
+
+    def fake_subprocess_run(command: list[str], check: bool) -> None:
+        assert check is True
+        converted.append(command)
+        Path(command[-1]).write_text("pmtiles")
+
+    monkeypatch.setattr("satmaps.tiler.build_mbtiles_from_webp_tree", fake_build_mbtiles_from_webp_tree)
+    monkeypatch.setattr("satmaps.tiler.build_mbtiles_overviews", fake_build_mbtiles_overviews)
+    monkeypatch.setattr("satmaps.tiler.finalize_mbtiles_metadata", lambda mbtiles_path: None)
+    monkeypatch.setattr("satmaps.subprocess.run", fake_subprocess_run)
+
+    temp_mbtiles = satmaps.convert_tile_tree_to_pmtiles(
+        "tiles",
+        "output.pmtiles",
+        resample_alg="lanczos",
+        max_zoom=13,
+        name="Test",
+        description="Test",
+        requested_bbox=(0.0, 1.0, 2.0, 3.0),
+    )
+
+    assert build_calls == [
+        {
+            "input_dir": "tiles",
+            "output_mbtiles": ".temp/output.mbtiles",
+            "name": "Test",
+            "description": "Test",
+            "maxzoom": 13,
+            "bounds_wgs84": (0.0, 1.0, 2.0, 3.0),
+        }
+    ]
+    assert overview_calls == [(".temp/output.mbtiles", "lanczos")]
+    assert converted == [["pmtiles", "convert", ".temp/output.mbtiles", ".temp_output.pmtiles"]]
+    assert temp_mbtiles == ".temp/output.mbtiles"
+
+
 def test_build_hillshade_command_matches_expected_flags(tmp_path: Path) -> None:
     command = ocean.build_hillshade_command(
         str(tmp_path / "in.vrt"),
@@ -3078,7 +3137,7 @@ def test_main_bbox_passes_chunk_bounds_to_tiler(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["satmaps.py", "--bbox", "0,0,1,1", "--no-land", "--parallel", "1"],
+        ["satmaps.py", "--bbox", "0,0,1,1", "--no-land", "--parallel", "1", "--format", "png"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     monkeypatch.setattr(
@@ -3108,6 +3167,95 @@ def test_main_bbox_passes_chunk_bounds_to_tiler(
         0.0, 0.0, 1.0, 1.0
     )
     assert "unique_id" not in captured_options
+
+
+def test_process_single_tile_writes_empty_marker_when_no_folders(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    completion_marker = tmp_path / "tilecache" / "markers" / "31TDF_0_0.json"
+    args = argparse.Namespace(cache=".cache", download=False)
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+
+    result = process_single_tile(
+        "31TDF_0_0",
+        ["2025/07/01"],
+        args,
+        tile_cache_dir=str(tmp_path / "tilecache" / "contributors" / "31TDF_0_0"),
+        completion_marker_path=str(completion_marker),
+    )
+    assert result is None
+    assert completion_marker.exists()
+    assert completion_marker.exists()
+    marker = completion_marker.read_text()
+    assert '"tile_count": 0' in marker
+    assert '"tiles": []' in marker
+
+
+def test_main_webp_resume_reuses_cache_markers_without_latest_state_fallback(
+    monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "--resume", "--parallel", "1", "--date", "2025/07/01"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr(satmaps, "S3_FOLDER_CACHE", {})
+    monkeypatch.setattr("satmaps.resolve_ocean_mask_source", lambda path: None)
+    monkeypatch.setattr("satmaps.resolve_land_mgrs_source", lambda: None)
+    monkeypatch.setattr(
+        "satmaps.discover_mgrs_bases",
+        lambda bbox, gebco_src, land_mgrs_list_path=None: ["31TDF"],
+    )
+    monkeypatch.setattr(
+        "satmaps.prepare_ocean_background_for_output",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr("satmaps.build_land_run_token", lambda *args, **kwargs: "webpresume")
+    monkeypatch.setattr("satmaps.tiler.merge_webp_trees", lambda dirs, final_tree, quality: 1)
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    work_units = satmaps.plan_subtile_work_units(["31TDF"])
+    for work_unit in work_units:
+        marker_path = satmaps.build_contributor_complete_marker(
+            "output.pmtiles",
+            "webpresume",
+            work_unit.unit_id,
+        )
+        satmaps.write_tile_cache_marker(marker_path, work_unit.unit_id, [])
+    contributor_dir = satmaps.build_contributor_tile_cache_dir(
+        "output.pmtiles",
+        "webpresume",
+        work_units[0].unit_id,
+    )
+    Path(contributor_dir).mkdir(parents=True, exist_ok=True)
+
+    stale_state = tmp_path / ".temp" / "state_stale.json"
+    stale_state.write_text(
+        '{"unique_id": "stale", "completed_units": ["stale"], "processed_tifs": [], "args": {}}'
+    )
+
+    processed_units: list[str] = []
+
+    def fake_process_land_work_unit(*args, **kwargs):
+        processed_units.append(args[0].unit_id)
+        return None
+
+    monkeypatch.setattr("satmaps.process_land_work_unit", fake_process_land_work_unit)
+
+    main()
+
+    assert processed_units == []
+    out = capsys.readouterr().out
+    assert "Reusing 4 existing tile cache contributor(s)." in out
+    assert "All sub-tiles already processed." in out
 
 
 def test_main_non_bbox_can_use_standalone_ocean(
@@ -3151,7 +3299,7 @@ def test_main_keeps_ocean_after_processing(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["satmaps.py", "--no-land", "--parallel", "1"],
+        ["satmaps.py", "--no-land", "--parallel", "1", "--format", "png"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
@@ -3268,7 +3416,7 @@ def test_main_delete_tifs_flag_controls_land_cleanup(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["satmaps.py", "--parallel", "1", "--date", "2025/07/01", *extra_args],
+        ["satmaps.py", "--parallel", "1", "--date", "2025/07/01", "--format", "png", *extra_args],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)

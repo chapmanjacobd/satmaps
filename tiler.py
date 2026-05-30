@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 from osgeo import gdal
+from PIL import Image
 
 gdal.UseExceptions()
 
@@ -428,6 +429,253 @@ def intersect_te_bounds(bounds_a: TEBounds, bounds_b: TEBounds) -> Optional[TEBo
     return minx, miny, maxx, maxy
 
 
+def build_tile_tree_tile_path(root_dir: str, z: int, x: int, y: int) -> str:
+    """Return the deterministic z/x/y.webp path for one cached tile."""
+    return os.path.join(root_dir, str(z), str(x), f"{y}.webp")
+
+
+def save_webp_image(
+    image: Image.Image,
+    output_path: str,
+    quality: int,
+    *,
+    lossless: bool = False,
+) -> str:
+    """Atomically write a PIL image as WebP."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    staged_output_path = build_staged_path(output_path)
+    remove_if_exists(staged_output_path)
+    save_kwargs: Dict[str, Any] = {"format": "WEBP"}
+    if lossless:
+        save_kwargs["lossless"] = True
+        save_kwargs["quality"] = 100
+    else:
+        save_kwargs["quality"] = quality
+    image.save(staged_output_path, **save_kwargs)
+    return publish_staged_path(staged_output_path, output_path)
+
+
+def render_dataset_tile(
+    dataset: gdal.Dataset,
+    bounds: TEBounds,
+    tile_size: int,
+    resample_alg: str,
+) -> np.ndarray:
+    """Read one Web Mercator XYZ tile from a dataset into a byte array."""
+    minx, miny, maxx, maxy = bounds
+    tile_ds = gdal.Translate(
+        "",
+        dataset,
+        options=gdal.TranslateOptions(
+            format="MEM",
+            projWin=[minx, maxy, maxx, miny],
+            width=tile_size,
+            height=tile_size,
+            resampleAlg=resample_alg if resample_alg != "gauss" else "bilinear",
+        ),
+    )
+    if tile_ds is None:
+        raise RuntimeError("Could not render tile into memory")
+    tile_array = tile_ds.ReadAsArray()
+    tile_ds = None
+    if tile_array is None:
+        raise RuntimeError("Could not read rendered tile data")
+    output = np.asarray(tile_array, dtype=np.uint8)
+    if output.ndim == 2:
+        output = output[np.newaxis, :, :]
+    if output.shape[0] < 3:
+        raise RuntimeError("Rendered tile must contain at least RGB bands")
+    if output.shape[0] > 4:
+        output = output[:4]
+    return output
+
+
+def export_raster_to_webp_tree(
+    input_raster: str,
+    output_dir: str,
+    zoom: int,
+    tile_size: int,
+    quality: int,
+    resample_alg: str,
+    *,
+    lossless: bool = False,
+) -> List[str]:
+    """Render a Web Mercator raster into max-zoom z/x/y.webp tiles."""
+    dataset = gdal.Open(input_raster)
+    if dataset is None:
+        raise RuntimeError(f"Could not open raster for tile export: {input_raster}")
+
+    try:
+        bounds = get_dataset_bounds(dataset)
+        tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, zoom)
+        written_tiles: List[str] = []
+        for ty in range(ty_min, ty_max + 1):
+            for tx in range(tx_min, tx_max + 1):
+                tile_array = render_dataset_tile(
+                    dataset,
+                    get_web_mercator_bounds(zoom, tx, ty),
+                    tile_size,
+                    resample_alg,
+                )
+                if tile_array.shape[0] == 4 and not np.any(tile_array[3]):
+                    continue
+                if tile_array.shape[0] == 4 and np.all(tile_array[3] == 255):
+                    tile_array = tile_array[:3]
+                mode = "RGBA" if tile_array.shape[0] == 4 else "RGB"
+                image = Image.fromarray(np.moveaxis(tile_array, 0, -1), mode=mode)
+                output_path = build_tile_tree_tile_path(output_dir, zoom, tx, ty)
+                save_webp_image(image, output_path, quality, lossless=lossless)
+                written_tiles.append(os.path.relpath(output_path, output_dir))
+        return written_tiles
+    finally:
+        dataset = None
+
+
+def iter_tile_tree_paths(root_dir: str) -> List[str]:
+    """Return all z/x/y.webp paths relative to a tile tree root."""
+    relative_paths: List[str] = []
+    if not os.path.isdir(root_dir):
+        return relative_paths
+    for current_root, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(".webp"):
+                absolute_path = os.path.join(current_root, filename)
+                relative_paths.append(os.path.relpath(absolute_path, root_dir))
+    relative_paths.sort()
+    return relative_paths
+
+
+def merge_webp_trees(
+    source_dirs: List[str],
+    output_dir: str,
+    quality: int,
+) -> int:
+    """Compose multiple contributor tile trees into one final z/x/y.webp tree."""
+    if os.path.isdir(output_dir):
+        shutil.rmtree(output_dir)
+    merged_count = 0
+    for source_dir in source_dirs:
+        if not os.path.isdir(source_dir):
+            continue
+        for relative_path in iter_tile_tree_paths(source_dir):
+            source_path = os.path.join(source_dir, relative_path)
+            destination_path = os.path.join(output_dir, relative_path)
+            with Image.open(source_path) as source_image:
+                source_rgba = source_image.convert("RGBA")
+            if file_has_content(destination_path):
+                with Image.open(destination_path) as destination_image:
+                    destination_rgba = destination_image.convert("RGBA")
+                composed = Image.alpha_composite(destination_rgba, source_rgba)
+            else:
+                composed = source_rgba
+            if composed.getchannel("A").getextrema() == (255, 255):
+                final_image: Image.Image = composed.convert("RGB")
+            else:
+                final_image = composed
+            save_webp_image(final_image, destination_path, quality, lossless=False)
+            merged_count += 1
+    return merged_count
+
+
+def initialize_mbtiles(cursor: sqlite3.Cursor) -> None:
+    """Create the basic MBTiles schema used by the custom tile-tree ingester."""
+    cursor.executescript(
+        """
+        CREATE TABLE metadata (name TEXT, value TEXT);
+        CREATE TABLE tiles (
+            zoom_level INTEGER NOT NULL,
+            tile_column INTEGER NOT NULL,
+            tile_row INTEGER NOT NULL,
+            tile_data BLOB NOT NULL
+        );
+        CREATE UNIQUE INDEX tile_index
+        ON tiles (zoom_level, tile_column, tile_row);
+        """
+    )
+
+
+def build_mbtiles_from_webp_tree(
+    input_dir: str,
+    output_mbtiles: str,
+    *,
+    name: str,
+    description: str,
+    maxzoom: int,
+    bounds_wgs84: Optional[Tuple[float, float, float, float]] = None,
+) -> int:
+    """Build a flat MBTiles database by copying cached WebP tile bytes as-is."""
+    staged_output_path = build_staged_path(output_mbtiles)
+    remove_if_exists(staged_output_path)
+    conn = sqlite3.connect(staged_output_path)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("PRAGMA synchronous = OFF")
+        cursor.execute("PRAGMA journal_mode = MEMORY")
+        initialize_mbtiles(cursor)
+        metadata_values = {
+            "name": name,
+            "description": description,
+            "type": "baselayer",
+            "version": "1",
+            "format": "webp",
+            "minzoom": str(maxzoom),
+            "maxzoom": str(maxzoom),
+        }
+        if bounds_wgs84 is not None:
+            metadata_values["bounds"] = ",".join(str(value) for value in bounds_wgs84)
+        for metadata_name, metadata_value in metadata_values.items():
+            cursor.execute(
+                "INSERT INTO metadata (name, value) VALUES (?, ?)",
+                (metadata_name, metadata_value),
+            )
+
+        inserted_tiles = 0
+        for relative_path in iter_tile_tree_paths(input_dir):
+            parts = relative_path.split(os.sep)
+            if len(parts) != 3:
+                continue
+            z_value, x_value, filename = parts
+            y_stem, extension = os.path.splitext(filename)
+            if extension.lower() != ".webp":
+                continue
+            zoom_level = int(z_value)
+            tile_column = int(x_value)
+            tile_y_xyz = int(y_stem)
+            tile_row = (1 << zoom_level) - 1 - tile_y_xyz
+            with open(os.path.join(input_dir, relative_path), "rb") as tile_file:
+                tile_bytes = tile_file.read()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data)
+                VALUES (?, ?, ?, ?)
+                """,
+                (zoom_level, tile_column, tile_row, tile_bytes),
+            )
+            inserted_tiles += 1
+
+        conn.commit()
+    finally:
+        conn.close()
+    finalize_mbtiles_metadata(staged_output_path)
+    publish_staged_path(staged_output_path, output_mbtiles)
+    return inserted_tiles
+
+
+def build_mbtiles_overviews(mbtiles_path: str, resample_alg: str) -> None:
+    """Populate lower zoom levels for an MBTiles archive using gdaladdo."""
+    print("Building overviews...")
+    gdaladdo_cmd = [
+        "gdaladdo",
+        "-r",
+        resample_alg if resample_alg != "gauss" else "bilinear",
+        "--config",
+        "GDAL_NUM_THREADS",
+        "ALL_CPUS",
+        mbtiles_path,
+    ]
+    subprocess.run(gdaladdo_cmd, check=True)
+
+
 def te_to_src_win(
     dataset: gdal.Dataset, te_bounds: TEBounds
 ) -> Tuple[int, int, int, int]:
@@ -773,17 +1021,7 @@ def run_tiling_simplified(
     finalize_mbtiles_metadata(staged_output_mbtiles)
 
     # Build overviews (all levels from maxzoom down to 0)
-    print("Building overviews...")
-    gdaladdo_cmd = [
-        "gdaladdo",
-        "-r",
-        options["resample_alg"] if options["resample_alg"] != "gauss" else "bilinear",
-        "--config",
-        "GDAL_NUM_THREADS",
-        "ALL_CPUS",
-        staged_output_mbtiles,
-    ]
-    subprocess.run(gdaladdo_cmd, check=True)
+    build_mbtiles_overviews(staged_output_mbtiles, options["resample_alg"])
 
     # Finalize metadata again after gdaladdo adds lower zoom tiles.
     finalize_mbtiles_metadata(staged_output_mbtiles)

@@ -135,7 +135,7 @@ satmaps --estimate
 - `--chunk-zoom`: Chunking zoom used during MBTiles generation (default: `4`).
 - `--parallel`: Number of worker processes/threads used for tile processing and chunk generation (default: `2`).
 - `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
-- `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before chunk generation. Coarser ocean masks (for example z4-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass.
+- `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before max-zoom tile caching. Coarser ocean masks (for example z4-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass.
 - Final Web Mercator land outputs target `--max-zoom` (supported: 4-14; default zoom 13, ~19.11 m/px at the equator). Ocean backgrounds may be reused from the same or a coarser zoom level and are resampled onto that final output grid during composition. Low-resolution runs at `--max-zoom 7` and below use a coarse-grid-first land renderer to avoid the full per-subtile pipeline.
 - `--land` / `--no-land`: Enable or skip Sentinel-2 land tile processing entirely.
 - `--tonemap` / `--no-tonemap`: Enable or disable the land tone-mapping stage.
@@ -196,7 +196,7 @@ You can override the defaults (tuned via `satmaps-tuner`):
 5.  Processing (NumPy):
     - Soft-Knee Tone Mapping: A 3-segment linear curve to compress high dynamic range while preserving local contrast.
     - Color Grading: Saturation adjustment and gamma correction for a "natural" look.
-6.  Packaging: The merged Web Mercator VRT is split into XYZ-aligned chunks at `--chunk-zoom`, each chunk is translated into MBTiles, those MBTiles are merged, and the result is converted to PMTiles. For `--bbox` runs, chunk selection stays clipped to the requested bbox rather than the full background extent.
+6.  Packaging: The default WebP path renders each land work unit and the prepared ocean background into a resumable max-zoom `z/x/y.webp` cache, merges those contributors into the final max-zoom tile tree, copies those WebP bytes into MBTiles, builds lower zooms with `gdaladdo`, and converts the archive to PMTiles. Non-WebP and `--vrt` runs keep the legacy raster/VRT packaging path.
 
 ## Datasets
 

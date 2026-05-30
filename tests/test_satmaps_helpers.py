@@ -373,6 +373,7 @@ def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: objec
     assert find_resume_path(str(newer)) == str(newer)
     assert find_resume_path(True) == str(Path(".temp") / "state_new.json")
     assert find_resume_path(True, preferred_path=str(older)) == str(older)
+    assert find_resume_path(True, allow_latest=False) is None
 
 
 def test_build_land_run_token_is_stable_for_matching_inputs() -> None:
