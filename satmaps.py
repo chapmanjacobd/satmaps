@@ -2261,14 +2261,14 @@ def main() -> None:
     parser.add_argument(
         "--exposure",
         type=float,
-        default=1.0,
+        default=2.5,
         help="Global brightness multiplier",
     )
-    parser.add_argument("--gamma", type=float, default=2.8)
+    parser.add_argument("--gamma", type=float, default=2.2)
     parser.add_argument(
         "--shoulder",
         type=float,
-        default=0.6,
+        default=0.5,
         help="Highlight shaping curve; values above 1 lift the top end",
     )
     parser.add_argument(
@@ -2278,13 +2278,13 @@ def main() -> None:
         "--db", "--black-break", "--grade-low-break", type=float, default=0.08
     )
     parser.add_argument(
-        "--ls", "--black-slope", "--grade-low-slope", type=float, default=0.7
+        "--ls", "--black-slope", "--grade-low-slope", type=float, default=0.0
     )
     parser.add_argument(
         "--ghb",
         "--grade-highlight-break",
         type=float,
-        default=0.82,
+        default=0.9,
         help="Upper breakpoint for the final grading curve",
     )
     parser.add_argument(
@@ -2297,7 +2297,7 @@ def main() -> None:
         "--ghs",
         "--grade-highlight-slope",
         type=float,
-        default=1.05,
+        default=1.7,
         help="Highlight slope for the final grading curve",
     )
     parser.add_argument(
