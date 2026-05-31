@@ -23,6 +23,14 @@ from satmaps import (
 )
 
 
+class StubBand:
+    def __init__(self, data: np.ndarray) -> None:
+        self.data = data
+
+    def ReadAsArray(self, xoff: int, yoff: int, width: int, height: int) -> np.ndarray:
+        return self.data[yoff : yoff + height, xoff : xoff + width]
+
+
 def test_list_mosaic_folders_for_tile_uses_cache(monkeypatch: object) -> None:
     # Pre-populate cache
     satmaps.S3_FOLDER_CACHE = {"2025/07/01": {"Sentinel-2_mosaic_2025_Q3_31TDF_0_0"}}
@@ -394,6 +402,88 @@ def test_average_tile_blocks_skips_horizontal_ocean(monkeypatch: object) -> None
     # Note: PROCESS_SLAB_HEIGHT is 24, so it should be one call for 4 rows
     assert len(calls) == 1
     assert calls[0] == (3, 0, 4, 4)
+
+
+def test_build_local_season_date_weights_blends_across_equator() -> None:
+    wgs84 = osr.SpatialReference()
+    wgs84.ImportFromEPSG(4326)
+    tile_grid = satmaps.TileGrid(
+        projection=wgs84.ExportToWkt(),
+        geotransform=(0.0, 1.0, 0.0, 2.0, 0.0, -1.0),
+        width=1,
+        height=4,
+    )
+
+    weights = satmaps.build_local_season_date_weights(
+        tile_grid, 0, 0, 1, 4, winter=False
+    )
+
+    assert weights.shape == (2, 4, 1)
+    np.testing.assert_allclose(weights[:, 0, 0], np.array([1.0, 0.0]), atol=1e-4)
+    assert 0.5 < weights[0, 1, 0] < 1.0
+    assert 0.0 < weights[0, 2, 0] < 0.5
+    np.testing.assert_allclose(weights[:, 3, 0], np.array([0.0, 1.0]), atol=1e-4)
+
+
+def test_build_local_season_date_weights_winter_flips_hemispheres() -> None:
+    wgs84 = osr.SpatialReference()
+    wgs84.ImportFromEPSG(4326)
+    tile_grid = satmaps.TileGrid(
+        projection=wgs84.ExportToWkt(),
+        geotransform=(0.0, 1.0, 0.0, 2.0, 0.0, -1.0),
+        width=1,
+        height=4,
+    )
+
+    summer_weights = satmaps.build_local_season_date_weights(
+        tile_grid, 0, 0, 1, 4, winter=False
+    )
+    winter_weights = satmaps.build_local_season_date_weights(
+        tile_grid, 0, 0, 1, 4, winter=True
+    )
+
+    np.testing.assert_allclose(winter_weights[0], 1.0 - summer_weights[0], atol=1e-6)
+    np.testing.assert_allclose(winter_weights[1], 1.0 - summer_weights[1], atol=1e-6)
+
+
+def test_average_block_weighted_blend_falls_back_when_preferred_date_is_missing() -> None:
+    north_missing = np.array(
+        [
+            [satmaps.SENTINEL_NODATA],
+            [100.0],
+        ],
+        dtype=np.float32,
+    )
+    south_valid = np.array(
+        [
+            [20.0],
+            [10.0],
+        ],
+        dtype=np.float32,
+    )
+    date_band_sets = [
+        ([StubBand(north_missing), StubBand(north_missing), StubBand(north_missing)], []),
+        ([StubBand(south_valid), StubBand(south_valid), StubBand(south_valid)], []),
+    ]
+
+    averaged, valid_mask = satmaps.average_block(
+        date_band_sets,
+        0,
+        0,
+        1,
+        2,
+        date_weights=np.array(
+            [
+                [[1.0], [1.0]],
+                [[0.0], [0.0]],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+    np.testing.assert_array_equal(valid_mask, np.array([[True], [True]]))
+    np.testing.assert_allclose(averaged[:, 0, 0], np.array([20.0, 20.0, 20.0]))
+    np.testing.assert_allclose(averaged[:, 1, 0], np.array([100.0, 100.0, 100.0]))
 
 
 def test_average_tile_blocks_skips_empty_slabs(monkeypatch: object) -> None:
@@ -2698,6 +2788,46 @@ def test_process_single_tile_skips_prefetch_when_land_percentage_below_threshold
     assert prefetched_cache_dir is None
 
 
+def test_build_land_run_token_changes_with_winter_flag() -> None:
+    common_args = dict(
+        output="render.pmtiles",
+        max_zoom=13,
+        resample_alg="lanczos",
+        stats_min=0.0,
+        stats_max=10000.0,
+        tonemap=True,
+        grade=True,
+        exposure=1.0,
+        sb=0.3,
+        hb=0.75,
+        ss=1.4,
+        ms=0.9,
+        hs=0.5,
+        gamma=1.0,
+        sat=0.9,
+        db=0.7,
+        ls=0.7,
+        ghb=None,
+        gms=1.0,
+        ghs=None,
+    )
+
+    summer_token = satmaps.build_land_run_token(
+        argparse.Namespace(**common_args, winter=False),
+        ["2025/07/01", "2025/01/01"],
+        None,
+        None,
+    )
+    winter_token = satmaps.build_land_run_token(
+        argparse.Namespace(**common_args, winter=True),
+        ["2025/07/01", "2025/01/01"],
+        None,
+        None,
+    )
+
+    assert summer_token != winter_token
+
+
 def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
@@ -2858,6 +2988,39 @@ def test_main_passes_ocean_path_to_tile_processing(
 
     assert gebco_sources
     assert set(gebco_sources) == {str(custom_ocean_path)}
+
+
+def test_main_passes_winter_flag_to_tile_processing(monkeypatch: object, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["satmaps.py", "--vrt", "--parallel", "1", "--winter"],
+    )
+    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
+    monkeypatch.setattr(satmaps, "S3_FOLDER_CACHE", {})
+    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: ["31TDF"])
+    winter_flags: list[bool] = []
+
+    def fake_process_single_tile(st, dates, args, gebco_src=None):
+        winter_flags.append(args.winter)
+        path = tmp_path / f"processed_{st}.tif"
+        path.write_text("fake tif")
+        return str(path)
+
+    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
+    monkeypatch.setattr(
+        "satmaps.gdal.BuildVRT",
+        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+    )
+
+    main()
+
+    assert winter_flags
+    assert set(winter_flags) == {True}
 
 
 def test_main_uses_rgba_ocean_as_alpha_mask_source(

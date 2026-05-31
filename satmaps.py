@@ -48,6 +48,11 @@ OCEAN_MASK_ALPHA_THRESHOLD = 254.5
 OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
 DEFAULT_PREFETCH_IF_LAND = 100.0
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
+MGRS_TILE_SIZE_METERS = 100_000.0
+LOCAL_SEASON_TRANSITION_TILES = 3.0
+LOCAL_SEASON_TRANSITION_HALF_LATITUDE_DEGREES = (
+    (LOCAL_SEASON_TRANSITION_TILES * MGRS_TILE_SIZE_METERS) / 2.0
+) / 111_320.0
 @dataclass(frozen=True)
 class LandWorkUnit:
     unit_id: str
@@ -463,6 +468,7 @@ def build_land_run_token(
             "ghb": args.ghb,
             "gms": args.gms,
             "ghs": args.ghs,
+            "winter": getattr(args, "winter", False),
             "ocean_mask_source": os.path.abspath(gebco_vrt_source) if gebco_vrt_source else None,
         },
         sort_keys=True,
@@ -1180,6 +1186,77 @@ def load_tile_grid(red_path: str) -> TileGrid:
     return tile_grid
 
 
+def build_projection_to_wgs84_transform(projection: str) -> osr.CoordinateTransformation:
+    """Build a traditional GIS-order transform from the source projection to WGS84."""
+    if not projection:
+        raise RuntimeError("Tile grid projection is required for seasonal blending")
+
+    source_srs = osr.SpatialReference()
+    if source_srs.ImportFromWkt(projection) != 0:
+        raise RuntimeError("Could not parse tile grid projection for seasonal blending")
+    wgs84_srs = osr.SpatialReference()
+    wgs84_srs.ImportFromEPSG(4326)
+    if hasattr(source_srs, "SetAxisMappingStrategy"):
+        source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    return osr.CoordinateTransformation(source_srs, wgs84_srs)
+
+
+def compute_block_row_latitudes(
+    tile_grid: TileGrid,
+    xoff: int,
+    yoff: int,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Return one WGS84 latitude per raster row using the block's horizontal center."""
+    transform = build_projection_to_wgs84_transform(tile_grid.projection)
+    center_col = xoff + (width / 2.0)
+    latitudes = np.empty(height, dtype=np.float32)
+
+    for row_index in range(height):
+        center_row = yoff + row_index + 0.5
+        x = tile_grid.geotransform[0] + (center_col * tile_grid.geotransform[1]) + (
+            center_row * tile_grid.geotransform[2]
+        )
+        y = tile_grid.geotransform[3] + (center_col * tile_grid.geotransform[4]) + (
+            center_row * tile_grid.geotransform[5]
+        )
+        _lon, lat, *_rest = transform.TransformPoint(float(x), float(y))
+        latitudes[row_index] = float(lat)
+
+    return latitudes
+
+
+def smoothstep(values: np.ndarray) -> np.ndarray:
+    """Clamp to [0, 1] and ease with a cubic smoothstep."""
+    clipped = np.clip(values, 0.0, 1.0)
+    return cast(np.ndarray, clipped * clipped * (3.0 - (2.0 * clipped)))
+
+
+def build_local_season_date_weights(
+    tile_grid: TileGrid,
+    xoff: int,
+    yoff: int,
+    width: int,
+    height: int,
+    *,
+    winter: bool,
+) -> np.ndarray:
+    """Return first-date/second-date row weights for the equator-centered seasonal blend."""
+    latitudes = compute_block_row_latitudes(tile_grid, xoff, yoff, width, height)
+    primary_northward_weight = smoothstep(
+        (latitudes + LOCAL_SEASON_TRANSITION_HALF_LATITUDE_DEGREES)
+        / (2.0 * LOCAL_SEASON_TRANSITION_HALF_LATITUDE_DEGREES)
+    ).astype(np.float32)
+    if winter:
+        primary_northward_weight = 1.0 - primary_northward_weight
+    secondary_weight = 1.0 - primary_northward_weight
+    return np.stack(
+        (primary_northward_weight[:, np.newaxis], secondary_weight[:, np.newaxis])
+    ).astype(np.float32)
+
+
 def open_gebco_mask(
     gebco_src: Optional[str],
     tile_grid: TileGrid,
@@ -1456,13 +1533,17 @@ def average_block(
     yoff: int,
     width: int,
     height: int,
+    *,
+    date_weights: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Average one block across all dates while requiring complete RGB observations."""
-    summed = np.zeros((3, height, width), dtype=np.float32)
-    valid_counts = np.zeros((height, width), dtype=np.uint16)
+    weighted_sum = np.zeros((3, height, width), dtype=np.float32)
+    weight_totals = np.zeros((height, width), dtype=np.float32)
+    fallback_sum = np.zeros((3, height, width), dtype=np.float32)
+    fallback_counts = np.zeros((height, width), dtype=np.uint16)
     valid_source_mask = np.zeros((height, width), dtype=bool)
 
-    for bands, _ in date_band_sets:
+    for date_index, (bands, _) in enumerate(date_band_sets):
         rgb_block = np.empty((3, height, width), dtype=np.float32)
         for band_index, band in enumerate(bands):
             block = band.ReadAsArray(xoff, yoff, width, height).astype(np.float32)
@@ -1473,22 +1554,40 @@ def average_block(
             continue
 
         valid_source_mask |= complete_rgb_mask
-        valid_counts[complete_rgb_mask] += 1
+        fallback_counts[complete_rgb_mask] += 1
+        if date_weights is None:
+            block_weights = complete_rgb_mask.astype(np.float32)
+        else:
+            block_weights = np.where(complete_rgb_mask, date_weights[date_index], 0.0)
+        np.add(weight_totals, block_weights, out=weight_totals)
         for band_index in range(rgb_block.shape[0]):
             np.add(
-                summed[band_index],
+                fallback_sum[band_index],
                 rgb_block[band_index],
-                out=summed[band_index],
+                out=fallback_sum[band_index],
                 where=complete_rgb_mask,
+            )
+            np.add(
+                weighted_sum[band_index],
+                np.where(complete_rgb_mask, rgb_block[band_index] * block_weights, 0.0),
+                out=weighted_sum[band_index],
             )
 
     averaged_block = np.full((3, height, width), np.nan, dtype=np.float32)
+    weighted_valid_mask = weight_totals > 0.0
+    fallback_mask = valid_source_mask & ~weighted_valid_mask
     for band_index in range(averaged_block.shape[0]):
         np.divide(
-            summed[band_index],
-            valid_counts,
+            weighted_sum[band_index],
+            weight_totals,
             out=averaged_block[band_index],
-            where=valid_source_mask,
+            where=weighted_valid_mask,
+        )
+        np.divide(
+            fallback_sum[band_index],
+            fallback_counts,
+            out=averaged_block[band_index],
+            where=fallback_mask,
         )
 
     return averaged_block, valid_source_mask
@@ -1498,6 +1597,9 @@ def average_tile_blocks(
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]],
     processing_window: ProcessingWindow,
     mask_slabs: Optional[dict[int, OceanMaskSlab]],
+    *,
+    tile_grid: Optional[TileGrid] = None,
+    winter: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Average the processing window and retain the matching output alpha blocks."""
     averaged = np.full(
@@ -1510,6 +1612,7 @@ def average_tile_blocks(
         if mask_slabs is not None
         else None
     )
+    use_local_season_blend = tile_grid is not None and len(date_band_sets) == 2
 
     for relative_yoff in range(0, processing_window.height, PROCESS_SLAB_HEIGHT):
         yoff = processing_window.yoff + relative_yoff
@@ -1531,9 +1634,27 @@ def average_tile_blocks(
             coverage_block = slab.coverage_block
             allowed_block = slab.fill_allowed_block
 
-        averaged_block, block_valid_sources = average_block(
-            date_band_sets, actual_xoff, yoff, actual_width, block_height
-        )
+        if use_local_season_blend:
+            assert tile_grid is not None
+            averaged_block, block_valid_sources = average_block(
+                date_band_sets,
+                actual_xoff,
+                yoff,
+                actual_width,
+                block_height,
+                date_weights=build_local_season_date_weights(
+                    tile_grid,
+                    actual_xoff,
+                    yoff,
+                    actual_width,
+                    block_height,
+                    winter=winter,
+                ),
+            )
+        else:
+            averaged_block, block_valid_sources = average_block(
+                date_band_sets, actual_xoff, yoff, actual_width, block_height
+            )
         if allowed_block is not None:
             averaged_block = np.where(allowed_block[np.newaxis, :, :], averaged_block, np.nan)
             block_valid_sources &= allowed_block
@@ -1954,6 +2075,8 @@ def process_single_tile(
             date_band_sets,
             processing_window,
             mask_slabs,
+            tile_grid=tile_grid,
+            winter=getattr(args, "winter", False),
         )
 
         averaged = fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
@@ -2092,7 +2215,10 @@ def main() -> None:
     parser.add_argument(
         "--date",
         default="2025/07/01,2025/01/01",
-        help="Mosaic date(s), comma-separated",
+        help=(
+            "Mosaic date(s), comma-separated. With two dates, the first is blended north "
+            "of the equator and the second south of it; --winter swaps the hemispheres."
+        ),
     )
     parser.add_argument(
         "--output", "-o", default="output.pmtiles", help="Output PMTiles filename"
@@ -2233,6 +2359,11 @@ def main() -> None:
         nargs="?",
         const=True,
         help="Resume from a previous run if a state file exists",
+    )
+    parser.add_argument(
+        "--winter",
+        action="store_true",
+        help="Swap the two-date equator blend so the first date favors the south and the second the north",
     )
     parser.add_argument(
         "--delete-tifs",
