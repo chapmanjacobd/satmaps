@@ -655,25 +655,26 @@ def tile_array_to_image(tile_array: np.ndarray) -> Optional[Image.Image]:
     return Image.fromarray(np.moveaxis(tile_array, 0, -1), mode=mode)
 
 
-def export_raster_to_webp_tree(
-    input_raster: str,
-    output_dir: str,
+def render_raster_to_webp_tile_images(
+    input_raster: str | gdal.Dataset,
     zoom: int,
     tile_size: int,
-    quality: int,
     resample_alg: str,
-    *,
-    lossless: bool = False,
-) -> List[str]:
-    """Render a Web Mercator raster into max-zoom z/x/y.webp tiles."""
-    dataset = gdal.Open(input_raster)
-    if dataset is None:
-        raise RuntimeError(f"Could not open raster for tile export: {input_raster}")
+) -> Dict[str, Image.Image]:
+    """Render a raster into max-zoom z/x/y tile images kept in memory."""
+    close_dataset = False
+    if isinstance(input_raster, str):
+        dataset = gdal.Open(input_raster)
+        close_dataset = True
+        if dataset is None:
+            raise RuntimeError(f"Could not open raster for tile rendering: {input_raster}")
+    else:
+        dataset = input_raster
 
     try:
         bounds = get_dataset_bounds(dataset)
         tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, zoom)
-        written_tiles: List[str] = []
+        tile_images: Dict[str, Image.Image] = {}
         for ty in range(ty_min, ty_max + 1):
             for tx in range(tx_min, tx_max + 1):
                 tile_array = render_dataset_tile(
@@ -685,12 +686,36 @@ def export_raster_to_webp_tree(
                 image = tile_array_to_image(tile_array)
                 if image is None:
                     continue
-                output_path = build_tile_tree_tile_path(output_dir, zoom, tx, ty)
-                save_webp_image(image, output_path, quality, lossless=lossless)
-                written_tiles.append(os.path.relpath(output_path, output_dir))
-        return written_tiles
+                tile_images[os.path.join(str(zoom), str(tx), f"{ty}.webp")] = image
+        return tile_images
     finally:
-        dataset = None
+        if close_dataset:
+            dataset = None
+
+
+def export_raster_to_webp_tree(
+    input_raster: str,
+    output_dir: str,
+    zoom: int,
+    tile_size: int,
+    quality: int,
+    resample_alg: str,
+    *,
+    lossless: bool = False,
+) -> List[str]:
+    """Render a Web Mercator raster into max-zoom z/x/y.webp tiles."""
+    tile_images = render_raster_to_webp_tile_images(
+        input_raster,
+        zoom,
+        tile_size,
+        resample_alg,
+    )
+    written_tiles: List[str] = []
+    for relative_path, image in sorted(tile_images.items()):
+        output_path = os.path.join(output_dir, relative_path)
+        save_webp_image(image, output_path, quality, lossless=lossless)
+        written_tiles.append(relative_path)
+    return written_tiles
 
 
 def iter_raster_tile_relpaths(input_raster: str, zoom: int) -> List[str]:

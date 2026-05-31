@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import glob
 import hashlib
 import json
 import os
@@ -29,6 +28,7 @@ import land_mgrs as land_mgrs_module
 import ocean
 from scipy.ndimage import binary_dilation, distance_transform_edt
 from osgeo import gdal, ogr, osr
+from PIL import Image
 
 import tiler
 
@@ -58,47 +58,6 @@ FINAL_TILE_CACHE_COMMIT_LOCK = threading.Lock()
 OCEAN_TILE_CACHE_CONTRIBUTOR_ID = "__ocean__"
 
 
-class FinalTileCacheCommitSequencer:
-    """Serialize contributor commits in a deterministic order for one WebP run."""
-
-    def __init__(self, ordered_contributors: Sequence[str]) -> None:
-        self._positions = {
-            contributor_id: index
-            for index, contributor_id in enumerate(ordered_contributors)
-        }
-        self._next_index = 0
-        self._aborted = False
-        self._condition = threading.Condition()
-
-    def wait_for_turn(self, contributor_id: str) -> None:
-        target_index = self._positions[contributor_id]
-        with self._condition:
-            while not self._aborted and target_index != self._next_index:
-                self._condition.wait()
-            if self._aborted:
-                raise RuntimeError("Final tile cache commit sequencing aborted")
-
-    def mark_committed(self, contributor_id: str) -> None:
-        target_index = self._positions[contributor_id]
-        with self._condition:
-            if self._aborted:
-                return
-            if target_index != self._next_index:
-                raise RuntimeError(
-                    f"Expected contributor at index {self._next_index}, got {contributor_id}"
-                )
-            self._next_index += 1
-            self._condition.notify_all()
-
-    def abort(self) -> None:
-        with self._condition:
-            self._aborted = True
-            self._condition.notify_all()
-
-
-FINAL_TILE_CACHE_COMMIT_SEQUENCERS: dict[str, FinalTileCacheCommitSequencer] = {}
-
-
 @dataclass(frozen=True)
 class LandWorkUnit:
     unit_id: str
@@ -109,6 +68,202 @@ class LandWorkUnit:
 class LandProcessingPlan:
     mgrs_bases: tuple[str, ...]
     work_units: tuple[LandWorkUnit, ...]
+
+
+@dataclass(frozen=True)
+class FinalTileFlushJob:
+    relative_path: str
+    contributor_images: tuple[tuple[str, Image.Image], ...]
+
+
+@dataclass
+class FinalTileFlushState:
+    pending_contributors: set[str]
+    contributor_images: dict[str, Image.Image]
+    flushing: bool = False
+
+
+class FinalTileCacheFlushCoordinator:
+    """Flush max-zoom WebP tiles only after every candidate land contributor is done."""
+
+    def __init__(
+        self,
+        output_path: str,
+        unique_id: str,
+        ordered_contributors: Sequence[str],
+        contributor_tile_candidates: dict[str, tuple[str, ...]],
+        quality: int,
+    ) -> None:
+        self._output_path = output_path
+        self._unique_id = unique_id
+        self._quality = quality
+        self._ordered_contributors = tuple(ordered_contributors)
+        self._positions = {
+            contributor_id: index
+            for index, contributor_id in enumerate(self._ordered_contributors)
+        }
+        self._contributor_tile_candidates = contributor_tile_candidates
+        self._contributor_done: set[str] = set()
+        self._contributor_actual_tiles: dict[str, tuple[str, ...]] = {
+            contributor_id: ()
+            for contributor_id in self._ordered_contributors
+        }
+        self._contributor_flushed_counts: dict[str, int] = {
+            contributor_id: 0
+            for contributor_id in self._ordered_contributors
+        }
+        self._marker_written: set[str] = set()
+        self._tile_states: dict[str, FinalTileFlushState] = {}
+        self._lock = threading.Lock()
+
+        for contributor_id, tile_relpaths in contributor_tile_candidates.items():
+            for relative_path in tile_relpaths:
+                tile_state = self._tile_states.setdefault(
+                    relative_path,
+                    FinalTileFlushState(
+                        pending_contributors=set(),
+                        contributor_images={},
+                    ),
+                )
+                tile_state.pending_contributors.add(contributor_id)
+
+    def record_contributor_completion(
+        self,
+        contributor_id: str,
+        tile_images: dict[str, Image.Image],
+    ) -> list[str]:
+        """Store in-memory contributor tiles and flush any final tiles that are now ready."""
+        if contributor_id not in self._positions:
+            raise RuntimeError(f"Unknown final tile contributor: {contributor_id}")
+
+        ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
+        ready_jobs: list[FinalTileFlushJob] = []
+        with self._lock:
+            self._contributor_done.add(contributor_id)
+            actual_tiles = tuple(sorted(tile_images))
+            self._contributor_actual_tiles[contributor_id] = actual_tiles
+
+            for relative_path, image in tile_images.items():
+                tile_state = self._tile_states.setdefault(
+                    relative_path,
+                    FinalTileFlushState(
+                        pending_contributors=set(),
+                        contributor_images={},
+                    ),
+                )
+                tile_state.contributor_images[contributor_id] = image
+
+            for relative_path in self._contributor_tile_candidates.get(contributor_id, ()):
+                candidate_tile_state = self._tile_states.get(relative_path)
+                if candidate_tile_state is None:
+                    continue
+                candidate_tile_state.pending_contributors.discard(contributor_id)
+                if (
+                    not candidate_tile_state.pending_contributors
+                    and not candidate_tile_state.flushing
+                ):
+                    candidate_tile_state.flushing = True
+                    ready_jobs.append(
+                        self._build_flush_job(relative_path, candidate_tile_state)
+                    )
+
+            ready_markers.extend(self._collect_ready_markers_locked())
+
+        self._write_markers(ready_markers)
+        self._flush_ready_tiles(ready_jobs)
+        return list(actual_tiles)
+
+    def _build_flush_job(
+        self,
+        relative_path: str,
+        tile_state: FinalTileFlushState,
+    ) -> FinalTileFlushJob:
+        ordered_images = tuple(
+            (contributor_id, tile_state.contributor_images[contributor_id])
+            for contributor_id in self._ordered_contributors
+            if contributor_id in tile_state.contributor_images
+        )
+        return FinalTileFlushJob(
+            relative_path=relative_path,
+            contributor_images=ordered_images,
+        )
+
+    def _flush_ready_tiles(self, ready_jobs: Sequence[FinalTileFlushJob]) -> None:
+        if not ready_jobs:
+            return
+
+        for job in ready_jobs:
+            self._flush_ready_tile(job)
+
+        ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
+        with self._lock:
+            for job in ready_jobs:
+                self._tile_states.pop(job.relative_path, None)
+                for contributor_id, _image in job.contributor_images:
+                    self._contributor_flushed_counts[contributor_id] += 1
+            ready_markers.extend(self._collect_ready_markers_locked())
+
+        self._write_markers(ready_markers)
+
+    def _flush_ready_tile(self, job: FinalTileFlushJob) -> None:
+        destination_path = os.path.join(
+            build_final_tile_cache_dir(self._output_path, self._unique_id),
+            job.relative_path,
+        )
+        composed_rgba: Image.Image | None = None
+        if file_has_content(destination_path):
+            with Image.open(destination_path) as destination_image:
+                composed_rgba = destination_image.convert("RGBA")
+
+        for _contributor_id, image in job.contributor_images:
+            source_rgba = image.convert("RGBA")
+            if composed_rgba is None:
+                composed_rgba = source_rgba
+            else:
+                composed_rgba = Image.alpha_composite(composed_rgba, source_rgba)
+
+        if composed_rgba is None:
+            return
+
+        if composed_rgba.getchannel("A").getextrema() == (255, 255):
+            final_image: Image.Image = composed_rgba.convert("RGB")
+        else:
+            final_image = composed_rgba
+        tiler.save_webp_image(final_image, destination_path, self._quality, lossless=False)
+
+    def _collect_ready_markers_locked(self) -> list[tuple[str, str, tuple[str, ...]]]:
+        ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
+        for contributor_id in self._ordered_contributors:
+            if contributor_id in self._marker_written:
+                continue
+            if contributor_id not in self._contributor_done:
+                continue
+            tile_relpaths = self._contributor_actual_tiles[contributor_id]
+            if self._contributor_flushed_counts[contributor_id] != len(tile_relpaths):
+                continue
+            self._marker_written.add(contributor_id)
+            ready_markers.append(
+                (
+                    build_contributor_complete_marker(
+                        self._output_path,
+                        self._unique_id,
+                        contributor_id,
+                    ),
+                    contributor_id,
+                    tile_relpaths,
+                )
+            )
+        return ready_markers
+
+    def _write_markers(
+        self,
+        ready_markers: Sequence[tuple[str, str, tuple[str, ...]]],
+    ) -> None:
+        for marker_path, contributor_id, tile_relpaths in ready_markers:
+            write_tile_cache_marker(marker_path, contributor_id, tile_relpaths)
+
+
+FINAL_TILE_CACHE_FLUSH_COORDINATORS: dict[str, FinalTileCacheFlushCoordinator] = {}
 
 
 def max_in_memory_write_pixels() -> int:
@@ -161,28 +316,6 @@ def build_contributor_complete_marker(
 def build_final_tile_cache_dir(output_path: str, unique_id: str) -> str:
     """Return the final merged max-zoom WebP tree path."""
     return os.path.join(build_tile_cache_root(output_path, unique_id), "final")
-
-
-def build_tile_cache_commit_root(output_path: str, unique_id: str) -> str:
-    """Return the root directory for staged final-tile commit artifacts."""
-    return os.path.join(build_tile_cache_root(output_path, unique_id), "commits")
-
-
-def build_tile_cache_commit_stage_dir(
-    output_path: str, unique_id: str, contributor_id: str
-) -> str:
-    """Return the staging directory for one contributor commit."""
-    return os.path.join(build_tile_cache_commit_root(output_path, unique_id), contributor_id)
-
-
-def build_tile_cache_commit_manifest_path(
-    output_path: str, unique_id: str, contributor_id: str
-) -> str:
-    """Return the manifest path for one contributor commit."""
-    return os.path.join(
-        build_tile_cache_commit_root(output_path, unique_id),
-        f"{contributor_id}.json",
-    )
 
 
 def build_land_mgrs_list_path() -> str:
@@ -368,31 +501,10 @@ def write_tile_cache_marker(
     os.replace(temp_marker_path, marker_path)
 
 
-def write_tile_cache_commit_manifest(
-    manifest_path: str,
-    contributor_id: str,
-    tile_relpaths: Sequence[str],
-) -> None:
-    """Persist the staged publish manifest for one final-tile commit."""
-    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-    temp_manifest_path = f"{manifest_path}.tmp"
-    with open(temp_manifest_path, "w") as manifest_file:
-        json.dump(
-            {
-                "contributor_id": contributor_id,
-                "tile_count": len(tile_relpaths),
-                "tiles": list(tile_relpaths),
-            },
-            manifest_file,
-            indent=2,
-        )
-    os.replace(temp_manifest_path, manifest_path)
-
-
-def read_tile_cache_commit_manifest(manifest_path: str) -> Tuple[str, List[str]]:
-    """Load the staged publish manifest for one final-tile commit."""
-    with open(manifest_path) as manifest_file:
-        payload = json.load(manifest_file)
+def read_tile_cache_marker(marker_path: str) -> Tuple[str, List[str]]:
+    """Load one contributor completion marker."""
+    with open(marker_path) as marker_file:
+        payload = json.load(marker_file)
     contributor_id = cast(str, payload["contributor_id"])
     tile_relpaths = [cast(str, tile_path) for tile_path in payload.get("tiles", [])]
     return contributor_id, tile_relpaths
@@ -884,52 +996,32 @@ def recover_cached_work_outputs(
 ) -> Set[str]:
     """Collect completed work units from cache markers."""
     recovered_units: Set[str] = set()
+    final_tile_tree = build_final_tile_cache_dir(output_path, unique_id)
     for work_unit in work_units:
         marker_path = build_contributor_complete_marker(
             output_path,
             unique_id,
             work_unit.unit_id,
         )
-        if file_has_content(marker_path):
+        if not file_has_content(marker_path):
+            continue
+        try:
+            marker_contributor_id, tile_relpaths = read_tile_cache_marker(marker_path)
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            print(f"Warning: Could not read tile cache marker {marker_path}: {exc}")
+            continue
+        if marker_contributor_id != work_unit.unit_id:
+            continue
+        if all(
+            file_has_content(os.path.join(final_tile_tree, relative_path))
+            for relative_path in tile_relpaths
+        ):
             recovered_units.add(work_unit.unit_id)
     return recovered_units
 
 
-def recover_pending_tile_cache_commits(
-    output_path: str,
-    unique_id: str,
-) -> Set[str]:
-    """Finish any interrupted staged final-tile publishes before resume checks."""
-    commit_root = build_tile_cache_commit_root(output_path, unique_id)
-    if not os.path.isdir(commit_root):
-        return set()
-
-    final_tile_tree = build_final_tile_cache_dir(output_path, unique_id)
-    recovered_contributors: Set[str] = set()
-    manifest_paths = sorted(glob.glob(os.path.join(commit_root, "*.json")))
-    manifest_contributors: Set[str] = set()
-    for manifest_path in manifest_paths:
-        contributor_id, tile_relpaths = read_tile_cache_commit_manifest(manifest_path)
-        manifest_contributors.add(contributor_id)
-        stage_dir = build_tile_cache_commit_stage_dir(output_path, unique_id, contributor_id)
-        tiler.publish_staged_webp_tree_commit(stage_dir, final_tile_tree, tile_relpaths)
-        write_tile_cache_marker(
-            build_contributor_complete_marker(output_path, unique_id, contributor_id),
-            contributor_id,
-            tile_relpaths,
-        )
-        remove_if_exists(manifest_path)
-        recovered_contributors.add(contributor_id)
-
-    for entry_name in os.listdir(commit_root):
-        entry_path = os.path.join(commit_root, entry_name)
-        if os.path.isdir(entry_path) and entry_name not in manifest_contributors:
-            shutil.rmtree(entry_path)
-    return recovered_contributors
-
-
 def commit_raster_to_final_tile_cache(
-    input_raster: str,
+    input_raster: str | gdal.Dataset,
     output_path: str,
     unique_id: str,
     contributor_id: str,
@@ -937,30 +1029,33 @@ def commit_raster_to_final_tile_cache(
     *,
     source_under_existing: bool = False,
 ) -> List[str]:
-    """Stage and publish one contributor directly into the shared final WebP tree."""
+    """Render and write one contributor directly into the shared final WebP tree."""
     final_tile_tree = build_final_tile_cache_dir(output_path, unique_id)
-    stage_dir = build_tile_cache_commit_stage_dir(output_path, unique_id, contributor_id)
-    manifest_path = build_tile_cache_commit_manifest_path(output_path, unique_id, contributor_id)
     marker_path = build_contributor_complete_marker(output_path, unique_id, contributor_id)
-
-    if os.path.isdir(stage_dir):
-        shutil.rmtree(stage_dir)
-    remove_if_exists(manifest_path)
-
-    tile_relpaths = tiler.stage_raster_to_webp_tree_commit(
+    tile_images = tiler.render_raster_to_webp_tile_images(
         input_raster,
-        final_tile_tree,
-        stage_dir,
         args.max_zoom,
         args.blocksize,
-        args.quality,
         args.resample_alg,
-        source_under_existing=source_under_existing,
     )
-    write_tile_cache_commit_manifest(manifest_path, contributor_id, tile_relpaths)
-    tiler.publish_staged_webp_tree_commit(stage_dir, final_tile_tree, tile_relpaths)
+    tile_relpaths = sorted(tile_images)
+    for relative_path in tile_relpaths:
+        destination_path = os.path.join(final_tile_tree, relative_path)
+        final_image = tile_images[relative_path]
+        if file_has_content(destination_path):
+            with Image.open(destination_path) as destination_image:
+                destination_rgba = destination_image.convert("RGBA")
+            source_rgba = final_image.convert("RGBA")
+            if source_under_existing:
+                composed = Image.alpha_composite(source_rgba, destination_rgba)
+            else:
+                composed = Image.alpha_composite(destination_rgba, source_rgba)
+            if composed.getchannel("A").getextrema() == (255, 255):
+                final_image = composed.convert("RGB")
+            else:
+                final_image = composed
+        tiler.save_webp_image(final_image, destination_path, args.quality, lossless=False)
     write_tile_cache_marker(marker_path, contributor_id, tile_relpaths)
-    remove_if_exists(manifest_path)
     return tile_relpaths
 
 
@@ -991,40 +1086,93 @@ def commit_ocean_to_final_tile_cache(
     return True
 
 
-def configure_final_tile_cache_commit_sequence(
-    unique_id: str,
-    ordered_contributors: Sequence[str],
-) -> None:
-    """Set the deterministic contributor commit order for one WebP run."""
-    FINAL_TILE_CACHE_COMMIT_SEQUENCERS[unique_id] = FinalTileCacheCommitSequencer(
-        ordered_contributors
+def build_web_mercator_srs() -> osr.SpatialReference:
+    """Return a reusable EPSG:3857 spatial reference."""
+    web_mercator_srs = osr.SpatialReference()
+    web_mercator_srs.ImportFromEPSG(3857)
+    if hasattr(web_mercator_srs, "SetAxisMappingStrategy"):
+        web_mercator_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    return web_mercator_srs
+
+
+def build_relpaths_for_tile_bounds(
+    bounds: tuple[float, float, float, float],
+    zoom: int,
+) -> tuple[str, ...]:
+    """Return max-zoom z/x/y.webp paths covering one bounds envelope."""
+    tx_min, ty_min, tx_max, ty_max = tiler.get_chunk_tile_range(bounds, zoom)
+    return tuple(
+        os.path.join(str(zoom), str(tx), f"{ty}.webp")
+        for ty in range(ty_min, ty_max + 1)
+        for tx in range(tx_min, tx_max + 1)
     )
 
 
-def clear_final_tile_cache_commit_sequence(unique_id: str) -> None:
-    """Drop cached sequencing state for a completed or failed WebP run."""
-    FINAL_TILE_CACHE_COMMIT_SEQUENCERS.pop(unique_id, None)
+def build_work_unit_candidate_tile_relpaths(
+    work_unit: LandWorkUnit,
+    zoom: int,
+) -> tuple[str, ...]:
+    """Return a conservative set of final tiles a work unit may affect."""
+    web_mercator_srs = build_web_mercator_srs()
+    candidate_relpaths: set[str] = set()
+    for source_subtile in work_unit.source_subtiles:
+        mgrs_base, _x_index, _y_index = source_subtile.rsplit("_", 2)
+        tile_geometry = build_mgrs_tile_geometry(mgrs_base, web_mercator_srs)
+        if tile_geometry is None or tile_geometry.IsEmpty():
+            raise RuntimeError(f"Could not build geometry for work unit {work_unit.unit_id}")
+        min_x, max_x, min_y, max_y = tile_geometry.GetEnvelope()
+        candidate_relpaths.update(
+            build_relpaths_for_tile_bounds((min_x, min_y, max_x, max_y), zoom)
+        )
+    return tuple(sorted(candidate_relpaths))
 
 
-def abort_final_tile_cache_commit_sequence(unique_id: str) -> None:
-    """Wake waiting workers when the WebP contributor commit order fails."""
-    sequencer = FINAL_TILE_CACHE_COMMIT_SEQUENCERS.get(unique_id)
-    if sequencer is not None:
-        sequencer.abort()
+def configure_final_tile_cache_flush_coordinator(
+    output_path: str,
+    unique_id: str,
+    work_units: Sequence[LandWorkUnit],
+    quality: int,
+    zoom: int,
+) -> None:
+    """Configure the in-memory flush coordinator for one WebP run."""
+    FINAL_TILE_CACHE_FLUSH_COORDINATORS[unique_id] = FinalTileCacheFlushCoordinator(
+        output_path,
+        unique_id,
+        [work_unit.unit_id for work_unit in work_units],
+        {
+            work_unit.unit_id: build_work_unit_candidate_tile_relpaths(work_unit, zoom)
+            for work_unit in work_units
+        },
+        quality,
+    )
 
 
-def wait_for_final_tile_cache_commit_turn(unique_id: str, contributor_id: str) -> None:
-    """Block until this contributor may publish into the final WebP tile cache."""
-    sequencer = FINAL_TILE_CACHE_COMMIT_SEQUENCERS.get(unique_id)
-    if sequencer is not None:
-        sequencer.wait_for_turn(contributor_id)
+def clear_final_tile_cache_flush_coordinator(unique_id: str) -> None:
+    """Drop the in-memory flush coordinator for a completed or failed run."""
+    FINAL_TILE_CACHE_FLUSH_COORDINATORS.pop(unique_id, None)
 
 
-def mark_final_tile_cache_commit_complete(unique_id: str, contributor_id: str) -> None:
-    """Advance the deterministic WebP commit sequence after one contributor finishes."""
-    sequencer = FINAL_TILE_CACHE_COMMIT_SEQUENCERS.get(unique_id)
-    if sequencer is not None:
-        sequencer.mark_committed(contributor_id)
+def commit_land_raster_to_final_tile_cache(
+    input_raster: Optional[gdal.Dataset],
+    _output_path: str,
+    unique_id: str,
+    contributor_id: str,
+    args: argparse.Namespace,
+) -> List[str]:
+    """Render one land contributor into in-memory tile images and flush when safe."""
+    coordinator = FINAL_TILE_CACHE_FLUSH_COORDINATORS.get(unique_id)
+    if coordinator is None:
+        raise RuntimeError("Land tile cache flush coordinator is not configured")
+
+    tile_images: dict[str, Image.Image] = {}
+    if input_raster is not None:
+        tile_images = tiler.render_raster_to_webp_tile_images(
+            input_raster,
+            args.max_zoom,
+            args.blocksize,
+            args.resample_alg,
+        )
+    return coordinator.record_contributor_completion(contributor_id, tile_images)
 
 
 def resolve_ocean_mask_source(ocean_background: str) -> Optional[str]:
@@ -1932,16 +2080,17 @@ def tone_mapped_byte_block(
 
 def warp_to_web_mercator(
     source_path: str | gdal.Dataset,
-    destination_path: str,
+    destination_path: Optional[str],
     resample_alg: str,
     max_zoom: int,
     blocksize: int,
-) -> None:
-    """Warp the temporary UTM GeoTIFF into the final EPSG:3857 intermediate."""
-    remove_if_exists(destination_path)
+) -> gdal.Dataset:
+    """Warp a raster into the final EPSG:3857 grid."""
+    if destination_path is not None:
+        remove_if_exists(destination_path)
     pixel_size = tiler.web_mercator_pixel_size_for_tile_size(max_zoom, blocksize)
     warp_options = gdal.WarpOptions(
-        format="GTiff",
+        format="MEM" if destination_path is None else "GTiff",
         dstSRS="EPSG:3857",
         xRes=pixel_size,
         yRes=pixel_size,
@@ -1951,7 +2100,11 @@ def warp_to_web_mercator(
         warpOptions=["NUM_THREADS=ALL_CPUS"],
         creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "TILED=YES", "BIGTIFF=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512"],
     )
-    gdal.Warp(destination_path, source_path, options=warp_options)
+    destination = "" if destination_path is None else destination_path
+    warped_ds = gdal.Warp(destination, source_path, options=warp_options)
+    if warped_ds is None:
+        raise RuntimeError("Could not warp raster to Web Mercator")
+    return warped_ds
 
 
 def process_land_work_unit(
@@ -1964,37 +2117,19 @@ def process_land_work_unit(
     """Process one land work unit into the final WebP tile cache."""
     if unique_id is None:
         raise RuntimeError("Land processing requires a run unique_id")
-    completion_marker_path = build_contributor_complete_marker(
+    processed_raster = process_single_tile(
+        work_unit.unit_id,
+        date_paths,
+        args,
+        gebco_src,
+    )
+    commit_land_raster_to_final_tile_cache(
+        processed_raster,
         args.output,
         unique_id,
         work_unit.unit_id,
+        args,
     )
-    try:
-        processed_raster = process_single_tile(
-            work_unit.unit_id,
-            date_paths,
-            args,
-            gebco_src,
-            use_in_memory_utm=True,
-            completion_marker_path=completion_marker_path,
-        )
-        wait_for_final_tile_cache_commit_turn(unique_id, work_unit.unit_id)
-        if processed_raster:
-            try:
-                with FINAL_TILE_CACHE_COMMIT_LOCK:
-                    commit_raster_to_final_tile_cache(
-                        processed_raster,
-                        args.output,
-                        unique_id,
-                        work_unit.unit_id,
-                        args,
-                    )
-            finally:
-                remove_if_exists(processed_raster)
-        mark_final_tile_cache_commit_complete(unique_id, work_unit.unit_id)
-    except Exception:
-        abort_final_tile_cache_commit_sequence(unique_id)
-        raise
     return None
 
 
@@ -2003,16 +2138,10 @@ def process_single_tile(
     date_paths: List[str],
     args: argparse.Namespace,
     gebco_src: Optional[str] = None,
-    *,
-    use_in_memory_utm: bool = False,
-    completion_marker_path: Optional[str] = None,
-) -> Optional[str]:
+) -> Optional[gdal.Dataset]:
     """Process a single MGRS sub-tile: fetch dates, average, tone-map, and warp to Web Mercator."""
-    cleanup_returned_raster = True
     folders = list_mosaic_folders_for_tile(mgrs_subtile, date_paths, args.cache)
     if not folders:
-        if completion_marker_path is not None:
-            write_tile_cache_marker(completion_marker_path, mgrs_subtile, [])
         return None
 
     if args.download:
@@ -2036,8 +2165,6 @@ def process_single_tile(
         if ocean_mask is not None:
             collected = collect_ocean_mask_slabs(ocean_mask, tile_grid)
             if collected is None:
-                if completion_marker_path is not None:
-                    write_tile_cache_marker(completion_marker_path, mgrs_subtile, [])
                 return None
             processing_window, mask_slabs = collected
 
@@ -2059,20 +2186,11 @@ def process_single_tile(
         )
 
         averaged = fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
-        temp_utm_path, temp_3857_path = build_processed_tile_paths(mgrs_subtile, args.output)
-        staged_3857_path = build_staged_path(temp_3857_path)
-        remove_if_exists(staged_3857_path)
-        staged_utm_path = build_staged_path(temp_utm_path)
-        in_memory_output = use_in_memory_utm or completion_marker_path is not None
-        if in_memory_output:
-            ds_out, color_bands, alpha_band = create_output_dataset(
-                None,
-                tile_grid,
-                driver_name="MEM",
-            )
-        else:
-            remove_if_exists(staged_utm_path)
-            ds_out, color_bands, alpha_band = create_output_dataset(staged_utm_path, tile_grid)
+        ds_out, color_bands, alpha_band = create_output_dataset(
+            None,
+            tile_grid,
+            driver_name="MEM",
+        )
         write_processed_blocks(
             averaged,
             alpha_mask,
@@ -2082,26 +2200,15 @@ def process_single_tile(
             alpha_band,
         )
         ds_out.FlushCache()
-        warp_source: str | gdal.Dataset
-        if in_memory_output:
-            warp_source = ds_out
-        else:
-            ds_out = None
-            publish_staged_path(staged_utm_path, temp_utm_path)
-            warp_source = temp_utm_path
-        warp_to_web_mercator(
-            warp_source,
-            staged_3857_path,
+        warped_ds = warp_to_web_mercator(
+            ds_out,
+            None,
             args.resample_alg,
             args.max_zoom,
             args.blocksize,
         )
         ds_out = None
-        publish_staged_path(staged_3857_path, temp_3857_path)
-        if not in_memory_output:
-            os.remove(temp_utm_path)
-        cleanup_returned_raster = False
-        return temp_3857_path
+        return warped_ds
     finally:
         for bands, datasets in date_band_sets:
             bands.clear()
@@ -2110,12 +2217,6 @@ def process_single_tile(
         ocean_mask = None
         fill_allowed_mask = None
         cleanup_prefetched_tile_bands(prefetch_cache_dir)
-        remove_if_exists(build_staged_path(build_processed_tile_paths(mgrs_subtile, args.output)[0]))
-        remove_if_exists(build_staged_path(build_processed_tile_paths(mgrs_subtile, args.output)[1]))
-        if completion_marker_path is not None and cleanup_returned_raster:
-            temp_utm_path, temp_3857_path = build_processed_tile_paths(mgrs_subtile, args.output)
-            remove_if_exists(temp_utm_path)
-            remove_if_exists(temp_3857_path)
 
 
 def calculate_estimates(args: argparse.Namespace) -> None:
@@ -2381,9 +2482,6 @@ def main() -> None:
             discover_available_subtiles_from_s3_cache(mgrs_bases),
         ),
     )
-    recovered_contributors = recover_pending_tile_cache_commits(args.output, unique_id)
-    if recovered_contributors:
-        print(f"Recovered {len(recovered_contributors)} pending WebP commit(s).")
     recovered_units = recover_cached_work_outputs(plan.work_units, args.output, unique_id)
     if recovered_units:
         print(f"Reusing {len(recovered_units)} completed WebP contributor(s).")
@@ -2431,9 +2529,12 @@ def main() -> None:
             )
             progress_line = LiveProgressLine()
             started_at = time.perf_counter()
-            configure_final_tile_cache_commit_sequence(
+            configure_final_tile_cache_flush_coordinator(
+                args.output,
                 unique_id,
-                [work_unit.unit_id for work_unit in work_units_to_process],
+                work_units_to_process,
+                args.quality,
+                args.max_zoom,
             )
             try:
                 with ThreadPoolExecutor(max_workers=args.parallel) as executor:
@@ -2471,7 +2572,7 @@ def main() -> None:
                             args,
                         )
             finally:
-                clear_final_tile_cache_commit_sequence(unique_id)
+                clear_final_tile_cache_flush_coordinator(unique_id)
             progress_line.finish()
         else:
             print("All sub-tiles already processed.")

@@ -1,5 +1,4 @@
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -1985,7 +1984,7 @@ def test_warp_to_web_mercator_uses_shared_zoom13_resolution(monkeypatch: object)
         "satmaps.gdal.WarpOptions",
         lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
     )
-    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: None)
+    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: object())
 
     satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 13, 256)
 
@@ -2008,7 +2007,7 @@ def test_warp_to_web_mercator_respects_requested_zoom(monkeypatch: object) -> No
         "satmaps.gdal.WarpOptions",
         lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
     )
-    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: None)
+    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: object())
 
     satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 14, 256)
 
@@ -2026,7 +2025,7 @@ def test_warp_to_web_mercator_respects_blocksize(monkeypatch: object) -> None:
         "satmaps.gdal.WarpOptions",
         lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
     )
-    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: None)
+    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: object())
 
     satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 13, 512)
 
@@ -2074,7 +2073,7 @@ def test_warp_to_web_mercator_removes_existing_destination(monkeypatch: object) 
 
     monkeypatch.setattr("satmaps.remove_if_exists", lambda path: removed.append(path))
     monkeypatch.setattr("satmaps.gdal.WarpOptions", lambda **kwargs: kwargs)
-    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: None)
+    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: object())
 
     satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 14, 256)
 
@@ -2367,18 +2366,18 @@ def test_process_single_tile_full_pipeline(
         output="render.pmtiles",
     )
 
-    out_path = process_single_tile("31TDF_0_0", ["2025/07/01"], args, None)
+    ds = process_single_tile("31TDF_0_0", ["2025/07/01"], args, None)
 
-    assert out_path is not None
-    assert Path(out_path).exists()
-
-    ds = gdal.Open(out_path)
+    assert ds is not None
     assert ds.RasterCount == 4
+    assert ds.GetDriver().ShortName == "MEM"
     assert ds.GetRasterBand(1).DataType == gdal.GDT_Byte
     assert ds.GetRasterBand(4).GetColorInterpretation() == gdal.GCI_AlphaBand
     # Check projection is 3857
     srs = osr.SpatialReference(ds.GetProjection())
     assert srs.GetAttrValue("AUTHORITY", 1) == "3857"
+    assert not (tmp_path / ".temp" / "render_31TDF_0_0_utm.tif").exists()
+    assert not (tmp_path / ".temp" / "render_31TDF_0_0_3857.tif").exists()
     out = capsys.readouterr().out
     assert "Processing tile 31TDF_0_0" not in out
     assert "Finished tile 31TDF_0_0" not in out
@@ -2457,10 +2456,7 @@ def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path
         output="render.pmtiles",
     )
 
-    out_path = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(gebco_path))
-
-    assert out_path is not None
-    out_ds = gdal.Open(out_path)
+    out_ds = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(gebco_path))
     assert out_ds is not None
     alpha = out_ds.GetRasterBand(4).ReadAsArray()
     assert np.any(alpha == 0)
@@ -2542,10 +2538,7 @@ def test_process_single_tile_with_rgba_ocean_alpha_mask(
         output="render.pmtiles",
     )
 
-    out_path = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(ocean_path))
-
-    assert out_path is not None
-    out_ds = gdal.Open(out_path)
+    out_ds = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(ocean_path))
     assert out_ds is not None
     alpha = out_ds.GetRasterBand(4).ReadAsArray()
     assert np.any(alpha == 255)
@@ -2656,14 +2649,14 @@ def test_process_single_tile_prefetches_all_requested_dates_and_cleans_up(
         output="render.pmtiles",
     )
 
-    out_path = process_single_tile(
+    out_ds = process_single_tile(
         "31TDF_0_0",
         ["2025/07/01", "2025/10/01"],
         args,
         str(ocean_path),
     )
 
-    assert out_path is not None
+    assert out_ds is not None
     assert [download for _cache, _date, download, _quiet in band_requests] == [
         False,
         True,
@@ -2780,9 +2773,9 @@ def test_process_single_tile_skips_prefetch_when_land_percentage_below_threshold
         output="render.pmtiles",
     )
 
-    out_path = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(ocean_path))
+    out_ds = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(ocean_path))
 
-    assert out_path is not None
+    assert out_ds is not None
     assert [download for _cache, download, _quiet in band_requests] == [False, False]
     assert prefetched_cache_dir is None
 
@@ -2858,16 +2851,14 @@ def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
     )
     monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
     processed_tiles: list[str] = []
-    committed_rasters: list[str] = []
+    committed_rasters: list[object] = []
     packaged: list[tuple[str, str, dict[str, object]]] = []
 
     def fake_process_single_tile(tile_id, dates, args, gebco_src=None, **kwargs):
         processed_tiles.append(tile_id)
-        path = tmp_path / f"{tile_id}.tif"
-        path.write_text("fake tif")
-        return str(path)
+        return object()
 
-    def fake_commit(input_raster, output_path, unique_id, contributor_id, args, *, source_under_existing=False):
+    def fake_commit(input_raster, output_path, unique_id, contributor_id, args):
         committed_rasters.append(input_raster)
         return ["13/1/2.webp"]
 
@@ -2876,7 +2867,7 @@ def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
         return str(tmp_path / ".temp" / "output.mbtiles")
 
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
-    monkeypatch.setattr("satmaps.commit_raster_to_final_tile_cache", fake_commit)
+    monkeypatch.setattr("satmaps.commit_land_raster_to_final_tile_cache", fake_commit)
     monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
     monkeypatch.setattr("satmaps.convert_tile_tree_to_pmtiles", fake_convert)
 
@@ -2912,13 +2903,11 @@ def test_main_reports_land_progress(
     monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
 
     def fake_process_single_tile(tile_id, dates, args, gebco_src=None, **kwargs):
-        path = tmp_path / f"{tile_id}.tif"
-        path.write_text("fake tif")
-        return str(path)
+        return object()
 
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
     monkeypatch.setattr(
-        "satmaps.commit_raster_to_final_tile_cache",
+        "satmaps.commit_land_raster_to_final_tile_cache",
         lambda *args, **kwargs: ["13/1/2.webp"],
     )
     monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
@@ -2950,13 +2939,11 @@ def test_main_low_zoom_uses_subtile_processing_strategy(
 
     def fake_process_single_tile(tile_id, dates, args, gebco_src=None, **kwargs):
         processed_tiles.append(tile_id)
-        path = tmp_path / f"{tile_id}.tif"
-        path.write_text("fake tif")
-        return str(path)
+        return object()
 
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
     monkeypatch.setattr(
-        "satmaps.commit_raster_to_final_tile_cache",
+        "satmaps.commit_land_raster_to_final_tile_cache",
         lambda *args, **kwargs: ["4/1/2.webp"],
     )
     monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["4/1/2.webp"])
@@ -3004,13 +2991,11 @@ def test_main_passes_ocean_path_to_tile_processing(
 
     def fake_process_single_tile(tile_id, dates, args, gebco_src=None, **kwargs):
         gebco_sources.append(gebco_src)
-        path = tmp_path / f"{tile_id}.tif"
-        path.write_text("fake tif")
-        return str(path)
+        return object()
 
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
     monkeypatch.setattr(
-        "satmaps.commit_raster_to_final_tile_cache",
+        "satmaps.commit_land_raster_to_final_tile_cache",
         lambda *args, **kwargs: ["13/1/2.webp"],
     )
     monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
@@ -3037,13 +3022,11 @@ def test_main_passes_winter_flag_to_tile_processing(monkeypatch: object, tmp_pat
 
     def fake_process_single_tile(tile_id, dates, args, gebco_src=None, **kwargs):
         winter_flags.append(args.winter)
-        path = tmp_path / f"{tile_id}.tif"
-        path.write_text("fake tif")
-        return str(path)
+        return object()
 
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
     monkeypatch.setattr(
-        "satmaps.commit_raster_to_final_tile_cache",
+        "satmaps.commit_land_raster_to_final_tile_cache",
         lambda *args, **kwargs: ["13/1/2.webp"],
     )
     monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
@@ -3172,28 +3155,19 @@ def test_main_keeps_ocean_after_processing(
     assert ocean_path.exists()
 
 
-def test_process_single_tile_writes_empty_marker_when_no_folders(
+def test_process_single_tile_returns_none_when_no_folders(
     monkeypatch: object, tmp_path: Path
 ) -> None:
-    completion_marker = tmp_path / "tilecache" / "markers" / "31TDF_0_0.json"
     args = argparse.Namespace(cache=".cache", download=False)
     monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
 
-    result = process_single_tile(
-        "31TDF_0_0",
-        ["2025/07/01"],
-        args,
-        completion_marker_path=str(completion_marker),
-    )
+    result = process_single_tile("31TDF_0_0", ["2025/07/01"], args)
+
     assert result is None
-    assert completion_marker.exists()
-    assert completion_marker.exists()
-    marker = completion_marker.read_text()
-    assert '"tile_count": 0' in marker
-    assert '"tiles": []' in marker
+    assert not list(tmp_path.rglob("*.json"))
 
 
-def test_process_land_work_unit_webp_commits_and_removes_temp_raster(
+def test_process_land_work_unit_commits_in_memory_raster(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -3208,30 +3182,24 @@ def test_process_land_work_unit_webp_commits_and_removes_temp_raster(
         resample_alg="bilinear",
     )
     work_unit = satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))
-    temp_raster = tmp_path / ".temp" / "output_31TDF_0_0_3857.tif"
-    seen_calls: list[tuple[str, str, str, bool]] = []
+    rendered_raster = object()
+    seen_calls: list[tuple[object, str, str]] = []
 
     def fake_process_single_tile(*args, **kwargs):
-        temp_raster.write_text("raster")
-        return str(temp_raster)
+        return rendered_raster
 
     def fake_commit(
-        input_raster: str,
+        input_raster: object,
         output_path: str,
         unique_id: str,
         contributor_id: str,
         args: argparse.Namespace,
-        *,
-        source_under_existing: bool = False,
     ) -> list[str]:
-        seen_calls.append(
-            (input_raster, output_path, contributor_id, source_under_existing)
-        )
-        assert Path(input_raster).exists()
+        seen_calls.append((input_raster, output_path, contributor_id))
         return ["13/1/2.webp"]
 
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
-    monkeypatch.setattr("satmaps.commit_raster_to_final_tile_cache", fake_commit)
+    monkeypatch.setattr("satmaps.commit_land_raster_to_final_tile_cache", fake_commit)
 
     result = satmaps.process_land_work_unit(
         work_unit,
@@ -3241,10 +3209,50 @@ def test_process_land_work_unit_webp_commits_and_removes_temp_raster(
     )
 
     assert result is None
-    assert seen_calls == [
-        (str(temp_raster), "output.pmtiles", work_unit.unit_id, False)
-    ]
-    assert not temp_raster.exists()
+    assert seen_calls == [(rendered_raster, "output.pmtiles", work_unit.unit_id)]
+
+
+def test_final_tile_flush_coordinator_waits_for_all_candidate_contributors(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    relative_tile = "13/1/2.webp"
+    coordinator = satmaps.FinalTileCacheFlushCoordinator(
+        "output.pmtiles",
+        "flush123",
+        ("31TDF_0_0", "31TDF_0_1"),
+        {
+            "31TDF_0_0": (relative_tile,),
+            "31TDF_0_1": (relative_tile,),
+        },
+        quality=100,
+    )
+    final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "flush123")) / relative_tile
+
+    coordinator.record_contributor_completion(
+        "31TDF_0_0",
+        {relative_tile: Image.new("RGBA", (8, 8), (255, 0, 0, 255))},
+    )
+
+    assert not final_tile_path.exists()
+    assert not Path(
+        satmaps.build_contributor_complete_marker("output.pmtiles", "flush123", "31TDF_0_0")
+    ).exists()
+
+    coordinator.record_contributor_completion(
+        "31TDF_0_1",
+        {relative_tile: Image.new("RGBA", (8, 8), (0, 255, 0, 255))},
+    )
+
+    assert final_tile_path.exists()
+    assert Path(
+        satmaps.build_contributor_complete_marker("output.pmtiles", "flush123", "31TDF_0_0")
+    ).exists()
+    assert Path(
+        satmaps.build_contributor_complete_marker("output.pmtiles", "flush123", "31TDF_0_1")
+    ).exists()
 
 
 def test_main_webp_resume_reuses_completed_markers_without_latest_state_fallback(
@@ -3309,7 +3317,7 @@ def test_main_webp_resume_reuses_completed_markers_without_latest_state_fallback
     assert "All sub-tiles already processed." in out
 
 
-def test_recover_pending_tile_cache_commits_publishes_staged_tiles_and_marks_complete(
+def test_recover_cached_work_outputs_requires_final_tiles_for_marker_reuse(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -3319,33 +3327,35 @@ def test_recover_pending_tile_cache_commits_publishes_staged_tiles_and_marks_com
     unique_id = "recover123"
     contributor_id = "31TDF_0_0"
     relative_tile = "13/1/2.webp"
-    stage_dir = Path(
-        satmaps.build_tile_cache_commit_stage_dir(output_path, unique_id, contributor_id)
-    )
-    staged_tile_path = stage_dir / relative_tile
-    tiler.save_webp_image(
-        Image.new("RGB", (8, 8), (10, 20, 30)),
-        str(staged_tile_path),
-        quality=100,
-    )
-    manifest_path = satmaps.build_tile_cache_commit_manifest_path(
+    marker_path = satmaps.build_contributor_complete_marker(
         output_path,
         unique_id,
         contributor_id,
     )
-    satmaps.write_tile_cache_commit_manifest(manifest_path, contributor_id, [relative_tile])
+    satmaps.write_tile_cache_marker(marker_path, contributor_id, [relative_tile])
 
-    recovered = satmaps.recover_pending_tile_cache_commits(output_path, unique_id)
+    recovered_without_final_tile = satmaps.recover_cached_work_outputs(
+        (satmaps.LandWorkUnit(contributor_id, (contributor_id,)),),
+        output_path,
+        unique_id,
+    )
 
-    assert recovered == {contributor_id}
+    assert recovered_without_final_tile == set()
+
     final_tile_path = Path(satmaps.build_final_tile_cache_dir(output_path, unique_id)) / relative_tile
-    assert final_tile_path.exists()
-    marker_path = Path(satmaps.build_contributor_complete_marker(output_path, unique_id, contributor_id))
-    marker_payload = json.loads(marker_path.read_text())
-    assert marker_payload["contributor_id"] == contributor_id
-    assert marker_payload["tiles"] == [relative_tile]
-    assert not Path(manifest_path).exists()
-    assert not stage_dir.exists()
+    tiler.save_webp_image(
+        Image.new("RGB", (8, 8), (10, 20, 30)),
+        str(final_tile_path),
+        quality=100,
+    )
+
+    recovered_with_final_tile = satmaps.recover_cached_work_outputs(
+        (satmaps.LandWorkUnit(contributor_id, (contributor_id,)),),
+        output_path,
+        unique_id,
+    )
+
+    assert recovered_with_final_tile == {contributor_id}
 
 
 def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
