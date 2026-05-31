@@ -1101,6 +1101,37 @@ def commit_ocean_to_final_tile_cache(
     return True
 
 
+def fill_missing_ocean_to_final_tile_cache(
+    input_raster: str,
+    output_path: str,
+    unique_id: str,
+    args: argparse.Namespace,
+) -> int:
+    """Backfill any missing final max-zoom tiles from the ocean background."""
+    final_tile_tree = build_final_tile_cache_dir(output_path, unique_id)
+    dataset = gdal.Open(input_raster)
+    if dataset is None:
+        raise RuntimeError(f"Could not open raster for tile rendering: {input_raster}")
+
+    written_tiles = 0
+    try:
+        for relative_path, image in tiler.iter_dataset_webp_tile_images(
+            dataset,
+            args.max_zoom,
+            args.blocksize,
+            args.resample_alg,
+        ):
+            destination_path = os.path.join(final_tile_tree, relative_path)
+            if file_has_content(destination_path):
+                continue
+            tiler.save_webp_image(image, destination_path, args.quality, lossless=False)
+            written_tiles += 1
+    finally:
+        dataset = None
+
+    return written_tiles
+
+
 def render_raster_tile_image(
     input_raster: str,
     relative_path: str,
@@ -2641,6 +2672,16 @@ def main() -> None:
     if args.download:
         print("Download complete.")
         return
+
+    if args.land and prepared_ocean_background:
+        backfilled_ocean_tiles = fill_missing_ocean_to_final_tile_cache(
+            prepared_ocean_background,
+            args.output,
+            unique_id,
+            args,
+        )
+        if backfilled_ocean_tiles > 0:
+            print(f"Backfilled {backfilled_ocean_tiles} ocean-only tile(s).")
 
     final_tile_tree = build_final_tile_cache_dir(args.output, unique_id)
     final_tile_count = len(tiler.iter_tile_tree_paths(final_tile_tree))

@@ -6,7 +6,7 @@ import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from common import build_staged_path, file_has_content, publish_staged_path, remove_if_exists
@@ -655,6 +655,29 @@ def tile_array_to_image(tile_array: np.ndarray) -> Optional[Image.Image]:
     return Image.fromarray(np.moveaxis(tile_array, 0, -1), mode=mode)
 
 
+def iter_dataset_webp_tile_images(
+    dataset: gdal.Dataset,
+    zoom: int,
+    tile_size: int,
+    resample_alg: str,
+) -> Iterator[tuple[str, Image.Image]]:
+    """Yield max-zoom z/x/y tile images for a dataset without buffering the full tile tree."""
+    bounds = get_dataset_bounds(dataset)
+    tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, zoom)
+    for ty in range(ty_min, ty_max + 1):
+        for tx in range(tx_min, tx_max + 1):
+            tile_array = render_dataset_tile(
+                dataset,
+                get_web_mercator_bounds(zoom, tx, ty),
+                tile_size,
+                resample_alg,
+            )
+            image = tile_array_to_image(tile_array)
+            if image is None:
+                continue
+            yield os.path.join(str(zoom), str(tx), f"{ty}.webp"), image
+
+
 def render_raster_to_webp_tile_images(
     input_raster: str | gdal.Dataset,
     zoom: int,
@@ -672,22 +695,7 @@ def render_raster_to_webp_tile_images(
         dataset = input_raster
 
     try:
-        bounds = get_dataset_bounds(dataset)
-        tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, zoom)
-        tile_images: Dict[str, Image.Image] = {}
-        for ty in range(ty_min, ty_max + 1):
-            for tx in range(tx_min, tx_max + 1):
-                tile_array = render_dataset_tile(
-                    dataset,
-                    get_web_mercator_bounds(zoom, tx, ty),
-                    tile_size,
-                    resample_alg,
-                )
-                image = tile_array_to_image(tile_array)
-                if image is None:
-                    continue
-                tile_images[os.path.join(str(zoom), str(tx), f"{ty}.webp")] = image
-        return tile_images
+        return dict(iter_dataset_webp_tile_images(dataset, zoom, tile_size, resample_alg))
     finally:
         if close_dataset:
             dataset = None

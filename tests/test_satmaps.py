@@ -3127,6 +3127,7 @@ def test_main_land_run_passes_prepared_ocean_to_flush_coordinator_without_eager_
         unique_id="lazyocean",
     )
     configure_calls: list[dict[str, object]] = []
+    backfill_calls: list[tuple[str, str, str]] = []
     package_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(
@@ -3154,6 +3155,13 @@ def test_main_land_run_passes_prepared_ocean_to_flush_coordinator_without_eager_
     )
     monkeypatch.setattr("satmaps.process_land_work_unit", lambda *args, **kwargs: None)
     monkeypatch.setattr("satmaps.clear_final_tile_cache_flush_coordinator", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "satmaps.fill_missing_ocean_to_final_tile_cache",
+        lambda input_raster, output_path, unique_id, args: backfill_calls.append(
+            (input_raster, output_path, unique_id)
+        )
+        or 1,
+    )
     monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
     monkeypatch.setattr(
         "satmaps.convert_tile_tree_to_pmtiles",
@@ -3174,6 +3182,9 @@ def test_main_land_run_passes_prepared_ocean_to_flush_coordinator_without_eager_
             "resample_alg": "lanczos",
             "prepared_ocean_background": ".temp/output_ocean_bbox.tif",
         }
+    ]
+    assert backfill_calls == [
+        (".temp/output_ocean_bbox.tif", "output.pmtiles", "lazyocean")
     ]
     assert package_calls == [
         {
@@ -3221,6 +3232,50 @@ def test_main_passes_requested_zoom_to_webp_pipeline(
 
     assert ocean_zooms == [max_zoom]
     assert package_zooms == [max_zoom]
+
+
+def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    final_tile_tree = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "oceanfill"))
+    existing_tile = final_tile_tree / "13/1/2.webp"
+    tiler.save_webp_image(Image.new("RGB", (8, 8), (1, 2, 3)), str(existing_tile), quality=100)
+    original_bytes = existing_tile.read_bytes()
+
+    args = argparse.Namespace(max_zoom=13, blocksize=512, resample_alg="lanczos", quality=74)
+    fake_dataset = object()
+    seen_dataset: list[object] = []
+
+    def fake_iter_dataset_webp_tile_images(dataset, zoom, tile_size, resample_alg):
+        seen_dataset.append(dataset)
+        assert zoom == 13
+        assert tile_size == 512
+        assert resample_alg == "lanczos"
+        return iter(
+            [
+                ("13/1/2.webp", Image.new("RGB", (8, 8), (10, 20, 30))),
+                ("13/1/3.webp", Image.new("RGB", (8, 8), (40, 50, 60))),
+            ]
+        )
+
+    monkeypatch.setattr("satmaps.gdal.Open", lambda path: fake_dataset)
+    monkeypatch.setattr("satmaps.tiler.iter_dataset_webp_tile_images", fake_iter_dataset_webp_tile_images)
+
+    written_tiles = satmaps.fill_missing_ocean_to_final_tile_cache(
+        "ocean.tif",
+        "output.pmtiles",
+        "oceanfill",
+        args,
+    )
+
+    assert written_tiles == 1
+    assert seen_dataset == [fake_dataset]
+    assert existing_tile.read_bytes() == original_bytes
+    new_tile_path = final_tile_tree / "13/1/3.webp"
+    assert new_tile_path.exists()
+    with Image.open(new_tile_path) as new_image:
+        assert new_image.size == (8, 8)
 
 
 def test_main_keeps_ocean_after_processing(
