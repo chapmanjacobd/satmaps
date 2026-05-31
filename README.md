@@ -184,6 +184,7 @@ You can override the defaults (tuned via `satmaps-tuner`):
 - `--exposure`: Global brightness multiplier.
 - `--sat`: Final saturation adjustment.
 - `--gamma`: Final gamma correction.
+- `--shoulder`: Highlight shaping curve for moving the top end.
 - `--db`, `--ls`: Low-tone grading breakpoint and slope.
 - `--ghb`, `--gms`, `--ghs`: Mid/high grading breakpoint and contrast slopes.
 
@@ -195,7 +196,7 @@ You can override the defaults (tuned via `satmaps-tuner`):
 4.  Reprojection: Warps processed land tiles to Web Mercator (EPSG:3857) and composites them with the standalone ocean background.
 5.  Processing (NumPy):
     - Soft-Knee Tone Mapping: A 3-segment linear curve to compress high dynamic range while preserving local contrast.
-    - Color Grading: Saturation adjustment and gamma correction for a "natural" look.
+    - Color Grading: Exposure, gamma/shoulder shaping, and contrast controls for a "natural" look.
 6.  Packaging: The default WebP path renders each land work unit and the prepared ocean background into a resumable max-zoom `z/x/y.webp` cache, merges those contributors into the final max-zoom tile tree, copies those WebP bytes into MBTiles, builds lower zooms with `gdaladdo`, and converts the archive to PMTiles. Non-WebP and `--vrt` runs keep the legacy raster/VRT packaging path.
 
 ## Datasets

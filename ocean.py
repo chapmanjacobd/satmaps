@@ -65,6 +65,7 @@ OCEAN_DEFAULT_SHADOW_SLOPE = 1.4
 OCEAN_DEFAULT_MID_SLOPE = 0.9
 OCEAN_DEFAULT_HIGHLIGHT_SLOPE = 0.5
 OCEAN_DEFAULT_GAMMA = 1.4
+OCEAN_DEFAULT_SHOULDER = 1.0
 OCEAN_DEFAULT_SATURATION = 1.0
 OCEAN_DEFAULT_BLACK_BREAK = 0.35
 OCEAN_DEFAULT_BLACK_SLOPE = 0.25
@@ -163,6 +164,7 @@ class OceanStyleOptions:
     mid_slope: float = OCEAN_DEFAULT_MID_SLOPE
     highlight_slope: float = OCEAN_DEFAULT_HIGHLIGHT_SLOPE
     gamma: float = OCEAN_DEFAULT_GAMMA
+    shoulder: float = OCEAN_DEFAULT_SHOULDER
     saturation: float = OCEAN_DEFAULT_SATURATION
     black_break: float = OCEAN_DEFAULT_BLACK_BREAK
     black_slope: float = OCEAN_DEFAULT_BLACK_SLOPE
@@ -657,6 +659,7 @@ def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
             darken_break=style.black_break,
             low_slope=style.black_slope,
             gamma=style.gamma,
+            shoulder=style.shoulder,
             highlight_break=style.grade_high_break,
             mid_slope=style.grade_mid_slope,
             high_slope=style.grade_high_slope,
@@ -1360,6 +1363,12 @@ def main() -> None:
     )
     parser.add_argument("--gamma", type=float, default=OCEAN_DEFAULT_GAMMA)
     parser.add_argument(
+        "--shoulder",
+        type=float,
+        default=OCEAN_DEFAULT_SHOULDER,
+        help="Highlight shaping curve; values above 1 lift the top end",
+    )
+    parser.add_argument(
         "--sat", "--saturation", type=float, default=OCEAN_DEFAULT_SATURATION
     )
     parser.add_argument(
@@ -1429,6 +1438,7 @@ def main() -> None:
             grade=args.grade,
             exposure=args.exposure,
             gamma=args.gamma,
+            shoulder=args.shoulder,
             saturation=args.sat,
             black_break=args.db,
             black_slope=args.ls,

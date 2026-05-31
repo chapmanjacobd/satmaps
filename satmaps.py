@@ -463,6 +463,7 @@ def build_land_run_token(
             "ms": getattr(args, "ms", tiler.SOFT_KNEE_MID_SLOPE) if tonemap_enabled else None,
             "hs": getattr(args, "hs", tiler.SOFT_KNEE_HIGHLIGHT_SLOPE) if tonemap_enabled else None,
             "gamma": args.gamma,
+            "shoulder": getattr(args, "shoulder", tiler.DEFAULT_SHOULDER),
             "sat": args.sat,
             "db": args.db,
             "ls": args.ls,
@@ -1838,6 +1839,7 @@ def tone_mapped_byte_block(
             darken_break=args.db,
             low_slope=args.ls,
             gamma=args.gamma,
+            shoulder=getattr(args, "shoulder", tiler.DEFAULT_SHOULDER),
             highlight_break=args.ghb,
             mid_slope=args.gms,
             high_slope=args.ghs,
@@ -2263,6 +2265,12 @@ def main() -> None:
         help="Global brightness multiplier",
     )
     parser.add_argument("--gamma", type=float, default=2.6)
+    parser.add_argument(
+        "--shoulder",
+        type=float,
+        default=tiler.DEFAULT_SHOULDER,
+        help="Highlight shaping curve; values above 1 lift the top end",
+    )
     parser.add_argument(
         "--sat", "--saturation", type=float, default=0.9
     )

@@ -36,6 +36,7 @@ PREVIEW_DARKEN_MID_SLOPE = 1.0
 # New default constants
 DEFAULT_EXPOSURE = 1.0
 DEFAULT_GAMMA = 1.0
+DEFAULT_SHOULDER = 1.0
 TERRARIUM_OFFSET = 32768.0
 TERRARIUM_MAX_VALUE = 65535.99609375
 
@@ -233,29 +234,61 @@ def derive_piecewise_high_slope(
     return derived_slope
 
 
+def apply_highlight_shoulder_numpy(
+    arr: np.ndarray,
+    *,
+    shoulder: float,
+    start: float,
+) -> np.ndarray:
+    """Apply a mirrored gamma curve only to the upper tonal range."""
+    clipped = np.clip(arr, 0.0, 1.0)
+    clipped_start = float(np.clip(start, 0.0, 1.0))
+    if shoulder == 1.0 or clipped_start >= 1.0:
+        return cast(np.ndarray, clipped)
+
+    normalized = np.clip((clipped - clipped_start) / (1.0 - clipped_start), 0.0, 1.0)
+    adjusted = 1.0 - np.power(1.0 - normalized, shoulder)
+    out = np.where(
+        clipped > clipped_start,
+        clipped_start + adjusted * (1.0 - clipped_start),
+        clipped,
+    )
+    return cast(np.ndarray, np.clip(out, 0.0, 1.0))
+
+
 def apply_preview_correction_numpy(
     rgb_arr: np.ndarray,
     saturation: float = PREVIEW_SATURATION,
     darken_break: float = PREVIEW_DARKEN_BREAK,
     low_slope: float = PREVIEW_DARKEN_LOW_SLOPE,
     gamma: float = DEFAULT_GAMMA,
+    shoulder: float = DEFAULT_SHOULDER,
     highlight_break: float | None = None,
     mid_slope: float = PREVIEW_DARKEN_MID_SLOPE,
     high_slope: float | None = None,
 ) -> np.ndarray:
     """Apply mild desaturation and preview darkening using NumPy. Expects (C, H, W) float32 [0,1]."""
+    resolved_highlight_break = darken_break if highlight_break is None else highlight_break
+
     # 1. Gamma
     if gamma != 1.0:
         rgb_arr = np.power(np.clip(rgb_arr, 0.0, 1.0), 1.0 / gamma)
 
-    # 2. Calculate luminance
+    # 2. Shoulder
+    if shoulder != 1.0:
+        rgb_arr = apply_highlight_shoulder_numpy(
+            rgb_arr,
+            shoulder=shoulder,
+            start=max(0.5, resolved_highlight_break),
+        )
+
+    # 3. Calculate luminance
     luma = LUMA_RED * rgb_arr[0] + LUMA_GREEN * rgb_arr[1] + LUMA_BLUE * rgb_arr[2]
 
-    # 3. Desaturate
+    # 4. Desaturate
     out = luma + (rgb_arr - luma) * saturation
 
-    # 4. Grading curve
-    resolved_highlight_break = darken_break if highlight_break is None else highlight_break
+    # 5. Grading curve
     resolved_high_slope = (
         derive_piecewise_high_slope(
             darken_break,

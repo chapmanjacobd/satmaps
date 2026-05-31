@@ -367,6 +367,7 @@ def test_build_land_run_token_is_stable_for_matching_inputs() -> None:
         ms=0.9,
         hs=0.5,
         gamma=2.6,
+        shoulder=1.0,
         sat=0.9,
         db=0.15,
         ls=0.2,

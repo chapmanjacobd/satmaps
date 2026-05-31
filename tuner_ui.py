@@ -26,6 +26,7 @@ LAND_SAMPLE_DEFAULT_OFF_Y = 2000
 LAND_SAMPLE_MIN = 0.0
 LAND_SAMPLE_MAX = 9000.0
 LAND_DEFAULT_GAMMA = 2.6
+LAND_DEFAULT_SHOULDER = 1.0
 LAND_DEFAULT_SATURATION = 0.9
 LAND_DEFAULT_GRADE_BREAK = 0.15
 LAND_DEFAULT_GRADE_LOW_SLOPE = 0.2
@@ -344,6 +345,7 @@ def get_mode_defaults(mode: str) -> dict[str, float]:
             "ms": ocean.OCEAN_DEFAULT_MID_SLOPE,
             "hs": ocean.OCEAN_DEFAULT_HIGHLIGHT_SLOPE,
             "gamma": ocean.OCEAN_DEFAULT_GAMMA,
+            "shoulder": ocean.OCEAN_DEFAULT_SHOULDER,
             "sat": ocean.OCEAN_DEFAULT_SATURATION,
             "dmin": -11000.0,
             "dmax": 0.0,
@@ -361,6 +363,7 @@ def get_mode_defaults(mode: str) -> dict[str, float]:
         "ms": tiler.SOFT_KNEE_MID_SLOPE,
         "hs": tiler.SOFT_KNEE_HIGHLIGHT_SLOPE,
         "gamma": LAND_DEFAULT_GAMMA,
+        "shoulder": LAND_DEFAULT_SHOULDER,
         "sat": LAND_DEFAULT_SATURATION,
         "blend": 0.0,
     }
@@ -584,6 +587,7 @@ def render() -> ResponseReturnValue:
                 darken_break=p["db"],
                 low_slope=p["ls"],
                 gamma=p["gamma"],
+                shoulder=p["shoulder"],
                 highlight_break=p["ghb"],
                 mid_slope=p["gms"],
                 high_slope=p["ghs"],
@@ -606,6 +610,7 @@ def render() -> ResponseReturnValue:
                 mid_slope=p["ms"],
                 highlight_slope=p["hs"],
                 gamma=p["gamma"],
+                shoulder=p["shoulder"],
                 saturation=p["sat"],
                 black_break=p["db"],
                 black_slope=p["ls"],

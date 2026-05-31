@@ -1,4 +1,7 @@
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tuner_ui
 
@@ -91,6 +94,7 @@ def test_land_defaults_match_cli_defaults() -> None:
     assert defaults["ms"] == tuner_ui.tiler.SOFT_KNEE_MID_SLOPE
     assert defaults["hs"] == tuner_ui.tiler.SOFT_KNEE_HIGHLIGHT_SLOPE
     assert defaults["gamma"] == tuner_ui.LAND_DEFAULT_GAMMA
+    assert defaults["shoulder"] == tuner_ui.LAND_DEFAULT_SHOULDER
     assert defaults["sat"] == tuner_ui.LAND_DEFAULT_SATURATION
     assert defaults["db"] == tuner_ui.LAND_DEFAULT_GRADE_BREAK
     assert defaults["ghb"] == tuner_ui.LAND_DEFAULT_GRADE_BREAK
@@ -108,6 +112,7 @@ def test_ocean_defaults_match_cli_defaults() -> None:
     assert defaults["ms"] == tuner_ui.ocean.OCEAN_DEFAULT_MID_SLOPE
     assert defaults["hs"] == tuner_ui.ocean.OCEAN_DEFAULT_HIGHLIGHT_SLOPE
     assert defaults["gamma"] == tuner_ui.ocean.OCEAN_DEFAULT_GAMMA
+    assert defaults["shoulder"] == tuner_ui.ocean.OCEAN_DEFAULT_SHOULDER
     assert defaults["sat"] == tuner_ui.ocean.OCEAN_DEFAULT_SATURATION
     assert defaults["db"] == tuner_ui.ocean.OCEAN_DEFAULT_BLACK_BREAK
     assert defaults["ghb"] == tuner_ui.ocean.OCEAN_DEFAULT_BLACK_BREAK
@@ -115,6 +120,17 @@ def test_ocean_defaults_match_cli_defaults() -> None:
     assert defaults["gms"] == tuner_ui.tiler.PREVIEW_DARKEN_MID_SLOPE
     assert defaults["dmin"] == -11000.0
     assert defaults["dmax"] == 0.0
+
+
+def test_index_exposes_shoulder_control() -> None:
+    client = tuner_ui.app.test_client()
+
+    response = client.get("/")
+
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "Shoulder" in html
+    assert "--shoulder" in html
 
 
 def test_get_land_blend_mode_defaults_to_crossfade() -> None:

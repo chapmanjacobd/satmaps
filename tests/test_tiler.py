@@ -174,6 +174,25 @@ def test_apply_preview_correction_numpy_supports_three_grade_regions() -> None:
     np.testing.assert_allclose(corrected, expected, atol=1e-5)
 
 
+def test_apply_preview_correction_numpy_supports_highlight_shoulder() -> None:
+    rgb = np.array([[[0.2, 0.8]], [[0.2, 0.8]], [[0.2, 0.8]]], dtype=np.float32)
+
+    corrected = apply_preview_correction_numpy(
+        rgb,
+        saturation=1.0,
+        darken_break=0.25,
+        low_slope=1.0,
+        gamma=1.0,
+        shoulder=0.5,
+        highlight_break=0.75,
+        mid_slope=1.0,
+        high_slope=1.0,
+    )
+
+    expected = np.array([[[0.2, 0.7763932]], [[0.2, 0.7763932]], [[0.2, 0.7763932]]], dtype=np.float32)
+    np.testing.assert_allclose(corrected, expected, atol=1e-5)
+
+
 def test_apply_preview_correction_numpy_derives_highlight_slope_from_breaks() -> None:
     rgb = np.array([[[1.0]], [[1.0]], [[1.0]]], dtype=np.float32)
 
