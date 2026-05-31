@@ -2032,6 +2032,31 @@ def test_warp_to_web_mercator_respects_blocksize(monkeypatch: object) -> None:
     expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(13, 512)
     assert warp_options_calls[0]["xRes"] == pytest.approx(expected)
     assert warp_options_calls[0]["yRes"] == pytest.approx(expected)
+    assert warp_options_calls[0]["creationOptions"] == [
+        "COMPRESS=ZSTD",
+        "ZSTD_LEVEL=5",
+        "TILED=YES",
+        "BIGTIFF=YES",
+        "BLOCKXSIZE=512",
+        "BLOCKYSIZE=512",
+    ]
+
+
+def test_warp_to_web_mercator_omits_gtiff_creation_options_for_mem_output(
+    monkeypatch: object,
+) -> None:
+    warp_options_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "satmaps.gdal.WarpOptions",
+        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: object())
+
+    satmaps.warp_to_web_mercator("input.tif", None, "lanczos", 13, 512)
+
+    assert warp_options_calls[0]["format"] == "MEM"
+    assert "creationOptions" not in warp_options_calls[0]
 
 
 def test_warp_to_web_mercator_aligns_adjacent_tiles_to_shared_pixel_grid(

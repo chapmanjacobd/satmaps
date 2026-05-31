@@ -2134,16 +2134,27 @@ def warp_to_web_mercator(
     if destination_path is not None:
         remove_if_exists(destination_path)
     pixel_size = tiler.web_mercator_pixel_size_for_tile_size(max_zoom, blocksize)
+    warp_kwargs: dict[str, object] = {
+        "format": "MEM" if destination_path is None else "GTiff",
+        "dstSRS": "EPSG:3857",
+        "xRes": pixel_size,
+        "yRes": pixel_size,
+        "resampleAlg": resample_alg,
+        "targetAlignedPixels": True,
+        "multithread": True,
+        "warpOptions": ["NUM_THREADS=ALL_CPUS"],
+    }
+    if destination_path is not None:
+        warp_kwargs["creationOptions"] = [
+            "COMPRESS=ZSTD",
+            "ZSTD_LEVEL=5",
+            "TILED=YES",
+            "BIGTIFF=YES",
+            f"BLOCKXSIZE={blocksize}",
+            f"BLOCKYSIZE={blocksize}",
+        ]
     warp_options = gdal.WarpOptions(
-        format="MEM" if destination_path is None else "GTiff",
-        dstSRS="EPSG:3857",
-        xRes=pixel_size,
-        yRes=pixel_size,
-        resampleAlg=resample_alg,
-        targetAlignedPixels=True,
-        multithread=True,
-        warpOptions=["NUM_THREADS=ALL_CPUS"],
-        creationOptions=["COMPRESS=ZSTD", "ZSTD_LEVEL=5", "TILED=YES", "BIGTIFF=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512"],
+        **warp_kwargs,
     )
     destination = "" if destination_path is None else destination_path
     warped_ds = gdal.Warp(destination, source_path, options=warp_options)
