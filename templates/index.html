@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Tone Mapping Tuner</title>
+    <title>Style Tuner</title>
     <style>
         body { font-family: sans-serif; background: #1a1a1a; color: #eee; margin: 0; padding: 20px; }
         h1 { margin-bottom: 30px; color: #fb0; }
@@ -37,7 +37,7 @@
 </head>
 <body>
     <div class="page">
-        <h1>Tone Mapping Tuner</h1>
+        <h1>Style Tuner</h1>
 
         <div class="mode-switcher">
             <button class="mode-btn {{ 'active' if mode == 'land' else '' }}" onclick="window.location.href='/?mode=land'">Land Mode</button>
@@ -120,15 +120,15 @@
             {% endif %}
 
             <div class="section-toggle">
-                <h3 style="margin: 0; border: none;">Tone Mapping</h3>
-                <input type="checkbox" id="tm_on" checked>
+                <h3 style="margin: 0; border: none;">Final Grade (Color & Contrast)</h3>
+                <input type="checkbox" id="fg_on" checked>
             </div>
 
-            <div class="viz-container" id="tone_map_viz">
-                <div class="viz-label">INPUT → TONE MAPPED</div>
-                <svg id="tm_svg" viewBox="0 0 256 128" preserveAspectRatio="none">
-                    <path id="tm_hist" fill="#333" d=""></path>
-                    <path id="tm_curve" stroke="#fb0" stroke-width="2" fill="none" d=""></path>
+            <div class="viz-container" id="final_grade_viz">
+                <div class="viz-label">INPUT → FINAL</div>
+                <svg id="fg_svg" viewBox="0 0 256 128" preserveAspectRatio="none">
+                    <path id="fg_hist" fill="#333" d=""></path>
+                    <path id="fg_curve" stroke="#0af" stroke-width="2" fill="none" d=""></path>
                     <line x1="0" y1="0" x2="256" y2="128" stroke="#222" stroke-dasharray="4"></line>
                 </svg>
             </div>
@@ -137,40 +137,6 @@
                 <label>Exposure <span class="val" id="exp_val"></span></label>
                 <input type="range" id="exp" min="0.1" max="4" step="0.1" value="{{ params.exp }}">
             </div>
-            <div class="slider-group">
-                <label>Shadow Break <span class="val" id="sb_val"></span></label>
-                <input type="range" id="sb" min="0" max="1" step="0.01" value="{{ params.sb }}">
-            </div>
-            <div class="slider-group">
-                <label>Highlight Break <span class="val" id="hb_val"></span></label>
-                <input type="range" id="hb" min="0" max="1" step="0.01" value="{{ params.hb }}">
-            </div>
-            <div class="slider-group">
-                <label>Shadow Slope <span class="val" id="ss_val"></span></label>
-                <input type="range" id="ss" min="0" max="4" step="0.1" value="{{ params.ss }}">
-            </div>
-            <div class="slider-group">
-                <label>Mid Slope <span class="val" id="ms_val"></span></label>
-                <input type="range" id="ms" min="0" max="3" step="0.05" value="{{ params.ms }}">
-            </div>
-            <div class="slider-group">
-                <label>Highlight Slope <span class="val" id="hs_val"></span></label>
-                <input type="range" id="hs" min="0" max="2" step="0.05" value="{{ params.hs }}">
-            </div>
-
-            <div class="section-toggle">
-                <h3 style="margin: 0; border: none;">Final Grade (Color & Contrast)</h3>
-                <input type="checkbox" id="fg_on" checked>
-            </div>
-
-            <div class="viz-container" id="final_grade_viz">
-                <div class="viz-label">TONE MAPPED → FINAL</div>
-                <svg id="fg_svg" viewBox="0 0 256 128" preserveAspectRatio="none">
-                    <path id="fg_curve" stroke="#0af" stroke-width="2" fill="none" d=""></path>
-                    <line x1="0" y1="0" x2="256" y2="128" stroke="#222" stroke-dasharray="4"></line>
-                </svg>
-            </div>
-
             <div class="slider-group">
                 <label>Gamma <span class="val" id="gamma_val"></span></label>
                 <input type="range" id="gamma" min="0.2" max="3" step="0.1" value="{{ params.gamma }}">
@@ -233,22 +199,18 @@
         const landDates = {{ land_dates | tojson }};
         let rawHist = {{ raw_hist | tojson }};
         const img = document.getElementById('preview');
-        const sharedControls = ['exp', 'sb', 'hb', 'ss', 'ms', 'hs', 'gamma', 'sat', 'db', 'ghb', 'ls', 'gms', 'ghs'];
+        const gradingControls = ['exp', 'gamma', 'sat', 'db', 'ghb', 'ls', 'gms', 'ghs'];
+        const sharedControls = [...gradingControls];
         const landViewControls = canPanLandView ? ['panx', 'pany'] : [];
         const renderControls = currentMode === 'land'
             ? [...landViewControls, ...(hasLandBlend ? ['blend', ...sharedControls] : [...sharedControls])]
             : [...sharedControls, 'dmin', 'dmax'];
         const cliControls = currentMode === 'land'
-            ? [...sharedControls]
-            : [...sharedControls, 'dmin', 'dmax'];
+            ? [...gradingControls]
+            : [...gradingControls, 'dmin', 'dmax'];
         const cliArgMap = {
             land: {
                 exp: '--exposure',
-                sb: '--shadow-break',
-                hb: '--highlight-break',
-                ss: '--shadow-slope',
-                ms: '--mid-slope',
-                hs: '--highlight-slope',
                 gamma: '--gamma',
                 sat: '--saturation',
                 db: '--grade-low-break',
@@ -259,11 +221,6 @@
             },
             ocean: {
                 exp: '--exposure',
-                sb: '--shadow-break',
-                hb: '--highlight-break',
-                ss: '--shadow-slope',
-                ms: '--mid-slope',
-                hs: '--highlight-slope',
                 gamma: '--gamma',
                 sat: '--saturation',
                 db: '--grade-low-break',
@@ -343,7 +300,7 @@
         }
 
         function drawHist() {
-            const path = document.getElementById('tm_hist');
+            const path = document.getElementById('fg_hist');
             if (!rawHist || rawHist.length === 0) {
                 path.setAttribute('d', '');
                 return;
@@ -371,19 +328,9 @@
             return highlightOutput + (x - p.highlightBreak) * p.highlightSlope;
         }
 
-        function getToneParams() {
-            return {
-                exp: getValue('exp'),
-                sb: getValue('sb'),
-                hb: Math.max(getValue('sb'), getValue('hb')),
-                ss: getValue('ss'),
-                ms: getValue('ms'),
-                hs: getValue('hs')
-            };
-        }
-
         function getGradeParams() {
             return {
+                exp: getValue('exp'),
                 gamma: getValue('gamma'),
                 sat: getValue('sat'),
                 db: getValue('db'),
@@ -392,17 +339,6 @@
                 gms: getValue('gms'),
                 ghs: getValue('ghs')
             };
-        }
-
-        function applyToneMap(x, p) {
-            const exposed = Math.min(1.0, x * p.exp);
-            return Math.min(1.0, Math.max(0.0, applyPiecewiseCurve(exposed, {
-                shadowBreak: p.sb,
-                highlightBreak: p.hb,
-                shadowSlope: p.ss,
-                midSlope: p.ms,
-                highlightSlope: p.hs
-            })));
         }
 
         function applyGrading(x, p) {
@@ -416,25 +352,15 @@
             })));
         }
 
-        function drawToneMapCurve() {
-            const p = getToneParams();
-            const path = document.getElementById('tm_curve');
-            let d = '';
-            for (let i = 0; i <= 256; i += 2) {
-                const x = i / 256;
-                const y = 1.0 - applyToneMap(x, p);
-                d += (i === 0 ? 'M' : 'L') + ` ${i} ${y * 128} `;
-            }
-            path.setAttribute('d', d);
-        }
-
         function drawFinalGradeCurve() {
             const p = getGradeParams();
+            const fgOn = document.getElementById('fg_on').checked;
             const path = document.getElementById('fg_curve');
             let d = '';
             for (let i = 0; i <= 256; i += 2) {
                 const x = i / 256;
-                const y = 1.0 - applyGrading(x, p);
+                const exposed = Math.min(1.0, x * p.exp);
+                const y = 1.0 - (fgOn ? applyGrading(exposed, p) : exposed);
                 d += (i === 0 ? 'M' : 'L') + ` ${i} ${y * 128} `;
             }
             path.setAttribute('d', d);
@@ -443,26 +369,14 @@
         function drawRamp() {
             if (currentMode !== 'ocean') return;
             const rampEl = document.getElementById('ramp_viz');
-            const tmOn = document.getElementById('tm_on').checked;
             const fgOn = document.getElementById('fg_on').checked;
-            const toneParams = getToneParams();
             const gradeParams = getGradeParams();
 
             const stops = makoRamp.map(stop => {
                 const frac = stop[0];
-                let r = stop[1] / 255;
-                let g = stop[2] / 255;
-                let b = stop[3] / 255;
-
-                if (tmOn) {
-                    r = applyToneMap(r, toneParams);
-                    g = applyToneMap(g, toneParams);
-                    b = applyToneMap(b, toneParams);
-                } else {
-                    r = Math.min(1.0, r * toneParams.exp);
-                    g = Math.min(1.0, g * toneParams.exp);
-                    b = Math.min(1.0, b * toneParams.exp);
-                }
+                let r = Math.min(1.0, (stop[1] / 255) * gradeParams.exp);
+                let g = Math.min(1.0, (stop[2] / 255) * gradeParams.exp);
+                let b = Math.min(1.0, (stop[3] / 255) * gradeParams.exp);
                 if (fgOn) {
                     const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
                     r = luma + (r - luma) * gradeParams.sat;
@@ -516,9 +430,8 @@
             clearTimeout(updateTimeout);
             const token = ++histogramToken;
             updateTimeout = setTimeout(() => {
-                const tmOn = document.getElementById('tm_on').checked ? '1' : '0';
                 const fgOn = document.getElementById('fg_on').checked ? '1' : '0';
-                const params = new URLSearchParams({ mode: currentMode, tm: tmOn, fg: fgOn });
+                const params = new URLSearchParams({ mode: currentMode, fg: fgOn });
                 if (currentMode === 'land') {
                     params.set('loc', currentLandLocation);
                     if (hasLandBlend) {
@@ -576,10 +489,6 @@
         }
 
         function update() {
-            const toneHighlightBreak = document.getElementById('hb');
-            if (toneHighlightBreak) {
-                toneHighlightBreak.value = Math.max(getValue('sb'), getValue('hb'));
-            }
             const gradeHighlightBreak = document.getElementById('ghb');
             if (gradeHighlightBreak) {
                 gradeHighlightBreak.value = Math.max(getValue('db'), getValue('ghb'));
@@ -587,7 +496,6 @@
 
             updateLabels();
             updateLandBlendUi();
-            drawToneMapCurve();
             drawFinalGradeCurve();
             drawRamp();
             queuePreviewRefresh();
@@ -621,7 +529,6 @@
         if (hasLandBlend) {
             document.getElementById('blend_mode').addEventListener('change', update);
         }
-        document.getElementById('tm_on').addEventListener('change', update);
         document.getElementById('fg_on').addEventListener('change', update);
 
         drawHist();

@@ -138,8 +138,8 @@ satmaps --estimate
 - `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before max-zoom tile caching. Coarser ocean masks (for example z4-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass.
 - Final Web Mercator land outputs target `--max-zoom` (supported: 4-14; default zoom 13, ~19.11 m/px at the equator). Ocean backgrounds may be reused from the same or a coarser zoom level and are resampled onto that final output grid during composition. Low-resolution runs at `--max-zoom 7` and below use a coarse-grid-first land renderer to avoid the full per-subtile pipeline.
 - `--land` / `--no-land`: Enable or skip Sentinel-2 land tile processing entirely.
-- `--tonemap` / `--no-tonemap`: Enable or disable the land tone-mapping stage.
 - `--grade` / `--no-grade`: Enable or disable final land grading.
+- `--exposure`: Global brightness multiplier.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
 - `--download`: Download source tiles into the cache and exit without building output tiles.
 - `--resume [STATE_FILE]`: Resume a previous run from a saved `.temp/state_*.json`; without a path, the most recent state file is used.
@@ -156,7 +156,7 @@ satmaps --estimate
 
 ### Ocean Background Options
 
-`ocean` supports the same tone-mapping controls as `satmaps`, plus:
+`ocean` supports the same grading controls as `satmaps`, plus:
 
 - `--bbox`: Export a Web Mercator ocean background cropped to a WGS84 bbox and snapped outward to the requested Web Mercator tile grid used for bbox renders in `satmaps`.
 - `--max-zoom`: Target Web Mercator zoom used for output resolution (`4` through `14`).
@@ -178,14 +178,14 @@ satmaps --estimate
 - `--resample-alg`: GEBCO warp kernel (`bilinear`, `cubicspline`, or `lanczos`).
 - `--temp-dir`: Directory for intermediate rasters/VRTs.
 
-### Tone Mapping Parameters
+### Grading Parameters
 
 You can override the defaults (tuned via `satmaps-tuner`):
 - `--exposure`: Global brightness multiplier.
-- `--sb`, `--hb`: Shadow and highlight "break" points for the soft-knee curve.
-- `--ss`, `--ms`, `--hs`: Slopes for shadow, mid-tone, and highlight segments.
 - `--sat`: Final saturation adjustment.
 - `--gamma`: Final gamma correction.
+- `--db`, `--ls`: Low-tone grading breakpoint and slope.
+- `--ghb`, `--gms`, `--ghs`: Mid/high grading breakpoint and contrast slopes.
 
 ## Technical Details
 

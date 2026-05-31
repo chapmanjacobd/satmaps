@@ -557,7 +557,7 @@ def render() -> ResponseReturnValue:
         get_land_pan_arg("pany"),
     )
     p = parse_request_params(mode)
-    tm_on = request.args.get("tm", "1") == "1"
+    tm_on = request.args.get("tm", "0") == "1"
     fg_on = request.args.get("fg", "1") == "1"
 
     if mode == "land":

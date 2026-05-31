@@ -444,6 +444,7 @@ def build_land_run_token(
     gebco_vrt_source: Optional[str],
 ) -> str:
     """Return a stable token so identical land-processing runs reuse temp outputs."""
+    tonemap_enabled = getattr(args, "tonemap", False)
     payload = json.dumps(
         {
             "output": os.path.abspath(args.output),
@@ -453,14 +454,14 @@ def build_land_run_token(
             "resample_alg": args.resample_alg,
             "stats_min": args.stats_min,
             "stats_max": args.stats_max,
-            "tonemap": args.tonemap,
+            "tonemap": tonemap_enabled,
             "grade": args.grade,
             "exposure": args.exposure,
-            "sb": args.sb,
-            "hb": args.hb,
-            "ss": args.ss,
-            "ms": args.ms,
-            "hs": args.hs,
+            "sb": getattr(args, "sb", tiler.SOFT_KNEE_SHADOW_BREAK) if tonemap_enabled else None,
+            "hb": getattr(args, "hb", tiler.SOFT_KNEE_HIGHLIGHT_BREAK) if tonemap_enabled else None,
+            "ss": getattr(args, "ss", tiler.SOFT_KNEE_SHADOW_SLOPE) if tonemap_enabled else None,
+            "ms": getattr(args, "ms", tiler.SOFT_KNEE_MID_SLOPE) if tonemap_enabled else None,
+            "hs": getattr(args, "hs", tiler.SOFT_KNEE_HIGHLIGHT_SLOPE) if tonemap_enabled else None,
             "gamma": args.gamma,
             "sat": args.sat,
             "db": args.db,
@@ -1815,19 +1816,20 @@ def tone_mapped_byte_block(
     """Return an 8-bit RGB block after normalization, tonemapping, and grading."""
     normalized = np.clip((averaged_block - source_min) / scale, 0.0, 1.0)
     normalized[np.isnan(normalized)] = 0.0
+    exposure = getattr(args, "exposure", tiler.DEFAULT_EXPOSURE)
 
-    if args.tonemap:
+    if getattr(args, "tonemap", False):
         toned_block = tiler.apply_soft_knee_numpy(
             normalized,
-            shadow_break=args.sb,
-            highlight_break=args.hb,
-            shadow_slope=args.ss,
-            mid_slope=args.ms,
-            highlight_slope=args.hs,
-            exposure=args.exposure,
+            shadow_break=getattr(args, "sb", tiler.SOFT_KNEE_SHADOW_BREAK),
+            highlight_break=getattr(args, "hb", tiler.SOFT_KNEE_HIGHLIGHT_BREAK),
+            shadow_slope=getattr(args, "ss", tiler.SOFT_KNEE_SHADOW_SLOPE),
+            mid_slope=getattr(args, "ms", tiler.SOFT_KNEE_MID_SLOPE),
+            highlight_slope=getattr(args, "hs", tiler.SOFT_KNEE_HIGHLIGHT_SLOPE),
+            exposure=exposure,
         )
     else:
-        toned_block = np.clip(normalized * args.exposure, 0.0, 1.0)
+        toned_block = np.clip(normalized * exposure, 0.0, 1.0)
 
     if args.grade:
         toned_block = tiler.apply_preview_correction_numpy(
@@ -2247,25 +2249,19 @@ def main() -> None:
     parser.add_argument("--stats-min", type=float, help="Hardcoded source min")
     parser.add_argument("--stats-max", type=float, help="Hardcoded source max")
 
-    # Tone Mapping
-    parser.add_argument("--exposure", type=float, default=tiler.DEFAULT_EXPOSURE)
-    parser.add_argument(
-        "--sb", "--shadow-break", type=float, default=tiler.SOFT_KNEE_SHADOW_BREAK
-    )
-    parser.add_argument(
-        "--hb", "--highlight-break", type=float, default=tiler.SOFT_KNEE_HIGHLIGHT_BREAK
-    )
-    parser.add_argument(
-        "--ss", "--shadow-slope", type=float, default=tiler.SOFT_KNEE_SHADOW_SLOPE
-    )
-    parser.add_argument(
-        "--ms", "--mid-slope", type=float, default=tiler.SOFT_KNEE_MID_SLOPE
-    )
-    parser.add_argument(
-        "--hs", "--highlight-slope", type=float, default=tiler.SOFT_KNEE_HIGHLIGHT_SLOPE
-    )
-
     # Grading
+    parser.add_argument(
+        "--grade",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable land final grading",
+    )
+    parser.add_argument(
+        "--exposure",
+        type=float,
+        default=tiler.DEFAULT_EXPOSURE,
+        help="Global brightness multiplier",
+    )
     parser.add_argument("--gamma", type=float, default=2.6)
     parser.add_argument(
         "--sat", "--saturation", type=float, default=0.9
@@ -2294,18 +2290,11 @@ def main() -> None:
         type=float,
         help="Highlight slope for the final grading curve; defaults to an anchored derived slope",
     )
-
     parser.add_argument(
         "--tonemap",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable/disable land tone mapping",
-    )
-    parser.add_argument(
-        "--grade",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable/disable land final grading",
+        default=False,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--land",

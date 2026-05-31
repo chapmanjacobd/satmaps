@@ -154,7 +154,7 @@ class OceanBackgroundArtifacts:
 
 @dataclass(frozen=True)
 class OceanStyleOptions:
-    tonemap: bool = True
+    tonemap: bool = False
     grade: bool = True
     exposure: float = OCEAN_DEFAULT_EXPOSURE
     shadow_break: float = OCEAN_DEFAULT_SHADOW_BREAK
@@ -1341,32 +1341,22 @@ def main() -> None:
         help="Vertical exaggeration passed to gdaldem hillshade",
     )
     parser.add_argument(
-        "--tonemap",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable/disable ocean tone mapping before colorization",
-    )
-    parser.add_argument(
         "--grade",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable/disable ocean final grading before colorization",
     )
-    parser.add_argument("--exposure", type=float, default=OCEAN_DEFAULT_EXPOSURE)
     parser.add_argument(
-        "--sb", "--shadow-break", type=float, default=OCEAN_DEFAULT_SHADOW_BREAK
+        "--exposure",
+        type=float,
+        default=OCEAN_DEFAULT_EXPOSURE,
+        help="Global brightness multiplier",
     )
     parser.add_argument(
-        "--hb", "--highlight-break", type=float, default=OCEAN_DEFAULT_HIGHLIGHT_BREAK
-    )
-    parser.add_argument(
-        "--ss", "--shadow-slope", type=float, default=OCEAN_DEFAULT_SHADOW_SLOPE
-    )
-    parser.add_argument(
-        "--ms", "--mid-slope", type=float, default=OCEAN_DEFAULT_MID_SLOPE
-    )
-    parser.add_argument(
-        "--hs", "--highlight-slope", type=float, default=OCEAN_DEFAULT_HIGHLIGHT_SLOPE
+        "--tonemap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--gamma", type=float, default=OCEAN_DEFAULT_GAMMA)
     parser.add_argument(
@@ -1438,11 +1428,6 @@ def main() -> None:
             tonemap=args.tonemap,
             grade=args.grade,
             exposure=args.exposure,
-            shadow_break=args.sb,
-            highlight_break=args.hb,
-            shadow_slope=args.ss,
-            mid_slope=args.ms,
-            highlight_slope=args.hs,
             gamma=args.gamma,
             saturation=args.sat,
             black_break=args.db,
