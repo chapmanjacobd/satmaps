@@ -105,3 +105,33 @@ def test_ocean_defaults_match_cli_defaults() -> None:
     assert defaults["gms"] == tuner_ui.tiler.PREVIEW_DARKEN_MID_SLOPE
     assert defaults["dmin"] == -11000.0
     assert defaults["dmax"] == 0.0
+
+
+def test_get_land_blend_mode_defaults_to_crossfade() -> None:
+    blend_mode = tuner_ui.get_land_blend_mode(None)
+
+    assert blend_mode.id == "crossfade"
+
+
+def test_blend_land_samples_supports_all_requested_modes() -> None:
+    primary = tuner_ui.np.zeros((3, 2, 4), dtype=tuner_ui.np.float32)
+    secondary = tuner_ui.np.ones((3, 2, 4), dtype=tuner_ui.np.float32)
+    samples = (primary, secondary)
+
+    crossfade = tuner_ui.blend_land_samples(samples, 0.25, "crossfade")
+    difference = tuner_ui.blend_land_samples(samples, 0.25, "difference")
+    lighten = tuner_ui.blend_land_samples(samples, 0.25, "lighten")
+    darken = tuner_ui.blend_land_samples(samples, 0.25, "darken")
+    swipe = tuner_ui.blend_land_samples(samples, 0.25, "swipe")
+
+    assert crossfade is not None
+    assert difference is not None
+    assert lighten is not None
+    assert darken is not None
+    assert swipe is not None
+    assert tuner_ui.np.allclose(crossfade, 0.25)
+    assert tuner_ui.np.allclose(difference, 1.0)
+    assert tuner_ui.np.allclose(lighten, 1.0)
+    assert tuner_ui.np.allclose(darken, 0.0)
+    assert tuner_ui.np.allclose(swipe[:, :, :3], 0.0)
+    assert tuner_ui.np.allclose(swipe[:, :, 3:], 1.0)

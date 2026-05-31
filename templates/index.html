@@ -60,14 +60,24 @@
             </div>
             {% if has_land_blend %}
             <div class="slider-group">
-                <label>Blend {{ land_dates[0] }} → {{ land_dates[1] }} <span class="val" id="blend_val"></span></label>
+                <label for="blend_mode">Blend Mode</label>
+                <select id="blend_mode">
+                    {% for blend_mode in land_blend_modes %}
+                    <option value="{{ blend_mode.id }}" {{ 'selected' if blend_mode.id == selected_land_blend_mode.id else '' }}>
+                        {{ blend_mode.label }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="slider-group" id="blend_group">
+                <label><span id="blend_label_text">Blend {{ land_dates[0] }} → {{ land_dates[1] }}</span> <span class="val" id="blend_val"></span></label>
                 <input type="range" id="blend" min="0" max="1" step="0.01" value="{{ params.blend }}">
                 <div class="range-hint">
                     <span>{{ land_dates[0] }}</span>
                     <span>{{ land_dates[1] }}</span>
                 </div>
             </div>
-            <p class="note">This slider only blends the preview crop so you can compare the two cached land dates quickly.</p>
+            <p class="note" id="blend_note">This slider crossfades the preview crop between the two cached land dates.</p>
             {% elif land_dates %}
             <p class="note">Loaded land sample date: <strong>{{ land_dates[0] }}</strong></p>
             {% else %}
@@ -218,6 +228,7 @@
         const currentLandLocation = {{ selected_land_location.id | tojson }};
         const hasLandBlend = {{ has_land_blend | tojson }};
         const canPanLandView = {{ (mode == 'land' and land_dates) | tojson }};
+        const defaultLandBlendMode = {{ default_land_blend_mode | tojson }};
         const defaultParams = {{ defaults | tojson }};
         const landDates = {{ land_dates | tojson }};
         let rawHist = {{ raw_hist | tojson }};
@@ -285,8 +296,15 @@
             return parseFloat(document.getElementById(id).value);
         }
 
+        function getBlendMode() {
+            return hasLandBlend ? document.getElementById('blend_mode').value : defaultLandBlendMode;
+        }
+
         function formatValue(id, value) {
             if (id === 'blend') {
+                if (getBlendMode() === 'swipe') {
+                    return `${Math.round(value * 100)}%`;
+                }
                 const newer = Math.round(value * 100);
                 const older = 100 - newer;
                 return `${older}/${newer}`;
@@ -298,6 +316,30 @@
                 return String(value);
             }
             return value.toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1');
+        }
+
+        function updateLandBlendUi() {
+            if (!hasLandBlend) return;
+            const blendMode = getBlendMode();
+            const blendGroup = document.getElementById('blend_group');
+            const blendLabel = document.getElementById('blend_label_text');
+            const blendNote = document.getElementById('blend_note');
+            const showBlendSlider = blendMode === 'crossfade' || blendMode === 'swipe';
+
+            blendGroup.style.display = showBlendSlider ? 'flex' : 'none';
+            if (blendMode === 'swipe') {
+                blendLabel.innerText = `Swipe ${landDates[0]} | ${landDates[1]}`;
+                blendNote.innerText = 'This slider moves the swipe divider across the preview crop.';
+            } else if (blendMode === 'crossfade') {
+                blendLabel.innerText = `Blend ${landDates[0]} \u2192 ${landDates[1]}`;
+                blendNote.innerText = 'This slider crossfades the preview crop between the two cached land dates.';
+            } else if (blendMode === 'difference') {
+                blendNote.innerText = 'Difference shows the absolute per-pixel change between the two cached land dates.';
+            } else if (blendMode === 'lighten') {
+                blendNote.innerText = 'Lighten keeps the brighter pixel from each of the two cached land dates.';
+            } else if (blendMode === 'darken') {
+                blendNote.innerText = 'Darken keeps the darker pixel from each of the two cached land dates.';
+            }
         }
 
         function drawHist() {
@@ -452,6 +494,7 @@
                 params.set('loc', currentLandLocation);
                 landViewControls.forEach(id => params.set(id, document.getElementById(id).value));
                 if (hasLandBlend) {
+                    params.set('blend_mode', getBlendMode());
                     params.set('blend', document.getElementById('blend').value);
                 }
             }
@@ -478,6 +521,9 @@
                 const params = new URLSearchParams({ mode: currentMode, tm: tmOn, fg: fgOn });
                 if (currentMode === 'land') {
                     params.set('loc', currentLandLocation);
+                    if (hasLandBlend) {
+                        params.set('blend_mode', getBlendMode());
+                    }
                 }
                 renderControls.forEach(id => params.set(id, document.getElementById(id).value));
                 img.src = `/render?${params.toString()}&t=${Date.now()}`;
@@ -540,6 +586,7 @@
             }
 
             updateLabels();
+            updateLandBlendUi();
             drawToneMapCurve();
             drawFinalGradeCurve();
             drawRamp();
@@ -551,6 +598,9 @@
                 const el = document.getElementById(key);
                 if (el) el.value = value;
             });
+            if (hasLandBlend) {
+                document.getElementById('blend_mode').value = defaultLandBlendMode;
+            }
             update();
         }
 
@@ -568,6 +618,9 @@
         }
 
         renderControls.forEach(id => document.getElementById(id).addEventListener('input', update));
+        if (hasLandBlend) {
+            document.getElementById('blend_mode').addEventListener('change', update);
+        }
         document.getElementById('tm_on').addEventListener('change', update);
         document.getElementById('fg_on').addEventListener('change', update);
 

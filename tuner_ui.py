@@ -59,6 +59,12 @@ class LandView:
     full_height: int
 
 
+@dataclass(frozen=True)
+class LandBlendMode:
+    id: str
+    label: str
+
+
 LAND_LOCATIONS = (
     LandLocation(
         id="barcelona",
@@ -123,10 +129,26 @@ LAND_LOCATIONS = (
 )
 DEFAULT_LAND_LOCATION_ID = "barcelona"
 LAND_LOCATIONS_BY_ID = {location.id: location for location in LAND_LOCATIONS}
+LAND_BLEND_MODES = (
+    LandBlendMode(id="crossfade", label="Crossfade"),
+    LandBlendMode(id="difference", label="Difference"),
+    LandBlendMode(id="lighten", label="Lighten"),
+    LandBlendMode(id="darken", label="Darken"),
+    LandBlendMode(id="swipe", label="Swipe"),
+)
+DEFAULT_LAND_BLEND_MODE = "crossfade"
+LAND_BLEND_MODES_BY_ID = {blend_mode.id: blend_mode for blend_mode in LAND_BLEND_MODES}
 
 
 def get_land_location(location_id: str | None) -> LandLocation:
     return LAND_LOCATIONS_BY_ID.get(location_id or DEFAULT_LAND_LOCATION_ID, LAND_LOCATIONS_BY_ID[DEFAULT_LAND_LOCATION_ID])
+
+
+def get_land_blend_mode(blend_mode_id: str | None) -> LandBlendMode:
+    return LAND_BLEND_MODES_BY_ID.get(
+        blend_mode_id or DEFAULT_LAND_BLEND_MODE,
+        LAND_BLEND_MODES_BY_ID[DEFAULT_LAND_BLEND_MODE],
+    )
 
 
 def find_land_samples(
@@ -331,11 +353,8 @@ def get_land_pan_arg(name: str) -> float | None:
     return clamp_unit(float(raw_value))
 
 
-def get_land_source(location_id: str, blend: float, land_view: LandView) -> FloatArray | None:
-    land_samples = LAND_SAMPLE_SOURCES[location_id]
-    if not land_samples:
-        return None
-    cropped_samples = tuple(
+def get_cropped_land_samples(location_id: str, land_view: LandView) -> tuple[FloatArray, ...]:
+    return tuple(
         load_land_sample_window(
             sample.paths["red"],
             sample.paths["green"],
@@ -345,19 +364,62 @@ def get_land_source(location_id: str, blend: float, land_view: LandView) -> Floa
             land_view.crop_width,
             land_view.crop_height,
         )
-        for sample in land_samples
+        for sample in LAND_SAMPLE_SOURCES[location_id]
     )
+
+
+def blend_land_samples(
+    cropped_samples: tuple[FloatArray, ...],
+    blend: float,
+    blend_mode_id: str,
+) -> FloatArray | None:
+    if not cropped_samples:
+        return None
     if len(cropped_samples) == 1:
         return cropped_samples[0]
+
+    primary = cropped_samples[0]
+    secondary = cropped_samples[1]
+    blend_mode = get_land_blend_mode(blend_mode_id).id
     mix = float(np.clip(blend, 0.0, 1.0))
+
+    if blend_mode == "difference":
+        return cast(FloatArray, np.abs(primary - secondary))
+    if blend_mode == "lighten":
+        return cast(FloatArray, np.maximum(primary, secondary))
+    if blend_mode == "darken":
+        return cast(FloatArray, np.minimum(primary, secondary))
+    if blend_mode == "swipe":
+        split = int(round(primary.shape[2] * (1.0 - mix)))
+        if split <= 0:
+            return secondary
+        if split >= primary.shape[2]:
+            return primary
+        return cast(
+            FloatArray,
+            np.concatenate((primary[:, :, :split], secondary[:, :, split:]), axis=2),
+        )
+
     return cast(
         FloatArray,
         np.clip(
-            (cropped_samples[0] * (1.0 - mix)) + (cropped_samples[1] * mix),
+            (primary * (1.0 - mix)) + (secondary * mix),
             0.0,
             1.0,
         ),
     )
+
+
+def get_land_source(
+    location_id: str,
+    blend: float,
+    blend_mode_id: str,
+    land_view: LandView,
+) -> FloatArray | None:
+    cropped_samples = get_cropped_land_samples(location_id, land_view)
+    if len(cropped_samples) == 1:
+        return cropped_samples[0]
+    return blend_land_samples(cropped_samples, blend, blend_mode_id)
 
 
 def get_histogram_data(
@@ -390,13 +452,18 @@ def index() -> ResponseReturnValue:
 
     land_location = get_land_location(request.args.get("loc"))
     land_samples = LAND_SAMPLE_SOURCES[land_location.id]
+    land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
         land_location.id,
         get_land_pan_arg("panx"),
         get_land_pan_arg("pany"),
     )
     params = parse_request_params(mode)
-    source = get_land_source(land_location.id, params.get("blend", 0.0), land_view) if mode == "land" else RAW_GEBCO
+    source = (
+        get_land_source(land_location.id, params.get("blend", 0.0), land_blend_mode.id, land_view)
+        if mode == "land"
+        else RAW_GEBCO
+    )
     hist = get_histogram_data(source, mode, params.get("dmin", -11000.0), params.get("dmax", 0.0))
     return render_template(
         "index.html",
@@ -405,6 +472,9 @@ def index() -> ResponseReturnValue:
         defaults=get_mode_defaults(mode),
         raw_hist=hist,
         land_locations=LAND_LOCATIONS,
+        land_blend_modes=LAND_BLEND_MODES,
+        selected_land_blend_mode=land_blend_mode,
+        default_land_blend_mode=DEFAULT_LAND_BLEND_MODE,
         selected_land_location=land_location,
         land_view=land_view,
         land_dates=[sample.date_label for sample in land_samples],
@@ -419,13 +489,18 @@ def histogram() -> ResponseReturnValue:
         mode = "land"
 
     land_location = get_land_location(request.args.get("loc"))
+    land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
         land_location.id,
         get_land_pan_arg("panx"),
         get_land_pan_arg("pany"),
     )
     params = parse_request_params(mode)
-    source = get_land_source(land_location.id, params.get("blend", 0.0), land_view) if mode == "land" else RAW_GEBCO
+    source = (
+        get_land_source(land_location.id, params.get("blend", 0.0), land_blend_mode.id, land_view)
+        if mode == "land"
+        else RAW_GEBCO
+    )
     return jsonify(
         {
             "hist": get_histogram_data(
@@ -445,6 +520,7 @@ def render() -> ResponseReturnValue:
         mode = "land"
 
     land_location = get_land_location(request.args.get("loc"))
+    land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
         land_location.id,
         get_land_pan_arg("panx"),
@@ -455,7 +531,7 @@ def render() -> ResponseReturnValue:
     fg_on = request.args.get("fg", "1") == "1"
 
     if mode == "land":
-        source_rgb = get_land_source(land_location.id, p.get("blend", 0.0), land_view)
+        source_rgb = get_land_source(land_location.id, p.get("blend", 0.0), land_blend_mode.id, land_view)
         if source_rgb is None:
             return "No sample data", 404
         if tm_on:
