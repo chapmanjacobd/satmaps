@@ -93,10 +93,16 @@ class FinalTileCacheFlushCoordinator:
         ordered_contributors: Sequence[str],
         contributor_tile_candidates: dict[str, tuple[str, ...]],
         quality: int,
+        tile_size: int = 512,
+        resample_alg: str = "lanczos",
+        prepared_ocean_background: Optional[str] = None,
     ) -> None:
         self._output_path = output_path
         self._unique_id = unique_id
         self._quality = quality
+        self._tile_size = tile_size
+        self._resample_alg = resample_alg
+        self._prepared_ocean_background = prepared_ocean_background
         self._ordered_contributors = tuple(ordered_contributors)
         self._positions = {
             contributor_id: index
@@ -214,6 +220,15 @@ class FinalTileCacheFlushCoordinator:
         if file_has_content(destination_path):
             with Image.open(destination_path) as destination_image:
                 composed_rgba = destination_image.convert("RGBA")
+        elif self._prepared_ocean_background is not None:
+            ocean_base = render_raster_tile_image(
+                self._prepared_ocean_background,
+                job.relative_path,
+                self._tile_size,
+                self._resample_alg,
+            )
+            if ocean_base is not None:
+                composed_rgba = ocean_base.convert("RGBA")
 
         for _contributor_id, image in job.contributor_images:
             source_rgba = image.convert("RGBA")
@@ -1086,6 +1101,30 @@ def commit_ocean_to_final_tile_cache(
     return True
 
 
+def render_raster_tile_image(
+    input_raster: str,
+    relative_path: str,
+    tile_size: int,
+    resample_alg: str,
+) -> Optional[Image.Image]:
+    """Render one z/x/y.webp tile from a raster into memory."""
+    dataset = gdal.Open(input_raster)
+    if dataset is None:
+        raise RuntimeError(f"Could not open raster for tile rendering: {input_raster}")
+
+    try:
+        zoom, tx, ty = parse_tile_tree_relpath(relative_path)
+        tile_array = tiler.render_dataset_tile(
+            dataset,
+            tiler.get_web_mercator_bounds(zoom, tx, ty),
+            tile_size,
+            resample_alg,
+        )
+        return tiler.tile_array_to_image(tile_array)
+    finally:
+        dataset = None
+
+
 def build_web_mercator_srs() -> osr.SpatialReference:
     """Return a reusable EPSG:3857 spatial reference."""
     web_mercator_srs = osr.SpatialReference()
@@ -1133,6 +1172,9 @@ def configure_final_tile_cache_flush_coordinator(
     work_units: Sequence[LandWorkUnit],
     quality: int,
     zoom: int,
+    tile_size: int = 512,
+    resample_alg: str = "lanczos",
+    prepared_ocean_background: Optional[str] = None,
 ) -> None:
     """Configure the in-memory flush coordinator for one WebP run."""
     FINAL_TILE_CACHE_FLUSH_COORDINATORS[unique_id] = FinalTileCacheFlushCoordinator(
@@ -1144,6 +1186,9 @@ def configure_final_tile_cache_flush_coordinator(
             for work_unit in work_units
         },
         quality,
+        tile_size=tile_size,
+        resample_alg=resample_alg,
+        prepared_ocean_background=prepared_ocean_background,
     )
 
 
@@ -2504,7 +2549,7 @@ def main() -> None:
             print(f"Using ocean background: {prepared_ocean_background}")
             if os.path.abspath(prepared_ocean_background) != os.path.abspath(args.ocean_background):
                 ocean_cleanup_paths.append(prepared_ocean_background)
-            if commit_ocean_to_final_tile_cache(
+            if (not args.land or not plan.work_units) and commit_ocean_to_final_tile_cache(
                 prepared_ocean_background,
                 args.output,
                 unique_id,
@@ -2535,6 +2580,9 @@ def main() -> None:
                 work_units_to_process,
                 args.quality,
                 args.max_zoom,
+                tile_size=args.blocksize,
+                resample_alg=args.resample_alg,
+                prepared_ocean_background=prepared_ocean_background,
             )
             try:
                 with ThreadPoolExecutor(max_workers=args.parallel) as executor:

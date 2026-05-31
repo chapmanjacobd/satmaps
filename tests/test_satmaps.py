@@ -3091,6 +3091,76 @@ def test_main_bbox_prepares_and_commits_ocean_background(
     ]
 
 
+def test_main_land_run_passes_prepared_ocean_to_flush_coordinator_without_eager_commit(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--bbox", "0,0,1,1", "--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
+        unique_id="lazyocean",
+    )
+    configure_calls: list[dict[str, object]] = []
+    package_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "satmaps.prepare_ocean_background_for_output",
+        lambda *args, **kwargs: ".temp/output_ocean_bbox.tif",
+    )
+    monkeypatch.setattr(
+        "satmaps.commit_ocean_to_final_tile_cache",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("land runs should not eagerly commit ocean tiles")
+        ),
+    )
+    monkeypatch.setattr(
+        "satmaps.configure_final_tile_cache_flush_coordinator",
+        lambda output_path, unique_id, work_units, quality, zoom, **kwargs: configure_calls.append(
+            {
+                "output_path": output_path,
+                "unique_id": unique_id,
+                "work_unit_count": len(work_units),
+                "quality": quality,
+                "zoom": zoom,
+                **kwargs,
+            }
+        ),
+    )
+    monkeypatch.setattr("satmaps.process_land_work_unit", lambda *args, **kwargs: None)
+    monkeypatch.setattr("satmaps.clear_final_tile_cache_flush_coordinator", lambda *args, **kwargs: None)
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: package_calls.append(dict(kwargs))
+        or str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    assert configure_calls == [
+        {
+            "output_path": "output.pmtiles",
+            "unique_id": "lazyocean",
+            "work_unit_count": 4,
+            "quality": 74,
+            "zoom": ocean.DEFAULT_MAX_ZOOM,
+            "tile_size": 512,
+            "resample_alg": "lanczos",
+            "prepared_ocean_background": ".temp/output_ocean_bbox.tif",
+        }
+    ]
+    assert package_calls == [
+        {
+            "resample_alg": "lanczos",
+            "max_zoom": ocean.DEFAULT_MAX_ZOOM,
+            "name": "Sentinel-2 Mosaic",
+            "description": "Copernicus Sentinel data",
+            "requested_bbox": (0.0, 0.0, 1.0, 1.0),
+        }
+    ]
+
+
 @pytest.mark.parametrize("max_zoom", [ocean.DEFAULT_MAX_ZOOM, 14, 11, 12, 4])
 def test_main_passes_requested_zoom_to_webp_pipeline(
     monkeypatch: object, tmp_path: Path, max_zoom: int
@@ -3253,6 +3323,47 @@ def test_final_tile_flush_coordinator_waits_for_all_candidate_contributors(
     assert Path(
         satmaps.build_contributor_complete_marker("output.pmtiles", "flush123", "31TDF_0_1")
     ).exists()
+
+
+def test_final_tile_flush_coordinator_lazily_composites_ocean_base(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    relative_tile = "13/1/2.webp"
+    ocean_calls: list[str] = []
+    coordinator = satmaps.FinalTileCacheFlushCoordinator(
+        "output.pmtiles",
+        "flushocean",
+        ("31TDF_0_0",),
+        {"31TDF_0_0": (relative_tile,)},
+        quality=100,
+        prepared_ocean_background="ocean.tif",
+    )
+    final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "flushocean")) / relative_tile
+
+    def fake_render_ocean(
+        input_raster: str,
+        tile_relpath: str,
+        tile_size: int,
+        resample_alg: str,
+    ) -> Image.Image:
+        ocean_calls.append(f"{input_raster}:{tile_relpath}:{tile_size}:{resample_alg}")
+        return Image.new("RGBA", (8, 8), (0, 0, 255, 255))
+
+    monkeypatch.setattr("satmaps.render_raster_tile_image", fake_render_ocean)
+
+    coordinator.record_contributor_completion(
+        "31TDF_0_0",
+        {relative_tile: Image.new("RGBA", (8, 8), (255, 0, 0, 128))},
+    )
+
+    assert ocean_calls == ["ocean.tif:13/1/2.webp:512:lanczos"]
+    with Image.open(final_tile_path) as final_tile:
+        pixel = final_tile.convert("RGBA").getpixel((0, 0))
+    assert pixel[0] > 0
+    assert pixel[2] > 0
 
 
 def test_main_webp_resume_reuses_completed_markers_without_latest_state_fallback(
