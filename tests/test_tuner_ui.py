@@ -28,3 +28,26 @@ def test_find_land_samples_uses_requested_location(tmp_path: Path) -> None:
     assert [sample.date_label for sample in samples] == ["2025-07-01", "2025-01-01"]
     assert samples[0].paths["red"].endswith("06VUN_0_0_B04.tif")
     assert all("31TDF_0_0" not in path for sample in samples for path in sample.paths.values())
+
+
+def test_land_locations_include_global_presets() -> None:
+    assert set(tuner_ui.LAND_LOCATIONS_BY_ID) == {
+        "barcelona",
+        "anchorage",
+        "shanghai",
+        "singapore",
+        "sao-paulo",
+        "cape-town",
+        "cairo",
+        "mexico-city",
+        "sydney",
+        "nairobi",
+    }
+
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["singapore"].tile_prefix == "48NUG_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["sao-paulo"].tile_prefix == "23KLP_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["cape-town"].tile_prefix == "34HBH_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["cairo"].tile_prefix == "36RUU_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["mexico-city"].tile_prefix == "14QMG_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["sydney"].tile_prefix == "56HLH_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["nairobi"].tile_prefix == "37MBU_0_0"

@@ -18,7 +18,6 @@ app = Flask(__name__)
 # GEBCO discovery for Ocean Mode
 GEBCO_ZIP = "gebco_2025_sub_ice_topo_geotiff.zip"
 LAND_CACHE_ROOT = Path(".cache")
-LAND_SAMPLE_PREFIX = "31TDF_0_0"
 LAND_SAMPLE_LIMIT = 2
 LAND_SAMPLE_CROP_SIZE = 1024
 LAND_SAMPLE_OFF_X = 2000
@@ -65,6 +64,48 @@ LAND_LOCATIONS = (
         name="Shanghai",
         sample_label="Shanghai (HLS L30 51RUQ)",
         tile_prefix="51RUQ_0_0",
+    ),
+    LandLocation(
+        id="singapore",
+        name="Singapore",
+        sample_label="Singapore (HLS L30 48NUG)",
+        tile_prefix="48NUG_0_0",
+    ),
+    LandLocation(
+        id="sao-paulo",
+        name="Sao Paulo",
+        sample_label="Sao Paulo (HLS L30 23KLP)",
+        tile_prefix="23KLP_0_0",
+    ),
+    LandLocation(
+        id="cape-town",
+        name="Cape Town",
+        sample_label="Cape Town (HLS L30 34HBH)",
+        tile_prefix="34HBH_0_0",
+    ),
+    LandLocation(
+        id="cairo",
+        name="Cairo",
+        sample_label="Cairo (HLS L30 36RUU)",
+        tile_prefix="36RUU_0_0",
+    ),
+    LandLocation(
+        id="mexico-city",
+        name="Mexico City",
+        sample_label="Mexico City (HLS L30 14QMG)",
+        tile_prefix="14QMG_0_0",
+    ),
+    LandLocation(
+        id="sydney",
+        name="Sydney",
+        sample_label="Sydney (HLS L30 56HLH)",
+        tile_prefix="56HLH_0_0",
+    ),
+    LandLocation(
+        id="nairobi",
+        name="Nairobi",
+        sample_label="Nairobi (HLS L30 37MBU)",
+        tile_prefix="37MBU_0_0",
     ),
 )
 DEFAULT_LAND_LOCATION_ID = "barcelona"
