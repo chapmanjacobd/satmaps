@@ -3358,7 +3358,63 @@ def test_process_single_tile_writes_empty_marker_when_no_folders(
     assert '"tiles": []' in marker
 
 
-def test_main_webp_resume_reuses_processed_rasters_without_latest_state_fallback(
+def test_process_land_work_unit_webp_commits_and_removes_temp_raster(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    args = argparse.Namespace(
+        output="output.pmtiles",
+        format="webp",
+        vrt=False,
+        cache=".cache",
+        max_zoom=13,
+        blocksize=512,
+        quality=74,
+        resample_alg="bilinear",
+    )
+    work_unit = satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))
+    temp_raster = tmp_path / ".temp" / "output_31TDF_0_0_3857.tif"
+    seen_calls: list[tuple[str, str, str, bool]] = []
+
+    def fake_process_single_tile(*args, **kwargs):
+        temp_raster.write_text("raster")
+        return str(temp_raster)
+
+    def fake_commit(
+        input_raster: str,
+        output_path: str,
+        unique_id: str,
+        contributor_id: str,
+        args: argparse.Namespace,
+        *,
+        source_under_existing: bool = False,
+    ) -> list[str]:
+        seen_calls.append(
+            (input_raster, output_path, contributor_id, source_under_existing)
+        )
+        assert Path(input_raster).exists()
+        return ["13/1/2.webp"]
+
+    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
+    monkeypatch.setattr("satmaps.commit_raster_to_final_tile_cache", fake_commit)
+
+    result = satmaps.process_land_work_unit(
+        work_unit,
+        ["2025/07/01"],
+        args,
+        unique_id="webpworker",
+    )
+
+    assert result is None
+    assert seen_calls == [
+        (str(temp_raster), "output.pmtiles", work_unit.unit_id, False)
+    ]
+    assert not temp_raster.exists()
+
+
+def test_main_webp_resume_reuses_completed_markers_without_latest_state_fallback(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -3383,7 +3439,6 @@ def test_main_webp_resume_reuses_processed_rasters_without_latest_state_fallback
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr("satmaps.build_land_run_token", lambda *args, **kwargs: "webpresume")
-    monkeypatch.setattr("satmaps.compose_final_webp_tile_tree", lambda *args, **kwargs: 1)
     monkeypatch.setattr(
         "satmaps.convert_tile_tree_to_pmtiles",
         lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
@@ -3391,9 +3446,12 @@ def test_main_webp_resume_reuses_processed_rasters_without_latest_state_fallback
 
     work_units = satmaps.plan_subtile_work_units(["31TDF"])
     for work_unit in work_units:
-        raster_path = Path(satmaps.build_work_unit_output_path(work_unit, "output.pmtiles"))
-        raster_path.parent.mkdir(parents=True, exist_ok=True)
-        raster_path.write_text("fake raster")
+        marker_path = satmaps.build_contributor_complete_marker(
+            "output.pmtiles",
+            "webpresume",
+            work_unit.unit_id,
+        )
+        satmaps.write_tile_cache_marker(marker_path, work_unit.unit_id, ["13/1/2.webp"])
     final_tile = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "webpresume")) / "13/1/2.webp"
     tiler.save_webp_image(Image.new("RGB", (8, 8), (0, 0, 255)), str(final_tile), quality=100)
 
@@ -3414,7 +3472,7 @@ def test_main_webp_resume_reuses_processed_rasters_without_latest_state_fallback
 
     assert processed_units == []
     out = capsys.readouterr().out
-    assert "Reusing 4 existing temp raster(s)." in out
+    assert "Reusing 4 completed WebP contributor(s)." in out
     assert "All sub-tiles already processed." in out
 
 

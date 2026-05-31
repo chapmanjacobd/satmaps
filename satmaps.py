@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -53,6 +54,51 @@ LOCAL_SEASON_TRANSITION_TILES = 3.0
 LOCAL_SEASON_TRANSITION_HALF_LATITUDE_DEGREES = (
     (LOCAL_SEASON_TRANSITION_TILES * MGRS_TILE_SIZE_METERS) / 2.0
 ) / 111_320.0
+FINAL_TILE_CACHE_COMMIT_LOCK = threading.Lock()
+OCEAN_TILE_CACHE_CONTRIBUTOR_ID = "__ocean__"
+
+
+class FinalTileCacheCommitSequencer:
+    """Serialize contributor commits in a deterministic order for one WebP run."""
+
+    def __init__(self, ordered_contributors: Sequence[str]) -> None:
+        self._positions = {
+            contributor_id: index
+            for index, contributor_id in enumerate(ordered_contributors)
+        }
+        self._next_index = 0
+        self._aborted = False
+        self._condition = threading.Condition()
+
+    def wait_for_turn(self, contributor_id: str) -> None:
+        target_index = self._positions[contributor_id]
+        with self._condition:
+            while not self._aborted and target_index != self._next_index:
+                self._condition.wait()
+            if self._aborted:
+                raise RuntimeError("Final tile cache commit sequencing aborted")
+
+    def mark_committed(self, contributor_id: str) -> None:
+        target_index = self._positions[contributor_id]
+        with self._condition:
+            if self._aborted:
+                return
+            if target_index != self._next_index:
+                raise RuntimeError(
+                    f"Expected contributor at index {self._next_index}, got {contributor_id}"
+                )
+            self._next_index += 1
+            self._condition.notify_all()
+
+    def abort(self) -> None:
+        with self._condition:
+            self._aborted = True
+            self._condition.notify_all()
+
+
+FINAL_TILE_CACHE_COMMIT_SEQUENCERS: dict[str, FinalTileCacheCommitSequencer] = {}
+
+
 @dataclass(frozen=True)
 class LandWorkUnit:
     unit_id: str
@@ -916,6 +962,8 @@ def commit_raster_to_final_tile_cache(
     unique_id: str,
     contributor_id: str,
     args: argparse.Namespace,
+    *,
+    source_under_existing: bool = False,
 ) -> List[str]:
     """Stage and publish one contributor directly into the shared final WebP tree."""
     final_tile_tree = build_final_tile_cache_dir(output_path, unique_id)
@@ -935,12 +983,76 @@ def commit_raster_to_final_tile_cache(
         args.blocksize,
         args.quality,
         args.resample_alg,
+        source_under_existing=source_under_existing,
     )
     write_tile_cache_commit_manifest(manifest_path, contributor_id, tile_relpaths)
     tiler.publish_staged_webp_tree_commit(stage_dir, final_tile_tree, tile_relpaths)
     write_tile_cache_marker(marker_path, contributor_id, tile_relpaths)
     remove_if_exists(manifest_path)
     return tile_relpaths
+
+
+def commit_ocean_to_final_tile_cache(
+    input_raster: str,
+    output_path: str,
+    unique_id: str,
+    args: argparse.Namespace,
+) -> bool:
+    """Seed or repair the final WebP tree with the ocean background beneath land tiles."""
+    marker_path = build_contributor_complete_marker(
+        output_path,
+        unique_id,
+        OCEAN_TILE_CACHE_CONTRIBUTOR_ID,
+    )
+    if file_has_content(marker_path):
+        return False
+
+    with FINAL_TILE_CACHE_COMMIT_LOCK:
+        commit_raster_to_final_tile_cache(
+            input_raster,
+            output_path,
+            unique_id,
+            OCEAN_TILE_CACHE_CONTRIBUTOR_ID,
+            args,
+            source_under_existing=True,
+        )
+    return True
+
+
+def configure_final_tile_cache_commit_sequence(
+    unique_id: str,
+    ordered_contributors: Sequence[str],
+) -> None:
+    """Set the deterministic contributor commit order for one WebP run."""
+    FINAL_TILE_CACHE_COMMIT_SEQUENCERS[unique_id] = FinalTileCacheCommitSequencer(
+        ordered_contributors
+    )
+
+
+def clear_final_tile_cache_commit_sequence(unique_id: str) -> None:
+    """Drop cached sequencing state for a completed or failed WebP run."""
+    FINAL_TILE_CACHE_COMMIT_SEQUENCERS.pop(unique_id, None)
+
+
+def abort_final_tile_cache_commit_sequence(unique_id: str) -> None:
+    """Wake waiting workers when the WebP contributor commit order fails."""
+    sequencer = FINAL_TILE_CACHE_COMMIT_SEQUENCERS.get(unique_id)
+    if sequencer is not None:
+        sequencer.abort()
+
+
+def wait_for_final_tile_cache_commit_turn(unique_id: str, contributor_id: str) -> None:
+    """Block until this contributor may publish into the final WebP tile cache."""
+    sequencer = FINAL_TILE_CACHE_COMMIT_SEQUENCERS.get(unique_id)
+    if sequencer is not None:
+        sequencer.wait_for_turn(contributor_id)
+
+
+def mark_final_tile_cache_commit_complete(unique_id: str, contributor_id: str) -> None:
+    """Advance the deterministic WebP commit sequence after one contributor finishes."""
+    sequencer = FINAL_TILE_CACHE_COMMIT_SEQUENCERS.get(unique_id)
+    if sequencer is not None:
+        sequencer.mark_committed(contributor_id)
 
 
 def resolve_ocean_mask_source(ocean_background: str) -> Optional[str]:
@@ -2013,13 +2125,40 @@ def process_land_work_unit(
 ) -> Optional[str]:
     """Dispatch one land-processing work unit to the appropriate strategy."""
     if should_use_webp_cache_pipeline(args):
-        return process_single_tile(
+        if unique_id is None:
+            raise RuntimeError("WebP cache processing requires a run unique_id")
+        completion_marker_path = build_contributor_complete_marker(
+            args.output,
+            unique_id,
             work_unit.unit_id,
-            date_paths,
-            args,
-            gebco_src,
-            use_in_memory_utm=True,
         )
+        try:
+            processed_raster = process_single_tile(
+                work_unit.unit_id,
+                date_paths,
+                args,
+                gebco_src,
+                use_in_memory_utm=True,
+                completion_marker_path=completion_marker_path,
+            )
+            wait_for_final_tile_cache_commit_turn(unique_id, work_unit.unit_id)
+            if processed_raster:
+                try:
+                    with FINAL_TILE_CACHE_COMMIT_LOCK:
+                        commit_raster_to_final_tile_cache(
+                            processed_raster,
+                            args.output,
+                            unique_id,
+                            work_unit.unit_id,
+                            args,
+                        )
+                finally:
+                    remove_if_exists(processed_raster)
+            mark_final_tile_cache_commit_complete(unique_id, work_unit.unit_id)
+        except Exception:
+            abort_final_tile_cache_commit_sequence(unique_id)
+            raise
+        return None
     return process_single_tile(work_unit.unit_id, date_paths, args, gebco_src)
 
 
@@ -2182,11 +2321,11 @@ def calculate_estimates(args: argparse.Namespace) -> None:
     )
     total_seconds += num_work_units * 2
     if args.format == "webp" and not args.vrt:
-        # The WebP path keeps the processed 3857 rasters until the final per-tile
-        # composite pass writes the max-zoom tree once.
+        # The WebP path only keeps one temporary 3857 raster per active worker
+        # before publishing its final z/x/y.webp tiles.
         disk_peak_gb = (
             total_tile_dates * 60
-            + num_work_units * 50
+            + max(args.parallel, 1) * 50
             + num_work_units * 5
             + 100
         ) / 1024
@@ -2429,17 +2568,15 @@ def main() -> None:
         ),
     )
     if use_webp_cache:
-        recovered_units, recovered_tile_paths = recover_processed_work_outputs(plan.work_units, args)
+        recovered_contributors = recover_pending_tile_cache_commits(args.output, unique_id)
+        if recovered_contributors:
+            print(f"Recovered {len(recovered_contributors)} pending WebP commit(s).")
+        recovered_units = recover_cached_work_outputs(plan.work_units, args.output, unique_id)
         if recovered_units:
-            print(f"Reusing {len(recovered_units)} existing temp raster(s).")
+            print(f"Reusing {len(recovered_units)} completed WebP contributor(s).")
         completed_units &= recovered_units
         completed_units.update(recovered_units)
-        land_output_paths = {build_work_unit_output_path(unit, args.output) for unit in plan.work_units}
-        processed_tifs = recovered_tile_paths + [
-            path
-            for path in processed_tifs
-            if path not in land_output_paths and file_has_content(path)
-        ]
+        processed_tifs = [path for path in processed_tifs if file_has_content(path)]
     else:
         recovered_units, recovered_tile_paths = recover_processed_work_outputs(plan.work_units, args)
         if recovered_units:
@@ -2469,6 +2606,13 @@ def main() -> None:
             print(f"Using ocean background: {prepared_ocean_background}")
             if os.path.abspath(prepared_ocean_background) != os.path.abspath(args.ocean_background):
                 ocean_cleanup_paths.append(prepared_ocean_background)
+            if commit_ocean_to_final_tile_cache(
+                prepared_ocean_background,
+                args.output,
+                unique_id,
+                args,
+            ):
+                print("Committed ocean background to final WebP tiles.")
         elif args.bbox:
             print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
 
@@ -2487,41 +2631,55 @@ def main() -> None:
             )
             progress_line = LiveProgressLine()
             started_at = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-                future_to_work_unit = {
-                    executor.submit(
-                        process_land_work_unit,
-                        work_unit,
-                        date_paths,
-                        args,
-                        gebco_vrt_source,
-                        unique_id,
-                    ): work_unit
-                    for work_unit in work_units_to_process
-                }
-                for future in as_completed(future_to_work_unit):
-                    work_unit = future_to_work_unit[future]
-                    res = future.result()
-                    completed_units.add(work_unit.unit_id)
-                    if res:
-                        processed_tifs.append(res)
-                    status_message = f"{len(processed_tifs)} raster(s) ready."
-                    update_count_progress(
-                        progress_line,
-                        "Land processing progress:",
-                        len(completed_units),
-                        len(plan.work_units),
-                        started_at,
-                        status_message,
-                        completed_before_start=completed_before_start,
-                    )
-                    write_resume_state(
-                        state_file,
-                        unique_id,
-                        completed_units,
-                        processed_tifs,
-                        args,
-                    )
+            if use_webp_cache:
+                configure_final_tile_cache_commit_sequence(
+                    unique_id,
+                    [work_unit.unit_id for work_unit in work_units_to_process],
+                )
+            try:
+                with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+                    future_to_work_unit = {
+                        executor.submit(
+                            process_land_work_unit,
+                            work_unit,
+                            date_paths,
+                            args,
+                            gebco_vrt_source,
+                            unique_id,
+                        ): work_unit
+                        for work_unit in work_units_to_process
+                    }
+                    for future in as_completed(future_to_work_unit):
+                        work_unit = future_to_work_unit[future]
+                        res = future.result()
+                        completed_units.add(work_unit.unit_id)
+                        if res:
+                            processed_tifs.append(res)
+                        if use_webp_cache:
+                            status_message = (
+                                f"{len(completed_units) - completed_before_start} contributor(s) committed."
+                            )
+                        else:
+                            status_message = f"{len(processed_tifs)} raster(s) ready."
+                        update_count_progress(
+                            progress_line,
+                            "Land processing progress:",
+                            len(completed_units),
+                            len(plan.work_units),
+                            started_at,
+                            status_message,
+                            completed_before_start=completed_before_start,
+                        )
+                        write_resume_state(
+                            state_file,
+                            unique_id,
+                            completed_units,
+                            processed_tifs,
+                            args,
+                        )
+            finally:
+                if use_webp_cache:
+                    clear_final_tile_cache_commit_sequence(unique_id)
             progress_line.finish()
         else:
             print("All sub-tiles already processed.")
@@ -2533,13 +2691,7 @@ def main() -> None:
         return
 
     if use_webp_cache:
-        ordered_rasters = build_ordered_webp_composite_rasters(
-            plan,
-            args,
-            prepared_ocean_background,
-        )
         final_tile_tree = build_final_tile_cache_dir(args.output, unique_id)
-        compose_final_webp_tile_tree(ordered_rasters, final_tile_tree, args)
         final_tile_count = len(tiler.iter_tile_tree_paths(final_tile_tree))
         if final_tile_count <= 0:
             print("Error: No max-zoom tiles were generated.")

@@ -763,6 +763,8 @@ def stage_raster_to_webp_tree_commit(
     tile_size: int,
     quality: int,
     resample_alg: str,
+    *,
+    source_under_existing: bool = False,
 ) -> List[str]:
     """Render a raster into staged final WebP tiles composed against the current output tree."""
     dataset = gdal.Open(input_raster)
@@ -794,7 +796,10 @@ def stage_raster_to_webp_tree_commit(
                     with Image.open(destination_path) as destination_image:
                         destination_rgba = destination_image.convert("RGBA")
                     source_rgba = image.convert("RGBA")
-                    composed = Image.alpha_composite(destination_rgba, source_rgba)
+                    if source_under_existing:
+                        composed = Image.alpha_composite(source_rgba, destination_rgba)
+                    else:
+                        composed = Image.alpha_composite(destination_rgba, source_rgba)
                     if composed.getchannel("A").getextrema() == (255, 255):
                         final_image = composed.convert("RGB")
                     else:
