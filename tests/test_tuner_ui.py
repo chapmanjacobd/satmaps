@@ -84,10 +84,10 @@ def test_build_land_view_clamps_pan_to_tile_edges() -> None:
     assert land_view.yoff == 0
 
 
-def test_land_defaults_match_cli_defaults() -> None:
+def test_land_defaults_match_tuned_land_preset() -> None:
     defaults = tuner_ui.get_mode_defaults("land")
 
-    assert defaults["exp"] == tuner_ui.tiler.DEFAULT_EXPOSURE
+    assert defaults["exp"] == tuner_ui.LAND_DEFAULT_EXPOSURE
     assert defaults["sb"] == tuner_ui.tiler.SOFT_KNEE_SHADOW_BREAK
     assert defaults["hb"] == tuner_ui.tiler.SOFT_KNEE_HIGHLIGHT_BREAK
     assert defaults["ss"] == tuner_ui.tiler.SOFT_KNEE_SHADOW_SLOPE
@@ -96,10 +96,11 @@ def test_land_defaults_match_cli_defaults() -> None:
     assert defaults["gamma"] == tuner_ui.LAND_DEFAULT_GAMMA
     assert defaults["shoulder"] == tuner_ui.LAND_DEFAULT_SHOULDER
     assert defaults["sat"] == tuner_ui.LAND_DEFAULT_SATURATION
-    assert defaults["db"] == tuner_ui.LAND_DEFAULT_GRADE_BREAK
-    assert defaults["ghb"] == tuner_ui.LAND_DEFAULT_GRADE_BREAK
+    assert defaults["db"] == tuner_ui.LAND_DEFAULT_GRADE_LOW_BREAK
+    assert defaults["ghb"] == tuner_ui.LAND_DEFAULT_GRADE_HIGHLIGHT_BREAK
     assert defaults["ls"] == tuner_ui.LAND_DEFAULT_GRADE_LOW_SLOPE
-    assert defaults["gms"] == tuner_ui.tiler.PREVIEW_DARKEN_MID_SLOPE
+    assert defaults["gms"] == tuner_ui.LAND_DEFAULT_GRADE_MID_SLOPE
+    assert defaults["ghs"] == tuner_ui.LAND_DEFAULT_GRADE_HIGHLIGHT_SLOPE
 
 
 def test_ocean_defaults_match_cli_defaults() -> None:
@@ -131,6 +132,28 @@ def test_index_exposes_shoulder_control() -> None:
     assert response.status_code == 200
     assert "Shoulder" in html
     assert "--shoulder" in html
+
+
+def test_index_preserves_land_controls_when_switching_locations() -> None:
+    client = tuner_ui.app.test_client()
+
+    response = client.get("/")
+
+    html = response.get_data(as_text=True)
+    assert "function appendLandParams(params, locationId = currentLandLocation)" in html
+    assert "renderControls.forEach(id => params.set(id, document.getElementById(id).value));" in html
+    assert "fg: document.getElementById('fg_on').checked ? '1' : '0'" in html
+
+
+def test_index_respects_fg_query_param() -> None:
+    client = tuner_ui.app.test_client()
+
+    response = client.get("/?fg=0")
+
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert '<input type="checkbox" id="fg_on" >' in html
+    assert '<input type="checkbox" id="fg_on" checked>' not in html
 
 
 def test_get_land_blend_mode_defaults_to_crossfade() -> None:

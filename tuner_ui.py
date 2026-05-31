@@ -25,11 +25,15 @@ LAND_SAMPLE_DEFAULT_OFF_X = 2000
 LAND_SAMPLE_DEFAULT_OFF_Y = 2000
 LAND_SAMPLE_MIN = 0.0
 LAND_SAMPLE_MAX = 9000.0
-LAND_DEFAULT_GAMMA = 2.6
-LAND_DEFAULT_SHOULDER = 1.0
+LAND_DEFAULT_EXPOSURE = 2.5
+LAND_DEFAULT_GAMMA = 2.2
+LAND_DEFAULT_SHOULDER = 0.5
 LAND_DEFAULT_SATURATION = 0.9
-LAND_DEFAULT_GRADE_BREAK = 0.15
-LAND_DEFAULT_GRADE_LOW_SLOPE = 0.2
+LAND_DEFAULT_GRADE_LOW_BREAK = 0.08
+LAND_DEFAULT_GRADE_HIGHLIGHT_BREAK = 0.9
+LAND_DEFAULT_GRADE_LOW_SLOPE = 0.0
+LAND_DEFAULT_GRADE_MID_SLOPE = 1.0
+LAND_DEFAULT_GRADE_HIGHLIGHT_SLOPE = 1.7
 
 FloatArray = NDArray[np.float32]
 
@@ -323,15 +327,29 @@ def load_gebco_sample() -> FloatArray | None:
 RAW_GEBCO = load_gebco_sample()
 
 
-def build_grade_defaults(low_break: float, low_slope: float) -> dict[str, float]:
-    highlight_break = low_break
-    mid_slope = tiler.PREVIEW_DARKEN_MID_SLOPE
+def build_grade_defaults(
+    low_break: float,
+    low_slope: float,
+    highlight_break: float | None = None,
+    mid_slope: float = tiler.PREVIEW_DARKEN_MID_SLOPE,
+    high_slope: float | None = None,
+) -> dict[str, float]:
+    resolved_highlight_break = low_break if highlight_break is None else highlight_break
     return {
         "db": low_break,
-        "ghb": highlight_break,
+        "ghb": resolved_highlight_break,
         "ls": low_slope,
         "gms": mid_slope,
-        "ghs": tiler.derive_piecewise_high_slope(low_break, highlight_break, low_slope, mid_slope),
+        "ghs": (
+            tiler.derive_piecewise_high_slope(
+                low_break,
+                resolved_highlight_break,
+                low_slope,
+                mid_slope,
+            )
+            if high_slope is None
+            else high_slope
+        ),
     }
 
 
@@ -356,7 +374,7 @@ def get_mode_defaults(mode: str) -> dict[str, float]:
         return params
 
     params = {
-        "exp": tiler.DEFAULT_EXPOSURE,
+        "exp": LAND_DEFAULT_EXPOSURE,
         "sb": tiler.SOFT_KNEE_SHADOW_BREAK,
         "hb": tiler.SOFT_KNEE_HIGHLIGHT_BREAK,
         "ss": tiler.SOFT_KNEE_SHADOW_SLOPE,
@@ -367,7 +385,15 @@ def get_mode_defaults(mode: str) -> dict[str, float]:
         "sat": LAND_DEFAULT_SATURATION,
         "blend": 0.0,
     }
-    params.update(build_grade_defaults(LAND_DEFAULT_GRADE_BREAK, LAND_DEFAULT_GRADE_LOW_SLOPE))
+    params.update(
+        build_grade_defaults(
+            LAND_DEFAULT_GRADE_LOW_BREAK,
+            LAND_DEFAULT_GRADE_LOW_SLOPE,
+            highlight_break=LAND_DEFAULT_GRADE_HIGHLIGHT_BREAK,
+            mid_slope=LAND_DEFAULT_GRADE_MID_SLOPE,
+            high_slope=LAND_DEFAULT_GRADE_HIGHLIGHT_SLOPE,
+        )
+    )
     return params
 
 
@@ -483,6 +509,7 @@ def index() -> ResponseReturnValue:
     if mode not in {"land", "ocean"}:
         mode = "land"
 
+    fg_on = request.args.get("fg", "1") == "1"
     land_location = get_land_location(request.args.get("loc"))
     land_samples = LAND_SAMPLE_SOURCES[land_location.id]
     land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
@@ -512,6 +539,7 @@ def index() -> ResponseReturnValue:
         land_view=land_view,
         land_dates=[sample.date_label for sample in land_samples],
         has_land_blend=len(land_samples) > 1,
+        fg_on=fg_on,
     )
 
 

@@ -2261,42 +2261,44 @@ def main() -> None:
     parser.add_argument(
         "--exposure",
         type=float,
-        default=tiler.DEFAULT_EXPOSURE,
+        default=2.5,
         help="Global brightness multiplier",
     )
-    parser.add_argument("--gamma", type=float, default=2.6)
+    parser.add_argument("--gamma", type=float, default=2.2)
     parser.add_argument(
         "--shoulder",
         type=float,
-        default=tiler.DEFAULT_SHOULDER,
+        default=0.5,
         help="Highlight shaping curve; values above 1 lift the top end",
     )
     parser.add_argument(
         "--sat", "--saturation", type=float, default=0.9
     )
     parser.add_argument(
-        "--db", "--black-break", "--grade-low-break", type=float, default=0.15
+        "--db", "--black-break", "--grade-low-break", type=float, default=0.08
     )
     parser.add_argument(
-        "--ls", "--black-slope", "--grade-low-slope", type=float, default=0.2
+        "--ls", "--black-slope", "--grade-low-slope", type=float, default=0.0
     )
     parser.add_argument(
         "--ghb",
         "--grade-highlight-break",
         type=float,
-        help="Upper breakpoint for the final grading curve; defaults to the low break",
+        default=0.9,
+        help="Upper breakpoint for the final grading curve",
     )
     parser.add_argument(
         "--gms",
         "--grade-mid-slope",
         type=float,
-        default=tiler.PREVIEW_DARKEN_MID_SLOPE,
+        default=1.0,
     )
     parser.add_argument(
         "--ghs",
         "--grade-highlight-slope",
         type=float,
-        help="Highlight slope for the final grading curve; defaults to an anchored derived slope",
+        default=1.7,
+        help="Highlight slope for the final grading curve",
     )
     parser.add_argument(
         "--tonemap",

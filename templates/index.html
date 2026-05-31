@@ -121,7 +121,7 @@
 
             <div class="section-toggle">
                 <h3 style="margin: 0; border: none;">Final Grade (Color & Contrast)</h3>
-                <input type="checkbox" id="fg_on" checked>
+                <input type="checkbox" id="fg_on" {{ 'checked' if fg_on else '' }}>
             </div>
 
             <div class="viz-container" id="final_grade_viz">
@@ -250,8 +250,20 @@
         let updateTimeout;
         let histogramToken = 0;
 
+        function appendLandParams(params, locationId = currentLandLocation) {
+            params.set('loc', locationId);
+            renderControls.forEach(id => params.set(id, document.getElementById(id).value));
+            if (hasLandBlend) {
+                params.set('blend_mode', getBlendMode());
+            }
+        }
+
         function changeLandLocation(locationId) {
-            const params = new URLSearchParams({ mode: 'land', loc: locationId });
+            const params = new URLSearchParams({
+                mode: 'land',
+                fg: document.getElementById('fg_on').checked ? '1' : '0'
+            });
+            appendLandParams(params, locationId);
             window.location.href = `/?${params.toString()}`;
         }
 
@@ -424,12 +436,7 @@
         async function refreshHistogram(token) {
             const params = new URLSearchParams({ mode: currentMode });
             if (currentMode === 'land') {
-                params.set('loc', currentLandLocation);
-                landViewControls.forEach(id => params.set(id, document.getElementById(id).value));
-                if (hasLandBlend) {
-                    params.set('blend_mode', getBlendMode());
-                    params.set('blend', document.getElementById('blend').value);
-                }
+                appendLandParams(params);
             }
             if (currentMode === 'ocean') {
                 params.set('dmin', document.getElementById('dmin').value);
@@ -452,12 +459,11 @@
                 const fgOn = document.getElementById('fg_on').checked ? '1' : '0';
                 const params = new URLSearchParams({ mode: currentMode, fg: fgOn });
                 if (currentMode === 'land') {
-                    params.set('loc', currentLandLocation);
-                    if (hasLandBlend) {
-                        params.set('blend_mode', getBlendMode());
-                    }
+                    appendLandParams(params);
                 }
-                renderControls.forEach(id => params.set(id, document.getElementById(id).value));
+                if (currentMode !== 'land') {
+                    renderControls.forEach(id => params.set(id, document.getElementById(id).value));
+                }
                 img.src = `/render?${params.toString()}&t=${Date.now()}`;
                 refreshHistogram(token);
             }, 100);
