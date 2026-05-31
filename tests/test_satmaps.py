@@ -1,10 +1,12 @@
 import argparse
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 from osgeo import gdal, osr
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -3161,7 +3163,6 @@ def test_process_single_tile_writes_empty_marker_when_no_folders(
         "31TDF_0_0",
         ["2025/07/01"],
         args,
-        tile_cache_dir=str(tmp_path / "tilecache" / "contributors" / "31TDF_0_0"),
         completion_marker_path=str(completion_marker),
     )
     assert result is None
@@ -3197,7 +3198,6 @@ def test_main_webp_resume_reuses_cache_markers_without_latest_state_fallback(
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr("satmaps.build_land_run_token", lambda *args, **kwargs: "webpresume")
-    monkeypatch.setattr("satmaps.tiler.merge_webp_trees", lambda dirs, final_tree, quality: 1)
     monkeypatch.setattr(
         "satmaps.convert_tile_tree_to_pmtiles",
         lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
@@ -3211,12 +3211,8 @@ def test_main_webp_resume_reuses_cache_markers_without_latest_state_fallback(
             work_unit.unit_id,
         )
         satmaps.write_tile_cache_marker(marker_path, work_unit.unit_id, [])
-    contributor_dir = satmaps.build_contributor_tile_cache_dir(
-        "output.pmtiles",
-        "webpresume",
-        work_units[0].unit_id,
-    )
-    Path(contributor_dir).mkdir(parents=True, exist_ok=True)
+    final_tile = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "webpresume")) / "13/1/2.webp"
+    tiler.save_webp_image(Image.new("RGB", (8, 8), (0, 0, 255)), str(final_tile), quality=100)
 
     stale_state = tmp_path / ".temp" / "state_stale.json"
     stale_state.write_text(
@@ -3237,6 +3233,45 @@ def test_main_webp_resume_reuses_cache_markers_without_latest_state_fallback(
     out = capsys.readouterr().out
     assert "Reusing 4 existing tile cache contributor(s)." in out
     assert "All sub-tiles already processed." in out
+
+
+def test_recover_pending_tile_cache_commits_publishes_staged_tiles_and_marks_complete(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    output_path = "output.pmtiles"
+    unique_id = "recover123"
+    contributor_id = "31TDF_0_0"
+    relative_tile = "13/1/2.webp"
+    stage_dir = Path(
+        satmaps.build_tile_cache_commit_stage_dir(output_path, unique_id, contributor_id)
+    )
+    staged_tile_path = stage_dir / relative_tile
+    tiler.save_webp_image(
+        Image.new("RGB", (8, 8), (10, 20, 30)),
+        str(staged_tile_path),
+        quality=100,
+    )
+    manifest_path = satmaps.build_tile_cache_commit_manifest_path(
+        output_path,
+        unique_id,
+        contributor_id,
+    )
+    satmaps.write_tile_cache_commit_manifest(manifest_path, contributor_id, [relative_tile])
+
+    recovered = satmaps.recover_pending_tile_cache_commits(output_path, unique_id)
+
+    assert recovered == {contributor_id}
+    final_tile_path = Path(satmaps.build_final_tile_cache_dir(output_path, unique_id)) / relative_tile
+    assert final_tile_path.exists()
+    marker_path = Path(satmaps.build_contributor_complete_marker(output_path, unique_id, contributor_id))
+    marker_payload = json.loads(marker_path.read_text())
+    assert marker_payload["contributor_id"] == contributor_id
+    assert marker_payload["tiles"] == [relative_tile]
+    assert not Path(manifest_path).exists()
+    assert not stage_dir.exists()
 
 
 def test_main_non_bbox_can_use_standalone_ocean(

@@ -6,7 +6,7 @@ import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from common import build_staged_path, file_has_content, publish_staged_path, remove_if_exists
@@ -547,6 +547,16 @@ def render_dataset_tile(
     return padded_output
 
 
+def tile_array_to_image(tile_array: np.ndarray) -> Optional[Image.Image]:
+    """Convert a rendered RGB(A) tile array into a PIL image, skipping empty alpha tiles."""
+    if tile_array.shape[0] == 4 and not np.any(tile_array[3]):
+        return None
+    if tile_array.shape[0] == 4 and np.all(tile_array[3] == 255):
+        tile_array = tile_array[:3]
+    mode = "RGBA" if tile_array.shape[0] == 4 else "RGB"
+    return Image.fromarray(np.moveaxis(tile_array, 0, -1), mode=mode)
+
+
 def export_raster_to_webp_tree(
     input_raster: str,
     output_dir: str,
@@ -574,18 +584,90 @@ def export_raster_to_webp_tree(
                     tile_size,
                     resample_alg,
                 )
-                if tile_array.shape[0] == 4 and not np.any(tile_array[3]):
+                image = tile_array_to_image(tile_array)
+                if image is None:
                     continue
-                if tile_array.shape[0] == 4 and np.all(tile_array[3] == 255):
-                    tile_array = tile_array[:3]
-                mode = "RGBA" if tile_array.shape[0] == 4 else "RGB"
-                image = Image.fromarray(np.moveaxis(tile_array, 0, -1), mode=mode)
                 output_path = build_tile_tree_tile_path(output_dir, zoom, tx, ty)
                 save_webp_image(image, output_path, quality, lossless=lossless)
                 written_tiles.append(os.path.relpath(output_path, output_dir))
         return written_tiles
     finally:
         dataset = None
+
+
+def stage_raster_to_webp_tree_commit(
+    input_raster: str,
+    output_dir: str,
+    staging_dir: str,
+    zoom: int,
+    tile_size: int,
+    quality: int,
+    resample_alg: str,
+) -> List[str]:
+    """Render a raster into staged final WebP tiles composed against the current output tree."""
+    dataset = gdal.Open(input_raster)
+    if dataset is None:
+        raise RuntimeError(f"Could not open raster for staged tile commit: {input_raster}")
+
+    try:
+        bounds = get_dataset_bounds(dataset)
+        tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, zoom)
+        staged_tiles: List[str] = []
+        for ty in range(ty_min, ty_max + 1):
+            for tx in range(tx_min, tx_max + 1):
+                tile_array = render_dataset_tile(
+                    dataset,
+                    get_web_mercator_bounds(zoom, tx, ty),
+                    tile_size,
+                    resample_alg,
+                )
+                image = tile_array_to_image(tile_array)
+                if image is None:
+                    continue
+
+                relative_path = os.path.join(str(zoom), str(tx), f"{ty}.webp")
+                destination_path = os.path.join(output_dir, relative_path)
+                staged_output_path = os.path.join(staging_dir, relative_path)
+
+                final_image: Image.Image = image
+                if file_has_content(destination_path):
+                    with Image.open(destination_path) as destination_image:
+                        destination_rgba = destination_image.convert("RGBA")
+                    source_rgba = image.convert("RGBA")
+                    composed = Image.alpha_composite(destination_rgba, source_rgba)
+                    if composed.getchannel("A").getextrema() == (255, 255):
+                        final_image = composed.convert("RGB")
+                    else:
+                        final_image = composed
+
+                save_webp_image(final_image, staged_output_path, quality, lossless=False)
+                staged_tiles.append(relative_path)
+        return staged_tiles
+    finally:
+        dataset = None
+
+
+def publish_staged_webp_tree_commit(
+    staging_dir: str,
+    output_dir: str,
+    tile_relpaths: Sequence[str],
+) -> int:
+    """Publish a staged final-tile commit into the live output tree."""
+    published_count = 0
+    for relative_path in tile_relpaths:
+        staged_path = os.path.join(staging_dir, relative_path)
+        destination_path = os.path.join(output_dir, relative_path)
+        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+        if file_has_content(staged_path):
+            publish_staged_path(staged_path, destination_path)
+        elif not file_has_content(destination_path):
+            raise RuntimeError(
+                f"Missing staged and destination tile during publish recovery: {relative_path}"
+            )
+        published_count += 1
+    if os.path.isdir(staging_dir):
+        shutil.rmtree(staging_dir)
+    return published_count
 
 
 def iter_tile_tree_paths(root_dir: str) -> List[str]:

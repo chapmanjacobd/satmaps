@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from osgeo import gdal, osr
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -20,8 +21,10 @@ from tiler import (
     intersect_te_bounds,
     lonlat_bbox_to_mercator_bounds,
     merge_mbtiles,
+    publish_staged_webp_tree_commit,
     render_dataset_tile,
     run_tiling_simplified,
+    stage_raster_to_webp_tree_commit,
     te_to_src_win,
     web_mercator_pixel_size,
     web_mercator_pixel_size_for_tile_size,
@@ -226,6 +229,73 @@ def test_render_dataset_tile_pads_partial_overlap_without_warning(
     captured = capsys.readouterr()
     assert "partially outside source raster extent" not in captured.err
     assert "partially outside source raster extent" not in captured.out
+
+
+def test_stage_and_publish_webp_tree_commit_composes_existing_destination(
+    tmp_path: Path,
+) -> None:
+    zoom = 7
+    tx = 10
+    ty = 20
+    tile_size = 64
+    bounds = get_web_mercator_bounds(zoom, tx, ty)
+    pixel_size = web_mercator_pixel_size_for_tile_size(zoom, tile_size)
+
+    input_path = tmp_path / "input.tif"
+    dataset = gdal.GetDriverByName("GTiff").Create(
+        str(input_path), tile_size, tile_size, 4, gdal.GDT_Byte
+    )
+    assert dataset is not None
+    dataset.SetGeoTransform((bounds[0], pixel_size, 0.0, bounds[3], 0.0, -pixel_size))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset.SetProjection(srs.ExportToWkt())
+    for band_index, value in enumerate((255, 0, 0, 128), start=1):
+        dataset.GetRasterBand(band_index).Fill(value)
+    dataset.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    dataset = None
+
+    output_dir = tmp_path / "final"
+    output_path = output_dir / f"{zoom}/{tx}/{ty}.webp"
+    tiler_module.save_webp_image(
+        Image.new("RGBA", (tile_size, tile_size), (0, 0, 255, 255)),
+        str(output_path),
+        quality=100,
+    )
+
+    staging_dir = tmp_path / "staged"
+    tile_relpaths = stage_raster_to_webp_tree_commit(
+        str(input_path),
+        str(output_dir),
+        str(staging_dir),
+        zoom,
+        tile_size,
+        100,
+        "bilinear",
+    )
+
+    assert tile_relpaths == [f"{zoom}/{tx}/{ty}.webp"]
+    assert (staging_dir / tile_relpaths[0]).exists()
+
+    with Image.open(output_path) as before_publish:
+        blue_pixel = before_publish.convert("RGBA").getpixel((tile_size // 2, tile_size // 2))
+    assert blue_pixel[2] > 200
+    assert blue_pixel[0] < 40
+
+    published_count = publish_staged_webp_tree_commit(
+        str(staging_dir),
+        str(output_dir),
+        tile_relpaths,
+    )
+    assert published_count == 1
+    assert not staging_dir.exists()
+
+    with Image.open(output_path) as published:
+        pixel = published.convert("RGBA").getpixel((tile_size // 2, tile_size // 2))
+    assert pixel[0] > 80
+    assert pixel[2] > 80
+    assert pixel[1] < 40
+    assert pixel[3] == 255
 
 
 def test_run_tiling_simplified_creates_mbtiles(
