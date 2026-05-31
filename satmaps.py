@@ -1433,6 +1433,17 @@ def write_resume_state(
     os.replace(temp_state_file, state_file)
 
 
+def parse_tile_tree_relpath(relative_path: str) -> Tuple[int, int, int]:
+        """Parse a z/x/y.webp path relative to a tile tree root."""
+        parts = relative_path.split(os.sep)
+        if len(parts) != 3:
+            raise ValueError(f"Invalid tile tree relative path: {relative_path}")
+        zoom = int(parts[0])
+        tx = int(parts[1])
+        ty = int(os.path.splitext(parts[2])[0])
+        return zoom, tx, ty
+
+
 def iter_processing_windows(tile_grid: TileGrid) -> Iterator[Tuple[int, int, int, int]]:
     """Yield full-width row slabs that match the striped source TIFF layout."""
     for yoff in range(0, tile_grid.height, PROCESS_SLAB_HEIGHT):
@@ -1783,6 +1794,91 @@ def recover_processed_work_outputs(
     return recovered_units, recovered_paths
 
 
+def build_ordered_webp_composite_rasters(
+    plan: LandProcessingPlan,
+    args: argparse.Namespace,
+    prepared_ocean_background: Optional[str],
+) -> List[str]:
+    """Return the deterministic ocean-first raster list for final WebP compositing."""
+    ordered_rasters: List[str] = []
+    if prepared_ocean_background and file_has_content(prepared_ocean_background):
+        ordered_rasters.append(prepared_ocean_background)
+
+    for work_unit in sorted(plan.work_units, key=lambda current: current.unit_id):
+        raster_path = build_work_unit_output_path(work_unit, args.output)
+        if file_has_content(raster_path):
+            ordered_rasters.append(raster_path)
+    return ordered_rasters
+
+
+def compose_final_webp_tile_tree(
+    ordered_rasters: Sequence[str],
+    output_dir: str,
+    args: argparse.Namespace,
+) -> int:
+    """Compose the final max-zoom WebP tree one tile at a time in memory."""
+    tile_inputs: Dict[str, List[str]] = {}
+    for raster_path in ordered_rasters:
+        for relative_path in tiler.iter_raster_tile_relpaths(raster_path, args.max_zoom):
+            tile_inputs.setdefault(relative_path, []).append(raster_path)
+
+    if not tile_inputs:
+        return 0
+
+    pending_tiles = [
+        relative_path
+        for relative_path in sorted(tile_inputs)
+        if not file_has_content(os.path.join(output_dir, relative_path))
+    ]
+    if not pending_tiles:
+        print("All final WebP tiles already composed.")
+        return len(tile_inputs)
+
+    print(
+        f"Compositing {len(pending_tiles)} final tile(s) from {len(ordered_rasters)} raster(s)..."
+    )
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
+    completed_before_start = len(tile_inputs) - len(pending_tiles)
+
+    def compose_one(relative_path: str) -> bool:
+        zoom, tx, ty = parse_tile_tree_relpath(relative_path)
+        return tiler.compose_webp_tile_from_rasters(
+            tile_inputs[relative_path],
+            os.path.join(output_dir, relative_path),
+            zoom,
+            tx,
+            ty,
+            args.blocksize,
+            args.quality,
+            args.resample_alg,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+            future_to_path = {
+                executor.submit(compose_one, relative_path): relative_path
+                for relative_path in pending_tiles
+            }
+            processed_tiles = completed_before_start
+            for future in as_completed(future_to_path):
+                future.result()
+                processed_tiles += 1
+                update_count_progress(
+                    progress_line,
+                    "Final tile compositing progress:",
+                    processed_tiles,
+                    len(tile_inputs),
+                    started_at,
+                    f"{processed_tiles} tile(s) processed.",
+                    completed_before_start=0,
+                )
+    finally:
+        progress_line.finish()
+
+    return len(tile_inputs)
+
+
 def process_land_work_unit(
     work_unit: LandWorkUnit,
     date_paths: List[str],
@@ -1792,18 +1888,12 @@ def process_land_work_unit(
 ) -> Optional[str]:
     """Dispatch one land-processing work unit to the appropriate strategy."""
     if should_use_webp_cache_pipeline(args):
-        if unique_id is None:
-            raise ValueError("unique_id is required for the WebP cache pipeline")
         return process_single_tile(
             work_unit.unit_id,
             date_paths,
             args,
             gebco_src,
-            completion_marker_path=build_contributor_complete_marker(
-                args.output,
-                unique_id,
-                work_unit.unit_id,
-            ),
+            use_in_memory_utm=True,
         )
     return process_single_tile(work_unit.unit_id, date_paths, args, gebco_src)
 
@@ -1814,6 +1904,7 @@ def process_single_tile(
     args: argparse.Namespace,
     gebco_src: Optional[str] = None,
     *,
+    use_in_memory_utm: bool = False,
     completion_marker_path: Optional[str] = None,
 ) -> Optional[str]:
     """Process a single MGRS sub-tile: fetch dates, average, tone-map, and warp to Web Mercator."""
@@ -1870,7 +1961,7 @@ def process_single_tile(
         staged_3857_path = build_staged_path(temp_3857_path)
         remove_if_exists(staged_3857_path)
         staged_utm_path = build_staged_path(temp_utm_path)
-        in_memory_output = completion_marker_path is not None
+        in_memory_output = use_in_memory_utm or completion_marker_path is not None
         if in_memory_output:
             ds_out, color_bands, alpha_band = create_output_dataset(
                 None,
@@ -1964,11 +2055,11 @@ def calculate_estimates(args: argparse.Namespace) -> None:
     )
     total_seconds += num_work_units * 2
     if args.format == "webp" and not args.vrt:
-        # The default path now keeps only worker-local TIFFs alive and persists a much
-        # smaller max-zoom WebP cache between processing and packaging.
+        # The WebP path keeps the processed 3857 rasters until the final per-tile
+        # composite pass writes the max-zoom tree once.
         disk_peak_gb = (
             total_tile_dates * 60
-            + max(args.parallel, 1) * 50
+            + num_work_units * 50
             + num_work_units * 5
             + 100
         ) / 1024
@@ -2208,15 +2299,17 @@ def main() -> None:
         ),
     )
     if use_webp_cache:
-        recovered_commits = recover_pending_tile_cache_commits(args.output, unique_id)
-        if recovered_commits:
-            print(f"Recovered {len(recovered_commits)} interrupted tile-cache commit(s).")
-        recovered_units = recover_cached_work_outputs(plan.work_units, args.output, unique_id)
+        recovered_units, recovered_tile_paths = recover_processed_work_outputs(plan.work_units, args)
         if recovered_units:
-            print(f"Reusing {len(recovered_units)} existing tile cache contributor(s).")
+            print(f"Reusing {len(recovered_units)} existing temp raster(s).")
         completed_units &= recovered_units
         completed_units.update(recovered_units)
-        processed_tifs = []
+        land_output_paths = {build_work_unit_output_path(unit, args.output) for unit in plan.work_units}
+        processed_tifs = recovered_tile_paths + [
+            path
+            for path in processed_tifs
+            if path not in land_output_paths and file_has_content(path)
+        ]
     else:
         recovered_units, recovered_tile_paths = recover_processed_work_outputs(plan.work_units, args)
         if recovered_units:
@@ -2244,19 +2337,6 @@ def main() -> None:
         )
         if prepared_ocean_background:
             print(f"Using ocean background: {prepared_ocean_background}")
-            ocean_marker_path = build_contributor_complete_marker(
-                args.output,
-                unique_id,
-                "ocean",
-            )
-            if not file_has_content(ocean_marker_path):
-                commit_raster_to_final_tile_cache(
-                    prepared_ocean_background,
-                    args.output,
-                    unique_id,
-                    "ocean",
-                    args,
-                )
             if os.path.abspath(prepared_ocean_background) != os.path.abspath(args.ocean_background):
                 ocean_cleanup_paths.append(prepared_ocean_background)
         elif args.bbox:
@@ -2277,11 +2357,6 @@ def main() -> None:
             )
             progress_line = LiveProgressLine()
             started_at = time.perf_counter()
-            ordered_work_units = (
-                sorted(work_units_to_process, key=lambda current: current.unit_id)
-                if use_webp_cache
-                else work_units_to_process
-            )
             with ThreadPoolExecutor(max_workers=args.parallel) as executor:
                 future_to_work_unit = {
                     executor.submit(
@@ -2292,71 +2367,31 @@ def main() -> None:
                         gebco_vrt_source,
                         unique_id,
                     ): work_unit
-                    for work_unit in ordered_work_units
+                    for work_unit in work_units_to_process
                 }
-                ready_cache_rasters: Dict[str, Optional[str]] = {}
-                next_commit_index = 0
                 for future in as_completed(future_to_work_unit):
                     work_unit = future_to_work_unit[future]
                     res = future.result()
-                    if not use_webp_cache:
-                        completed_units.add(work_unit.unit_id)
-                        if res:
-                            processed_tifs.append(res)
-                        status_message = f"{len(processed_tifs)} raster(s) ready."
-                        update_count_progress(
-                            progress_line,
-                            "Land processing progress:",
-                            len(completed_units),
-                            len(plan.work_units),
-                            started_at,
-                            status_message,
-                            completed_before_start=completed_before_start,
-                        )
-                        write_resume_state(
-                            state_file,
-                            unique_id,
-                            completed_units,
-                            processed_tifs,
-                            args,
-                        )
-                        continue
-
-                    ready_cache_rasters[work_unit.unit_id] = res
-                    while next_commit_index < len(ordered_work_units):
-                        next_work_unit = ordered_work_units[next_commit_index]
-                        cached_raster = ready_cache_rasters.get(next_work_unit.unit_id)
-                        if next_work_unit.unit_id not in ready_cache_rasters:
-                            break
-                        if cached_raster is not None:
-                            commit_raster_to_final_tile_cache(
-                                cached_raster,
-                                args.output,
-                                unique_id,
-                                next_work_unit.unit_id,
-                                args,
-                            )
-                            remove_if_exists(cached_raster)
-                        ready_cache_rasters.pop(next_work_unit.unit_id)
-                        completed_units.add(next_work_unit.unit_id)
-                        status_message = f"{len(completed_units)} work unit(s) cached."
-                        update_count_progress(
-                            progress_line,
-                            "Land processing progress:",
-                            len(completed_units),
-                            len(plan.work_units),
-                            started_at,
-                            status_message,
-                            completed_before_start=completed_before_start,
-                        )
-                        write_resume_state(
-                            state_file,
-                            unique_id,
-                            completed_units,
-                            [],
-                            args,
-                        )
-                        next_commit_index += 1
+                    completed_units.add(work_unit.unit_id)
+                    if res:
+                        processed_tifs.append(res)
+                    status_message = f"{len(processed_tifs)} raster(s) ready."
+                    update_count_progress(
+                        progress_line,
+                        "Land processing progress:",
+                        len(completed_units),
+                        len(plan.work_units),
+                        started_at,
+                        status_message,
+                        completed_before_start=completed_before_start,
+                    )
+                    write_resume_state(
+                        state_file,
+                        unique_id,
+                        completed_units,
+                        processed_tifs,
+                        args,
+                    )
             progress_line.finish()
         else:
             print("All sub-tiles already processed.")
@@ -2368,7 +2403,13 @@ def main() -> None:
         return
 
     if use_webp_cache:
+        ordered_rasters = build_ordered_webp_composite_rasters(
+            plan,
+            args,
+            prepared_ocean_background,
+        )
         final_tile_tree = build_final_tile_cache_dir(args.output, unique_id)
+        compose_final_webp_tile_tree(ordered_rasters, final_tile_tree, args)
         final_tile_count = len(tiler.iter_tile_tree_paths(final_tile_tree))
         if final_tile_count <= 0:
             print("Error: No max-zoom tiles were generated.")
@@ -2383,7 +2424,7 @@ def main() -> None:
             description="Copernicus Sentinel data",
             requested_bbox=requested_bbox,
         )
-        cleanup_temporary_files([temp_mbtiles] + ocean_cleanup_paths)
+        cleanup_temporary_files([temp_mbtiles] + processed_tifs + ocean_cleanup_paths)
     else:
         prepared_ocean_background = prepare_ocean_background_for_output(
             args.ocean_background,

@@ -39,16 +39,55 @@ class LandSample:
     paths: dict[str, str]
 
 
-def find_land_samples(cache_root: Path = LAND_CACHE_ROOT) -> tuple[LandSample, ...]:
+@dataclass(frozen=True)
+class LandLocation:
+    id: str
+    name: str
+    sample_label: str
+    tile_prefix: str
+
+
+LAND_LOCATIONS = (
+    LandLocation(
+        id="barcelona",
+        name="Barcelona",
+        sample_label="Barcelona Downtown (HLS L30 31TDF)",
+        tile_prefix="31TDF_0_0",
+    ),
+    LandLocation(
+        id="anchorage",
+        name="Anchorage",
+        sample_label="Anchorage (HLS L30 06VUN)",
+        tile_prefix="06VUN_0_0",
+    ),
+    LandLocation(
+        id="shanghai",
+        name="Shanghai",
+        sample_label="Shanghai (HLS L30 51RUQ)",
+        tile_prefix="51RUQ_0_0",
+    ),
+)
+DEFAULT_LAND_LOCATION_ID = "barcelona"
+LAND_LOCATIONS_BY_ID = {location.id: location for location in LAND_LOCATIONS}
+
+
+def get_land_location(location_id: str | None) -> LandLocation:
+    return LAND_LOCATIONS_BY_ID.get(location_id or DEFAULT_LAND_LOCATION_ID, LAND_LOCATIONS_BY_ID[DEFAULT_LAND_LOCATION_ID])
+
+
+def find_land_samples(
+    location: LandLocation,
+    cache_root: Path = LAND_CACHE_ROOT,
+) -> tuple[LandSample, ...]:
     if not cache_root.exists():
         return ()
 
     samples: list[LandSample] = []
     for date_dir in sorted((path for path in cache_root.iterdir() if path.is_dir()), reverse=True):
         paths = {
-            "red": str(date_dir / f"{LAND_SAMPLE_PREFIX}_B04.tif"),
-            "green": str(date_dir / f"{LAND_SAMPLE_PREFIX}_B03.tif"),
-            "blue": str(date_dir / f"{LAND_SAMPLE_PREFIX}_B02.tif"),
+            "red": str(date_dir / f"{location.tile_prefix}_B04.tif"),
+            "green": str(date_dir / f"{location.tile_prefix}_B03.tif"),
+            "blue": str(date_dir / f"{location.tile_prefix}_B02.tif"),
         }
         if all(Path(path).exists() for path in paths.values()):
             samples.append(LandSample(date_label=date_dir.name, paths=paths))
@@ -57,7 +96,9 @@ def find_land_samples(cache_root: Path = LAND_CACHE_ROOT) -> tuple[LandSample, .
     return tuple(samples)
 
 
-LAND_SAMPLE_SOURCES = find_land_samples()
+LAND_SAMPLE_SOURCES = {
+    location.id: find_land_samples(location) for location in LAND_LOCATIONS
+}
 
 
 def load_land_sample(paths: dict[str, str]) -> FloatArray:
@@ -90,7 +131,10 @@ def load_land_sample(paths: dict[str, str]) -> FloatArray:
     return cast(FloatArray, np.nan_to_num(normalized, nan=0.0))
 
 
-RAW_LAND_SAMPLES = tuple(load_land_sample(sample.paths) for sample in LAND_SAMPLE_SOURCES)
+RAW_LAND_SAMPLES = {
+    location_id: tuple(load_land_sample(sample.paths) for sample in samples)
+    for location_id, samples in LAND_SAMPLE_SOURCES.items()
+}
 
 
 def load_gebco_sample() -> FloatArray | None:
@@ -170,16 +214,17 @@ def parse_request_params(mode: str) -> dict[str, float]:
     return params
 
 
-def get_land_source(blend: float) -> FloatArray | None:
-    if not RAW_LAND_SAMPLES:
+def get_land_source(location_id: str, blend: float) -> FloatArray | None:
+    land_samples = RAW_LAND_SAMPLES[location_id]
+    if not land_samples:
         return None
-    if len(RAW_LAND_SAMPLES) == 1:
-        return RAW_LAND_SAMPLES[0]
+    if len(land_samples) == 1:
+        return land_samples[0]
     mix = float(np.clip(blend, 0.0, 1.0))
     return cast(
         FloatArray,
         np.clip(
-            (RAW_LAND_SAMPLES[0] * (1.0 - mix)) + (RAW_LAND_SAMPLES[1] * mix),
+            (land_samples[0] * (1.0 - mix)) + (land_samples[1] * mix),
             0.0,
             1.0,
         ),
@@ -214,8 +259,10 @@ def index() -> ResponseReturnValue:
     if mode not in {"land", "ocean"}:
         mode = "land"
 
+    land_location = get_land_location(request.args.get("loc"))
+    land_samples = LAND_SAMPLE_SOURCES[land_location.id]
     params = parse_request_params(mode)
-    source = get_land_source(params.get("blend", 0.0)) if mode == "land" else RAW_GEBCO
+    source = get_land_source(land_location.id, params.get("blend", 0.0)) if mode == "land" else RAW_GEBCO
     hist = get_histogram_data(source, mode, params.get("dmin", -11000.0), params.get("dmax", 0.0))
     return render_template(
         "index.html",
@@ -223,8 +270,10 @@ def index() -> ResponseReturnValue:
         params=params,
         defaults=get_mode_defaults(mode),
         raw_hist=hist,
-        land_dates=[sample.date_label for sample in LAND_SAMPLE_SOURCES],
-        has_land_blend=len(RAW_LAND_SAMPLES) > 1,
+        land_locations=LAND_LOCATIONS,
+        selected_land_location=land_location,
+        land_dates=[sample.date_label for sample in land_samples],
+        has_land_blend=len(RAW_LAND_SAMPLES[land_location.id]) > 1,
     )
 
 
@@ -234,8 +283,9 @@ def histogram() -> ResponseReturnValue:
     if mode not in {"land", "ocean"}:
         mode = "land"
 
+    land_location = get_land_location(request.args.get("loc"))
     params = parse_request_params(mode)
-    source = get_land_source(params.get("blend", 0.0)) if mode == "land" else RAW_GEBCO
+    source = get_land_source(land_location.id, params.get("blend", 0.0)) if mode == "land" else RAW_GEBCO
     return jsonify(
         {
             "hist": get_histogram_data(
@@ -254,12 +304,13 @@ def render() -> ResponseReturnValue:
     if mode not in {"land", "ocean"}:
         mode = "land"
 
+    land_location = get_land_location(request.args.get("loc"))
     p = parse_request_params(mode)
     tm_on = request.args.get("tm", "1") == "1"
     fg_on = request.args.get("fg", "1") == "1"
 
     if mode == "land":
-        source_rgb = get_land_source(p.get("blend", 0.0))
+        source_rgb = get_land_source(land_location.id, p.get("blend", 0.0))
         if source_rgb is None:
             return "No sample data", 404
         if tm_on:

@@ -660,6 +660,68 @@ def export_raster_to_webp_tree(
         dataset = None
 
 
+def iter_raster_tile_relpaths(input_raster: str, zoom: int) -> List[str]:
+    """Return all max-zoom z/x/y.webp paths touched by a raster."""
+    dataset = gdal.Open(input_raster)
+    if dataset is None:
+        raise RuntimeError(f"Could not open raster for tile enumeration: {input_raster}")
+
+    try:
+        bounds = get_dataset_bounds(dataset)
+        tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, zoom)
+        relpaths: List[str] = []
+        for ty in range(ty_min, ty_max + 1):
+            for tx in range(tx_min, tx_max + 1):
+                relpaths.append(os.path.join(str(zoom), str(tx), f"{ty}.webp"))
+        return relpaths
+    finally:
+        dataset = None
+
+
+def compose_webp_tile_from_rasters(
+    input_rasters: Sequence[str],
+    output_path: str,
+    zoom: int,
+    tx: int,
+    ty: int,
+    tile_size: int,
+    quality: int,
+    resample_alg: str,
+) -> bool:
+    """Render and composite one final WebP tile entirely in memory."""
+    tile_bounds = get_web_mercator_bounds(zoom, tx, ty)
+    composed_rgba: Optional[Image.Image] = None
+
+    for input_raster in input_rasters:
+        dataset = gdal.Open(input_raster)
+        if dataset is None:
+            raise RuntimeError(f"Could not open raster for tile compositing: {input_raster}")
+        try:
+            tile_array = render_dataset_tile(dataset, tile_bounds, tile_size, resample_alg)
+        finally:
+            dataset = None
+
+        image = tile_array_to_image(tile_array)
+        if image is None:
+            continue
+
+        source_rgba = image.convert("RGBA")
+        if composed_rgba is None:
+            composed_rgba = source_rgba
+        else:
+            composed_rgba = Image.alpha_composite(composed_rgba, source_rgba)
+
+    if composed_rgba is None:
+        return False
+
+    if composed_rgba.getchannel("A").getextrema() == (255, 255):
+        final_image: Image.Image = composed_rgba.convert("RGB")
+    else:
+        final_image = composed_rgba
+    save_webp_image(final_image, output_path, quality, lossless=False)
+    return True
+
+
 def stage_raster_to_webp_tree_commit(
     input_raster: str,
     output_dir: str,
