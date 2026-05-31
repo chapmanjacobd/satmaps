@@ -3347,21 +3347,29 @@ def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
     args = argparse.Namespace(max_zoom=13, blocksize=512, resample_alg="lanczos", quality=74)
     fake_dataset = object()
     seen_dataset: list[object] = []
+    rendered_bounds: list[tuple[float, float, float, float]] = []
 
-    def fake_iter_dataset_webp_tile_images(dataset, zoom, tile_size, resample_alg):
+    def fake_iter_dataset_tile_relpaths(dataset, zoom):
         seen_dataset.append(dataset)
         assert zoom == 13
-        assert tile_size == 512
-        assert resample_alg == "lanczos"
         return iter(
             [
-                ("13/1/2.webp", Image.new("RGB", (8, 8), (10, 20, 30))),
-                ("13/1/3.webp", Image.new("RGB", (8, 8), (40, 50, 60))),
+                "13/1/2.webp",
+                "13/1/3.webp",
             ]
         )
 
     monkeypatch.setattr("satmaps.gdal.Open", lambda path: fake_dataset)
-    monkeypatch.setattr("satmaps.tiler.iter_dataset_webp_tile_images", fake_iter_dataset_webp_tile_images)
+    monkeypatch.setattr("satmaps.tiler.iter_dataset_tile_relpaths", fake_iter_dataset_tile_relpaths)
+
+    def fake_render_dataset_tile(dataset, bounds, tile_size, resample_alg):
+        assert dataset is fake_dataset
+        assert tile_size == 512
+        assert resample_alg == "lanczos"
+        rendered_bounds.append(bounds)
+        return np.full((3, 8, 8), 60, dtype=np.uint8)
+
+    monkeypatch.setattr("satmaps.tiler.render_dataset_tile", fake_render_dataset_tile)
 
     written_tiles = satmaps.fill_missing_ocean_to_final_tile_cache(
         "ocean.tif",
@@ -3372,6 +3380,7 @@ def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
 
     assert written_tiles == 1
     assert seen_dataset == [fake_dataset]
+    assert rendered_bounds == [tiler.get_web_mercator_bounds(13, 1, 3)]
     assert existing_tile.read_bytes() == original_bytes
     new_tile_path = final_tile_tree / "13/1/3.webp"
     assert new_tile_path.exists()

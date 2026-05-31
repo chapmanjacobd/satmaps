@@ -1160,14 +1160,19 @@ def fill_missing_ocean_to_final_tile_cache(
 
     written_tiles = 0
     try:
-        for relative_path, image in tiler.iter_dataset_webp_tile_images(
-            dataset,
-            args.max_zoom,
-            args.blocksize,
-            args.resample_alg,
-        ):
+        for relative_path in tiler.iter_dataset_tile_relpaths(dataset, args.max_zoom):
             destination_path = os.path.join(final_tile_tree, relative_path)
             if file_has_content(destination_path):
+                continue
+            zoom, tx, ty = parse_tile_tree_relpath(relative_path)
+            tile_array = tiler.render_dataset_tile(
+                dataset,
+                tiler.get_web_mercator_bounds(zoom, tx, ty),
+                args.blocksize,
+                args.resample_alg,
+            )
+            image = tiler.tile_array_to_image(tile_array)
+            if image is None:
                 continue
             tiler.save_webp_image(image, destination_path, args.quality, lossless=False)
             written_tiles += 1
