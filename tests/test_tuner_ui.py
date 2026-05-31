@@ -34,21 +34,31 @@ def test_land_locations_include_global_presets() -> None:
     assert set(tuner_ui.LAND_LOCATIONS_BY_ID) == {
         "barcelona",
         "anchorage",
+        "bariloche",
         "shanghai",
         "singapore",
         "sao-paulo",
+        "santiago",
         "cape-town",
         "cairo",
+        "lesotho",
         "mexico-city",
+        "queenstown-wanaka",
+        "snowy-mountains",
         "sydney",
         "nairobi",
     }
 
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["bariloche"].tile_prefix == "19GBQ_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["singapore"].tile_prefix == "48NUG_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["sao-paulo"].tile_prefix == "23KLP_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["santiago"].tile_prefix == "19HCD_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["cape-town"].tile_prefix == "34HBH_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["cairo"].tile_prefix == "36RUU_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["lesotho"].tile_prefix == "35JPJ_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["mexico-city"].tile_prefix == "14QMG_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["queenstown-wanaka"].tile_prefix == "59GLL_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["snowy-mountains"].tile_prefix == "55HFV_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["sydney"].tile_prefix == "56HLH_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["nairobi"].tile_prefix == "37MBU_0_0"
 

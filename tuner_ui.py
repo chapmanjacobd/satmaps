@@ -121,6 +121,36 @@ LAND_LOCATIONS = (
         tile_prefix="56HLH_0_0",
     ),
     LandLocation(
+        id="santiago",
+        name="Santiago, Chile",
+        sample_label="Santiago / Valle Nevado (HLS L30 19HCD)",
+        tile_prefix="19HCD_0_0",
+    ),
+    LandLocation(
+        id="bariloche",
+        name="Bariloche, Argentina",
+        sample_label="Bariloche / Cerro Catedral (HLS L30 19GBQ)",
+        tile_prefix="19GBQ_0_0",
+    ),
+    LandLocation(
+        id="queenstown-wanaka",
+        name="Queenstown & Wanaka, New Zealand",
+        sample_label="Queenstown / Wanaka (HLS L30 59GLL)",
+        tile_prefix="59GLL_0_0",
+    ),
+    LandLocation(
+        id="snowy-mountains",
+        name="Snowy Mountains, Australia",
+        sample_label="Snowy Mountains / Perisher (HLS L30 55HFV)",
+        tile_prefix="55HFV_0_0",
+    ),
+    LandLocation(
+        id="lesotho",
+        name="Lesotho",
+        sample_label="Lesotho / Afriski (HLS L30 35JPJ)",
+        tile_prefix="35JPJ_0_0",
+    ),
+    LandLocation(
         id="nairobi",
         name="Nairobi",
         sample_label="Nairobi (HLS L30 37MBU)",
