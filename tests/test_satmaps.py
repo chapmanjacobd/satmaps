@@ -2093,6 +2093,101 @@ def test_warp_to_web_mercator_aligns_adjacent_tiles_to_shared_pixel_grid(
     assert gt_1[3] == pytest.approx(gt_2[3], abs=1e-6)
 
 
+def test_build_source_raster_candidate_tile_relpaths_matches_real_warp(tmp_path: Path) -> None:
+    source_path = tmp_path / "source_utm.tif"
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32604)
+    dataset = gdal.GetDriverByName("GTiff").Create(str(source_path), 64, 64, 1, gdal.GDT_Byte)
+    assert dataset is not None
+    dataset.SetProjection(srs.ExportToWkt())
+    dataset.SetGeoTransform((500000.0, 30.0, 0.0, 2300.0, 0.0, -30.0))
+    dataset.GetRasterBand(1).WriteArray(np.full((64, 64), 255, dtype=np.uint8))
+    dataset = None
+
+    actual = satmaps.build_source_raster_candidate_tile_relpaths(
+        str(source_path),
+        13,
+        tile_size=512,
+        resample_alg="lanczos",
+    )
+    warped = satmaps.warp_to_web_mercator(str(source_path), None, "lanczos", 13, 512)
+    expected = satmaps.build_relpaths_for_tile_bounds(tiler.get_dataset_bounds(warped), 13)
+
+    assert actual == expected
+
+
+def test_build_work_unit_candidate_tile_relpaths_from_sources_uses_actual_source_bounds(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    work_unit = satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))
+    full_tile_geometry = satmaps.build_mgrs_tile_geometry("31TDF", satmaps.build_web_mercator_srs())
+    assert full_tile_geometry is not None
+    min_x, max_x, min_y, max_y = full_tile_geometry.GetEnvelope()
+    mid_x = (min_x + max_x) / 2.0
+    mid_y = (min_y + max_y) / 2.0
+
+    source_path = tmp_path / "source_3857_half.tif"
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset = gdal.GetDriverByName("GTiff").Create(str(source_path), 64, 64, 1, gdal.GDT_Byte)
+    assert dataset is not None
+    dataset.SetProjection(srs.ExportToWkt())
+    dataset.SetGeoTransform((min_x, (mid_x - min_x) / 64.0, 0.0, mid_y, 0.0, -((mid_y - min_y) / 64.0)))
+    dataset.GetRasterBand(1).WriteArray(np.full((64, 64), 255, dtype=np.uint8))
+    dataset = None
+
+    monkeypatch.setattr(
+        "satmaps.list_mosaic_folders_for_tile",
+        lambda mgrs_tile, date_paths, cache_dir: [("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")],
+    )
+    monkeypatch.setattr(
+        "satmaps.get_tile_paths",
+        lambda folder_name, date_path, cache_dir, download=False, quiet=False: {"red": str(source_path)},
+    )
+
+    actual = set(
+        satmaps.build_work_unit_candidate_tile_relpaths_from_sources(
+            work_unit,
+            ["2025/07/01"],
+            ".cache",
+            13,
+        )
+    )
+    conservative = set(satmaps.build_work_unit_candidate_tile_relpaths(work_unit, 13))
+
+    assert actual
+    assert actual < conservative
+
+
+def test_build_work_unit_candidate_tile_relpaths_from_sources_falls_back_on_inspection_error(
+    monkeypatch: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    work_unit = satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))
+    monkeypatch.setattr(
+        "satmaps.list_mosaic_folders_for_tile",
+        lambda mgrs_tile, date_paths, cache_dir: [("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")],
+    )
+    monkeypatch.setattr(
+        "satmaps.get_tile_paths",
+        lambda folder_name, date_path, cache_dir, download=False, quiet=False: {"red": "broken.tif"},
+    )
+    monkeypatch.setattr(
+        "satmaps.gdal.Open",
+        lambda path: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    actual = satmaps.build_work_unit_candidate_tile_relpaths_from_sources(
+        work_unit,
+        ["2025/07/01"],
+        ".cache",
+        13,
+    )
+
+    assert actual == satmaps.build_work_unit_candidate_tile_relpaths(work_unit, 13)
+    assert "Could not inspect source footprint for 31TDF_0_0" in capsys.readouterr().out
+
+
 def test_warp_to_web_mercator_removes_existing_destination(monkeypatch: object) -> None:
     removed: list[str] = []
 
@@ -3171,18 +3266,24 @@ def test_main_land_run_passes_prepared_ocean_to_flush_coordinator_without_eager_
 
     main()
 
-    assert configure_calls == [
-        {
-            "output_path": "output.pmtiles",
-            "unique_id": "lazyocean",
-            "work_unit_count": 4,
-            "quality": 74,
-            "zoom": ocean.DEFAULT_MAX_ZOOM,
-            "tile_size": 512,
-            "resample_alg": "lanczos",
-            "prepared_ocean_background": ".temp/output_ocean_bbox.tif",
-        }
-    ]
+    assert len(configure_calls) == 1
+    assert configure_calls[0]["output_path"] == "output.pmtiles"
+    assert configure_calls[0]["unique_id"] == "lazyocean"
+    assert configure_calls[0]["work_unit_count"] == 4
+    assert configure_calls[0]["quality"] == 74
+    assert configure_calls[0]["zoom"] == ocean.DEFAULT_MAX_ZOOM
+    assert configure_calls[0]["tile_size"] == 512
+    assert configure_calls[0]["resample_alg"] == "lanczos"
+    assert configure_calls[0]["prepared_ocean_background"] == ".temp/output_ocean_bbox.tif"
+    contributor_tile_candidates = configure_calls[0]["contributor_tile_candidates"]
+    assert isinstance(contributor_tile_candidates, dict)
+    assert set(contributor_tile_candidates) == {
+        "31TDF_0_0",
+        "31TDF_0_1",
+        "31TDF_1_0",
+        "31TDF_1_1",
+    }
+    assert all(candidate_relpaths for candidate_relpaths in contributor_tile_candidates.values())
     assert backfill_calls == [
         (".temp/output_ocean_bbox.tif", "output.pmtiles", "lazyocean")
     ]
@@ -3444,6 +3545,30 @@ def test_final_tile_flush_coordinator_lazily_composites_ocean_base(
         pixel = final_tile.convert("RGBA").getpixel((0, 0))
     assert pixel[0] > 0
     assert pixel[2] > 0
+
+
+def test_configure_final_tile_cache_flush_coordinator_uses_precomputed_candidates(
+    monkeypatch: object,
+) -> None:
+    unique_id = "precomputed"
+    work_units = (satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),)
+    monkeypatch.setattr(
+        "satmaps.build_work_unit_candidate_tile_relpaths",
+        lambda work_unit, zoom: (_ for _ in ()).throw(
+            AssertionError("expected precomputed candidates to bypass conservative builder")
+        ),
+    )
+
+    satmaps.configure_final_tile_cache_flush_coordinator(
+        "output.pmtiles",
+        unique_id,
+        work_units,
+        quality=100,
+        zoom=13,
+        contributor_tile_candidates={"31TDF_0_0": ("13/1/2.webp",)},
+    )
+
+    satmaps.clear_final_tile_cache_flush_coordinator(unique_id)
 
 
 def test_main_webp_resume_reuses_completed_markers_without_latest_state_fallback(

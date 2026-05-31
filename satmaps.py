@@ -1178,6 +1178,39 @@ def build_relpaths_for_tile_bounds(
     )
 
 
+def build_web_mercator_warp_options(
+    destination_path: Optional[str],
+    resample_alg: str,
+    max_zoom: int,
+    blocksize: int,
+    *,
+    output_format: Optional[str] = None,
+) -> gdal.WarpOptions:
+    """Build the shared Web Mercator warp options for real output or metadata-only VRTs."""
+    pixel_size = tiler.web_mercator_pixel_size_for_tile_size(max_zoom, blocksize)
+    resolved_format = output_format or ("MEM" if destination_path is None else "GTiff")
+    warp_kwargs: dict[str, object] = {
+        "format": resolved_format,
+        "dstSRS": "EPSG:3857",
+        "xRes": pixel_size,
+        "yRes": pixel_size,
+        "resampleAlg": resample_alg,
+        "targetAlignedPixels": True,
+        "multithread": True,
+        "warpOptions": ["NUM_THREADS=ALL_CPUS"],
+    }
+    if destination_path is not None and resolved_format == "GTiff":
+        warp_kwargs["creationOptions"] = [
+            "COMPRESS=ZSTD",
+            "ZSTD_LEVEL=5",
+            "TILED=YES",
+            "BIGTIFF=YES",
+            f"BLOCKXSIZE={blocksize}",
+            f"BLOCKYSIZE={blocksize}",
+        ]
+    return gdal.WarpOptions(**warp_kwargs)
+
+
 def build_work_unit_candidate_tile_relpaths(
     work_unit: LandWorkUnit,
     zoom: int,
@@ -1197,6 +1230,137 @@ def build_work_unit_candidate_tile_relpaths(
     return tuple(sorted(candidate_relpaths))
 
 
+def build_source_raster_candidate_tile_relpaths(
+    source_path: str,
+    zoom: int,
+    *,
+    tile_size: int = 512,
+    resample_alg: str = "lanczos",
+) -> tuple[str, ...]:
+    """Inspect one source raster and return the max-zoom tiles its aligned 3857 warp can touch."""
+    dataset = gdal.Open(source_path)
+    if dataset is None:
+        raise RuntimeError(f"Could not open source raster for footprint inspection: {source_path}")
+
+    warped_vrt: Optional[gdal.Dataset] = None
+    try:
+        warped_vrt = gdal.Warp(
+            "",
+            dataset,
+            options=build_web_mercator_warp_options(
+                None,
+                resample_alg,
+                zoom,
+                tile_size,
+                output_format="VRT",
+            ),
+        )
+        if warped_vrt is None:
+            raise RuntimeError(
+                f"Could not derive Web Mercator footprint for source raster: {source_path}"
+            )
+        return build_relpaths_for_tile_bounds(tiler.get_dataset_bounds(warped_vrt), zoom)
+    finally:
+        warped_vrt = None
+        dataset = None
+
+
+def build_work_unit_candidate_tile_relpaths_from_sources(
+    work_unit: LandWorkUnit,
+    date_paths: List[str],
+    cache_dir: str,
+    zoom: int,
+    *,
+    tile_size: int = 512,
+    resample_alg: str = "lanczos",
+) -> tuple[str, ...]:
+    """Inspect actual source rasters for one work unit, with a conservative MGRS fallback."""
+    candidate_relpaths: set[str] = set()
+    inspected_any_source = False
+
+    for source_subtile in work_unit.source_subtiles:
+        folders = list_mosaic_folders_for_tile(source_subtile, date_paths, cache_dir)
+        if not folders:
+            continue
+
+        folder_name, date_path = folders[0]
+        try:
+            source_path = get_tile_paths(
+                folder_name,
+                date_path,
+                cache_dir,
+                download=False,
+                quiet=True,
+            )["red"]
+            candidate_relpaths.update(
+                build_source_raster_candidate_tile_relpaths(
+                    source_path,
+                    zoom,
+                    tile_size=tile_size,
+                    resample_alg=resample_alg,
+                )
+            )
+            inspected_any_source = True
+        except RuntimeError as exc:
+            print(
+                f"Warning: Could not inspect source footprint for {source_subtile} "
+                f"({folder_name}): {exc}"
+            )
+            return build_work_unit_candidate_tile_relpaths(work_unit, zoom)
+
+    if inspected_any_source and candidate_relpaths:
+        return tuple(sorted(candidate_relpaths))
+    return build_work_unit_candidate_tile_relpaths(work_unit, zoom)
+
+
+def precompute_work_unit_candidate_tile_relpaths_from_sources(
+    work_units: Sequence[LandWorkUnit],
+    date_paths: List[str],
+    cache_dir: str,
+    zoom: int,
+    *,
+    tile_size: int = 512,
+    resample_alg: str = "lanczos",
+    parallel: int = 1,
+) -> dict[str, tuple[str, ...]]:
+    """Inspect source footprints for all work units before final-tile flushing starts."""
+    if not work_units:
+        return {}
+
+    max_workers = max(1, min(parallel, len(work_units)))
+    if max_workers == 1:
+        return {
+            work_unit.unit_id: build_work_unit_candidate_tile_relpaths_from_sources(
+                work_unit,
+                date_paths,
+                cache_dir,
+                zoom,
+                tile_size=tile_size,
+                resample_alg=resample_alg,
+            )
+            for work_unit in work_units
+        }
+
+    candidate_relpaths_by_work_unit: dict[str, tuple[str, ...]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_work_unit = {
+            executor.submit(
+                build_work_unit_candidate_tile_relpaths_from_sources,
+                work_unit,
+                date_paths,
+                cache_dir,
+                zoom,
+                tile_size=tile_size,
+                resample_alg=resample_alg,
+            ): work_unit
+            for work_unit in work_units
+        }
+        for future in as_completed(future_to_work_unit):
+            work_unit = future_to_work_unit[future]
+            candidate_relpaths_by_work_unit[work_unit.unit_id] = future.result()
+    return candidate_relpaths_by_work_unit
+
+
 def configure_final_tile_cache_flush_coordinator(
     output_path: str,
     unique_id: str,
@@ -1206,16 +1370,18 @@ def configure_final_tile_cache_flush_coordinator(
     tile_size: int = 512,
     resample_alg: str = "lanczos",
     prepared_ocean_background: Optional[str] = None,
+    contributor_tile_candidates: Optional[dict[str, tuple[str, ...]]] = None,
 ) -> None:
     """Configure the in-memory flush coordinator for one WebP run."""
+    resolved_tile_candidates = contributor_tile_candidates or {
+        work_unit.unit_id: build_work_unit_candidate_tile_relpaths(work_unit, zoom)
+        for work_unit in work_units
+    }
     FINAL_TILE_CACHE_FLUSH_COORDINATORS[unique_id] = FinalTileCacheFlushCoordinator(
         output_path,
         unique_id,
         [work_unit.unit_id for work_unit in work_units],
-        {
-            work_unit.unit_id: build_work_unit_candidate_tile_relpaths(work_unit, zoom)
-            for work_unit in work_units
-        },
+        resolved_tile_candidates,
         quality,
         tile_size=tile_size,
         resample_alg=resample_alg,
@@ -2164,28 +2330,11 @@ def warp_to_web_mercator(
     """Warp a raster into the final EPSG:3857 grid."""
     if destination_path is not None:
         remove_if_exists(destination_path)
-    pixel_size = tiler.web_mercator_pixel_size_for_tile_size(max_zoom, blocksize)
-    warp_kwargs: dict[str, object] = {
-        "format": "MEM" if destination_path is None else "GTiff",
-        "dstSRS": "EPSG:3857",
-        "xRes": pixel_size,
-        "yRes": pixel_size,
-        "resampleAlg": resample_alg,
-        "targetAlignedPixels": True,
-        "multithread": True,
-        "warpOptions": ["NUM_THREADS=ALL_CPUS"],
-    }
-    if destination_path is not None:
-        warp_kwargs["creationOptions"] = [
-            "COMPRESS=ZSTD",
-            "ZSTD_LEVEL=5",
-            "TILED=YES",
-            "BIGTIFF=YES",
-            f"BLOCKXSIZE={blocksize}",
-            f"BLOCKYSIZE={blocksize}",
-        ]
-    warp_options = gdal.WarpOptions(
-        **warp_kwargs,
+    warp_options = build_web_mercator_warp_options(
+        destination_path,
+        resample_alg,
+        max_zoom,
+        blocksize,
     )
     destination = "" if destination_path is None else destination_path
     warped_ds = gdal.Warp(destination, source_path, options=warp_options)
@@ -2616,6 +2765,15 @@ def main() -> None:
             )
             progress_line = LiveProgressLine()
             started_at = time.perf_counter()
+            contributor_tile_candidates = precompute_work_unit_candidate_tile_relpaths_from_sources(
+                work_units_to_process,
+                date_paths,
+                args.cache,
+                args.max_zoom,
+                tile_size=args.blocksize,
+                resample_alg=args.resample_alg,
+                parallel=args.parallel,
+            )
             configure_final_tile_cache_flush_coordinator(
                 args.output,
                 unique_id,
@@ -2625,6 +2783,7 @@ def main() -> None:
                 tile_size=args.blocksize,
                 resample_alg=args.resample_alg,
                 prepared_ocean_background=prepared_ocean_background,
+                contributor_tile_candidates=contributor_tile_candidates,
             )
             try:
                 with ThreadPoolExecutor(max_workers=args.parallel) as executor:
