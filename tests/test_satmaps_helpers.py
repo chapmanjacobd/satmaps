@@ -26,7 +26,6 @@ from satmaps import (
     iter_processing_windows,
     open_date_band_sets,
     parse_bbox,
-    recover_processed_tile_output,
     restore_resume_state,
 )
 
@@ -80,15 +79,12 @@ def test_restore_resume_state_round_trip(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     state_file = tmp_path / "state.json"
-    kept_tif = tmp_path / "kept.tif"
-    kept_tif.write_text("kept")
-
     state_file.write_text(
         json.dumps(
             {
                 "unique_id": "resume-id",
                 "completed_units": ["31TDF_0_0", "31TDF_1_0"],
-                "processed_tifs": [str(kept_tif), str(tmp_path / "missing.tif")],
+                "processed_tifs": [str(tmp_path / "legacy.tif")],
                 "args": {"parallel": 2},
             }
         )
@@ -99,22 +95,20 @@ def test_restore_resume_state_round_trip(
         "state_file": str(state_file),
         "unique_id": "resume-id",
         "completed_units": {"31TDF_0_0", "31TDF_1_0"},
-        "processed_tifs": [str(kept_tif)],
     }
     assert "Resuming from state file" in capsys.readouterr().out
 
 
-def test_restore_resume_state_drops_zero_byte_outputs(tmp_path: Path) -> None:
+def test_restore_resume_state_accepts_files_without_legacy_processed_tifs(
+    tmp_path: Path,
+) -> None:
     state_file = tmp_path / "state.json"
-    empty_tif = tmp_path / "empty.tif"
-    empty_tif.touch()
 
     state_file.write_text(
         json.dumps(
             {
                 "unique_id": "resume-id",
                 "completed_units": ["31TDF_0_0"],
-                "processed_tifs": [str(empty_tif)],
                 "args": {"parallel": 2},
             }
         )
@@ -123,7 +117,7 @@ def test_restore_resume_state_drops_zero_byte_outputs(tmp_path: Path) -> None:
     restored = restore_resume_state(str(state_file))
 
     assert restored is not None
-    assert restored["processed_tifs"] == []
+    assert restored["completed_units"] == {"31TDF_0_0"}
 
 
 def test_plan_subtile_work_units_expands_subtiles() -> None:
@@ -345,9 +339,8 @@ def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: objec
     os.utime(newer, (2, 2))
 
     assert find_resume_path(str(newer)) == str(newer)
-    assert find_resume_path(True) == str(Path(".temp") / "state_new.json")
     assert find_resume_path(True, preferred_path=str(older)) == str(older)
-    assert find_resume_path(True, allow_latest=False) is None
+    assert find_resume_path(True) is None
 
 
 def test_build_land_run_token_is_stable_for_matching_inputs() -> None:
@@ -397,46 +390,6 @@ def test_build_land_run_token_is_stable_for_matching_inputs() -> None:
 
     assert token_a == token_b
     assert token_a != token_c
-
-
-def test_recover_processed_tile_output_rebuilds_from_surviving_utm(
-    tmp_path: Path, monkeypatch: object
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    args = satmaps.argparse.Namespace(
-        output="render.pmtiles",
-        resample_alg="near",
-        max_zoom=13,
-        blocksize=256,
-    )
-    utm_path = tmp_path / ".temp" / "render_31TDF_0_0_utm.tif"
-    utm_path.write_text("utm")
-
-    warp_calls: list[tuple[str, str, str, int, int]] = []
-
-    def fake_warp(
-        source: str, destination: str, resample_alg: str, max_zoom: int, blocksize: int
-    ) -> None:
-        warp_calls.append((source, destination, resample_alg, max_zoom, blocksize))
-        Path(destination).write_text("warped")
-
-    monkeypatch.setattr(satmaps, "warp_to_web_mercator", fake_warp)
-
-    recovered = recover_processed_tile_output("31TDF_0_0", args)
-
-    assert recovered == ".temp/render_31TDF_0_0_3857.tif"
-    assert warp_calls == [
-        (
-            ".temp/render_31TDF_0_0_utm.tif",
-            ".temp/.temp_render_31TDF_0_0_3857.tif",
-            "near",
-            13,
-            256,
-        )
-    ]
-    assert Path(recovered).read_text() == "warped"
-    assert not utm_path.exists()
 
 
 def test_helper_modules_reexport_common_helpers() -> None:

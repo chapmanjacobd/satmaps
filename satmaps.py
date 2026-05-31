@@ -132,11 +132,6 @@ def build_state_file_path(unique_id: str) -> str:
     return f".temp/state_{unique_id}.json"
 
 
-def build_master_vrt_path(output_path: str, unique_id: str) -> str:
-    """Return the run-scoped lightweight master VRT path."""
-    return f".temp/master_{temp_basename_from_output(output_path)}_{unique_id}.vrt"
-
-
 def build_temp_mbtiles_path(output_path: str) -> str:
     """Return the deterministic heavyweight MBTiles path."""
     return f".temp/{temp_basename_from_output(output_path)}.mbtiles"
@@ -814,21 +809,13 @@ def expand_subtiles(mgrs_bases: List[str]) -> List[str]:
 def find_resume_path(
     resume_arg: object,
     preferred_path: Optional[str] = None,
-    *,
-    allow_latest: bool = True,
 ) -> Optional[str]:
-    """Resolve the explicit or latest state file path for --resume."""
+    """Resolve the explicit or current-run state file path for --resume."""
     if isinstance(resume_arg, str) and os.path.exists(resume_arg):
         return resume_arg
     if preferred_path and os.path.exists(preferred_path):
         return preferred_path
-    if not allow_latest:
-        return None
-
-    states = glob.glob(".temp/state_*.json")
-    if not states:
-        return None
-    return max(states, key=os.path.getmtime)
+    return None
 
 
 def load_saved_land_mgrs_list(
@@ -862,7 +849,7 @@ def save_land_mgrs_list(
 
 
 def restore_resume_state(resume_path: str) -> Optional[Dict[str, Any]]:
-    """Load a previous run state and keep only surviving intermediate files."""
+    """Load a previous run state and keep only the resumable work-unit state."""
     try:
         with open(resume_path, "r") as f:
             state = json.load(f)
@@ -870,39 +857,24 @@ def restore_resume_state(resume_path: str) -> Optional[Dict[str, Any]]:
             raise ValueError("state file must contain a JSON object")
         unique_id = state["unique_id"]
         completed_units_raw = state["completed_units"]
-        processed_tifs_raw = state["processed_tifs"]
         if not isinstance(unique_id, str):
             raise ValueError("unique_id must be a string")
         if not isinstance(completed_units_raw, list):
             raise ValueError("completed_units must be a list")
-        if not isinstance(processed_tifs_raw, list):
-            raise ValueError("processed_tifs must be a list")
         if not all(isinstance(unit_id, str) for unit_id in completed_units_raw):
             raise ValueError("completed_units entries must be strings")
-        if not all(isinstance(path, str) for path in processed_tifs_raw):
-            raise ValueError("processed_tifs entries must be strings")
     except (OSError, ValueError, TypeError, KeyError) as e:
         print(f"Warning: Could not load state file: {e}")
         return None
 
     completed_units = set(completed_units_raw)
-    processed_tifs = [path for path in processed_tifs_raw if file_has_content(path)]
     print(f"Resuming from state file: {resume_path} (unique_id: {unique_id})")
-    print(
-        f"Already completed {len(completed_units)} sub-tile(s), "
-        f"{len(processed_tifs)} TIFs found."
-    )
+    print(f"Already completed {len(completed_units)} sub-tile(s).")
     return {
         "state_file": resume_path,
         "unique_id": unique_id,
         "completed_units": completed_units,
-        "processed_tifs": processed_tifs,
     }
-
-
-def should_use_webp_cache_pipeline(args: argparse.Namespace) -> bool:
-    """Return True when the run should use the max-zoom WebP cache pipeline."""
-    return not args.vrt and args.format == "webp"
 
 
 def recover_cached_work_outputs(
@@ -1605,7 +1577,6 @@ def write_resume_state(
     state_file: str,
     unique_id: str,
     completed_units: Set[str],
-    processed_tifs: List[str],
     args: argparse.Namespace,
 ) -> None:
     """Persist resume state atomically so interrupted writes do not corrupt the JSON file."""
@@ -1615,7 +1586,6 @@ def write_resume_state(
             {
                 "unique_id": unique_id,
                 "completed_units": list(completed_units),
-                "processed_tifs": processed_tifs,
                 "args": vars(args),
             },
             f,
@@ -1984,182 +1954,48 @@ def warp_to_web_mercator(
     gdal.Warp(destination_path, source_path, options=warp_options)
 
 
-def recover_processed_tile_output(
-    mgrs_subtile: str,
-    args: argparse.Namespace,
-) -> Optional[str]:
-    """Reuse a finished temp output or recover one from a surviving UTM intermediate."""
-    temp_utm_path, temp_3857_path = build_processed_tile_paths(mgrs_subtile, args.output)
-    staged_3857_path = build_staged_path(temp_3857_path)
-
-    if os.path.exists(temp_3857_path) and not file_has_content(temp_3857_path):
-        remove_if_exists(temp_3857_path)
-    if file_has_content(temp_3857_path):
-        return temp_3857_path
-
-    if os.path.exists(temp_utm_path) and not file_has_content(temp_utm_path):
-        remove_if_exists(temp_utm_path)
-    if not file_has_content(temp_utm_path):
-        return None
-
-    remove_if_exists(staged_3857_path)
-    warp_to_web_mercator(
-        temp_utm_path,
-        staged_3857_path,
-        args.resample_alg,
-        args.max_zoom,
-        args.blocksize,
-    )
-    publish_staged_path(staged_3857_path, temp_3857_path)
-    remove_if_exists(temp_utm_path)
-    return temp_3857_path
-
-
-def recover_processed_work_outputs(
-    work_units: tuple[LandWorkUnit, ...],
-    args: argparse.Namespace,
-) -> Tuple[Set[str], List[str]]:
-    """Collect reusable temp outputs for the requested work units."""
-    recovered_units: Set[str] = set()
-    recovered_paths: List[str] = []
-    for work_unit in work_units:
-        recovered_path = recover_processed_tile_output(work_unit.unit_id, args)
-        if recovered_path is None:
-            continue
-        recovered_units.add(work_unit.unit_id)
-        recovered_paths.append(recovered_path)
-    return recovered_units, recovered_paths
-
-
-def build_ordered_webp_composite_rasters(
-    plan: LandProcessingPlan,
-    args: argparse.Namespace,
-    prepared_ocean_background: Optional[str],
-) -> List[str]:
-    """Return the deterministic ocean-first raster list for final WebP compositing."""
-    ordered_rasters: List[str] = []
-    if prepared_ocean_background and file_has_content(prepared_ocean_background):
-        ordered_rasters.append(prepared_ocean_background)
-
-    for work_unit in sorted(plan.work_units, key=lambda current: current.unit_id):
-        raster_path = build_work_unit_output_path(work_unit, args.output)
-        if file_has_content(raster_path):
-            ordered_rasters.append(raster_path)
-    return ordered_rasters
-
-
-def compose_final_webp_tile_tree(
-    ordered_rasters: Sequence[str],
-    output_dir: str,
-    args: argparse.Namespace,
-) -> int:
-    """Compose the final max-zoom WebP tree one tile at a time in memory."""
-    tile_inputs: Dict[str, List[str]] = {}
-    for raster_path in ordered_rasters:
-        for relative_path in tiler.iter_raster_tile_relpaths(raster_path, args.max_zoom):
-            tile_inputs.setdefault(relative_path, []).append(raster_path)
-
-    if not tile_inputs:
-        return 0
-
-    pending_tiles = [
-        relative_path
-        for relative_path in sorted(tile_inputs)
-        if not file_has_content(os.path.join(output_dir, relative_path))
-    ]
-    if not pending_tiles:
-        print("All final WebP tiles already composed.")
-        return len(tile_inputs)
-
-    print(
-        f"Compositing {len(pending_tiles)} final tile(s) from {len(ordered_rasters)} raster(s)..."
-    )
-    progress_line = LiveProgressLine()
-    started_at = time.perf_counter()
-    completed_before_start = len(tile_inputs) - len(pending_tiles)
-
-    def compose_one(relative_path: str) -> bool:
-        zoom, tx, ty = parse_tile_tree_relpath(relative_path)
-        return tiler.compose_webp_tile_from_rasters(
-            tile_inputs[relative_path],
-            os.path.join(output_dir, relative_path),
-            zoom,
-            tx,
-            ty,
-            args.blocksize,
-            args.quality,
-            args.resample_alg,
-        )
-
-    try:
-        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-            future_to_path = {
-                executor.submit(compose_one, relative_path): relative_path
-                for relative_path in pending_tiles
-            }
-            processed_tiles = completed_before_start
-            for future in as_completed(future_to_path):
-                future.result()
-                processed_tiles += 1
-                update_count_progress(
-                    progress_line,
-                    "Final tile compositing progress:",
-                    processed_tiles,
-                    len(tile_inputs),
-                    started_at,
-                    f"{processed_tiles} tile(s) processed.",
-                    completed_before_start=0,
-                )
-    finally:
-        progress_line.finish()
-
-    return len(tile_inputs)
-
-
 def process_land_work_unit(
     work_unit: LandWorkUnit,
     date_paths: List[str],
     args: argparse.Namespace,
     gebco_src: Optional[str] = None,
     unique_id: Optional[str] = None,
-) -> Optional[str]:
-    """Dispatch one land-processing work unit to the appropriate strategy."""
-    if should_use_webp_cache_pipeline(args):
-        if unique_id is None:
-            raise RuntimeError("WebP cache processing requires a run unique_id")
-        completion_marker_path = build_contributor_complete_marker(
-            args.output,
-            unique_id,
+) -> None:
+    """Process one land work unit into the final WebP tile cache."""
+    if unique_id is None:
+        raise RuntimeError("Land processing requires a run unique_id")
+    completion_marker_path = build_contributor_complete_marker(
+        args.output,
+        unique_id,
+        work_unit.unit_id,
+    )
+    try:
+        processed_raster = process_single_tile(
             work_unit.unit_id,
+            date_paths,
+            args,
+            gebco_src,
+            use_in_memory_utm=True,
+            completion_marker_path=completion_marker_path,
         )
-        try:
-            processed_raster = process_single_tile(
-                work_unit.unit_id,
-                date_paths,
-                args,
-                gebco_src,
-                use_in_memory_utm=True,
-                completion_marker_path=completion_marker_path,
-            )
-            wait_for_final_tile_cache_commit_turn(unique_id, work_unit.unit_id)
-            if processed_raster:
-                try:
-                    with FINAL_TILE_CACHE_COMMIT_LOCK:
-                        commit_raster_to_final_tile_cache(
-                            processed_raster,
-                            args.output,
-                            unique_id,
-                            work_unit.unit_id,
-                            args,
-                        )
-                finally:
-                    remove_if_exists(processed_raster)
-            mark_final_tile_cache_commit_complete(unique_id, work_unit.unit_id)
-        except Exception:
-            abort_final_tile_cache_commit_sequence(unique_id)
-            raise
-        return None
-    return process_single_tile(work_unit.unit_id, date_paths, args, gebco_src)
+        wait_for_final_tile_cache_commit_turn(unique_id, work_unit.unit_id)
+        if processed_raster:
+            try:
+                with FINAL_TILE_CACHE_COMMIT_LOCK:
+                    commit_raster_to_final_tile_cache(
+                        processed_raster,
+                        args.output,
+                        unique_id,
+                        work_unit.unit_id,
+                        args,
+                    )
+            finally:
+                remove_if_exists(processed_raster)
+        mark_final_tile_cache_commit_complete(unique_id, work_unit.unit_id)
+    except Exception:
+        abort_final_tile_cache_commit_sequence(unique_id)
+        raise
+    return None
 
 
 def process_single_tile(
@@ -2320,19 +2156,15 @@ def calculate_estimates(args: argparse.Namespace) -> None:
         num_work_units * 30 / max(args.parallel, 1)
     )
     total_seconds += num_work_units * 2
-    if args.format == "webp" and not args.vrt:
-        # The WebP path only keeps one temporary 3857 raster per active worker
-        # before publishing its final z/x/y.webp tiles.
-        disk_peak_gb = (
-            total_tile_dates * 60
-            + max(args.parallel, 1) * 50
-            + num_work_units * 5
-            + 100
-        ) / 1024
-        disk_end_gb = (num_work_units * 4) / 1024
-    else:
-        disk_peak_gb = (total_tile_dates * 60 + num_work_units * 50 + 100) / 1024
-        disk_end_gb = (num_work_units * 40) / 1024
+    # The WebP path only keeps one temporary 3857 raster per active worker
+    # before publishing its final z/x/y.webp tiles.
+    disk_peak_gb = (
+        total_tile_dates * 60
+        + max(args.parallel, 1) * 50
+        + num_work_units * 5
+        + 100
+    ) / 1024
+    disk_end_gb = (num_work_units * 4) / 1024
 
     hours = int(total_seconds // 3600)
     minutes = int((total_seconds % 3600) // 60)
@@ -2366,13 +2198,7 @@ def main() -> None:
     parser.add_argument(
         "--output", "-o", default="output.pmtiles", help="Output PMTiles filename"
     )
-    parser.add_argument(
-        "--format",
-        choices=["webp", "jpg", "png", "png8"],
-        default="webp",
-        help="Tile format",
-    )
-    parser.add_argument("--quality", type=int, default=74, help="Quality (0-100)")
+    parser.add_argument("--quality", type=int, default=74, help="WebP quality (0-100)")
     parser.add_argument(
         "--resample-alg",
         default="lanczos",
@@ -2485,9 +2311,6 @@ def main() -> None:
         help="Target Web Mercator zoom used for output resolution",
     )
     parser.add_argument(
-        "--vrt", action="store_true", help="Write final VRT and skip MBTiles"
-    )
-    parser.add_argument(
         "--estimate",
         action="store_true",
         help="Print estimated time, RAM, disk space, and network size then exit",
@@ -2502,11 +2325,6 @@ def main() -> None:
         "--winter",
         action="store_true",
         help="Swap the two-date equator blend so the first date favors the south and the second the north",
-    )
-    parser.add_argument(
-        "--delete-tifs",
-        action="store_true",
-        help="Delete durable land GeoTIFF intermediates after packaging when using the legacy raster pipeline",
     )
     land_mgrs_module.add_land_mgrs_cli_args(parser)
     args = parser.parse_args()
@@ -2537,15 +2355,12 @@ def main() -> None:
 
     unique_id = build_land_run_token(args, date_paths, requested_bbox, gebco_vrt_source)
     state_file = build_state_file_path(unique_id)
-    use_webp_cache = should_use_webp_cache_pipeline(args)
     completed_units: Set[str] = set()
-    processed_tifs: List[str] = []
 
     if args.resume:
         resume_path = find_resume_path(
             args.resume,
             preferred_path=state_file,
-            allow_latest=not use_webp_cache,
         )
         if resume_path:
             resume_state = restore_resume_state(resume_path)
@@ -2553,7 +2368,6 @@ def main() -> None:
                 state_file = cast(str, resume_state["state_file"])
                 unique_id = cast(str, resume_state["unique_id"])
                 completed_units = cast(Set[str], resume_state["completed_units"])
-                processed_tifs = cast(List[str], resume_state["processed_tifs"])
 
     mgrs_bases = discover_mgrs_bases(
         requested_bbox,
@@ -2567,33 +2381,19 @@ def main() -> None:
             discover_available_subtiles_from_s3_cache(mgrs_bases),
         ),
     )
-    if use_webp_cache:
-        recovered_contributors = recover_pending_tile_cache_commits(args.output, unique_id)
-        if recovered_contributors:
-            print(f"Recovered {len(recovered_contributors)} pending WebP commit(s).")
-        recovered_units = recover_cached_work_outputs(plan.work_units, args.output, unique_id)
-        if recovered_units:
-            print(f"Reusing {len(recovered_units)} completed WebP contributor(s).")
-        completed_units &= recovered_units
-        completed_units.update(recovered_units)
-        processed_tifs = [path for path in processed_tifs if file_has_content(path)]
-    else:
-        recovered_units, recovered_tile_paths = recover_processed_work_outputs(plan.work_units, args)
-        if recovered_units:
-            print(f"Reusing {len(recovered_units)} existing temp raster(s).")
-        completed_units &= recovered_units
-        completed_units.update(recovered_units)
-        land_output_paths = {build_work_unit_output_path(unit, args.output) for unit in plan.work_units}
-        processed_tifs = recovered_tile_paths + [
-            path
-            for path in processed_tifs
-            if path not in land_output_paths and file_has_content(path)
-        ]
+    recovered_contributors = recover_pending_tile_cache_commits(args.output, unique_id)
+    if recovered_contributors:
+        print(f"Recovered {len(recovered_contributors)} pending WebP commit(s).")
+    recovered_units = recover_cached_work_outputs(plan.work_units, args.output, unique_id)
+    if recovered_units:
+        print(f"Reusing {len(recovered_units)} completed WebP contributor(s).")
+    completed_units &= recovered_units
+    completed_units.update(recovered_units)
     print(describe_land_processing_plan(plan, len(date_paths)))
 
     prepared_ocean_background: Optional[str] = None
     ocean_cleanup_paths: List[str] = []
-    if use_webp_cache and not args.download:
+    if not args.download:
         prepared_ocean_background = prepare_ocean_background_for_output(
             args.ocean_background,
             requested_bbox,
@@ -2631,11 +2431,10 @@ def main() -> None:
             )
             progress_line = LiveProgressLine()
             started_at = time.perf_counter()
-            if use_webp_cache:
-                configure_final_tile_cache_commit_sequence(
-                    unique_id,
-                    [work_unit.unit_id for work_unit in work_units_to_process],
-                )
+            configure_final_tile_cache_commit_sequence(
+                unique_id,
+                [work_unit.unit_id for work_unit in work_units_to_process],
+            )
             try:
                 with ThreadPoolExecutor(max_workers=args.parallel) as executor:
                     future_to_work_unit = {
@@ -2651,16 +2450,11 @@ def main() -> None:
                     }
                     for future in as_completed(future_to_work_unit):
                         work_unit = future_to_work_unit[future]
-                        res = future.result()
+                        future.result()
                         completed_units.add(work_unit.unit_id)
-                        if res:
-                            processed_tifs.append(res)
-                        if use_webp_cache:
-                            status_message = (
-                                f"{len(completed_units) - completed_before_start} contributor(s) committed."
-                            )
-                        else:
-                            status_message = f"{len(processed_tifs)} raster(s) ready."
+                        status_message = (
+                            f"{len(completed_units) - completed_before_start} contributor(s) committed."
+                        )
                         update_count_progress(
                             progress_line,
                             "Land processing progress:",
@@ -2674,12 +2468,10 @@ def main() -> None:
                             state_file,
                             unique_id,
                             completed_units,
-                            processed_tifs,
                             args,
                         )
             finally:
-                if use_webp_cache:
-                    clear_final_tile_cache_commit_sequence(unique_id)
+                clear_final_tile_cache_commit_sequence(unique_id)
             progress_line.finish()
         else:
             print("All sub-tiles already processed.")
@@ -2690,106 +2482,22 @@ def main() -> None:
         print("Download complete.")
         return
 
-    if use_webp_cache:
-        final_tile_tree = build_final_tile_cache_dir(args.output, unique_id)
-        final_tile_count = len(tiler.iter_tile_tree_paths(final_tile_tree))
-        if final_tile_count <= 0:
-            print("Error: No max-zoom tiles were generated.")
-            sys.exit(1)
+    final_tile_tree = build_final_tile_cache_dir(args.output, unique_id)
+    final_tile_count = len(tiler.iter_tile_tree_paths(final_tile_tree))
+    if final_tile_count <= 0:
+        print("Error: No max-zoom tiles were generated.")
+        sys.exit(1)
 
-        temp_mbtiles = convert_tile_tree_to_pmtiles(
-            final_tile_tree,
-            args.output,
-            resample_alg=args.resample_alg,
-            max_zoom=args.max_zoom,
-            name="Sentinel-2 Mosaic",
-            description="Copernicus Sentinel data",
-            requested_bbox=requested_bbox,
-        )
-        cleanup_temporary_files([temp_mbtiles] + processed_tifs + ocean_cleanup_paths)
-    else:
-        prepared_ocean_background = prepare_ocean_background_for_output(
-            args.ocean_background,
-            requested_bbox,
-            args.output,
-            args.resample_alg,
-            args.max_zoom,
-            args.blocksize,
-        )
-        if prepared_ocean_background:
-            print(f"Using ocean background: {prepared_ocean_background}")
-            if prepared_ocean_background not in processed_tifs:
-                processed_tifs.insert(0, prepared_ocean_background)
-        elif args.bbox:
-            print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
-
-        if not processed_tifs:
-            print("Error: No data processed.")
-            sys.exit(1)
-
-        master_vrt = build_master_vrt_path(args.output, unique_id)
-        staged_master_vrt = build_staged_path(master_vrt)
-        pixel_size = tiler.web_mercator_pixel_size_for_tile_size(
-            args.max_zoom,
-            args.blocksize,
-        )
-        remove_if_exists(staged_master_vrt)
-        progress_line = LiveProgressLine()
-        master_vrt_callback = build_gdal_progress_callback(
-            progress_line,
-            f"Building master VRT from {len(processed_tifs)} raster(s)...",
-            time.perf_counter(),
-        )
-        master_vrt_callback(0.0, "", None)
-        try:
-            gdal.BuildVRT(
-                staged_master_vrt,
-                processed_tifs,
-                resolution="user",
-                xRes=pixel_size,
-                yRes=pixel_size,
-                callback=master_vrt_callback,
-            )
-            master_vrt_callback(1.0, "", None)
-        finally:
-            progress_line.finish()
-        publish_staged_path(staged_master_vrt, master_vrt)
-
-        if args.vrt:
-            print(f"Success! Master VRT: {master_vrt}")
-            return
-
-        land_output_abspaths = {
-            os.path.abspath(build_work_unit_output_path(unit, args.output))
-            for unit in plan.work_units
-        }
-        persistent_paths = {os.path.abspath(args.ocean_background)}
-        cleanup_paths = [
-            path
-            for path in processed_tifs
-            if os.path.abspath(path) not in persistent_paths
-            and (
-                args.delete_tifs
-                or os.path.abspath(path) not in land_output_abspaths
-            )
-        ]
-        packaged_tiles = convert_raster_to_pmtiles(
-            master_vrt,
-            args.output,
-            tile_format=args.format,
-            quality=args.quality,
-            resample_alg=args.resample_alg,
-            chunk_zoom=args.chunk_zoom,
-            parallel=args.parallel,
-            blocksize=args.blocksize,
-            name="Sentinel-2 Mosaic",
-            description="Copernicus Sentinel data",
-            requested_bbox=requested_bbox,
-            cleanup_input_paths=cleanup_paths,
-        )
-        cleanup_temporary_files(
-            [packaged_tiles.temp_mbtiles] + packaged_tiles.tiling_artifacts.cleanup_paths
-        )
+    temp_mbtiles = convert_tile_tree_to_pmtiles(
+        final_tile_tree,
+        args.output,
+        resample_alg=args.resample_alg,
+        max_zoom=args.max_zoom,
+        name="Sentinel-2 Mosaic",
+        description="Copernicus Sentinel data",
+        requested_bbox=requested_bbox,
+    )
+    cleanup_temporary_files([temp_mbtiles] + ocean_cleanup_paths)
 
     if os.path.exists(state_file):
         os.remove(state_file)

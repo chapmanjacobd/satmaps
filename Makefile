@@ -1,4 +1,4 @@
-.PHONY: help install dev-install lint typecheck test tune hawaii vrt clean clean-cache
+.PHONY: help install dev-install lint typecheck test tune hawaii clean clean-cache
 
 PYTHON := python3
 PIP := $(PYTHON) -m pip
@@ -12,7 +12,6 @@ help:
 	@echo "  test         : Run pytest"
 	@echo "  tune         : Start the Tuner UI (port 5001)"
 	@echo "  hawaii       : Build the Hawaii ocean background and PMTiles"
-	@echo "  vrt          : Build the Hawaii PMTiles VRT"
 	@echo "  clean        : Remove temporary files and build artifacts"
 	@echo "  clean-cache  : Remove cached tiles"
 
@@ -39,9 +38,6 @@ tune:
 hawaii: clean
 	$(PYTHON) ocean.py --grade --bbox -158.4172265727475519,20.7947063146676037,-156.1288551802102802,21.8768578466807000
 	$(PYTHON) satmaps.py --grade --max-zoom 14 --bbox -158.4172265727475519,20.7947063146676037,-156.1288551802102802,21.8768578466807000 --output hawaii.pmtiles
-
-vrt:
-	$(PYTHON) satmaps.py --grade --max-zoom 14 --bbox -158.4172265727475519,20.7947063146676037,-156.1288551802102802,21.8768578466807000 --output hawaii.pmtiles --vrt --resume
 
 clean:
 	rm -rf __pycache__ .ruff_cache .mypy_cache .temp

@@ -2,7 +2,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import pytest
@@ -2828,66 +2827,104 @@ def test_build_land_run_token_changes_with_winter_flag() -> None:
     assert summer_token != winter_token
 
 
-def test_main_vrt_mode(monkeypatch: object, tmp_path: Path) -> None:
+def configure_main_defaults(
+    monkeypatch: object,
+    tmp_path: Path,
+    argv: list[str],
+    *,
+    mgrs_bases: list[str],
+    unique_id: str = "testrun",
+) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--vrt", "--parallel", "1", "--date", "2025/07/01"],
-    )
+    monkeypatch.setattr(sys, "argv", ["satmaps.py", *argv])
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
     monkeypatch.setattr(satmaps, "S3_FOLDER_CACHE", {})
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: ["31TDF"])
+    monkeypatch.setattr("satmaps.build_land_run_token", lambda *args, **kwargs: unique_id)
+    monkeypatch.setattr(
+        "satmaps.discover_mgrs_bases",
+        lambda bbox, gebco_src, land_mgrs_list_path=None: mgrs_bases,
+    )
 
-    # Mock process_single_tile to return a fake path
-    def fake_process_single_tile(st, dates, args, gebco_src=None):
-        path = tmp_path / f"processed_{st}.tif"
+
+def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
+        unique_id="mainwebp",
+    )
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    processed_tiles: list[str] = []
+    committed_rasters: list[str] = []
+    packaged: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_process_single_tile(tile_id, dates, args, gebco_src=None, **kwargs):
+        processed_tiles.append(tile_id)
+        path = tmp_path / f"{tile_id}.tif"
         path.write_text("fake tif")
         return str(path)
 
-    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
+    def fake_commit(input_raster, output_path, unique_id, contributor_id, args, *, source_under_existing=False):
+        committed_rasters.append(input_raster)
+        return ["13/1/2.webp"]
 
-    # Mock gdal.BuildVRT
-    monkeypatch.setattr(
-        "satmaps.gdal.BuildVRT",
-        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
-    )
+    def fake_convert(input_tile_tree: str, output_path: str, **kwargs: object) -> str:
+        packaged.append((input_tile_tree, output_path, dict(kwargs)))
+        return str(tmp_path / ".temp" / "output.mbtiles")
+
+    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
+    monkeypatch.setattr("satmaps.commit_raster_to_final_tile_cache", fake_commit)
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr("satmaps.convert_tile_tree_to_pmtiles", fake_convert)
 
     main()
 
-    # Check that the master VRT was created
-    master_vrts = list(tmp_path.glob(".temp/master_*.vrt"))
-    assert len(master_vrts) == 1
+    assert processed_tiles == ["31TDF_0_0", "31TDF_0_1", "31TDF_1_0", "31TDF_1_1"]
+    assert len(committed_rasters) == 4
+    assert packaged == [
+        (
+            satmaps.build_final_tile_cache_dir("output.pmtiles", "mainwebp"),
+            "output.pmtiles",
+            {
+                "resample_alg": "lanczos",
+                "max_zoom": ocean.DEFAULT_MAX_ZOOM,
+                "name": "Sentinel-2 Mosaic",
+                "description": "Copernicus Sentinel data",
+                "requested_bbox": None,
+            },
+        )
+    ]
+    assert list(tmp_path.glob(".temp/master_*.vrt")) == []
 
 
 def test_main_reports_land_progress(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--vrt", "--parallel", "1", "--date", "2025/07/01"],
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
     )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr(satmaps, "S3_FOLDER_CACHE", {})
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: ["31TDF"])
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
 
-    def fake_process_single_tile(st, dates, args, gebco_src=None):
-        path = tmp_path / f"processed_{st}.tif"
+    def fake_process_single_tile(tile_id, dates, args, gebco_src=None, **kwargs):
+        path = tmp_path / f"{tile_id}.tif"
         path.write_text("fake tif")
         return str(path)
 
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
     monkeypatch.setattr(
-        "satmaps.gdal.BuildVRT",
-        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+        "satmaps.commit_raster_to_final_tile_cache",
+        lambda *args, **kwargs: ["13/1/2.webp"],
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
     )
 
     main()
@@ -2895,28 +2932,23 @@ def test_main_reports_land_progress(
     out = capsys.readouterr().out
     assert "Expanded 1 MGRS tiles into 4 sub-tiles across 1 date(s)." in out
     assert "Land processing progress: 4/4 (100%); Elapsed:" in out
-    assert "4 raster(s) ready." in out
-    assert "Building master VRT from 4 raster(s)... 100%; Elapsed:" in out
+    assert "4 contributor(s) committed." in out
+    assert "Building master VRT" not in out
 
 
 def test_main_low_zoom_uses_subtile_processing_strategy(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--vrt", "--parallel", "1", "--date", "2025/07/01", "--max-zoom", "4"],
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--parallel", "1", "--date", "2025/07/01", "--max-zoom", "4"],
+        mgrs_bases=["31TDF"],
     )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr(satmaps, "S3_FOLDER_CACHE", {})
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: ["31TDF"])
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
     processed_tiles: list[str] = []
 
-    def fake_process_single_tile(tile_id, dates, args, gebco_src=None):
+    def fake_process_single_tile(tile_id, dates, args, gebco_src=None, **kwargs):
         processed_tiles.append(tile_id)
         path = tmp_path / f"{tile_id}.tif"
         path.write_text("fake tif")
@@ -2924,8 +2956,13 @@ def test_main_low_zoom_uses_subtile_processing_strategy(
 
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
     monkeypatch.setattr(
-        "satmaps.gdal.BuildVRT",
-        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+        "satmaps.commit_raster_to_final_tile_cache",
+        lambda *args, **kwargs: ["4/1/2.webp"],
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["4/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
     )
 
     main()
@@ -2935,14 +2972,12 @@ def test_main_low_zoom_uses_subtile_processing_strategy(
     assert "Expanded 1 MGRS tiles into 4 sub-tiles across 1 date(s)." in out
     assert "Starting sub-tile processing for 4 sub-tile(s) with 1 worker(s);" in out
     assert "Land processing progress: 4/4 (100%); Elapsed:" in out
-    assert "4 raster(s) ready." in out
+    assert "4 contributor(s) committed." in out
 
 
 def test_main_passes_ocean_path_to_tile_processing(
     monkeypatch: object, tmp_path: Path
 ) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
     custom_ocean_path = tmp_path / "custom-ocean.tif"
     custom_ocean_ds = gdal.GetDriverByName("GTiff").Create(
         str(custom_ocean_path), 1, 1, 4, gdal.GDT_Byte
@@ -2951,13 +2986,10 @@ def test_main_passes_ocean_path_to_tile_processing(
     custom_ocean_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
     custom_ocean_ds.GetRasterBand(4).Fill(255)
     custom_ocean_ds = None
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
         [
-            "satmaps.py",
-            "--vrt",
             "--parallel",
             "1",
             "--date",
@@ -2965,23 +2997,26 @@ def test_main_passes_ocean_path_to_tile_processing(
             "--ocean-background",
             str(custom_ocean_path),
         ],
+        mgrs_bases=["31TDF"],
     )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr(satmaps, "S3_FOLDER_CACHE", {})
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: ["31TDF"])
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
     gebco_sources: list[str | None] = []
 
-    def fake_process_single_tile(st, dates, args, gebco_src=None):
+    def fake_process_single_tile(tile_id, dates, args, gebco_src=None, **kwargs):
         gebco_sources.append(gebco_src)
-        path = tmp_path / f"processed_{st}.tif"
+        path = tmp_path / f"{tile_id}.tif"
         path.write_text("fake tif")
         return str(path)
 
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
     monkeypatch.setattr(
-        "satmaps.gdal.BuildVRT",
-        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+        "satmaps.commit_raster_to_final_tile_cache",
+        lambda *args, **kwargs: ["13/1/2.webp"],
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
     )
 
     main()
@@ -2991,30 +3026,30 @@ def test_main_passes_ocean_path_to_tile_processing(
 
 
 def test_main_passes_winter_flag_to_tile_processing(monkeypatch: object, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--vrt", "--parallel", "1", "--winter"],
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--parallel", "1", "--winter"],
+        mgrs_bases=["31TDF"],
     )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr(satmaps, "S3_FOLDER_CACHE", {})
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: ["31TDF"])
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
     winter_flags: list[bool] = []
 
-    def fake_process_single_tile(st, dates, args, gebco_src=None):
+    def fake_process_single_tile(tile_id, dates, args, gebco_src=None, **kwargs):
         winter_flags.append(args.winter)
-        path = tmp_path / f"processed_{st}.tif"
+        path = tmp_path / f"{tile_id}.tif"
         path.write_text("fake tif")
         return str(path)
 
     monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
     monkeypatch.setattr(
-        "satmaps.gdal.BuildVRT",
-        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
+        "satmaps.commit_raster_to_final_tile_cache",
+        lambda *args, **kwargs: ["13/1/2.webp"],
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
     )
 
     main()
@@ -3023,318 +3058,118 @@ def test_main_passes_winter_flag_to_tile_processing(monkeypatch: object, tmp_pat
     assert set(winter_flags) == {True}
 
 
-def test_main_uses_rgba_ocean_as_alpha_mask_source(
+def test_main_bbox_prepares_and_commits_ocean_background(
     monkeypatch: object, tmp_path: Path
 ) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    custom_ocean_path = tmp_path / "custom-ocean.tif"
-    custom_ocean_ds = gdal.GetDriverByName("GTiff").Create(
-        str(custom_ocean_path), 1, 1, 4, gdal.GDT_Byte
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--bbox", "0,0,1,1", "--no-land", "--parallel", "1"],
+        mgrs_bases=[],
+        unique_id="bboxrun",
     )
-    assert custom_ocean_ds is not None
-    for band_index in range(1, 5):
-        custom_ocean_ds.GetRasterBand(band_index).Fill(band_index)
-    custom_ocean_ds = None
+    prepare_calls: list[tuple[object, ...]] = []
+    commit_calls: list[tuple[object, ...]] = []
+    package_calls: list[dict[str, object]] = []
 
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "satmaps.py",
-            "--vrt",
-            "--parallel",
-            "1",
-            "--date",
-            "2025/07/01",
-            "--ocean-background",
-            str(custom_ocean_path),
-        ],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr(satmaps, "S3_FOLDER_CACHE", {})
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: ["31TDF"])
-    gebco_sources: list[str | None] = []
+    def fake_prepare(*args):
+        prepare_calls.append(args)
+        return ".temp/output_ocean_bbox.tif"
 
-    def fake_process_single_tile(st, dates, args, gebco_src=None):
-        gebco_sources.append(gebco_src)
-        path = tmp_path / f"processed_{st}.tif"
-        path.write_text("fake tif")
-        return str(path)
+    def fake_commit(*args):
+        commit_calls.append(args)
+        return True
 
-    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
-    monkeypatch.setattr(
-        "satmaps.gdal.BuildVRT",
-        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
-    )
+    def fake_convert(*args, **kwargs):
+        package_calls.append(dict(kwargs))
+        return str(tmp_path / ".temp" / "output.mbtiles")
+
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", fake_prepare)
+    monkeypatch.setattr("satmaps.commit_ocean_to_final_tile_cache", fake_commit)
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr("satmaps.convert_tile_tree_to_pmtiles", fake_convert)
 
     main()
 
-    assert gebco_sources
-    assert gebco_sources
-    assert set(gebco_sources) == {str(custom_ocean_path)}
+    assert prepare_calls == [
+        ("ocean.tif", (0.0, 0.0, 1.0, 1.0), "output.pmtiles", "lanczos", ocean.DEFAULT_MAX_ZOOM, 512)
+    ]
+    assert len(commit_calls) == 1
+    assert commit_calls[0][:3] == (".temp/output_ocean_bbox.tif", "output.pmtiles", "bboxrun")
+    assert isinstance(commit_calls[0][3], argparse.Namespace)
+    assert package_calls == [
+        {
+            "resample_alg": "lanczos",
+            "max_zoom": ocean.DEFAULT_MAX_ZOOM,
+            "name": "Sentinel-2 Mosaic",
+            "description": "Copernicus Sentinel data",
+            "requested_bbox": (0.0, 0.0, 1.0, 1.0),
+        }
+    ]
 
 
-def test_main_bbox_uses_standalone_ocean(monkeypatch: object, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
+@pytest.mark.parametrize("max_zoom", [ocean.DEFAULT_MAX_ZOOM, 14, 11, 12, 4])
+def test_main_passes_requested_zoom_to_webp_pipeline(
+    monkeypatch: object, tmp_path: Path, max_zoom: int
+) -> None:
+    argv = ["--no-land", "--parallel", "1"]
+    if max_zoom != ocean.DEFAULT_MAX_ZOOM:
+        argv.extend(["--max-zoom", str(max_zoom)])
+    configure_main_defaults(monkeypatch, tmp_path, argv, mgrs_bases=[])
+    ocean_zooms: list[int] = []
+    package_zooms: list[int] = []
+
+    def fake_prepare(
+        ocean_background: str,
+        requested_bbox: tuple[float, float, float, float] | None,
+        output_path: str,
+        resample_alg: str,
+        requested_zoom: int,
+        blocksize: int,
+    ) -> str:
+        ocean_zooms.append(requested_zoom)
+        return "ocean.tif"
+
+    def fake_convert(*args, **kwargs):
+        package_zooms.append(kwargs["max_zoom"])
+        return str(tmp_path / ".temp" / "output.mbtiles")
+
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", fake_prepare)
+    monkeypatch.setattr("satmaps.commit_ocean_to_final_tile_cache", lambda *args, **kwargs: False)
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr("satmaps.convert_tile_tree_to_pmtiles", fake_convert)
+
+    main()
+
+    assert ocean_zooms == [max_zoom]
+    assert package_zooms == [max_zoom]
+
+
+def test_main_keeps_ocean_after_processing(
+    monkeypatch: object, tmp_path: Path
+) -> None:
     ocean_path = tmp_path / "ocean.tif"
     ocean_path.write_text("fake ocean")
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--bbox", "0,0,1,1", "--no-land", "--vrt", "--parallel", "1"],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    buildvrt_sources: list[list[str]] = []
-    warp_options_calls: list[dict[str, object]] = []
-
-    def fake_build_vrt(out, src, **kwargs):
-        buildvrt_sources.append(list(src))
-        Path(out).write_text("fake vrt")
-
-    monkeypatch.setattr(
-        "satmaps.gdal.WarpOptions",
-        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--no-land", "--parallel", "1"],
+        mgrs_bases=[],
     )
     monkeypatch.setattr(
-        "satmaps.gdal.Warp",
-        lambda destination, source, options=None: Path(destination).write_text("fake ocean"),
+        "satmaps.prepare_ocean_background_for_output",
+        lambda *args, **kwargs: str(ocean_path),
     )
-    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
-
-    main()
-
-    master_vrts = list(tmp_path.glob(".temp/master_*.vrt"))
-    assert len(master_vrts) == 1
-    assert buildvrt_sources[-1][0] != "ocean.tif"
-    assert Path(buildvrt_sources[-1][0]).name == "output_ocean_bbox.tif"
-    snapped_bounds, pixel_size, _zoom = ocean.snapped_tile_grid_for_bbox(
-        (0.0, 0.0, 1.0, 1.0),
-        tile_size=512,
-    )
-    assert warp_options_calls[0]["outputBounds"] == pytest.approx(snapped_bounds)
-    assert warp_options_calls[0]["xRes"] == pytest.approx(pixel_size)
-    assert warp_options_calls[0]["yRes"] == pytest.approx(pixel_size)
-
-
-def test_main_builds_master_vrt_with_shared_zoom13_resolution(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    ocean_path = tmp_path / "ocean.tif"
-    ocean_path.write_text("fake ocean")
-
+    monkeypatch.setattr("satmaps.commit_ocean_to_final_tile_cache", lambda *args, **kwargs: False)
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
     monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1"],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: [])
-    buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
-
-    def fake_build_vrt(out, src, **kwargs):
-        buildvrt_calls.append((list(src), kwargs))
-        Path(out).write_text("fake vrt")
-
-    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
-
-    main()
-
-    assert buildvrt_calls
-    _, kwargs = buildvrt_calls[-1]
-    assert kwargs["resolution"] == "user"
-    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(
-        ocean.DEFAULT_MAX_ZOOM,
-        512,
-    )
-    assert kwargs["xRes"] == pytest.approx(expected)
-    assert kwargs["yRes"] == pytest.approx(expected)
-
-
-def test_main_builds_master_vrt_with_requested_zoom14_resolution(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    ocean_path = tmp_path / "ocean.tif"
-    ocean_path.write_text("fake ocean")
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1", "--max-zoom", "14"],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: [])
-    buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
-
-    def fake_build_vrt(out, src, **kwargs):
-        buildvrt_calls.append((list(src), kwargs))
-        Path(out).write_text("fake vrt")
-
-    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
-
-    main()
-
-    assert buildvrt_calls
-    _, kwargs = buildvrt_calls[-1]
-    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(14, 512)
-    assert kwargs["xRes"] == pytest.approx(expected)
-    assert kwargs["yRes"] == pytest.approx(expected)
-
-
-def test_main_builds_master_vrt_with_requested_zoom11_resolution(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    ocean_path = tmp_path / "ocean.tif"
-    ocean_path.write_text("fake ocean")
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1", "--max-zoom", "11"],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: [])
-    buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
-
-    def fake_build_vrt(out, src, **kwargs):
-        buildvrt_calls.append((list(src), kwargs))
-        Path(out).write_text("fake vrt")
-
-    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
-
-    main()
-
-    assert buildvrt_calls
-    _, kwargs = buildvrt_calls[-1]
-    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(11, 512)
-    assert kwargs["xRes"] == pytest.approx(expected)
-    assert kwargs["yRes"] == pytest.approx(expected)
-
-
-def test_main_builds_master_vrt_with_requested_zoom12_resolution(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    ocean_path = tmp_path / "ocean.tif"
-    ocean_path.write_text("fake ocean")
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1", "--max-zoom", "12"],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: [])
-    buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
-
-    def fake_build_vrt(out, src, **kwargs):
-        buildvrt_calls.append((list(src), kwargs))
-        Path(out).write_text("fake vrt")
-
-    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
-
-    main()
-
-    assert buildvrt_calls
-    _, kwargs = buildvrt_calls[-1]
-    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(12, 512)
-    assert kwargs["xRes"] == pytest.approx(expected)
-    assert kwargs["yRes"] == pytest.approx(expected)
-
-
-def test_main_builds_master_vrt_with_requested_zoom4_resolution(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    ocean_path = tmp_path / "ocean.tif"
-    ocean_path.write_text("fake ocean")
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1", "--max-zoom", "4"],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: [])
-    buildvrt_calls: list[tuple[list[str], dict[str, object]]] = []
-
-    def fake_build_vrt(out, src, **kwargs):
-        buildvrt_calls.append((list(src), kwargs))
-        Path(out).write_text("fake vrt")
-
-    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
-
-    main()
-
-    assert buildvrt_calls
-    _, kwargs = buildvrt_calls[-1]
-    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(4, 512)
-    assert kwargs["xRes"] == pytest.approx(expected)
-    assert kwargs["yRes"] == pytest.approx(expected)
-
-
-def test_main_bbox_passes_chunk_bounds_to_tiler(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    ocean_path = tmp_path / "ocean.tif"
-    ocean_ds = gdal.GetDriverByName("GTiff").Create(
-        str(ocean_path), 1, 1, 1, gdal.GDT_Byte
-    )
-    assert ocean_ds is not None
-    ocean_ds.GetRasterBand(1).Fill(1)
-    ocean_ds = None
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--bbox", "0,0,1,1", "--no-land", "--parallel", "1", "--format", "png"],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr(
-        "satmaps.gdal.BuildVRT",
-        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
-    )
-    monkeypatch.setattr("satmaps.gdal.WarpOptions", lambda **kwargs: kwargs)
-    monkeypatch.setattr(
-        "satmaps.gdal.Warp",
-        lambda destination, source, options=None: Path(destination).write_text("fake ocean"),
-    )
-    captured_options: dict[str, object] = {}
-
-    def fake_run_tiling_simplified(input_vrt: str, output_mbtiles: str, options: dict[str, object]):
-        captured_options.update(options)
-        return satmaps.tiler.TilingArtifacts(final_vrt=input_vrt, cleanup_paths=[])
-
-    monkeypatch.setattr("satmaps.tiler.run_tiling_simplified", fake_run_tiling_simplified)
-    monkeypatch.setattr(
-        "satmaps.subprocess.run",
-        lambda cmd, check: Path(cmd[-1]).write_text("fake pmtiles"),
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
     )
 
     main()
 
-    assert captured_options["chunk_bounds"] == satmaps.tiler.lonlat_bbox_to_mercator_bounds(
-        0.0, 0.0, 1.0, 1.0
-    )
-    assert "unique_id" not in captured_options
+    assert ocean_path.exists()
 
 
 def test_process_single_tile_writes_empty_marker_when_no_folders(
@@ -3366,8 +3201,6 @@ def test_process_land_work_unit_webp_commits_and_removes_temp_raster(
 
     args = argparse.Namespace(
         output="output.pmtiles",
-        format="webp",
-        vrt=False,
         cache=".cache",
         max_zoom=13,
         blocksize=512,
@@ -3476,60 +3309,6 @@ def test_main_webp_resume_reuses_completed_markers_without_latest_state_fallback
     assert "All sub-tiles already processed." in out
 
 
-def test_compose_final_webp_tile_tree_skips_existing_tiles_and_preserves_order(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    output_dir = tmp_path / "final"
-    existing_tile = output_dir / "13/1/3.webp"
-    existing_tile.parent.mkdir(parents=True, exist_ok=True)
-    existing_tile.write_text("done")
-
-    raster_a = "/tmp/ocean.tif"
-    raster_b = "/tmp/31TDF_0_0.tif"
-    raster_c = "/tmp/31TDF_0_1.tif"
-    tile_map = {
-        raster_a: ["13/1/2.webp", "13/1/3.webp"],
-        raster_b: ["13/1/2.webp"],
-        raster_c: ["13/1/2.webp"],
-    }
-    calls: list[tuple[list[str], str, int, int, int]] = []
-
-    monkeypatch.setattr(
-        satmaps.tiler,
-        "iter_raster_tile_relpaths",
-        lambda path, zoom: tile_map[path],
-    )
-
-    def fake_compose(
-        input_rasters: Sequence[str],
-        output_path: str,
-        zoom: int,
-        tx: int,
-        ty: int,
-        tile_size: int,
-        quality: int,
-        resample_alg: str,
-    ) -> bool:
-        calls.append((list(input_rasters), output_path, zoom, tx, ty))
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(output_path).write_text("tile")
-        return True
-
-    monkeypatch.setattr(satmaps.tiler, "compose_webp_tile_from_rasters", fake_compose)
-
-    args = argparse.Namespace(max_zoom=13, blocksize=512, quality=74, resample_alg="lanczos", parallel=1)
-    total_tiles = satmaps.compose_final_webp_tile_tree(
-        [raster_a, raster_b, raster_c],
-        str(output_dir),
-        args,
-    )
-
-    assert total_tiles == 2
-    assert calls == [
-        ([raster_a, raster_b, raster_c], str(output_dir / "13/1/2.webp"), 13, 1, 2)
-    ]
-
-
 def test_recover_pending_tile_cache_commits_publishes_staged_tiles_and_marks_complete(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -3567,75 +3346,6 @@ def test_recover_pending_tile_cache_commits_publishes_staged_tiles_and_marks_com
     assert marker_payload["tiles"] == [relative_tile]
     assert not Path(manifest_path).exists()
     assert not stage_dir.exists()
-
-
-def test_main_non_bbox_can_use_standalone_ocean(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    (tmp_path / "ocean.tif").write_text("fake ocean")
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--no-land", "--vrt", "--parallel", "1"],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: [])
-    buildvrt_sources: list[list[str]] = []
-
-    def fake_build_vrt(out, src, **kwargs):
-        buildvrt_sources.append(list(src))
-        Path(out).write_text("fake vrt")
-
-    monkeypatch.setattr("satmaps.gdal.BuildVRT", fake_build_vrt)
-
-    main()
-
-    master_vrts = list(tmp_path.glob(".temp/master_*.vrt"))
-    assert len(master_vrts) == 1
-    assert buildvrt_sources[-1] == ["ocean.tif"]
-
-
-def test_main_keeps_ocean_after_processing(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    ocean_path = tmp_path / "ocean.tif"
-    ocean_path.write_text("fake ocean")
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--no-land", "--parallel", "1", "--format", "png"],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr("satmaps.discover_mgrs_bases", lambda bbox, gebco_src, land_mgrs_list_path=None: [])
-    monkeypatch.setattr(
-        "satmaps.gdal.BuildVRT",
-        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
-    )
-
-    def fake_run_tiling_simplified(input_vrt: str, output_mbtiles: str, options: dict[str, object]):
-        Path(output_mbtiles).write_text("fake mbtiles")
-        return satmaps.tiler.TilingArtifacts(final_vrt=input_vrt, cleanup_paths=[])
-
-    monkeypatch.setattr("satmaps.tiler.run_tiling_simplified", fake_run_tiling_simplified)
-    monkeypatch.setattr(
-        "satmaps.subprocess.run",
-        lambda cmd, check: Path(cmd[-1]).write_text("fake pmtiles"),
-    )
-
-    main()
-
-    assert ocean_path.exists()
-    master_vrts = list(tmp_path.glob(".temp/master_*.vrt"))
-    assert len(master_vrts) == 1
-    assert master_vrts[0].exists()
 
 
 def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
@@ -3705,62 +3415,3 @@ def test_main_refresh_land_mgrs_list_requires_mask_source(
         f"Error: --refresh-land-mgrs-list requires {ocean.DEFAULT_GEBCO_ZIP} in the current directory."
         in capsys.readouterr().out
     )
-
-
-@pytest.mark.parametrize(
-    ("extra_args", "expect_land_tif_during_pmtiles", "expect_land_tif_after_main"),
-    [
-        ([], True, True),
-        (["--delete-tifs"], False, False),
-    ],
-)
-def test_main_delete_tifs_flag_controls_land_cleanup(
-    monkeypatch: object,
-    tmp_path: Path,
-    extra_args: list[str],
-    expect_land_tif_during_pmtiles: bool,
-    expect_land_tif_after_main: bool,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["satmaps.py", "--parallel", "1", "--date", "2025/07/01", "--format", "png", *extra_args],
-    )
-    monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
-    monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
-    monkeypatch.setattr(
-        "satmaps.discover_mgrs_bases",
-        lambda bbox, gebco_src, land_mgrs_list_path=None: ["31TDF"],
-    )
-    monkeypatch.setattr(
-        "satmaps.gdal.BuildVRT",
-        lambda out, src, **kwargs: Path(out).write_text("fake vrt"),
-    )
-
-    def fake_process_single_tile(st, dates, args, gebco_src=None):
-        path = Path(".temp") / f"output_{st}_3857.tif"
-        path.write_text("fake tif")
-        return str(path)
-
-    def fake_run_tiling_simplified(input_vrt: str, output_mbtiles: str, options: dict[str, object]):
-        Path(output_mbtiles).write_text("fake mbtiles")
-        return satmaps.tiler.TilingArtifacts(final_vrt=input_vrt, cleanup_paths=[])
-
-    checked_inputs: list[bool] = []
-
-    def fake_subprocess_run(cmd, check):
-        land_tif = Path(".temp/output_31TDF_0_0_3857.tif")
-        checked_inputs.append(land_tif.exists())
-        Path(cmd[-1]).write_text("fake pmtiles")
-
-    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
-    monkeypatch.setattr("satmaps.tiler.run_tiling_simplified", fake_run_tiling_simplified)
-    monkeypatch.setattr("satmaps.subprocess.run", fake_subprocess_run)
-
-    main()
-
-    assert checked_inputs == [expect_land_tif_during_pmtiles]
-    assert Path(".temp/output_31TDF_0_0_3857.tif").exists() is expect_land_tif_after_main

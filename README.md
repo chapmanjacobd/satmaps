@@ -129,8 +129,7 @@ satmaps --estimate
 
 - `--bbox`: Discover MGRS tiles touched by a WGS84 bbox (`min_lon,min_lat,max_lon,max_lat`). When `--bbox` is omitted, `satmaps` processes all discovered land tiles from the source mosaics.
 - `--date`: Comma-separated list of mosaic dates (default: `2025/07/01,2025/01/01`). Overlapping areas are averaged.
-- `--format`: Output tile format (`webp`, `jpg`, `png`, `png8`).
-- `--quality`: Output tile quality for lossy formats.
+- `--quality`: Output WebP quality.
 - `--resample-alg`: Resampling algorithm (`lanczos`, `bilinear`, `average`, `gauss`).
 - `--chunk-zoom`: Chunking zoom used during MBTiles generation (default: `4`).
 - `--parallel`: Number of worker processes/threads used for tile processing and chunk generation (default: `2`).
@@ -142,10 +141,9 @@ satmaps --estimate
 - `--exposure`: Global brightness multiplier.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
 - `--download`: Download source tiles into the cache and exit without building output tiles.
-- `--resume [STATE_FILE]`: Resume a previous run from a saved `.temp/state_*.json`; without a path, the most recent state file is used.
+- `--resume [STATE_FILE]`: Resume a previous run from a saved `.temp/state_*.json`; without a path, `satmaps` only resumes the matching current-run state file if it exists.
 - `--refresh-land-mgrs-list`: Rebuild `land_mgrs.list` in the repository root from `gebco_2025_sub_ice_topo_geotiff.zip` using the same generator as `land-mgrs --refresh`, then exit.
 - `--estimate`: Print estimated time, RAM, disk, and network usage, then exit.
-- `--vrt`: Generate the final VRT and exit (useful for inspection in QGIS).
 
 ### `land-mgrs` Options
 
@@ -197,7 +195,7 @@ You can override the defaults (tuned via `satmaps-tuner`):
 5.  Processing (NumPy):
     - Soft-Knee Tone Mapping: A 3-segment linear curve to compress high dynamic range while preserving local contrast.
     - Color Grading: Exposure, gamma/shoulder shaping, and contrast controls for a "natural" look.
-6.  Packaging: The default WebP path renders each land work unit and the prepared ocean background into a resumable max-zoom `z/x/y.webp` cache, merges those contributors into the final max-zoom tile tree, copies those WebP bytes into MBTiles, builds lower zooms with `gdaladdo`, and converts the archive to PMTiles. Non-WebP and `--vrt` runs keep the legacy raster/VRT packaging path.
+6.  Packaging: `satmaps` renders each land work unit and the prepared ocean background into a resumable max-zoom `z/x/y.webp` cache, merges those contributors into the final max-zoom tile tree, copies those WebP bytes into MBTiles, builds lower zooms with `gdaladdo`, and converts the archive to PMTiles.
 
 ## Datasets
 
