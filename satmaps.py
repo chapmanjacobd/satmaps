@@ -139,27 +139,51 @@ class FinalTileCacheFlushCoordinator:
         tile_images: dict[str, Image.Image],
     ) -> list[str]:
         """Store in-memory contributor tiles and flush any final tiles that are now ready."""
+        return self.record_contributor_tiles(contributor_id, iter(tile_images.items()))
+
+    def record_contributor_tiles(
+        self,
+        contributor_id: str,
+        tile_images: Iterator[tuple[str, Image.Image]],
+    ) -> list[str]:
+        """Stream contributor tiles into the coordinator and flush any final tiles now ready."""
         if contributor_id not in self._positions:
             raise RuntimeError(f"Unknown final tile contributor: {contributor_id}")
 
+        actual_tile_relpaths: set[str] = set()
+        try:
+            for relative_path, image in tile_images:
+                actual_tile_relpaths.add(relative_path)
+                with self._lock:
+                    tile_state = self._tile_states.setdefault(
+                        relative_path,
+                        FinalTileFlushState(
+                            pending_contributors=set(),
+                            contributor_images={},
+                        ),
+                    )
+                    tile_state.contributor_images[contributor_id] = image
+        except Exception:
+            self._discard_contributor_tiles(contributor_id, actual_tile_relpaths)
+            raise
+
+        return self._finish_contributor(contributor_id, actual_tile_relpaths)
+
+    def _finish_contributor(
+        self,
+        contributor_id: str,
+        actual_tile_relpaths: set[str],
+    ) -> list[str]:
         ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
         ready_jobs: list[FinalTileFlushJob] = []
+        actual_tiles = tuple(sorted(actual_tile_relpaths))
         with self._lock:
             self._contributor_done.add(contributor_id)
-            actual_tiles = tuple(sorted(tile_images))
             self._contributor_actual_tiles[contributor_id] = actual_tiles
 
-            for relative_path, image in tile_images.items():
-                tile_state = self._tile_states.setdefault(
-                    relative_path,
-                    FinalTileFlushState(
-                        pending_contributors=set(),
-                        contributor_images={},
-                    ),
-                )
-                tile_state.contributor_images[contributor_id] = image
-
-            for relative_path in self._contributor_tile_candidates.get(contributor_id, ()):
+            for relative_path in set(self._contributor_tile_candidates.get(contributor_id, ())).union(
+                actual_tile_relpaths
+            ):
                 candidate_tile_state = self._tile_states.get(relative_path)
                 if candidate_tile_state is None:
                     continue
@@ -178,6 +202,27 @@ class FinalTileCacheFlushCoordinator:
         self._write_markers(ready_markers)
         self._flush_ready_tiles(ready_jobs)
         return list(actual_tiles)
+
+    def _discard_contributor_tiles(
+        self,
+        contributor_id: str,
+        actual_tile_relpaths: set[str],
+    ) -> None:
+        if not actual_tile_relpaths:
+            return
+
+        with self._lock:
+            for relative_path in actual_tile_relpaths:
+                tile_state = self._tile_states.get(relative_path)
+                if tile_state is None:
+                    continue
+                tile_state.contributor_images.pop(contributor_id, None)
+                if (
+                    not tile_state.pending_contributors
+                    and not tile_state.contributor_images
+                    and not tile_state.flushing
+                ):
+                    self._tile_states.pop(relative_path, None)
 
     def _build_flush_job(
         self,
@@ -1401,20 +1446,20 @@ def commit_land_raster_to_final_tile_cache(
     contributor_id: str,
     args: argparse.Namespace,
 ) -> List[str]:
-    """Render one land contributor into in-memory tile images and flush when safe."""
+    """Render one land contributor into streamed tile images and flush when safe."""
     coordinator = FINAL_TILE_CACHE_FLUSH_COORDINATORS.get(unique_id)
     if coordinator is None:
         raise RuntimeError("Land tile cache flush coordinator is not configured")
 
-    tile_images: dict[str, Image.Image] = {}
+    tile_images: Iterator[tuple[str, Image.Image]] = iter(())
     if input_raster is not None:
-        tile_images = tiler.render_raster_to_webp_tile_images(
+        tile_images = tiler.iter_dataset_webp_tile_images(
             input_raster,
             args.max_zoom,
             args.blocksize,
             args.resample_alg,
         )
-    return coordinator.record_contributor_completion(contributor_id, tile_images)
+    return coordinator.record_contributor_tiles(contributor_id, tile_images)
 
 
 def resolve_ocean_mask_source(ocean_background: str) -> Optional[str]:

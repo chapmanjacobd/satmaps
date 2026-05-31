@@ -3463,6 +3463,62 @@ def test_process_land_work_unit_commits_in_memory_raster(
     assert seen_calls == [(rendered_raster, "output.pmtiles", work_unit.unit_id)]
 
 
+def test_commit_land_raster_to_final_tile_cache_streams_tile_images(monkeypatch: object) -> None:
+    args = argparse.Namespace(
+        max_zoom=13,
+        blocksize=512,
+        resample_alg="bilinear",
+    )
+    fake_dataset = object()
+    seen_calls: list[tuple[str, list[str]]] = []
+
+    class FakeCoordinator:
+        def record_contributor_tiles(
+            self,
+            contributor_id: str,
+            tile_images: object,
+        ) -> list[str]:
+            relpaths = [relative_path for relative_path, _image in tile_images]
+            seen_calls.append((contributor_id, relpaths))
+            return relpaths
+
+    satmaps.FINAL_TILE_CACHE_FLUSH_COORDINATORS["streamcommit"] = FakeCoordinator()  # type: ignore[assignment]
+
+    def fake_iter_dataset_webp_tile_images(dataset, zoom, tile_size, resample_alg):
+        assert dataset is fake_dataset
+        assert zoom == 13
+        assert tile_size == 512
+        assert resample_alg == "bilinear"
+        return iter(
+            [
+                ("13/1/2.webp", Image.new("RGB", (8, 8), (10, 20, 30))),
+                ("13/1/3.webp", Image.new("RGB", (8, 8), (40, 50, 60))),
+            ]
+        )
+
+    monkeypatch.setattr(
+        "satmaps.tiler.render_raster_to_webp_tile_images",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("expected streamed tile rendering, not eager dict rendering")
+        ),
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_dataset_webp_tile_images", fake_iter_dataset_webp_tile_images)
+
+    try:
+        relpaths = satmaps.commit_land_raster_to_final_tile_cache(
+            fake_dataset,
+            "output.pmtiles",
+            "streamcommit",
+            "31TDF_0_0",
+            args,
+        )
+    finally:
+        satmaps.clear_final_tile_cache_flush_coordinator("streamcommit")
+
+    assert relpaths == ["13/1/2.webp", "13/1/3.webp"]
+    assert seen_calls == [("31TDF_0_0", ["13/1/2.webp", "13/1/3.webp"])]
+
+
 def test_final_tile_flush_coordinator_waits_for_all_candidate_contributors(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -3503,6 +3559,36 @@ def test_final_tile_flush_coordinator_waits_for_all_candidate_contributors(
     ).exists()
     assert Path(
         satmaps.build_contributor_complete_marker("output.pmtiles", "flush123", "31TDF_0_1")
+    ).exists()
+
+
+def test_final_tile_flush_coordinator_rolls_back_partial_stream_on_error(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    relative_tile = "13/1/2.webp"
+    coordinator = satmaps.FinalTileCacheFlushCoordinator(
+        "output.pmtiles",
+        "flushrollback",
+        ("31TDF_0_0",),
+        {"31TDF_0_0": (relative_tile,)},
+        quality=100,
+    )
+
+    def failing_stream():
+        yield (relative_tile, Image.new("RGBA", (8, 8), (255, 0, 0, 255)))
+        raise RuntimeError("stream exploded")
+
+    with pytest.raises(RuntimeError, match="stream exploded"):
+        coordinator.record_contributor_tiles("31TDF_0_0", failing_stream())
+
+    tile_state = coordinator._tile_states[relative_tile]
+    assert tile_state.contributor_images == {}
+    assert "31TDF_0_0" not in coordinator._contributor_done
+    assert not Path(
+        satmaps.build_contributor_complete_marker("output.pmtiles", "flushrollback", "31TDF_0_0")
     ).exists()
 
 
