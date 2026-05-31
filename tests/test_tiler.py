@@ -156,6 +156,41 @@ def test_apply_preview_correction_numpy_basics() -> None:
     np.testing.assert_allclose(corrected, expected, atol=1e-5)
 
 
+def test_apply_preview_correction_numpy_supports_three_grade_regions() -> None:
+    rgb = np.array([[[0.2, 0.5, 0.8]]] * 3, dtype=np.float32)
+
+    corrected = apply_preview_correction_numpy(
+        rgb,
+        saturation=1.0,
+        darken_break=0.25,
+        low_slope=0.5,
+        gamma=1.0,
+        highlight_break=0.75,
+        mid_slope=1.0,
+        high_slope=1.5,
+    )
+
+    expected = np.array([[[0.1, 0.375, 0.7]]] * 3, dtype=np.float32)
+    np.testing.assert_allclose(corrected, expected, atol=1e-5)
+
+
+def test_apply_preview_correction_numpy_derives_highlight_slope_from_breaks() -> None:
+    rgb = np.array([[[1.0]], [[1.0]], [[1.0]]], dtype=np.float32)
+
+    corrected = apply_preview_correction_numpy(
+        rgb,
+        saturation=1.0,
+        darken_break=0.2,
+        low_slope=0.25,
+        gamma=1.0,
+        highlight_break=0.2,
+        mid_slope=1.0,
+    )
+
+    expected = np.array([[[1.0]], [[1.0]], [[1.0]]], dtype=np.float32)
+    np.testing.assert_allclose(corrected, expected, atol=1e-5)
+
+
 def test_encode_terrarium_numpy_round_trips_elevations() -> None:
     elevations = np.array([[-11000.25, -1.0, 0.0, 1234.5, 8848.0]], dtype=np.float32)
 

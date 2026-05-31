@@ -370,6 +370,9 @@ def test_build_land_run_token_is_stable_for_matching_inputs() -> None:
         sat=0.9,
         db=0.15,
         ls=0.2,
+        ghb=None,
+        gms=1.0,
+        ghs=None,
     )
 
     token_a = build_land_run_token(

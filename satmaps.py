@@ -460,6 +460,9 @@ def build_land_run_token(
             "sat": args.sat,
             "db": args.db,
             "ls": args.ls,
+            "ghb": args.ghb,
+            "gms": args.gms,
+            "ghs": args.ghs,
             "ocean_mask_source": os.path.abspath(gebco_vrt_source) if gebco_vrt_source else None,
         },
         sort_keys=True,
@@ -1701,6 +1704,9 @@ def tone_mapped_byte_block(
             darken_break=args.db,
             low_slope=args.ls,
             gamma=args.gamma,
+            highlight_break=args.ghb,
+            mid_slope=args.gms,
+            high_slope=args.ghs,
         )
 
     return np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
@@ -2048,10 +2054,28 @@ def main() -> None:
         "--sat", "--saturation", type=float, default=0.9
     )
     parser.add_argument(
-        "--db", "--black-break", type=float, default=0.15
+        "--db", "--black-break", "--grade-low-break", type=float, default=0.15
     )
     parser.add_argument(
-        "--ls", "--black-slope", type=float, default=0.2
+        "--ls", "--black-slope", "--grade-low-slope", type=float, default=0.2
+    )
+    parser.add_argument(
+        "--ghb",
+        "--grade-highlight-break",
+        type=float,
+        help="Upper breakpoint for the final grading curve; defaults to the low break",
+    )
+    parser.add_argument(
+        "--gms",
+        "--grade-mid-slope",
+        type=float,
+        default=tiler.PREVIEW_DARKEN_MID_SLOPE,
+    )
+    parser.add_argument(
+        "--ghs",
+        "--grade-highlight-slope",
+        type=float,
+        help="Highlight slope for the final grading curve; defaults to an anchored derived slope",
     )
 
     parser.add_argument(

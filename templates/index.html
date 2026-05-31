@@ -5,28 +5,30 @@
     <style>
         body { font-family: sans-serif; background: #1a1a1a; color: #eee; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; }
         h1 { margin-bottom: 30px; color: #fb0; }
-        .container { display: flex; gap: 40px; padding: 20px; max-width: 1200px; width: 100%; justify-content: center; }
-        .controls { display: flex; flex-direction: column; gap: 15px; width: 350px; background: #2a2a2a; padding: 20px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        h3 { border-bottom: 1px solid #444; padding-bottom: 5px; margin-top: 20px; margin-bottom: 10px; font-size: 16px; color: #fb0; }
+        h3:first-child { margin-top: 0; }
+        .container { display: flex; gap: 40px; padding: 20px; max-width: 1280px; width: 100%; justify-content: center; }
+        .controls { display: flex; flex-direction: column; gap: 15px; width: 380px; background: #2a2a2a; padding: 20px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
         .slider-group { display: flex; flex-direction: column; }
-        .slider-group label { font-size: 13px; margin-bottom: 6px; color: #ccc; display: flex; justify-content: space-between; }
+        .slider-group label { font-size: 13px; margin-bottom: 6px; color: #ccc; display: flex; justify-content: space-between; gap: 12px; }
         .image-container { position: relative; flex-grow: 1; display: flex; flex-direction: column; align-items: center; }
         img { max-width: 100%; border: 2px solid #333; border-radius: 4px; box-shadow: 0 0 20px rgba(0,0,0,0.4); }
-        span.val { font-weight: bold; color: #fb0; min-width: 40px; text-align: right; }
-        
+        span.val { font-weight: bold; color: #fb0; min-width: 68px; text-align: right; }
         .viz-container { margin-top: 10px; margin-bottom: 20px; background: #000; border: 1px solid #444; position: relative; height: 120px; }
         .viz-container svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
         .viz-label { position: absolute; top: 2px; left: 5px; font-size: 10px; color: #666; pointer-events: none; }
-        
-        h3 { border-bottom: 1px solid #444; padding-bottom: 5px; margin-top: 20px; margin-bottom: 10px; font-size: 16px; color: #fb0; }
-        h3:first-child { margin-top: 0; }
-
-        input[type=range] { cursor: pointer; }
-
         .mode-switcher { display: flex; gap: 10px; margin-bottom: 20px; }
         .mode-btn { padding: 8px 16px; cursor: pointer; background: #444; border: none; color: white; border-radius: 4px; font-weight: bold; }
         .mode-btn.active { background: #fb0; color: #1a1a1a; }
-
         #ramp_viz { height: 30px; width: 100%; background: linear-gradient(to right, #000, #fff); margin-bottom: 10px; border: 1px solid #444; border-radius: 4px; }
+        input[type=range] { cursor: pointer; }
+        .section-toggle { display: flex; justify-content: space-between; align-items: center; }
+        .button-row { display: flex; gap: 10px; margin-top: 20px; }
+        .button-row button { padding: 10px; cursor: pointer; border: none; border-radius: 4px; }
+        .primary-btn { flex: 1; background: #fb0; font-weight: bold; }
+        .secondary-btn { background: #444; color: white; }
+        .note { margin: 0; color: #999; font-size: 12px; line-height: 1.4; }
+        .range-hint { display: flex; justify-content: space-between; color: #777; font-size: 11px; margin-top: 4px; }
     </style>
 </head>
 <body>
@@ -39,26 +41,45 @@
 
     <div class="container">
         <div class="controls">
+            {% if mode == 'land' %}
+            <h3>Land Sample</h3>
+            {% if has_land_blend %}
+            <div class="slider-group">
+                <label>Blend {{ land_dates[0] }} → {{ land_dates[1] }} <span class="val" id="blend_val"></span></label>
+                <input type="range" id="blend" min="0" max="1" step="0.01" value="{{ params.blend }}">
+                <div class="range-hint">
+                    <span>{{ land_dates[0] }}</span>
+                    <span>{{ land_dates[1] }}</span>
+                </div>
+            </div>
+            <p class="note">This slider only blends the preview crop so you can compare the two cached land dates quickly.</p>
+            {% elif land_dates %}
+            <p class="note">Loaded land sample date: <strong>{{ land_dates[0] }}</strong></p>
+            {% else %}
+            <p class="note">No cached Barcelona sample tile was found under <code>.cache/</code>.</p>
+            {% endif %}
+            {% endif %}
+
             {% if mode == 'ocean' %}
             <h3>Depth Range (Vertical Scale)</h3>
             <div class="slider-group">
-                <label>Depth Min: <span class="val" id="dmin_val"></span></label>
-                <input type="range" id="dmin" min="-11000" max="0" step="100" value="{{params.depth_min}}">
+                <label>Depth Min <span class="val" id="dmin_val"></span></label>
+                <input type="range" id="dmin" min="-11000" max="0" step="100" value="{{ params.dmin }}">
             </div>
             <div class="slider-group">
-                <label>Depth Max: <span class="val" id="dmax_val"></span></label>
-                <input type="range" id="dmax" min="-11000" max="0" step="100" value="{{params.depth_max}}">
+                <label>Depth Max <span class="val" id="dmax_val"></span></label>
+                <input type="range" id="dmax" min="-11000" max="0" step="100" value="{{ params.dmax }}">
             </div>
-            
+
             <h3>Mako Color Ramp</h3>
             <div id="ramp_viz"></div>
             {% endif %}
 
-            <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div class="section-toggle">
                 <h3 style="margin: 0; border: none;">Tone Mapping</h3>
                 <input type="checkbox" id="tm_on" checked>
             </div>
-            
+
             <div class="viz-container" id="tone_map_viz">
                 <div class="viz-label">INPUT → TONE MAPPED</div>
                 <svg id="tm_svg" viewBox="0 0 256 128" preserveAspectRatio="none">
@@ -69,31 +90,31 @@
             </div>
 
             <div class="slider-group">
-                <label>Exposure: <span class="val" id="exp_val"></span></label>
-                <input type="range" id="exp" min="0.1" max="4" step="0.1" value="{{params.exposure}}">
+                <label>Exposure <span class="val" id="exp_val"></span></label>
+                <input type="range" id="exp" min="0.1" max="4" step="0.1" value="{{ params.exp }}">
             </div>
             <div class="slider-group">
-                <label>Shadow Break: <span class="val" id="sb_val"></span></label>
-                <input type="range" id="sb" min="0" max="1" step="0.01" value="{{params.shadow_break}}">
+                <label>Shadow Break <span class="val" id="sb_val"></span></label>
+                <input type="range" id="sb" min="0" max="1" step="0.01" value="{{ params.sb }}">
             </div>
             <div class="slider-group">
-                <label>Highlight Break: <span class="val" id="hb_val"></span></label>
-                <input type="range" id="hb" min="0" max="1" step="0.01" value="{{params.highlight_break}}">
+                <label>Highlight Break <span class="val" id="hb_val"></span></label>
+                <input type="range" id="hb" min="0" max="1" step="0.01" value="{{ params.hb }}">
             </div>
             <div class="slider-group">
-                <label>Shadow Slope: <span class="val" id="ss_val"></span></label>
-                <input type="range" id="ss" min="0" max="4" step="0.1" value="{{params.shadow_slope}}">
+                <label>Shadow Slope <span class="val" id="ss_val"></span></label>
+                <input type="range" id="ss" min="0" max="4" step="0.1" value="{{ params.ss }}">
             </div>
             <div class="slider-group">
-                <label>Mid Slope: <span class="val" id="ms_val"></span></label>
-                <input type="range" id="ms" min="0" max="3" step="0.05" value="{{params.mid_slope}}">
+                <label>Mid Slope <span class="val" id="ms_val"></span></label>
+                <input type="range" id="ms" min="0" max="3" step="0.05" value="{{ params.ms }}">
             </div>
             <div class="slider-group">
-                <label>Highlight Slope: <span class="val" id="hs_val"></span></label>
-                <input type="range" id="hs" min="0" max="2" step="0.05" value="{{params.highlight_slope}}">
+                <label>Highlight Slope <span class="val" id="hs_val"></span></label>
+                <input type="range" id="hs" min="0" max="2" step="0.05" value="{{ params.hs }}">
             </div>
-            
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 20px;">
+
+            <div class="section-toggle">
                 <h3 style="margin: 0; border: none;">Final Grade (Color & Contrast)</h3>
                 <input type="checkbox" id="fg_on" checked>
             </div>
@@ -107,32 +128,45 @@
             </div>
 
             <div class="slider-group">
-                <label>Gamma: <span class="val" id="gamma_val"></span></label>
-                <input type="range" id="gamma" min="0.2" max="3" step="0.1" value="{{params.gamma}}">
+                <label>Gamma <span class="val" id="gamma_val"></span></label>
+                <input type="range" id="gamma" min="0.2" max="3" step="0.1" value="{{ params.gamma }}">
             </div>
             <div class="slider-group">
-                <label>Saturation: <span class="val" id="sat_val"></span></label>
-                <input type="range" id="sat" min="0" max="2" step="0.1" value="{{params.saturation}}">
+                <label>Saturation <span class="val" id="sat_val"></span></label>
+                <input type="range" id="sat" min="0" max="2" step="0.1" value="{{ params.sat }}">
             </div>
             <div class="slider-group">
-                <label>Black Level Break: <span class="val" id="db_val"></span></label>
-                <input type="range" id="db" min="0" max="1" step="0.05" value="{{params.darken_break}}">
+                <label>Low/Mid Break <span class="val" id="db_val"></span></label>
+                <input type="range" id="db" min="0" max="1" step="0.01" value="{{ params.db }}">
             </div>
             <div class="slider-group">
-                <label>Black Level Slope: <span class="val" id="ls_val"></span></label>
-                <input type="range" id="ls" min="0" max="1" step="0.05" value="{{params.low_slope}}">
+                <label>Mid/High Break <span class="val" id="ghb_val"></span></label>
+                <input type="range" id="ghb" min="0" max="1" step="0.01" value="{{ params.ghb }}">
+            </div>
+            <div class="slider-group">
+                <label>Low-tone Contrast <span class="val" id="ls_val"></span></label>
+                <input type="range" id="ls" min="0" max="2" step="0.05" value="{{ params.ls }}">
+            </div>
+            <div class="slider-group">
+                <label>Mid-tone Contrast <span class="val" id="gms_val"></span></label>
+                <input type="range" id="gms" min="0" max="2" step="0.05" value="{{ params.gms }}">
+            </div>
+            <div class="slider-group">
+                <label>High-tone Contrast <span class="val" id="ghs_val"></span></label>
+                <input type="range" id="ghs" min="0" max="2" step="0.05" value="{{ params.ghs }}">
             </div>
 
-            <div style="display: flex; gap: 10px; margin-top: 20px;">
-                <button onclick="copyCLI()" style="flex: 1; padding: 10px; cursor: pointer; background: #fb0; border: none; font-weight: bold; border-radius: 4px;">Copy CLI Args</button>
-                <button onclick="resetDefaults()" style="padding: 10px; cursor: pointer; background: #444; border: none; color: white; border-radius: 4px;">Reset</button>
+            <div class="button-row">
+                <button class="primary-btn" onclick="copyCLI(this)">Copy CLI Args</button>
+                <button class="secondary-btn" onclick="resetDefaults()">Reset</button>
             </div>
         </div>
+
         <div class="image-container">
             <img id="preview" src="/render?mode={{ mode }}">
             <p style="font-size: 12px; color: #666; margin-top: 10px;">
                 {% if mode == 'land' %}
-                Sample: Barcelona Downtown (HLS L30 31TDF)
+                Sample: Barcelona Downtown (HLS L30 31TDF){% if land_dates %} — {{ land_dates | join(' / ') }}{% endif %}
                 {% else %}
                 Sample: Hawaii Bathymetry (GEBCO 2025)
                 {% endif %}
@@ -141,12 +175,53 @@
     </div>
 
     <script>
-        const baseSliders = ['exp', 'sb', 'hb', 'ss', 'ms', 'hs', 'gamma', 'sat', 'db', 'ls'];
         const currentMode = "{{ mode }}";
-        const sliders = currentMode === 'land' ? baseSliders : [...baseSliders, 'dmin', 'dmax'];
-        
+        const hasLandBlend = {{ has_land_blend | tojson }};
+        const defaultParams = {{ defaults | tojson }};
+        const landDates = {{ land_dates | tojson }};
+        let rawHist = {{ raw_hist | tojson }};
         const img = document.getElementById('preview');
-        const rawHist = {{ raw_hist | tojson }};
+        const sharedControls = ['exp', 'sb', 'hb', 'ss', 'ms', 'hs', 'gamma', 'sat', 'db', 'ghb', 'ls', 'gms', 'ghs'];
+        const renderControls = currentMode === 'land'
+            ? (hasLandBlend ? ['blend', ...sharedControls] : [...sharedControls])
+            : [...sharedControls, 'dmin', 'dmax'];
+        const cliControls = currentMode === 'land'
+            ? [...sharedControls]
+            : [...sharedControls, 'dmin', 'dmax'];
+        const cliArgMap = {
+            land: {
+                exp: '--exposure',
+                sb: '--shadow-break',
+                hb: '--highlight-break',
+                ss: '--shadow-slope',
+                ms: '--mid-slope',
+                hs: '--highlight-slope',
+                gamma: '--gamma',
+                sat: '--saturation',
+                db: '--grade-low-break',
+                ghb: '--grade-highlight-break',
+                ls: '--grade-low-slope',
+                gms: '--grade-mid-slope',
+                ghs: '--grade-highlight-slope'
+            },
+            ocean: {
+                exp: '--exposure',
+                sb: '--shadow-break',
+                hb: '--highlight-break',
+                ss: '--shadow-slope',
+                ms: '--mid-slope',
+                hs: '--highlight-slope',
+                gamma: '--gamma',
+                sat: '--saturation',
+                db: '--grade-low-break',
+                ghb: '--grade-highlight-break',
+                ls: '--grade-low-slope',
+                gms: '--grade-mid-slope',
+                ghs: '--grade-highlight-slope',
+                dmin: '--depth-min',
+                dmax: '--depth-max'
+            }
+        };
         const makoRamp = [
             [0.00, 0, 8, 37], [0.05, 5, 16, 46], [0.10, 10, 24, 55], [0.15, 25, 39, 76],
             [0.20, 31, 49, 88], [0.25, 37, 60, 101], [0.30, 42, 71, 114], [0.35, 46, 82, 127],
@@ -156,82 +231,119 @@
             [1.00, 121, 217, 251]
         ];
 
+        let updateTimeout;
+        let histogramToken = 0;
+
+        function getValue(id) {
+            return parseFloat(document.getElementById(id).value);
+        }
+
+        function formatValue(id, value) {
+            if (id === 'blend') {
+                const newer = Math.round(value * 100);
+                const older = 100 - newer;
+                return `${older}/${newer}`;
+            }
+            if (Number.isInteger(value)) {
+                return String(value);
+            }
+            return value.toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1');
+        }
+
         function drawHist() {
             const path = document.getElementById('tm_hist');
-            if (!rawHist || rawHist.length === 0) return;
-            
-            let d = "M 0 128 ";
+            if (!rawHist || rawHist.length === 0) {
+                path.setAttribute('d', '');
+                return;
+            }
+
+            let d = 'M 0 128 ';
             for (let i = 0; i < rawHist.length; i++) {
                 const x = (i / (rawHist.length - 1)) * 256;
                 const y = 128 - (rawHist[i] * 120);
                 d += `L ${x} ${y} `;
             }
-            d += "L 256 128 Z";
+            d += 'L 256 128 Z';
             path.setAttribute('d', d);
         }
 
-        function applyToneMap(x, p) {
-            let val = Math.min(1.0, x * p.exp);
-            let out;
-            const shadow_output = p.sb * p.ss;
-            const highlight_output = shadow_output + (p.hb - p.sb) * p.ms;
-            
-            if (val < p.sb) {
-                out = val * p.ss;
-            } else if (val < p.hb) {
-                out = shadow_output + (val - p.sb) * p.ms;
-            } else {
-                out = highlight_output + (val - p.hb) * p.hs;
+        function applyPiecewiseCurve(x, p) {
+            const shadowOutput = p.shadowBreak * p.shadowSlope;
+            const highlightOutput = shadowOutput + (p.highlightBreak - p.shadowBreak) * p.midSlope;
+            if (x < p.shadowBreak) {
+                return x * p.shadowSlope;
             }
-            return Math.min(1.0, Math.max(0.0, out));
+            if (x < p.highlightBreak) {
+                return shadowOutput + (x - p.shadowBreak) * p.midSlope;
+            }
+            return highlightOutput + (x - p.highlightBreak) * p.highlightSlope;
+        }
+
+        function getToneParams() {
+            return {
+                exp: getValue('exp'),
+                sb: getValue('sb'),
+                hb: Math.max(getValue('sb'), getValue('hb')),
+                ss: getValue('ss'),
+                ms: getValue('ms'),
+                hs: getValue('hs')
+            };
+        }
+
+        function getGradeParams() {
+            return {
+                gamma: getValue('gamma'),
+                sat: getValue('sat'),
+                db: getValue('db'),
+                ghb: Math.max(getValue('db'), getValue('ghb')),
+                ls: getValue('ls'),
+                gms: getValue('gms'),
+                ghs: getValue('ghs')
+            };
+        }
+
+        function applyToneMap(x, p) {
+            const exposed = Math.min(1.0, x * p.exp);
+            return Math.min(1.0, Math.max(0.0, applyPiecewiseCurve(exposed, {
+                shadowBreak: p.sb,
+                highlightBreak: p.hb,
+                shadowSlope: p.ss,
+                midSlope: p.ms,
+                highlightSlope: p.hs
+            })));
         }
 
         function applyGrading(x, p) {
-            // 1. Gamma
-            let val = Math.pow(x, 1.0 / p.gamma);
-            // 2. Darken curve
-            const high_slope = (1.0 - (p.db * p.ls)) / (1.0 - p.db);
-            const break_output = p.db * p.ls;
-            let out;
-            if (val < p.db) {
-                out = val * p.ls;
-            } else {
-                out = break_output + (val - p.db) * high_slope;
-            }
-            return Math.min(1.0, Math.max(0.0, out));
+            const gammaAdjusted = Math.pow(Math.max(0.0, x), 1.0 / p.gamma);
+            return Math.min(1.0, Math.max(0.0, applyPiecewiseCurve(gammaAdjusted, {
+                shadowBreak: p.db,
+                highlightBreak: p.ghb,
+                shadowSlope: p.ls,
+                midSlope: p.gms,
+                highlightSlope: p.ghs
+            })));
         }
 
         function drawToneMapCurve() {
-            const p = {
-                exp: parseFloat(document.getElementById('exp').value),
-                sb: parseFloat(document.getElementById('sb').value),
-                hb: parseFloat(document.getElementById('hb').value),
-                ss: parseFloat(document.getElementById('ss').value),
-                ms: parseFloat(document.getElementById('ms').value),
-                hs: parseFloat(document.getElementById('hs').value)
-            };
+            const p = getToneParams();
             const path = document.getElementById('tm_curve');
-            let d = "";
+            let d = '';
             for (let i = 0; i <= 256; i += 2) {
                 const x = i / 256;
                 const y = 1.0 - applyToneMap(x, p);
-                d += (i === 0 ? "M" : "L") + ` ${i} ${y * 128} `;
+                d += (i === 0 ? 'M' : 'L') + ` ${i} ${y * 128} `;
             }
             path.setAttribute('d', d);
         }
 
         function drawFinalGradeCurve() {
-            const p = {
-                gamma: parseFloat(document.getElementById('gamma').value),
-                db: parseFloat(document.getElementById('db').value),
-                ls: parseFloat(document.getElementById('ls').value)
-            };
+            const p = getGradeParams();
             const path = document.getElementById('fg_curve');
-            let d = "";
+            let d = '';
             for (let i = 0; i <= 256; i += 2) {
                 const x = i / 256;
                 const y = 1.0 - applyGrading(x, p);
-                d += (i === 0 ? "M" : "L") + ` ${i} ${y * 128} `;
+                d += (i === 0 ? 'M' : 'L') + ` ${i} ${y * 128} `;
             }
             path.setAttribute('d', d);
         }
@@ -241,21 +353,8 @@
             const rampEl = document.getElementById('ramp_viz');
             const tmOn = document.getElementById('tm_on').checked;
             const fgOn = document.getElementById('fg_on').checked;
-
-            const p_tm = {
-                exp: parseFloat(document.getElementById('exp').value),
-                sb: parseFloat(document.getElementById('sb').value),
-                hb: parseFloat(document.getElementById('hb').value),
-                ss: parseFloat(document.getElementById('ss').value),
-                ms: parseFloat(document.getElementById('ms').value),
-                hs: parseFloat(document.getElementById('hs').value)
-            };
-            const p_fg = {
-                gamma: parseFloat(document.getElementById('gamma').value),
-                db: parseFloat(document.getElementById('db').value),
-                ls: parseFloat(document.getElementById('ls').value),
-                sat: parseFloat(document.getElementById('sat').value)
-            };
+            const toneParams = getToneParams();
+            const gradeParams = getGradeParams();
 
             const stops = makoRamp.map(stop => {
                 const frac = stop[0];
@@ -264,18 +363,22 @@
                 let b = stop[3] / 255;
 
                 if (tmOn) {
-                    r = applyToneMap(r, p_tm);
-                    g = applyToneMap(g, p_tm);
-                    b = applyToneMap(b, p_tm);
+                    r = applyToneMap(r, toneParams);
+                    g = applyToneMap(g, toneParams);
+                    b = applyToneMap(b, toneParams);
+                } else {
+                    r = Math.min(1.0, r * toneParams.exp);
+                    g = Math.min(1.0, g * toneParams.exp);
+                    b = Math.min(1.0, b * toneParams.exp);
                 }
                 if (fgOn) {
                     const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                    r = luma + (r - luma) * p_fg.sat;
-                    g = luma + (g - luma) * p_fg.sat;
-                    b = luma + (b - luma) * p_fg.sat;
-                    r = applyGrading(r, p_fg);
-                    g = applyGrading(g, p_fg);
-                    b = applyGrading(b, p_fg);
+                    r = luma + (r - luma) * gradeParams.sat;
+                    g = luma + (g - luma) * gradeParams.sat;
+                    b = luma + (b - luma) * gradeParams.sat;
+                    r = applyGrading(r, gradeParams);
+                    g = applyGrading(g, gradeParams);
+                    b = applyGrading(b, gradeParams);
                 }
 
                 return `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)}) ${frac * 100}%`;
@@ -284,70 +387,86 @@
             rampEl.style.background = `linear-gradient(to right, ${stops})`;
         }
 
-        let updateTimeout;
-        function update() {
-            clearTimeout(updateTimeout);
-            sliders.forEach(s => {
-                document.getElementById(`${s}_val`).innerText = document.getElementById(s).value;
+        function updateLabels() {
+            renderControls.forEach(id => {
+                const valueEl = document.getElementById(`${id}_val`);
+                if (valueEl) {
+                    valueEl.innerText = formatValue(id, getValue(id));
+                }
             });
-            drawToneMapCurve();
-            drawFinalGradeCurve();
-            drawRamp();
+        }
 
+        async function refreshHistogram(token) {
+            const params = new URLSearchParams({ mode: currentMode });
+            if (currentMode === 'land' && hasLandBlend) {
+                params.set('blend', document.getElementById('blend').value);
+            }
+            if (currentMode === 'ocean') {
+                params.set('dmin', document.getElementById('dmin').value);
+                params.set('dmax', document.getElementById('dmax').value);
+            }
+
+            const response = await fetch(`/histogram?${params.toString()}`);
+            if (!response.ok || token !== histogramToken) return;
+
+            const payload = await response.json();
+            if (token !== histogramToken) return;
+            rawHist = payload.hist || [];
+            drawHist();
+        }
+
+        function queuePreviewRefresh() {
+            clearTimeout(updateTimeout);
+            const token = ++histogramToken;
             updateTimeout = setTimeout(() => {
                 const tmOn = document.getElementById('tm_on').checked ? '1' : '0';
                 const fgOn = document.getElementById('fg_on').checked ? '1' : '0';
-                const params = sliders.map(s => `${s}=${document.getElementById(s).value}`).join('&');
-                img.src = `/render?mode=${currentMode}&${params}&tm=${tmOn}&fg=${fgOn}&t=${Date.now()}`;
+                const params = new URLSearchParams({ mode: currentMode, tm: tmOn, fg: fgOn });
+                renderControls.forEach(id => params.set(id, document.getElementById(id).value));
+                img.src = `/render?${params.toString()}&t=${Date.now()}`;
+                refreshHistogram(token);
             }, 100);
         }
 
-        function resetDefaults() {
-            const defaults = {{ params | tojson }};
-            const map = {
-                'exposure': 'exp', 'shadow_break': 'sb', 'highlight_break': 'hb', 
-                'shadow_slope': 'ss', 'mid_slope': 'ms', 'highlight_slope': 'hs',
-                'gamma': 'gamma', 'saturation': 'sat', 'darken_break': 'db', 'low_slope': 'ls',
-                'depth_min': 'dmin', 'depth_max': 'dmax'
-            };
-            for (let [key, val] of Object.entries(defaults)) {
-                const id = map[key];
-                if (document.getElementById(id)) document.getElementById(id).value = val;
+        function update() {
+            const toneHighlightBreak = document.getElementById('hb');
+            if (toneHighlightBreak) {
+                toneHighlightBreak.value = Math.max(getValue('sb'), getValue('hb'));
             }
+            const gradeHighlightBreak = document.getElementById('ghb');
+            if (gradeHighlightBreak) {
+                gradeHighlightBreak.value = Math.max(getValue('db'), getValue('ghb'));
+            }
+
+            updateLabels();
+            drawToneMapCurve();
+            drawFinalGradeCurve();
+            drawRamp();
+            queuePreviewRefresh();
+        }
+
+        function resetDefaults() {
+            Object.entries(defaultParams).forEach(([key, value]) => {
+                const el = document.getElementById(key);
+                if (el) el.value = value;
+            });
             update();
         }
 
-        function copyCLI() {
-            const args = sliders.map(s => {
-                const val = document.getElementById(s).value;
-                let argMap;
-                if (currentMode === 'land') {
-                    argMap = {
-                        'exp': '--exposure', 'sb': '--sb', 'hb': '--hb', 'ss': '--ss', 
-                        'ms': '--ms', 'hs': '--hs', 'gamma': '--gamma', 
-                        'sat': '--sat', 'db': '--db', 'ls': '--ls'
-                    };
-                    if (!argMap[s]) return ""; 
-                } else {
-                    argMap = {
-                        'exp': '--ocean-exposure', 'sb': '--osb', 'hb': '--ohb', 'ss': '--oss', 
-                        'ms': '--oms', 'hs': '--ohs', 'gamma': '--ocean-gamma', 
-                        'sat': '--osat', 'db': '--odb', 'ls': '--ols',
-                        'dmin': '--ocean-depth-min', 'dmax': '--ocean-depth-max'
-                    };
-                }
-                return `${argMap[s]} ${val}`;
-            }).filter(a => a !== "").join(' ');
-            
+        function copyCLI(button) {
+            const args = cliControls.map(id => {
+                const flag = cliArgMap[currentMode][id];
+                return `${flag} ${document.getElementById(id).value}`;
+            }).join(' ');
+
             navigator.clipboard.writeText(args).then(() => {
-                const btn = event.target;
-                const oldText = btn.innerText;
-                btn.innerText = "Copied!";
-                setTimeout(() => btn.innerText = oldText, 2000);
+                const oldText = button.innerText;
+                button.innerText = 'Copied!';
+                setTimeout(() => button.innerText = oldText, 2000);
             });
         }
 
-        sliders.forEach(s => document.getElementById(s).addEventListener('input', update));
+        renderControls.forEach(id => document.getElementById(id).addEventListener('input', update));
         document.getElementById('tm_on').addEventListener('change', update);
         document.getElementById('fg_on').addEventListener('change', update);
 

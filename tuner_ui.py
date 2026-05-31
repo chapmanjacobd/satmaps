@@ -1,9 +1,10 @@
 import io
-import os
+from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 
 import numpy as np
-from flask import Flask, render_template, request, send_file
+from flask import Flask, jsonify, render_template, request, send_file
 from flask.typing import ResponseReturnValue
 from numpy.typing import NDArray
 from osgeo import gdal
@@ -16,114 +17,192 @@ app = Flask(__name__)
 
 # GEBCO discovery for Ocean Mode
 GEBCO_ZIP = "gebco_2025_sub_ice_topo_geotiff.zip"
-
+LAND_CACHE_ROOT = Path(".cache")
+LAND_SAMPLE_PREFIX = "31TDF_0_0"
+LAND_SAMPLE_LIMIT = 2
+LAND_SAMPLE_CROP_SIZE = 1024
+LAND_SAMPLE_OFF_X = 2000
+LAND_SAMPLE_OFF_Y = 2000
+LAND_SAMPLE_MIN = 0.0
+LAND_SAMPLE_MAX = 9000.0
+LAND_DEFAULT_GAMMA = 2.6
+LAND_DEFAULT_SATURATION = 0.9
+LAND_DEFAULT_GRADE_BREAK = 0.15
+LAND_DEFAULT_GRADE_LOW_SLOPE = 0.2
 
 FloatArray = NDArray[np.float32]
 
 
-def find_sample_tile() -> dict[str, str] | None:
-    cache_root = ".cache/2025-07-01"
-    if not os.path.exists(cache_root):
-        return None
-
-    # 31TDF sub-tile covering downtown
-    prefix = "31TDF_0_0"
-    paths = {
-        "red": os.path.join(cache_root, f"{prefix}_B04.tif"),
-        "green": os.path.join(cache_root, f"{prefix}_B03.tif"),
-        "blue": os.path.join(cache_root, f"{prefix}_B02.tif"),
-    }
-
-    if all(os.path.exists(p) for p in paths.values()):
-        return paths
-    return None
+@dataclass(frozen=True)
+class LandSample:
+    date_label: str
+    paths: dict[str, str]
 
 
-SAMPLE_PATHS = find_sample_tile()
+def find_land_samples(cache_root: Path = LAND_CACHE_ROOT) -> tuple[LandSample, ...]:
+    if not cache_root.exists():
+        return ()
+
+    samples: list[LandSample] = []
+    for date_dir in sorted((path for path in cache_root.iterdir() if path.is_dir()), reverse=True):
+        paths = {
+            "red": str(date_dir / f"{LAND_SAMPLE_PREFIX}_B04.tif"),
+            "green": str(date_dir / f"{LAND_SAMPLE_PREFIX}_B03.tif"),
+            "blue": str(date_dir / f"{LAND_SAMPLE_PREFIX}_B02.tif"),
+        }
+        if all(Path(path).exists() for path in paths.values()):
+            samples.append(LandSample(date_label=date_dir.name, paths=paths))
+        if len(samples) >= LAND_SAMPLE_LIMIT:
+            break
+    return tuple(samples)
 
 
-def load_and_average_sample(paths: dict[str, str]) -> FloatArray:
-    """Load sample RGB bands and return as float32 normalized numpy array (cropped for RAM)."""
+LAND_SAMPLE_SOURCES = find_land_samples()
+
+
+def load_land_sample(paths: dict[str, str]) -> FloatArray:
+    """Load a land sample RGB crop and normalize it to the satmaps baseline."""
     data: list[FloatArray] = []
-    # Crop to a 1024x1024 area in Barcelona Downtown (approx center of 31TDF_0_0)
-    CROP_SIZE = 1024
-    OFF_X, OFF_Y = 2000, 2000
-
-    for band in ["red", "green", "blue"]:
+    for band in ("red", "green", "blue"):
         ds = gdal.Open(paths[band])
         if ds is None:
             raise RuntimeError(f"Could not open sample band: {paths[band]}")
-        # Use ReadAsArray with offsets to load only a small portion
         arr = cast(
             FloatArray,
             ds.GetRasterBand(1)
-            .ReadAsArray(OFF_X, OFF_Y, CROP_SIZE, CROP_SIZE)
+            .ReadAsArray(
+                LAND_SAMPLE_OFF_X,
+                LAND_SAMPLE_OFF_Y,
+                LAND_SAMPLE_CROP_SIZE,
+                LAND_SAMPLE_CROP_SIZE,
+            )
             .astype(np.float32),
         )
-        # Handle nodata -32768
+        ds = None
         arr[arr == -32768] = np.nan
         data.append(arr)
 
-    rgb = cast(FloatArray, np.stack(data))  # (3, 1024, 1024)
-    # Standardize normalization for the tuner baseline
-    v_min = 0.0
-    v_max = 9000.0  # Match satmaps.py universal baseline
-    rgb = cast(FloatArray, np.clip((rgb - v_min) / (v_max - v_min), 0, 1))
-    rgb[np.isnan(rgb)] = 0
-    return rgb
+    rgb = cast(FloatArray, np.stack(data))
+    normalized = cast(
+        FloatArray,
+        np.clip((rgb - LAND_SAMPLE_MIN) / (LAND_SAMPLE_MAX - LAND_SAMPLE_MIN), 0.0, 1.0),
+    )
+    return cast(FloatArray, np.nan_to_num(normalized, nan=0.0))
 
 
-RAW_RGB = load_and_average_sample(SAMPLE_PATHS) if SAMPLE_PATHS else None
+RAW_LAND_SAMPLES = tuple(load_land_sample(sample.paths) for sample in LAND_SAMPLE_SOURCES)
 
 
 def load_gebco_sample() -> FloatArray | None:
-    """Load a sample of GEBCO data for ocean mode (Hawaii Area)."""
-    if not os.path.exists(GEBCO_ZIP):
+    """Load a sample of GEBCO data for ocean mode (Hawaii area)."""
+    if not Path(GEBCO_ZIP).exists():
         return None
 
-    # Hawaii is in n90.0_s0.0_w-180.0_e-90.0.tif
     gebco_vsi = f"/vsizip/{GEBCO_ZIP}/gebco_2025_sub_ice_n90.0_s0.0_w-180.0_e-90.0.tif"
     ds = gdal.Open(gebco_vsi)
     if ds is None:
         raise RuntimeError(f"Could not open GEBCO sample: {gebco_vsi}")
 
-    # Hawaii Center approx 19.5N, -159.5W
-    # Tile origin: -180, 90. Resolution: 1/240 degree.
-    # x_off = (-159.5 - (-180)) * 240 = 20.5 * 240 = 4920
-    # y_off = (90 - 19.5) * 240 = 70.5 * 240 = 16920
-    CROP_SIZE = 1024
     data = cast(
         FloatArray,
         ds.GetRasterBand(1)
-        .ReadAsArray(4408, 16408, CROP_SIZE, CROP_SIZE)
+        .ReadAsArray(4408, 16408, LAND_SAMPLE_CROP_SIZE, LAND_SAMPLE_CROP_SIZE)
         .astype(np.float32),
     )
+    ds = None
     return data
 
 
 RAW_GEBCO = load_gebco_sample()
 
 
+def build_grade_defaults(low_break: float, low_slope: float) -> dict[str, float]:
+    highlight_break = low_break
+    mid_slope = tiler.PREVIEW_DARKEN_MID_SLOPE
+    return {
+        "db": low_break,
+        "ghb": highlight_break,
+        "ls": low_slope,
+        "gms": mid_slope,
+        "ghs": tiler.derive_piecewise_high_slope(low_break, highlight_break, low_slope, mid_slope),
+    }
+
+
+def get_mode_defaults(mode: str) -> dict[str, float]:
+    params = {
+        "exp": tiler.DEFAULT_EXPOSURE,
+        "sb": tiler.SOFT_KNEE_SHADOW_BREAK,
+        "hb": tiler.SOFT_KNEE_HIGHLIGHT_BREAK,
+        "ss": tiler.SOFT_KNEE_SHADOW_SLOPE,
+        "ms": tiler.SOFT_KNEE_MID_SLOPE,
+        "hs": tiler.SOFT_KNEE_HIGHLIGHT_SLOPE,
+    }
+    if mode == "ocean":
+        params.update(
+            {
+                "gamma": ocean.OCEAN_DEFAULT_GAMMA,
+                "sat": ocean.OCEAN_DEFAULT_SATURATION,
+                "dmin": -11000.0,
+                "dmax": 0.0,
+            }
+        )
+        params.update(
+            build_grade_defaults(ocean.OCEAN_DEFAULT_BLACK_BREAK, ocean.OCEAN_DEFAULT_BLACK_SLOPE)
+        )
+        return params
+
+    params.update(
+        {
+            "gamma": LAND_DEFAULT_GAMMA,
+            "sat": LAND_DEFAULT_SATURATION,
+            "blend": 0.0,
+        }
+    )
+    params.update(build_grade_defaults(LAND_DEFAULT_GRADE_BREAK, LAND_DEFAULT_GRADE_LOW_SLOPE))
+    return params
+
+
+def parse_request_params(mode: str) -> dict[str, float]:
+    defaults = get_mode_defaults(mode)
+    params = {key: float(request.args.get(key, default)) for key, default in defaults.items()}
+    if "blend" in params:
+        params["blend"] = float(np.clip(params["blend"], 0.0, 1.0))
+    return params
+
+
+def get_land_source(blend: float) -> FloatArray | None:
+    if not RAW_LAND_SAMPLES:
+        return None
+    if len(RAW_LAND_SAMPLES) == 1:
+        return RAW_LAND_SAMPLES[0]
+    mix = float(np.clip(blend, 0.0, 1.0))
+    return cast(
+        FloatArray,
+        np.clip(
+            (RAW_LAND_SAMPLES[0] * (1.0 - mix)) + (RAW_LAND_SAMPLES[1] * mix),
+            0.0,
+            1.0,
+        ),
+    )
+
+
 def get_histogram_data(
     arr: FloatArray | None,
-    mode: str = "land",
-    depth_min: float = -11000,
-    depth_max: float = 0,
+    mode: str,
+    depth_min: float = -11000.0,
+    depth_max: float = 0.0,
 ) -> list[float]:
     if arr is None:
         return []
     if mode == "land":
-        # Use luma for histogram
         luma = 0.2126 * arr[0] + 0.7152 * arr[1] + 0.0722 * arr[2]
     else:
-        # Normalize GEBCO band to 0-1 based on current depth range for histogram
         luma = cast(
             FloatArray,
             np.clip((arr - depth_min) / (depth_max - depth_min), 0.0, 1.0),
         )
 
     hist, _ = np.histogram(luma, bins=128, range=(0, 1))
-    # Normalize to 0-1
     if hist.max() > 0:
         hist = hist / hist.max()
     return [float(value) for value in hist.tolist()]
@@ -132,75 +211,84 @@ def get_histogram_data(
 @app.route("/")
 def index() -> ResponseReturnValue:
     mode = request.args.get("mode", "land")
-    depth_min = float(request.args.get("dmin", -11000))
-    depth_max = float(request.args.get("dmax", 0))
+    if mode not in {"land", "ocean"}:
+        mode = "land"
 
-    hist = get_histogram_data(
-        RAW_RGB if mode == "land" else RAW_GEBCO, mode, depth_min, depth_max
-    )
+    params = parse_request_params(mode)
+    source = get_land_source(params.get("blend", 0.0)) if mode == "land" else RAW_GEBCO
+    hist = get_histogram_data(source, mode, params.get("dmin", -11000.0), params.get("dmax", 0.0))
     return render_template(
         "index.html",
         mode=mode,
-        params={
-            "exposure": tiler.DEFAULT_EXPOSURE,
-            "shadow_break": tiler.SOFT_KNEE_SHADOW_BREAK,
-            "highlight_break": tiler.SOFT_KNEE_HIGHLIGHT_BREAK,
-            "shadow_slope": tiler.SOFT_KNEE_SHADOW_SLOPE,
-            "mid_slope": tiler.SOFT_KNEE_MID_SLOPE,
-            "highlight_slope": tiler.SOFT_KNEE_HIGHLIGHT_SLOPE,
-            "gamma": tiler.DEFAULT_GAMMA,
-            "saturation": tiler.PREVIEW_SATURATION,
-            "darken_break": tiler.PREVIEW_DARKEN_BREAK,
-            "low_slope": tiler.PREVIEW_DARKEN_LOW_SLOPE,
-            "depth_min": depth_min,
-            "depth_max": depth_max,
-        },
+        params=params,
+        defaults=get_mode_defaults(mode),
         raw_hist=hist,
+        land_dates=[sample.date_label for sample in LAND_SAMPLE_SOURCES],
+        has_land_blend=len(RAW_LAND_SAMPLES) > 1,
+    )
+
+
+@app.route("/histogram")
+def histogram() -> ResponseReturnValue:
+    mode = request.args.get("mode", "land")
+    if mode not in {"land", "ocean"}:
+        mode = "land"
+
+    params = parse_request_params(mode)
+    source = get_land_source(params.get("blend", 0.0)) if mode == "land" else RAW_GEBCO
+    return jsonify(
+        {
+            "hist": get_histogram_data(
+                source,
+                mode,
+                params.get("dmin", -11000.0),
+                params.get("dmax", 0.0),
+            )
+        }
     )
 
 
 @app.route("/render")
 def render() -> ResponseReturnValue:
     mode = request.args.get("mode", "land")
+    if mode not in {"land", "ocean"}:
+        mode = "land"
 
-    p = {
-        "exp": float(request.args.get("exp", tiler.DEFAULT_EXPOSURE)),
-        "sb": float(request.args.get("sb", tiler.SOFT_KNEE_SHADOW_BREAK)),
-        "hb": float(request.args.get("hb", tiler.SOFT_KNEE_HIGHLIGHT_BREAK)),
-        "ss": float(request.args.get("ss", tiler.SOFT_KNEE_SHADOW_SLOPE)),
-        "ms": float(request.args.get("ms", tiler.SOFT_KNEE_MID_SLOPE)),
-        "hs": float(request.args.get("hs", tiler.SOFT_KNEE_HIGHLIGHT_SLOPE)),
-        "gamma": float(request.args.get("gamma", tiler.DEFAULT_GAMMA)),
-        "sat": float(request.args.get("sat", tiler.PREVIEW_SATURATION)),
-        "db": float(request.args.get("db", tiler.PREVIEW_DARKEN_BREAK)),
-        "ls": float(request.args.get("ls", tiler.PREVIEW_DARKEN_LOW_SLOPE)),
-        "dmin": float(request.args.get("dmin", -11000)),
-        "dmax": float(request.args.get("dmax", 0)),
-    }
-
+    p = parse_request_params(mode)
     tm_on = request.args.get("tm", "1") == "1"
     fg_on = request.args.get("fg", "1") == "1"
 
     if mode == "land":
-        if RAW_RGB is None:
+        source_rgb = get_land_source(p.get("blend", 0.0))
+        if source_rgb is None:
             return "No sample data", 404
-        # 1. Tone Mapping
         if tm_on:
             toned = tiler.apply_soft_knee_numpy(
-                RAW_RGB, p["sb"], p["hb"], p["ss"], p["ms"], p["hs"], p["exp"]
+                source_rgb,
+                p["sb"],
+                p["hb"],
+                p["ss"],
+                p["ms"],
+                p["hs"],
+                p["exp"],
             )
         else:
-            toned = np.clip(RAW_RGB * p["exp"], 0.0, 1.0)
+            toned = np.clip(source_rgb * p["exp"], 0.0, 1.0)
 
-        # 2. Grading
         if fg_on:
             corrected = tiler.apply_preview_correction_numpy(
-                toned, p["sat"], p["db"], p["ls"], p["gamma"]
+                toned,
+                saturation=p["sat"],
+                darken_break=p["db"],
+                low_slope=p["ls"],
+                gamma=p["gamma"],
+                highlight_break=p["ghb"],
+                mid_slope=p["gms"],
+                high_slope=p["ghs"],
             )
         else:
             corrected = toned
     else:
-        # Ocean Mode
         if RAW_GEBCO is None:
             return "No GEBCO zip found", 404
 
@@ -219,12 +307,14 @@ def render() -> ResponseReturnValue:
                 saturation=p["sat"],
                 black_break=p["db"],
                 black_slope=p["ls"],
+                grade_high_break=p["ghb"],
+                grade_mid_slope=p["gms"],
+                grade_high_slope=p["ghs"],
                 depth_min=p["dmin"],
                 depth_max=p["dmax"],
             ),
         )
 
-    # 3. Convert to Byte and JPEG
     byte_arr = (np.clip(corrected, 0, 1) * 255).astype(np.uint8)
     img = Image.fromarray(np.transpose(byte_arr, (1, 2, 0)))
 

@@ -31,6 +31,7 @@ SOFT_KNEE_HIGHLIGHT_SLOPE = 0.5
 PREVIEW_SATURATION = 0.9
 PREVIEW_DARKEN_BREAK = 0.7
 PREVIEW_DARKEN_LOW_SLOPE = 0.7
+PREVIEW_DARKEN_MID_SLOPE = 1.0
 
 # New default constants
 DEFAULT_EXPOSURE = 1.0
@@ -161,6 +162,31 @@ def apply_soft_knee_numpy(
     """Apply soft-knee tone mapping using NumPy."""
     arr = np.clip(arr * exposure, 0.0, 1.0)
 
+    return apply_piecewise_linear_curve_numpy(
+        arr,
+        shadow_break=shadow_break,
+        highlight_break=highlight_break,
+        shadow_slope=shadow_slope,
+        mid_slope=mid_slope,
+        highlight_slope=highlight_slope,
+    )
+
+
+def apply_piecewise_linear_curve_numpy(
+    arr: np.ndarray,
+    *,
+    shadow_break: float,
+    highlight_break: float,
+    shadow_slope: float,
+    mid_slope: float,
+    highlight_slope: float,
+) -> np.ndarray:
+    """Apply a monotonic three-segment linear curve using NumPy."""
+    if shadow_break < 0.0 or highlight_break > 1.0 or shadow_break > highlight_break:
+        raise ValueError("piecewise breaks must satisfy 0 <= shadow_break <= highlight_break <= 1")
+    if shadow_slope < 0.0 or mid_slope < 0.0 or highlight_slope < 0.0:
+        raise ValueError("piecewise slopes must be non-negative")
+
     shadow_output = shadow_break * shadow_slope
     highlight_output = shadow_output + (highlight_break - shadow_break) * mid_slope
 
@@ -183,12 +209,39 @@ def apply_soft_knee_numpy(
     return cast(np.ndarray, np.clip(out, 0.0, 1.0))
 
 
+def derive_piecewise_high_slope(
+    shadow_break: float,
+    highlight_break: float,
+    shadow_slope: float,
+    mid_slope: float,
+) -> float:
+    """Resolve a highlight slope that keeps the curve anchored at x=1 -> y=1."""
+    if shadow_break < 0.0 or highlight_break > 1.0 or shadow_break > highlight_break:
+        raise ValueError("piecewise breaks must satisfy 0 <= shadow_break <= highlight_break <= 1")
+    if shadow_slope < 0.0 or mid_slope < 0.0:
+        raise ValueError("piecewise slopes must be non-negative")
+    if highlight_break >= 1.0:
+        return 1.0
+
+    shadow_output = shadow_break * shadow_slope
+    highlight_output = shadow_output + (highlight_break - shadow_break) * mid_slope
+    derived_slope = (1.0 - highlight_output) / (1.0 - highlight_break)
+    if derived_slope < 0.0:
+        raise ValueError(
+            "piecewise grading settings require an explicit highlight slope because the derived slope would be negative"
+        )
+    return derived_slope
+
+
 def apply_preview_correction_numpy(
     rgb_arr: np.ndarray,
     saturation: float = PREVIEW_SATURATION,
     darken_break: float = PREVIEW_DARKEN_BREAK,
     low_slope: float = PREVIEW_DARKEN_LOW_SLOPE,
     gamma: float = DEFAULT_GAMMA,
+    highlight_break: float | None = None,
+    mid_slope: float = PREVIEW_DARKEN_MID_SLOPE,
+    high_slope: float | None = None,
 ) -> np.ndarray:
     """Apply mild desaturation and preview darkening using NumPy. Expects (C, H, W) float32 [0,1]."""
     # 1. Gamma
@@ -201,15 +254,27 @@ def apply_preview_correction_numpy(
     # 3. Desaturate
     out = luma + (rgb_arr - luma) * saturation
 
-    # 4. Darken curve
-    high_slope = (1.0 - (darken_break * low_slope)) / (1.0 - darken_break)
-    break_output = darken_break * low_slope
+    # 4. Grading curve
+    resolved_highlight_break = darken_break if highlight_break is None else highlight_break
+    resolved_high_slope = (
+        derive_piecewise_high_slope(
+            darken_break,
+            resolved_highlight_break,
+            low_slope,
+            mid_slope,
+        )
+        if high_slope is None
+        else high_slope
+    )
 
-    mask_low = out < darken_break
-    out[mask_low] = out[mask_low] * low_slope
-    out[~mask_low] = break_output + (out[~mask_low] - darken_break) * high_slope
-
-    return cast(np.ndarray, np.clip(out, 0.0, 1.0))
+    return apply_piecewise_linear_curve_numpy(
+        out,
+        shadow_break=darken_break,
+        highlight_break=resolved_highlight_break,
+        shadow_slope=low_slope,
+        mid_slope=mid_slope,
+        highlight_slope=resolved_high_slope,
+    )
 
 
 @dataclass(frozen=True)

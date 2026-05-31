@@ -25,6 +25,7 @@ from scipy.ndimage import label
 
 from tiler import (
     MAKO_RAMP,
+    PREVIEW_DARKEN_MID_SLOPE,
     apply_preview_correction_numpy,
     apply_soft_knee_numpy,
     compute_in_memory_pixel_limit,
@@ -165,6 +166,9 @@ class OceanStyleOptions:
     saturation: float = OCEAN_DEFAULT_SATURATION
     black_break: float = OCEAN_DEFAULT_BLACK_BREAK
     black_slope: float = OCEAN_DEFAULT_BLACK_SLOPE
+    grade_high_break: float | None = None
+    grade_mid_slope: float = PREVIEW_DARKEN_MID_SLOPE
+    grade_high_slope: float | None = None
     depth_min: float = -11000.0
     depth_max: float = 0.0
 
@@ -653,6 +657,9 @@ def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
             darken_break=style.black_break,
             low_slope=style.black_slope,
             gamma=style.gamma,
+            highlight_break=style.grade_high_break,
+            mid_slope=style.grade_mid_slope,
+            high_slope=style.grade_high_slope,
         )
         mako_colors = graded_mako.reshape(3, -1).T
 
@@ -1366,10 +1373,28 @@ def main() -> None:
         "--sat", "--saturation", type=float, default=OCEAN_DEFAULT_SATURATION
     )
     parser.add_argument(
-        "--db", "--black-break", type=float, default=OCEAN_DEFAULT_BLACK_BREAK
+        "--db", "--black-break", "--grade-low-break", type=float, default=OCEAN_DEFAULT_BLACK_BREAK
     )
     parser.add_argument(
-        "--ls", "--black-slope", type=float, default=OCEAN_DEFAULT_BLACK_SLOPE
+        "--ls", "--black-slope", "--grade-low-slope", type=float, default=OCEAN_DEFAULT_BLACK_SLOPE
+    )
+    parser.add_argument(
+        "--ghb",
+        "--grade-highlight-break",
+        type=float,
+        help="Upper breakpoint for the final grading curve; defaults to the low break",
+    )
+    parser.add_argument(
+        "--gms",
+        "--grade-mid-slope",
+        type=float,
+        default=PREVIEW_DARKEN_MID_SLOPE,
+    )
+    parser.add_argument(
+        "--ghs",
+        "--grade-highlight-slope",
+        type=float,
+        help="Highlight slope for the final grading curve; defaults to an anchored derived slope",
     )
     parser.add_argument(
         "--depth-min",
@@ -1422,6 +1447,9 @@ def main() -> None:
             saturation=args.sat,
             black_break=args.db,
             black_slope=args.ls,
+            grade_high_break=args.ghb,
+            grade_mid_slope=args.gms,
+            grade_high_slope=args.ghs,
             depth_min=args.depth_min,
             depth_max=args.depth_max,
         ),
