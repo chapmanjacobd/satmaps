@@ -13,6 +13,8 @@
         .slider-group label { font-size: 13px; margin-bottom: 6px; color: #ccc; display: flex; justify-content: space-between; gap: 12px; }
         .image-container { position: relative; flex-grow: 1; display: flex; flex-direction: column; align-items: center; }
         img { max-width: 100%; border: 2px solid #333; border-radius: 4px; box-shadow: 0 0 20px rgba(0,0,0,0.4); }
+        #preview.land-preview { cursor: grab; touch-action: none; }
+        #preview.land-preview.dragging { cursor: grabbing; }
         span.val { font-weight: bold; color: #fb0; min-width: 68px; text-align: right; }
         .viz-container { margin-top: 10px; margin-bottom: 20px; background: #000; border: 1px solid #444; position: relative; height: 120px; }
         .viz-container svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
@@ -68,6 +70,25 @@
             <p class="note">Loaded land sample date: <strong>{{ land_dates[0] }}</strong></p>
             {% else %}
             <p class="note">No cached {{ selected_land_location.name }} sample tile was found under <code>.cache/</code>.</p>
+            {% endif %}
+            {% if land_dates %}
+            <div class="slider-group">
+                <label>View X <span class="val" id="panx_val"></span></label>
+                <input type="range" id="panx" min="0" max="1" step="0.001" value="{{ land_view.pan_x }}">
+                <div class="range-hint">
+                    <span>West edge</span>
+                    <span>East edge</span>
+                </div>
+            </div>
+            <div class="slider-group">
+                <label>View Y <span class="val" id="pany_val"></span></label>
+                <input type="range" id="pany" min="0" max="1" step="0.001" value="{{ land_view.pan_y }}">
+                <div class="range-hint">
+                    <span>North edge</span>
+                    <span>South edge</span>
+                </div>
+            </div>
+            <p class="note">Drag the preview to pan within the current MGRS subtile, or use the view sliders to move to the tile edges.</p>
             {% endif %}
             {% endif %}
 
@@ -174,7 +195,11 @@
         </div>
 
         <div class="image-container">
-            <img id="preview" src="/render?mode={{ mode }}{% if mode == 'land' %}&loc={{ selected_land_location.id }}{% endif %}">
+            <img
+                id="preview"
+                class="{{ 'land-preview' if mode == 'land' else '' }}"
+                src="/render?mode={{ mode }}{% if mode == 'land' %}&loc={{ selected_land_location.id }}&panx={{ land_view.pan_x }}&pany={{ land_view.pan_y }}{% endif %}"
+            >
             <p style="font-size: 12px; color: #666; margin-top: 10px;">
                 {% if mode == 'land' %}
                 Sample: {{ selected_land_location.sample_label }}{% if land_dates %} — {{ land_dates | join(' / ') }}{% endif %}
@@ -189,13 +214,15 @@
         const currentMode = "{{ mode }}";
         const currentLandLocation = {{ selected_land_location.id | tojson }};
         const hasLandBlend = {{ has_land_blend | tojson }};
+        const canPanLandView = {{ (mode == 'land' and land_dates) | tojson }};
         const defaultParams = {{ defaults | tojson }};
         const landDates = {{ land_dates | tojson }};
         let rawHist = {{ raw_hist | tojson }};
         const img = document.getElementById('preview');
         const sharedControls = ['exp', 'sb', 'hb', 'ss', 'ms', 'hs', 'gamma', 'sat', 'db', 'ghb', 'ls', 'gms', 'ghs'];
+        const landViewControls = canPanLandView ? ['panx', 'pany'] : [];
         const renderControls = currentMode === 'land'
-            ? (hasLandBlend ? ['blend', ...sharedControls] : [...sharedControls])
+            ? [...landViewControls, ...(hasLandBlend ? ['blend', ...sharedControls] : [...sharedControls])]
             : [...sharedControls, 'dmin', 'dmax'];
         const cliControls = currentMode === 'land'
             ? [...sharedControls]
@@ -260,6 +287,9 @@
                 const newer = Math.round(value * 100);
                 const older = 100 - newer;
                 return `${older}/${newer}`;
+            }
+            if (id === 'panx' || id === 'pany') {
+                return `${Math.round(value * 100)}%`;
             }
             if (Number.isInteger(value)) {
                 return String(value);
@@ -417,6 +447,7 @@
             const params = new URLSearchParams({ mode: currentMode });
             if (currentMode === 'land') {
                 params.set('loc', currentLandLocation);
+                landViewControls.forEach(id => params.set(id, document.getElementById(id).value));
                 if (hasLandBlend) {
                     params.set('blend', document.getElementById('blend').value);
                 }
@@ -449,6 +480,50 @@
                 img.src = `/render?${params.toString()}&t=${Date.now()}`;
                 refreshHistogram(token);
             }, 100);
+        }
+
+        function setLandPan(panX, panY) {
+            if (!canPanLandView) return;
+            document.getElementById('panx').value = Math.min(1, Math.max(0, panX));
+            document.getElementById('pany').value = Math.min(1, Math.max(0, panY));
+            update();
+        }
+
+        function setupLandDragging() {
+            if (!canPanLandView) return;
+            let dragState = null;
+            img.addEventListener('pointerdown', event => {
+                const rect = img.getBoundingClientRect();
+                if (!rect.width || !rect.height) return;
+                dragState = {
+                    pointerId: event.pointerId,
+                    startClientX: event.clientX,
+                    startClientY: event.clientY,
+                    startPanX: getValue('panx'),
+                    startPanY: getValue('pany'),
+                    width: rect.width,
+                    height: rect.height
+                };
+                img.classList.add('dragging');
+                img.setPointerCapture(event.pointerId);
+                event.preventDefault();
+            });
+            img.addEventListener('pointermove', event => {
+                if (!dragState || event.pointerId !== dragState.pointerId) return;
+                const nextPanX = dragState.startPanX - ((event.clientX - dragState.startClientX) / dragState.width);
+                const nextPanY = dragState.startPanY - ((event.clientY - dragState.startClientY) / dragState.height);
+                setLandPan(nextPanX, nextPanY);
+            });
+            const endDrag = event => {
+                if (!dragState || event.pointerId !== dragState.pointerId) return;
+                dragState = null;
+                img.classList.remove('dragging');
+                if (img.hasPointerCapture(event.pointerId)) {
+                    img.releasePointerCapture(event.pointerId);
+                }
+            };
+            img.addEventListener('pointerup', endDrag);
+            img.addEventListener('pointercancel', endDrag);
         }
 
         function update() {
@@ -495,6 +570,7 @@
 
         drawHist();
         update();
+        setupLandDragging();
     </script>
 </body>
 </html>

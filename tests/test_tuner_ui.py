@@ -51,3 +51,21 @@ def test_land_locations_include_global_presets() -> None:
     assert tuner_ui.LAND_LOCATIONS_BY_ID["mexico-city"].tile_prefix == "14QMG_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["sydney"].tile_prefix == "56HLH_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["nairobi"].tile_prefix == "37MBU_0_0"
+
+
+def test_build_land_view_defaults_to_previous_fixed_crop() -> None:
+    land_view = tuner_ui.build_land_view(10980, 10980)
+
+    assert land_view.crop_width == tuner_ui.LAND_SAMPLE_CROP_SIZE
+    assert land_view.crop_height == tuner_ui.LAND_SAMPLE_CROP_SIZE
+    assert land_view.xoff == tuner_ui.LAND_SAMPLE_DEFAULT_OFF_X
+    assert land_view.yoff == tuner_ui.LAND_SAMPLE_DEFAULT_OFF_Y
+
+
+def test_build_land_view_clamps_pan_to_tile_edges() -> None:
+    land_view = tuner_ui.build_land_view(10980, 10980, pan_x=1.5, pan_y=-1.0)
+
+    assert land_view.pan_x == 1.0
+    assert land_view.pan_y == 0.0
+    assert land_view.xoff == 10980 - tuner_ui.LAND_SAMPLE_CROP_SIZE
+    assert land_view.yoff == 0

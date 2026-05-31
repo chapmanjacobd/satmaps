@@ -1,4 +1,5 @@
 import io
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -20,8 +21,8 @@ GEBCO_ZIP = "gebco_2025_sub_ice_topo_geotiff.zip"
 LAND_CACHE_ROOT = Path(".cache")
 LAND_SAMPLE_LIMIT = 2
 LAND_SAMPLE_CROP_SIZE = 1024
-LAND_SAMPLE_OFF_X = 2000
-LAND_SAMPLE_OFF_Y = 2000
+LAND_SAMPLE_DEFAULT_OFF_X = 2000
+LAND_SAMPLE_DEFAULT_OFF_Y = 2000
 LAND_SAMPLE_MIN = 0.0
 LAND_SAMPLE_MAX = 9000.0
 LAND_DEFAULT_GAMMA = 2.6
@@ -44,6 +45,18 @@ class LandLocation:
     name: str
     sample_label: str
     tile_prefix: str
+
+
+@dataclass(frozen=True)
+class LandView:
+    pan_x: float
+    pan_y: float
+    xoff: int
+    yoff: int
+    crop_width: int
+    crop_height: int
+    full_width: int
+    full_height: int
 
 
 LAND_LOCATIONS = (
@@ -137,26 +150,88 @@ def find_land_samples(
     return tuple(samples)
 
 
+def clamp_unit(value: float) -> float:
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def build_land_view(
+    full_width: int,
+    full_height: int,
+    pan_x: float | None = None,
+    pan_y: float | None = None,
+) -> LandView:
+    crop_width = min(LAND_SAMPLE_CROP_SIZE, full_width)
+    crop_height = min(LAND_SAMPLE_CROP_SIZE, full_height)
+    max_xoff = max(0, full_width - crop_width)
+    max_yoff = max(0, full_height - crop_height)
+    default_pan_x = 0.0 if max_xoff == 0 else min(LAND_SAMPLE_DEFAULT_OFF_X, max_xoff) / max_xoff
+    default_pan_y = 0.0 if max_yoff == 0 else min(LAND_SAMPLE_DEFAULT_OFF_Y, max_yoff) / max_yoff
+    resolved_pan_x = clamp_unit(default_pan_x if pan_x is None else pan_x)
+    resolved_pan_y = clamp_unit(default_pan_y if pan_y is None else pan_y)
+    return LandView(
+        pan_x=resolved_pan_x,
+        pan_y=resolved_pan_y,
+        xoff=int(round(max_xoff * resolved_pan_x)),
+        yoff=int(round(max_yoff * resolved_pan_y)),
+        crop_width=crop_width,
+        crop_height=crop_height,
+        full_width=full_width,
+        full_height=full_height,
+    )
+
+
 LAND_SAMPLE_SOURCES = {
     location.id: find_land_samples(location) for location in LAND_LOCATIONS
 }
 
 
-def load_land_sample(paths: dict[str, str]) -> FloatArray:
+@lru_cache(maxsize=64)
+def get_raster_size(path: str) -> tuple[int, int]:
+    ds = gdal.Open(path)
+    if ds is None:
+        raise RuntimeError(f"Could not open sample band: {path}")
+    size = (ds.RasterXSize, ds.RasterYSize)
+    ds = None
+    return size
+
+
+def get_land_view(location_id: str, pan_x: float | None = None, pan_y: float | None = None) -> LandView:
+    land_samples = LAND_SAMPLE_SOURCES[location_id]
+    if not land_samples:
+        return build_land_view(LAND_SAMPLE_CROP_SIZE, LAND_SAMPLE_CROP_SIZE, pan_x, pan_y)
+    widths: list[int] = []
+    heights: list[int] = []
+    for sample in land_samples:
+        width, height = get_raster_size(sample.paths["red"])
+        widths.append(width)
+        heights.append(height)
+    return build_land_view(min(widths), min(heights), pan_x, pan_y)
+
+
+@lru_cache(maxsize=8)
+def load_land_sample_window(
+    red_path: str,
+    green_path: str,
+    blue_path: str,
+    xoff: int,
+    yoff: int,
+    crop_width: int,
+    crop_height: int,
+) -> FloatArray:
     """Load a land sample RGB crop and normalize it to the satmaps baseline."""
     data: list[FloatArray] = []
-    for band in ("red", "green", "blue"):
-        ds = gdal.Open(paths[band])
+    for band_path in (red_path, green_path, blue_path):
+        ds = gdal.Open(band_path)
         if ds is None:
-            raise RuntimeError(f"Could not open sample band: {paths[band]}")
+            raise RuntimeError(f"Could not open sample band: {band_path}")
         arr = cast(
             FloatArray,
             ds.GetRasterBand(1)
             .ReadAsArray(
-                LAND_SAMPLE_OFF_X,
-                LAND_SAMPLE_OFF_Y,
-                LAND_SAMPLE_CROP_SIZE,
-                LAND_SAMPLE_CROP_SIZE,
+                xoff,
+                yoff,
+                crop_width,
+                crop_height,
             )
             .astype(np.float32),
         )
@@ -170,12 +245,6 @@ def load_land_sample(paths: dict[str, str]) -> FloatArray:
         np.clip((rgb - LAND_SAMPLE_MIN) / (LAND_SAMPLE_MAX - LAND_SAMPLE_MIN), 0.0, 1.0),
     )
     return cast(FloatArray, np.nan_to_num(normalized, nan=0.0))
-
-
-RAW_LAND_SAMPLES = {
-    location_id: tuple(load_land_sample(sample.paths) for sample in samples)
-    for location_id, samples in LAND_SAMPLE_SOURCES.items()
-}
 
 
 def load_gebco_sample() -> FloatArray | None:
@@ -255,17 +324,36 @@ def parse_request_params(mode: str) -> dict[str, float]:
     return params
 
 
-def get_land_source(location_id: str, blend: float) -> FloatArray | None:
-    land_samples = RAW_LAND_SAMPLES[location_id]
+def get_land_pan_arg(name: str) -> float | None:
+    raw_value = request.args.get(name)
+    if raw_value is None:
+        return None
+    return clamp_unit(float(raw_value))
+
+
+def get_land_source(location_id: str, blend: float, land_view: LandView) -> FloatArray | None:
+    land_samples = LAND_SAMPLE_SOURCES[location_id]
     if not land_samples:
         return None
-    if len(land_samples) == 1:
-        return land_samples[0]
+    cropped_samples = tuple(
+        load_land_sample_window(
+            sample.paths["red"],
+            sample.paths["green"],
+            sample.paths["blue"],
+            land_view.xoff,
+            land_view.yoff,
+            land_view.crop_width,
+            land_view.crop_height,
+        )
+        for sample in land_samples
+    )
+    if len(cropped_samples) == 1:
+        return cropped_samples[0]
     mix = float(np.clip(blend, 0.0, 1.0))
     return cast(
         FloatArray,
         np.clip(
-            (land_samples[0] * (1.0 - mix)) + (land_samples[1] * mix),
+            (cropped_samples[0] * (1.0 - mix)) + (cropped_samples[1] * mix),
             0.0,
             1.0,
         ),
@@ -302,8 +390,13 @@ def index() -> ResponseReturnValue:
 
     land_location = get_land_location(request.args.get("loc"))
     land_samples = LAND_SAMPLE_SOURCES[land_location.id]
+    land_view = get_land_view(
+        land_location.id,
+        get_land_pan_arg("panx"),
+        get_land_pan_arg("pany"),
+    )
     params = parse_request_params(mode)
-    source = get_land_source(land_location.id, params.get("blend", 0.0)) if mode == "land" else RAW_GEBCO
+    source = get_land_source(land_location.id, params.get("blend", 0.0), land_view) if mode == "land" else RAW_GEBCO
     hist = get_histogram_data(source, mode, params.get("dmin", -11000.0), params.get("dmax", 0.0))
     return render_template(
         "index.html",
@@ -313,8 +406,9 @@ def index() -> ResponseReturnValue:
         raw_hist=hist,
         land_locations=LAND_LOCATIONS,
         selected_land_location=land_location,
+        land_view=land_view,
         land_dates=[sample.date_label for sample in land_samples],
-        has_land_blend=len(RAW_LAND_SAMPLES[land_location.id]) > 1,
+        has_land_blend=len(land_samples) > 1,
     )
 
 
@@ -325,8 +419,13 @@ def histogram() -> ResponseReturnValue:
         mode = "land"
 
     land_location = get_land_location(request.args.get("loc"))
+    land_view = get_land_view(
+        land_location.id,
+        get_land_pan_arg("panx"),
+        get_land_pan_arg("pany"),
+    )
     params = parse_request_params(mode)
-    source = get_land_source(land_location.id, params.get("blend", 0.0)) if mode == "land" else RAW_GEBCO
+    source = get_land_source(land_location.id, params.get("blend", 0.0), land_view) if mode == "land" else RAW_GEBCO
     return jsonify(
         {
             "hist": get_histogram_data(
@@ -346,12 +445,17 @@ def render() -> ResponseReturnValue:
         mode = "land"
 
     land_location = get_land_location(request.args.get("loc"))
+    land_view = get_land_view(
+        land_location.id,
+        get_land_pan_arg("panx"),
+        get_land_pan_arg("pany"),
+    )
     p = parse_request_params(mode)
     tm_on = request.args.get("tm", "1") == "1"
     fg_on = request.args.get("fg", "1") == "1"
 
     if mode == "land":
-        source_rgb = get_land_source(land_location.id, p.get("blend", 0.0))
+        source_rgb = get_land_source(land_location.id, p.get("blend", 0.0), land_view)
         if source_rgb is None:
             return "No sample data", 404
         if tm_on:
