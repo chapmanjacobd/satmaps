@@ -283,6 +283,24 @@ def build_grade_defaults(low_break: float, low_slope: float) -> dict[str, float]
 
 
 def get_mode_defaults(mode: str) -> dict[str, float]:
+    if mode == "ocean":
+        params = {
+            "exp": ocean.OCEAN_DEFAULT_EXPOSURE,
+            "sb": ocean.OCEAN_DEFAULT_SHADOW_BREAK,
+            "hb": ocean.OCEAN_DEFAULT_HIGHLIGHT_BREAK,
+            "ss": ocean.OCEAN_DEFAULT_SHADOW_SLOPE,
+            "ms": ocean.OCEAN_DEFAULT_MID_SLOPE,
+            "hs": ocean.OCEAN_DEFAULT_HIGHLIGHT_SLOPE,
+            "gamma": ocean.OCEAN_DEFAULT_GAMMA,
+            "sat": ocean.OCEAN_DEFAULT_SATURATION,
+            "dmin": -11000.0,
+            "dmax": 0.0,
+        }
+        params.update(
+            build_grade_defaults(ocean.OCEAN_DEFAULT_BLACK_BREAK, ocean.OCEAN_DEFAULT_BLACK_SLOPE)
+        )
+        return params
+
     params = {
         "exp": tiler.DEFAULT_EXPOSURE,
         "sb": tiler.SOFT_KNEE_SHADOW_BREAK,
@@ -290,28 +308,10 @@ def get_mode_defaults(mode: str) -> dict[str, float]:
         "ss": tiler.SOFT_KNEE_SHADOW_SLOPE,
         "ms": tiler.SOFT_KNEE_MID_SLOPE,
         "hs": tiler.SOFT_KNEE_HIGHLIGHT_SLOPE,
+        "gamma": LAND_DEFAULT_GAMMA,
+        "sat": LAND_DEFAULT_SATURATION,
+        "blend": 0.0,
     }
-    if mode == "ocean":
-        params.update(
-            {
-                "gamma": ocean.OCEAN_DEFAULT_GAMMA,
-                "sat": ocean.OCEAN_DEFAULT_SATURATION,
-                "dmin": -11000.0,
-                "dmax": 0.0,
-            }
-        )
-        params.update(
-            build_grade_defaults(ocean.OCEAN_DEFAULT_BLACK_BREAK, ocean.OCEAN_DEFAULT_BLACK_SLOPE)
-        )
-        return params
-
-    params.update(
-        {
-            "gamma": LAND_DEFAULT_GAMMA,
-            "sat": LAND_DEFAULT_SATURATION,
-            "blend": 0.0,
-        }
-    )
     params.update(build_grade_defaults(LAND_DEFAULT_GRADE_BREAK, LAND_DEFAULT_GRADE_LOW_SLOPE))
     return params
 

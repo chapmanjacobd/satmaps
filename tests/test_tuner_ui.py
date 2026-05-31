@@ -69,3 +69,39 @@ def test_build_land_view_clamps_pan_to_tile_edges() -> None:
     assert land_view.pan_y == 0.0
     assert land_view.xoff == 10980 - tuner_ui.LAND_SAMPLE_CROP_SIZE
     assert land_view.yoff == 0
+
+
+def test_land_defaults_match_cli_defaults() -> None:
+    defaults = tuner_ui.get_mode_defaults("land")
+
+    assert defaults["exp"] == tuner_ui.tiler.DEFAULT_EXPOSURE
+    assert defaults["sb"] == tuner_ui.tiler.SOFT_KNEE_SHADOW_BREAK
+    assert defaults["hb"] == tuner_ui.tiler.SOFT_KNEE_HIGHLIGHT_BREAK
+    assert defaults["ss"] == tuner_ui.tiler.SOFT_KNEE_SHADOW_SLOPE
+    assert defaults["ms"] == tuner_ui.tiler.SOFT_KNEE_MID_SLOPE
+    assert defaults["hs"] == tuner_ui.tiler.SOFT_KNEE_HIGHLIGHT_SLOPE
+    assert defaults["gamma"] == tuner_ui.LAND_DEFAULT_GAMMA
+    assert defaults["sat"] == tuner_ui.LAND_DEFAULT_SATURATION
+    assert defaults["db"] == tuner_ui.LAND_DEFAULT_GRADE_BREAK
+    assert defaults["ghb"] == tuner_ui.LAND_DEFAULT_GRADE_BREAK
+    assert defaults["ls"] == tuner_ui.LAND_DEFAULT_GRADE_LOW_SLOPE
+    assert defaults["gms"] == tuner_ui.tiler.PREVIEW_DARKEN_MID_SLOPE
+
+
+def test_ocean_defaults_match_cli_defaults() -> None:
+    defaults = tuner_ui.get_mode_defaults("ocean")
+
+    assert defaults["exp"] == tuner_ui.ocean.OCEAN_DEFAULT_EXPOSURE
+    assert defaults["sb"] == tuner_ui.ocean.OCEAN_DEFAULT_SHADOW_BREAK
+    assert defaults["hb"] == tuner_ui.ocean.OCEAN_DEFAULT_HIGHLIGHT_BREAK
+    assert defaults["ss"] == tuner_ui.ocean.OCEAN_DEFAULT_SHADOW_SLOPE
+    assert defaults["ms"] == tuner_ui.ocean.OCEAN_DEFAULT_MID_SLOPE
+    assert defaults["hs"] == tuner_ui.ocean.OCEAN_DEFAULT_HIGHLIGHT_SLOPE
+    assert defaults["gamma"] == tuner_ui.ocean.OCEAN_DEFAULT_GAMMA
+    assert defaults["sat"] == tuner_ui.ocean.OCEAN_DEFAULT_SATURATION
+    assert defaults["db"] == tuner_ui.ocean.OCEAN_DEFAULT_BLACK_BREAK
+    assert defaults["ghb"] == tuner_ui.ocean.OCEAN_DEFAULT_BLACK_BREAK
+    assert defaults["ls"] == tuner_ui.ocean.OCEAN_DEFAULT_BLACK_SLOPE
+    assert defaults["gms"] == tuner_ui.tiler.PREVIEW_DARKEN_MID_SLOPE
+    assert defaults["dmin"] == -11000.0
+    assert defaults["dmax"] == 0.0

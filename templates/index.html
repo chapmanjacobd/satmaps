@@ -3,15 +3,16 @@
 <head>
     <title>Tone Mapping Tuner</title>
     <style>
-        body { font-family: sans-serif; background: #1a1a1a; color: #eee; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; }
+        body { font-family: sans-serif; background: #1a1a1a; color: #eee; margin: 0; padding: 20px; }
         h1 { margin-bottom: 30px; color: #fb0; }
         h3 { border-bottom: 1px solid #444; padding-bottom: 5px; margin-top: 20px; margin-bottom: 10px; font-size: 16px; color: #fb0; }
         h3:first-child { margin-top: 0; }
-        .container { display: flex; gap: 40px; padding: 20px; max-width: 1280px; width: 100%; justify-content: center; }
+        .page { max-width: 1280px; width: 100%; margin: 0 auto; }
+        .container { display: flex; gap: 40px; padding: 20px; width: 100%; justify-content: center; align-items: flex-start; }
         .controls { display: flex; flex-direction: column; gap: 15px; width: 380px; background: #2a2a2a; padding: 20px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
         .slider-group { display: flex; flex-direction: column; }
         .slider-group label { font-size: 13px; margin-bottom: 6px; color: #ccc; display: flex; justify-content: space-between; gap: 12px; }
-        .image-container { position: relative; flex-grow: 1; display: flex; flex-direction: column; align-items: center; }
+        .image-container { position: sticky; top: 20px; flex-grow: 1; display: flex; flex-direction: column; align-items: center; align-self: flex-start; height: fit-content; }
         img { max-width: 100%; border: 2px solid #333; border-radius: 4px; box-shadow: 0 0 20px rgba(0,0,0,0.4); }
         #preview.land-preview { cursor: grab; touch-action: none; }
         #preview.land-preview.dragging { cursor: grabbing; }
@@ -35,14 +36,15 @@
     </style>
 </head>
 <body>
-    <h1>Tone Mapping Tuner</h1>
+    <div class="page">
+        <h1>Tone Mapping Tuner</h1>
 
-    <div class="mode-switcher">
-        <button class="mode-btn {{ 'active' if mode == 'land' else '' }}" onclick="window.location.href='/?mode=land'">Land Mode</button>
-        <button class="mode-btn {{ 'active' if mode == 'ocean' else '' }}" onclick="window.location.href='/?mode=ocean'">Ocean Mode</button>
-    </div>
+        <div class="mode-switcher">
+            <button class="mode-btn {{ 'active' if mode == 'land' else '' }}" onclick="window.location.href='/?mode=land'">Land Mode</button>
+            <button class="mode-btn {{ 'active' if mode == 'ocean' else '' }}" onclick="window.location.href='/?mode=ocean'">Ocean Mode</button>
+        </div>
 
-    <div class="container">
+        <div class="container">
         <div class="controls">
             {% if mode == 'land' %}
             <h3>Land Sample</h3>
@@ -208,6 +210,7 @@
                 {% endif %}
             </p>
         </div>
+    </div>
     </div>
 
     <script>
