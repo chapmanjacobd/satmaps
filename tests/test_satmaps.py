@@ -10,6 +10,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import ocean
+import land_mgrs
 import satmaps
 import tiler
 from satmaps import (
@@ -3546,6 +3547,14 @@ def test_final_tile_flush_coordinator_waits_for_all_candidate_contributors(
         quality=100,
     )
     final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "flush123")) / relative_tile
+    first_contributor_tile_path = (
+        Path(satmaps.build_contributor_tile_cache_dir("output.pmtiles", "flush123", "31TDF_0_0"))
+        / relative_tile
+    )
+    second_contributor_tile_path = (
+        Path(satmaps.build_contributor_tile_cache_dir("output.pmtiles", "flush123", "31TDF_0_1"))
+        / relative_tile
+    )
 
     coordinator.record_contributor_completion(
         "31TDF_0_0",
@@ -3553,9 +3562,13 @@ def test_final_tile_flush_coordinator_waits_for_all_candidate_contributors(
     )
 
     assert not final_tile_path.exists()
+    assert first_contributor_tile_path.exists()
     assert not Path(
         satmaps.build_contributor_complete_marker("output.pmtiles", "flush123", "31TDF_0_0")
     ).exists()
+    assert coordinator._tile_states[relative_tile].contributor_tile_paths == {
+        "31TDF_0_0": str(first_contributor_tile_path)
+    }
 
     coordinator.record_contributor_completion(
         "31TDF_0_1",
@@ -3563,6 +3576,8 @@ def test_final_tile_flush_coordinator_waits_for_all_candidate_contributors(
     )
 
     assert final_tile_path.exists()
+    assert not first_contributor_tile_path.exists()
+    assert not second_contributor_tile_path.exists()
     assert Path(
         satmaps.build_contributor_complete_marker("output.pmtiles", "flush123", "31TDF_0_0")
     ).exists()
@@ -3585,6 +3600,17 @@ def test_final_tile_flush_coordinator_rolls_back_partial_stream_on_error(
         {"31TDF_0_0": (relative_tile,)},
         quality=100,
     )
+    final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "flushrollback")) / relative_tile
+    contributor_tile_path = (
+        Path(
+            satmaps.build_contributor_tile_cache_dir(
+                "output.pmtiles",
+                "flushrollback",
+                "31TDF_0_0",
+            )
+        )
+        / relative_tile
+    )
 
     def failing_stream():
         yield (relative_tile, Image.new("RGBA", (8, 8), (255, 0, 0, 255)))
@@ -3593,12 +3619,71 @@ def test_final_tile_flush_coordinator_rolls_back_partial_stream_on_error(
     with pytest.raises(RuntimeError, match="stream exploded"):
         coordinator.record_contributor_tiles("31TDF_0_0", failing_stream())
 
-    tile_state = coordinator._tile_states[relative_tile]
-    assert tile_state.contributor_images == {}
+    assert relative_tile not in coordinator._tile_states
+    assert not final_tile_path.exists()
+    assert not contributor_tile_path.exists()
     assert "31TDF_0_0" not in coordinator._contributor_done
     assert not Path(
         satmaps.build_contributor_complete_marker("output.pmtiles", "flushrollback", "31TDF_0_0")
     ).exists()
+
+
+def test_final_tile_flush_coordinator_flushes_waiting_tiles_when_peer_fails(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    relative_tile = "13/1/2.webp"
+    coordinator = satmaps.FinalTileCacheFlushCoordinator(
+        "output.pmtiles",
+        "flushpeerfail",
+        ("31TDF_0_0", "31TDF_0_1"),
+        {
+            "31TDF_0_0": (relative_tile,),
+            "31TDF_0_1": (relative_tile,),
+        },
+        quality=100,
+    )
+    final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "flushpeerfail")) / relative_tile
+    waiting_tile_path = (
+        Path(
+            satmaps.build_contributor_tile_cache_dir(
+                "output.pmtiles",
+                "flushpeerfail",
+                "31TDF_0_0",
+            )
+        )
+        / relative_tile
+    )
+
+    coordinator.record_contributor_completion(
+        "31TDF_0_0",
+        {relative_tile: Image.new("RGBA", (8, 8), (255, 0, 0, 255))},
+    )
+
+    def failing_stream():
+        if False:
+            yield (relative_tile, Image.new("RGBA", (8, 8), (0, 255, 0, 255)))
+        raise RuntimeError("stream exploded")
+
+    with pytest.raises(RuntimeError, match="stream exploded"):
+        coordinator.record_contributor_tiles("31TDF_0_1", failing_stream())
+
+    assert final_tile_path.exists()
+    assert not waiting_tile_path.exists()
+    assert relative_tile not in coordinator._tile_states
+    assert Path(
+        satmaps.build_contributor_complete_marker("output.pmtiles", "flushpeerfail", "31TDF_0_0")
+    ).exists()
+    assert not Path(
+        satmaps.build_contributor_complete_marker("output.pmtiles", "flushpeerfail", "31TDF_0_1")
+    ).exists()
+    with Image.open(final_tile_path) as final_tile:
+        pixel = final_tile.convert("RGBA").getpixel((0, 0))
+    assert pixel[0] > 200
+    assert pixel[1] < 80
+    assert pixel[2] < 80
 
 
 def test_final_tile_flush_coordinator_lazily_composites_ocean_base(
@@ -3640,6 +3725,17 @@ def test_final_tile_flush_coordinator_lazily_composites_ocean_base(
         pixel = final_tile.convert("RGBA").getpixel((0, 0))
     assert pixel[0] > 0
     assert pixel[2] > 0
+
+
+def test_envelopes_overlap_rejects_touching_edges() -> None:
+    assert not land_mgrs.envelopes_overlap(
+        (0.0, 10.0, 0.0, 10.0),
+        (10.0, 20.0, 0.0, 10.0),
+    )
+    assert land_mgrs.envelopes_overlap(
+        (0.0, 10.0, 0.0, 10.0),
+        (9.999, 20.0, 0.0, 10.0),
+    )
 
 
 def test_configure_final_tile_cache_flush_coordinator_uses_precomputed_candidates(

@@ -11,7 +11,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, cast
 
 import mgrs
 from mgrs import core as mgrs_core
@@ -73,13 +73,13 @@ class LandProcessingPlan:
 @dataclass(frozen=True)
 class FinalTileFlushJob:
     relative_path: str
-    contributor_images: tuple[tuple[str, Image.Image], ...]
+    contributor_tile_paths: tuple[tuple[str, str], ...]
 
 
 @dataclass
 class FinalTileFlushState:
     pending_contributors: set[str]
-    contributor_images: dict[str, Image.Image]
+    contributor_tile_paths: dict[str, str]
     flushing: bool = False
 
 
@@ -128,17 +128,25 @@ class FinalTileCacheFlushCoordinator:
                     relative_path,
                     FinalTileFlushState(
                         pending_contributors=set(),
-                        contributor_images={},
+                        contributor_tile_paths={},
                     ),
                 )
                 tile_state.pending_contributors.add(contributor_id)
+
+    def cleanup(self) -> None:
+        with self._lock:
+            self._tile_states.clear()
+        shutil.rmtree(
+            os.path.join(build_tile_cache_root(self._output_path, self._unique_id), "contributors"),
+            ignore_errors=True,
+        )
 
     def record_contributor_completion(
         self,
         contributor_id: str,
         tile_images: dict[str, Image.Image],
     ) -> list[str]:
-        """Store in-memory contributor tiles and flush any final tiles that are now ready."""
+        """Store contributor tiles and flush any final tiles that are now ready."""
         return self.record_contributor_tiles(contributor_id, iter(tile_images.items()))
 
     def record_contributor_tiles(
@@ -153,16 +161,30 @@ class FinalTileCacheFlushCoordinator:
         actual_tile_relpaths: set[str] = set()
         try:
             for relative_path, image in tile_images:
+                try:
+                    contributor_tile_path = self._build_contributor_tile_path(
+                        contributor_id,
+                        relative_path,
+                    )
+                    tiler.save_webp_image(
+                        image,
+                        contributor_tile_path,
+                        self._quality,
+                        lossless=True,
+                    )
+                finally:
+                    image.close()
+
                 actual_tile_relpaths.add(relative_path)
                 with self._lock:
                     tile_state = self._tile_states.setdefault(
                         relative_path,
                         FinalTileFlushState(
                             pending_contributors=set(),
-                            contributor_images={},
+                            contributor_tile_paths={},
                         ),
                     )
-                    tile_state.contributor_images[contributor_id] = image
+                    tile_state.contributor_tile_paths[contributor_id] = contributor_tile_path
         except Exception:
             self._discard_contributor_tiles(contributor_id, actual_tile_relpaths)
             raise
@@ -208,35 +230,42 @@ class FinalTileCacheFlushCoordinator:
         contributor_id: str,
         actual_tile_relpaths: set[str],
     ) -> None:
-        if not actual_tile_relpaths:
-            return
-
+        impacted_tile_relpaths = set(self._contributor_tile_candidates.get(contributor_id, ()))
+        impacted_tile_relpaths.update(actual_tile_relpaths)
+        stale_tile_paths: list[str] = []
+        ready_jobs: list[FinalTileFlushJob] = []
+        ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
         with self._lock:
-            for relative_path in actual_tile_relpaths:
+            for relative_path in impacted_tile_relpaths:
                 tile_state = self._tile_states.get(relative_path)
                 if tile_state is None:
                     continue
-                tile_state.contributor_images.pop(contributor_id, None)
-                if (
-                    not tile_state.pending_contributors
-                    and not tile_state.contributor_images
-                    and not tile_state.flushing
-                ):
-                    self._tile_states.pop(relative_path, None)
+                stale_tile_path = tile_state.contributor_tile_paths.pop(contributor_id, None)
+                if stale_tile_path is not None:
+                    stale_tile_paths.append(stale_tile_path)
+                tile_state.pending_contributors.discard(contributor_id)
+                if not tile_state.pending_contributors and not tile_state.flushing:
+                    tile_state.flushing = True
+                    ready_jobs.append(self._build_flush_job(relative_path, tile_state))
+            ready_markers.extend(self._collect_ready_markers_locked())
+
+        self._cleanup_contributor_tile_paths(stale_tile_paths)
+        self._write_markers(ready_markers)
+        self._flush_ready_tiles(ready_jobs)
 
     def _build_flush_job(
         self,
         relative_path: str,
         tile_state: FinalTileFlushState,
     ) -> FinalTileFlushJob:
-        ordered_images = tuple(
-            (contributor_id, tile_state.contributor_images[contributor_id])
+        ordered_tile_paths = tuple(
+            (contributor_id, tile_state.contributor_tile_paths[contributor_id])
             for contributor_id in self._ordered_contributors
-            if contributor_id in tile_state.contributor_images
+            if contributor_id in tile_state.contributor_tile_paths
         )
         return FinalTileFlushJob(
             relative_path=relative_path,
-            contributor_images=ordered_images,
+            contributor_tile_paths=ordered_tile_paths,
         )
 
     def _flush_ready_tiles(self, ready_jobs: Sequence[FinalTileFlushJob]) -> None:
@@ -247,13 +276,16 @@ class FinalTileCacheFlushCoordinator:
             self._flush_ready_tile(job)
 
         ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
+        stale_tile_paths: list[str] = []
         with self._lock:
             for job in ready_jobs:
                 self._tile_states.pop(job.relative_path, None)
-                for contributor_id, _image in job.contributor_images:
+                for contributor_id, contributor_tile_path in job.contributor_tile_paths:
                     self._contributor_flushed_counts[contributor_id] += 1
+                    stale_tile_paths.append(contributor_tile_path)
             ready_markers.extend(self._collect_ready_markers_locked())
 
+        self._cleanup_contributor_tile_paths(stale_tile_paths)
         self._write_markers(ready_markers)
 
     def _flush_ready_tile(self, job: FinalTileFlushJob) -> None:
@@ -275,8 +307,9 @@ class FinalTileCacheFlushCoordinator:
             if ocean_base is not None:
                 composed_rgba = ocean_base.convert("RGBA")
 
-        for _contributor_id, image in job.contributor_images:
-            source_rgba = image.convert("RGBA")
+        for _contributor_id, contributor_tile_path in job.contributor_tile_paths:
+            with Image.open(contributor_tile_path) as source_image:
+                source_rgba = source_image.convert("RGBA")
             if composed_rgba is None:
                 composed_rgba = source_rgba
             else:
@@ -321,6 +354,20 @@ class FinalTileCacheFlushCoordinator:
     ) -> None:
         for marker_path, contributor_id, tile_relpaths in ready_markers:
             write_tile_cache_marker(marker_path, contributor_id, tile_relpaths)
+
+    def _build_contributor_tile_path(self, contributor_id: str, relative_path: str) -> str:
+        return os.path.join(
+            build_contributor_tile_cache_dir(
+                self._output_path,
+                self._unique_id,
+                contributor_id,
+            ),
+            relative_path,
+        )
+
+    def _cleanup_contributor_tile_paths(self, tile_paths: Iterable[str]) -> None:
+        for tile_path in set(tile_paths):
+            remove_if_exists(tile_path)
 
 
 FINAL_TILE_CACHE_FLUSH_COORDINATORS: dict[str, FinalTileCacheFlushCoordinator] = {}
@@ -1422,7 +1469,7 @@ def configure_final_tile_cache_flush_coordinator(
     prepared_ocean_background: Optional[str] = None,
     contributor_tile_candidates: Optional[dict[str, tuple[str, ...]]] = None,
 ) -> None:
-    """Configure the in-memory flush coordinator for one WebP run."""
+    """Configure the flush coordinator for one WebP run."""
     resolved_tile_candidates = contributor_tile_candidates or {
         work_unit.unit_id: build_work_unit_candidate_tile_relpaths(work_unit, zoom)
         for work_unit in work_units
@@ -1440,8 +1487,12 @@ def configure_final_tile_cache_flush_coordinator(
 
 
 def clear_final_tile_cache_flush_coordinator(unique_id: str) -> None:
-    """Drop the in-memory flush coordinator for a completed or failed run."""
-    FINAL_TILE_CACHE_FLUSH_COORDINATORS.pop(unique_id, None)
+    """Drop the flush coordinator for a completed or failed run."""
+    coordinator = FINAL_TILE_CACHE_FLUSH_COORDINATORS.pop(unique_id, None)
+    if coordinator is not None:
+        cleanup = getattr(coordinator, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
 
 
 def commit_land_raster_to_final_tile_cache(
