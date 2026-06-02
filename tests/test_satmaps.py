@@ -3699,6 +3699,61 @@ def test_commit_land_raster_to_final_tile_cache_streams_tile_images(monkeypatch:
     assert seen_calls == [("31TDF_0_0", ["13/1/2.webp", "13/1/3.webp"])]
 
 
+def test_commit_raster_to_final_tile_cache_streams_tile_images(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    args = argparse.Namespace(
+        max_zoom=13,
+        blocksize=512,
+        resample_alg="bilinear",
+        quality=75,
+    )
+    fake_dataset = object()
+
+    monkeypatch.setattr(
+        "satmaps.tiler.render_raster_to_webp_tile_images",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("expected streamed tile rendering, not eager dict rendering")
+        ),
+    )
+
+    def fake_iter_dataset_webp_tile_images(dataset, zoom, tile_size, resample_alg):
+        assert dataset is fake_dataset
+        assert zoom == 13
+        assert tile_size == 512
+        assert resample_alg == "bilinear"
+        return iter(
+            [
+                ("13/1/3.webp", Image.new("RGB", (8, 8), (40, 50, 60))),
+                ("13/1/2.webp", Image.new("RGB", (8, 8), (10, 20, 30))),
+            ]
+        )
+
+    monkeypatch.setattr("satmaps.tiler.iter_dataset_webp_tile_images", fake_iter_dataset_webp_tile_images)
+
+    relpaths = satmaps.commit_raster_to_final_tile_cache(
+        fake_dataset,
+        "output.pmtiles",
+        "streamraster",
+        "31TDF_0_0",
+        args,
+    )
+
+    assert relpaths == ["13/1/2.webp", "13/1/3.webp"]
+    marker_path = Path(
+        satmaps.build_contributor_complete_marker("output.pmtiles", "streamraster", "31TDF_0_0")
+    )
+    assert marker_path.exists()
+    assert satmaps.read_tile_cache_marker(str(marker_path)) == ("31TDF_0_0", relpaths)
+    for relative_path in relpaths:
+        assert (
+            Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "streamraster")) / relative_path
+        ).exists()
+
+
 def test_final_tile_flush_coordinator_waits_for_all_candidate_contributors(
     monkeypatch: object, tmp_path: Path
 ) -> None:

@@ -122,6 +122,64 @@ def test_merge_mbtiles_merges_all_attached_tile_tables(tmp_path: Path) -> None:
     ]
 
 
+def test_iter_tile_tree_paths_yields_sorted_paths(tmp_path: Path) -> None:
+    root = tmp_path / "tiles"
+    (root / "13" / "10").mkdir(parents=True)
+    (root / "13" / "2").mkdir(parents=True)
+    (root / "13" / "10" / "5.webp").write_bytes(b"a")
+    (root / "13" / "2" / "9.webp").write_bytes(b"b")
+    (root / "13" / "2" / "1.txt").write_text("ignore")
+
+    assert list(tiler_module.iter_tile_tree_paths(str(root))) == [
+        "13/10/5.webp",
+        "13/2/9.webp",
+    ]
+
+
+def test_export_raster_to_webp_tree_streams_tile_images(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    input_path = tmp_path / "input.tif"
+    output_dir = tmp_path / "out"
+    fake_dataset = object()
+
+    monkeypatch.setattr(tiler_module.gdal, "Open", lambda path: fake_dataset if path == str(input_path) else None)
+    monkeypatch.setattr(
+        tiler_module,
+        "render_raster_to_webp_tile_images",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("expected streamed tile rendering, not eager dict rendering")
+        ),
+    )
+
+    def fake_iter_dataset_webp_tile_images(dataset, zoom, tile_size, resample_alg):
+        assert dataset is fake_dataset
+        assert zoom == 13
+        assert tile_size == 512
+        assert resample_alg == "bilinear"
+        return iter(
+            [
+                ("13/1/3.webp", Image.new("RGB", (8, 8), (40, 50, 60))),
+                ("13/1/2.webp", Image.new("RGB", (8, 8), (10, 20, 30))),
+            ]
+        )
+
+    monkeypatch.setattr(tiler_module, "iter_dataset_webp_tile_images", fake_iter_dataset_webp_tile_images)
+
+    written_tiles = tiler_module.export_raster_to_webp_tree(
+        str(input_path),
+        str(output_dir),
+        13,
+        512,
+        90,
+        "bilinear",
+    )
+
+    assert written_tiles == ["13/1/2.webp", "13/1/3.webp"]
+    for relative_path in written_tiles:
+        assert (output_dir / relative_path).exists()
+
+
 def test_apply_soft_knee_numpy_basics() -> None:
     arr = np.array([0.0, 0.2, 0.5, 0.8, 1.0], dtype=np.float32)
     toned = apply_soft_knee_numpy(

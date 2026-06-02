@@ -80,7 +80,6 @@ class FinalTileFlushJob:
 
 @dataclass
 class FinalTileFlushState:
-    pending_contributors: set[str]
     contributor_tile_paths: dict[str, str]
     flushing: bool = False
 
@@ -111,7 +110,9 @@ class FinalTileCacheFlushCoordinator:
             for index, contributor_id in enumerate(self._ordered_contributors)
         }
         normalized_tile_candidates = {
-            contributor_id: tuple(dict.fromkeys(contributor_tile_candidates.get(contributor_id, ())))
+            contributor_id: tuple(
+                dict.fromkeys(contributor_tile_candidates.get(contributor_id, ()))
+            )
             for contributor_id in self._ordered_contributors
         }
         self._contributor_done: set[str] = set()
@@ -125,21 +126,17 @@ class FinalTileCacheFlushCoordinator:
         }
         self._marker_written: set[str] = set()
         self._tile_states: dict[str, FinalTileFlushState] = {}
+        self._tile_pending_counts: dict[str, int] = {}
         self._lock = threading.Lock()
 
         for contributor_id, tile_relpaths in normalized_tile_candidates.items():
             for relative_path in tile_relpaths:
-                tile_state = self._tile_states.setdefault(
-                    relative_path,
-                    FinalTileFlushState(
-                        pending_contributors=set(),
-                        contributor_tile_paths={},
-                    ),
+                self._tile_pending_counts[relative_path] = (
+                    self._tile_pending_counts.get(relative_path, 0) + 1
                 )
-                tile_state.pending_contributors.add(contributor_id)
         self._tile_sibling_counts = {
-            relative_path: len(tile_state.pending_contributors)
-            for relative_path, tile_state in self._tile_states.items()
+            relative_path: count
+            for relative_path, count in self._tile_pending_counts.items()
         }
         self._contributor_tile_candidates = {
             contributor_id: self._sort_tile_relpaths(tile_relpaths)
@@ -149,6 +146,8 @@ class FinalTileCacheFlushCoordinator:
     def cleanup(self) -> None:
         with self._lock:
             self._tile_states.clear()
+            self._tile_pending_counts.clear()
+            self._contributor_tile_candidates.clear()
         shutil.rmtree(
             os.path.join(build_tile_cache_root(self._output_path, self._unique_id), "contributors"),
             ignore_errors=True,
@@ -193,7 +192,6 @@ class FinalTileCacheFlushCoordinator:
                     tile_state = self._tile_states.setdefault(
                         relative_path,
                         FinalTileFlushState(
-                            pending_contributors=set(),
                             contributor_tile_paths={},
                         ),
                     )
@@ -216,22 +214,24 @@ class FinalTileCacheFlushCoordinator:
             self._contributor_done.add(contributor_id)
             self._contributor_actual_tiles[contributor_id] = actual_tiles
 
-            for relative_path in self._ordered_contributor_tile_relpaths(
+            ordered_relpaths = self._ordered_contributor_tile_relpaths(
                 contributor_id,
                 actual_tile_relpaths,
-            ):
-                candidate_tile_state = self._tile_states.get(relative_path)
-                if candidate_tile_state is None:
-                    continue
-                candidate_tile_state.pending_contributors.discard(contributor_id)
-                if (
-                    not candidate_tile_state.pending_contributors
-                    and not candidate_tile_state.flushing
-                ):
-                    candidate_tile_state.flushing = True
-                    ready_jobs.append(
-                        self._build_flush_job(relative_path, candidate_tile_state)
+            )
+            self._contributor_tile_candidates.pop(contributor_id, None)
+            for relative_path in ordered_relpaths:
+                remaining_candidates = self._decrement_pending_count_locked(relative_path)
+                tile_state = self._tile_states.get(relative_path)
+                if tile_state is None:
+                    if remaining_candidates > 0:
+                        continue
+                    tile_state = self._tile_states.setdefault(
+                        relative_path,
+                        FinalTileFlushState(contributor_tile_paths={}),
                     )
+                if remaining_candidates <= 0 and not tile_state.flushing:
+                    tile_state.flushing = True
+                    ready_jobs.append(self._build_flush_job(relative_path, tile_state))
 
             ready_markers.extend(self._collect_ready_markers_locked())
 
@@ -250,18 +250,27 @@ class FinalTileCacheFlushCoordinator:
         ready_jobs: list[FinalTileFlushJob] = []
         ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
         with self._lock:
-            for relative_path in self._ordered_contributor_tile_relpaths(
+            ordered_relpaths = self._ordered_contributor_tile_relpaths(
                 contributor_id,
                 impacted_tile_relpaths,
-            ):
+            )
+            self._contributor_tile_candidates.pop(contributor_id, None)
+            for relative_path in ordered_relpaths:
                 tile_state = self._tile_states.get(relative_path)
-                if tile_state is None:
-                    continue
-                stale_tile_path = tile_state.contributor_tile_paths.pop(contributor_id, None)
+                stale_tile_path = None
+                if tile_state is not None:
+                    stale_tile_path = tile_state.contributor_tile_paths.pop(contributor_id, None)
                 if stale_tile_path is not None:
                     stale_tile_paths.append(stale_tile_path)
-                tile_state.pending_contributors.discard(contributor_id)
-                if not tile_state.pending_contributors and not tile_state.flushing:
+                remaining_candidates = self._decrement_pending_count_locked(relative_path)
+                if tile_state is None:
+                    if remaining_candidates > 0:
+                        continue
+                    tile_state = self._tile_states.setdefault(
+                        relative_path,
+                        FinalTileFlushState(contributor_tile_paths={}),
+                    )
+                if remaining_candidates <= 0 and not tile_state.flushing:
                     tile_state.flushing = True
                     ready_jobs.append(self._build_flush_job(relative_path, tile_state))
             ready_markers.extend(self._collect_ready_markers_locked())
@@ -409,6 +418,17 @@ class FinalTileCacheFlushCoordinator:
     def _cleanup_contributor_tile_paths(self, tile_paths: Iterable[str]) -> None:
         for tile_path in set(tile_paths):
             remove_if_exists(tile_path)
+
+    def _decrement_pending_count_locked(self, relative_path: str) -> int:
+        remaining = self._tile_pending_counts.get(relative_path)
+        if remaining is None:
+            return 0
+        if remaining <= 1:
+            self._tile_pending_counts.pop(relative_path, None)
+            return 0
+        remaining -= 1
+        self._tile_pending_counts[relative_path] = remaining
+        return remaining
 
 
 FINAL_TILE_CACHE_FLUSH_COORDINATORS: dict[str, FinalTileCacheFlushCoordinator] = {}
@@ -1287,29 +1307,55 @@ def commit_raster_to_final_tile_cache(
     """Render and write one contributor directly into the shared final WebP tree."""
     final_tile_tree = build_final_tile_cache_dir(output_path, unique_id)
     marker_path = build_contributor_complete_marker(output_path, unique_id, contributor_id)
-    tile_images = tiler.render_raster_to_webp_tile_images(
-        input_raster,
-        args.max_zoom,
-        args.blocksize,
-        args.resample_alg,
-    )
-    tile_relpaths = sorted(tile_images)
-    for relative_path in tile_relpaths:
-        destination_path = os.path.join(final_tile_tree, relative_path)
-        final_image = tile_images[relative_path]
-        if file_has_content(destination_path):
-            with Image.open(destination_path) as destination_image:
-                destination_rgba = destination_image.convert("RGBA")
-            source_rgba = final_image.convert("RGBA")
-            if source_under_existing:
-                composed = Image.alpha_composite(source_rgba, destination_rgba)
-            else:
-                composed = Image.alpha_composite(destination_rgba, source_rgba)
-            if composed.getchannel("A").getextrema() == (255, 255):
-                final_image = composed.convert("RGB")
-            else:
-                final_image = composed
-        tiler.save_webp_image(final_image, destination_path, args.quality, lossless=False)
+    close_dataset = False
+    if isinstance(input_raster, str):
+        dataset = gdal.Open(input_raster)
+        close_dataset = True
+        if dataset is None:
+            raise RuntimeError(f"Could not open raster for tile rendering: {input_raster}")
+    else:
+        dataset = input_raster
+
+    tile_relpaths: list[str] = []
+    try:
+        for relative_path, tile_image in tiler.iter_dataset_webp_tile_images(
+            dataset,
+            args.max_zoom,
+            args.blocksize,
+            args.resample_alg,
+        ):
+            tile_relpaths.append(relative_path)
+            destination_path = os.path.join(final_tile_tree, relative_path)
+            final_image: Image.Image = tile_image
+            derived_images: list[Image.Image] = []
+            try:
+                if file_has_content(destination_path):
+                    with Image.open(destination_path) as destination_image:
+                        destination_rgba = destination_image.convert("RGBA")
+                    derived_images.append(destination_rgba)
+                    source_rgba = tile_image.convert("RGBA")
+                    derived_images.append(source_rgba)
+                    if source_under_existing:
+                        composed = Image.alpha_composite(source_rgba, destination_rgba)
+                    else:
+                        composed = Image.alpha_composite(destination_rgba, source_rgba)
+                    derived_images.append(composed)
+                    if composed.getchannel("A").getextrema() == (255, 255):
+                        final_image = composed.convert("RGB")
+                        derived_images.append(final_image)
+                    else:
+                        final_image = composed
+                tiler.save_webp_image(final_image, destination_path, args.quality, lossless=False)
+            finally:
+                tile_image.close()
+                for image in reversed(derived_images):
+                    if image is not tile_image:
+                        image.close()
+    finally:
+        if close_dataset:
+            dataset = None
+
+    tile_relpaths.sort()
     write_tile_cache_marker(marker_path, contributor_id, tile_relpaths)
     return tile_relpaths
 
@@ -3269,7 +3315,7 @@ def main() -> None:
             print(f"Backfilled {backfilled_ocean_tiles} ocean-only tile(s).")
 
     final_tile_tree = build_final_tile_cache_dir(args.output, unique_id)
-    final_tile_count = len(tiler.iter_tile_tree_paths(final_tile_tree))
+    final_tile_count = sum(1 for _ in tiler.iter_tile_tree_paths(final_tile_tree))
     if final_tile_count <= 0:
         print("Error: No max-zoom tiles were generated.")
         sys.exit(1)

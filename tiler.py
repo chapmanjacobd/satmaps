@@ -719,18 +719,28 @@ def export_raster_to_webp_tree(
     lossless: bool = False,
 ) -> List[str]:
     """Render a Web Mercator raster into max-zoom z/x/y.webp tiles."""
-    tile_images = render_raster_to_webp_tile_images(
-        input_raster,
-        zoom,
-        tile_size,
-        resample_alg,
-    )
+    dataset = gdal.Open(input_raster)
+    if dataset is None:
+        raise RuntimeError(f"Could not open raster for tile rendering: {input_raster}")
+
     written_tiles: List[str] = []
-    for relative_path, image in sorted(tile_images.items()):
-        output_path = os.path.join(output_dir, relative_path)
-        save_webp_image(image, output_path, quality, lossless=lossless)
-        written_tiles.append(relative_path)
-    return written_tiles
+    try:
+        for relative_path, image in iter_dataset_webp_tile_images(
+            dataset,
+            zoom,
+            tile_size,
+            resample_alg,
+        ):
+            try:
+                output_path = os.path.join(output_dir, relative_path)
+                save_webp_image(image, output_path, quality, lossless=lossless)
+                written_tiles.append(relative_path)
+            finally:
+                image.close()
+        written_tiles.sort()
+        return written_tiles
+    finally:
+        dataset = None
 
 
 def iter_raster_tile_relpaths(input_raster: str, zoom: int) -> List[str]:
@@ -875,18 +885,16 @@ def publish_staged_webp_tree_commit(
     return published_count
 
 
-def iter_tile_tree_paths(root_dir: str) -> List[str]:
-    """Return all z/x/y.webp paths relative to a tile tree root."""
-    relative_paths: List[str] = []
+def iter_tile_tree_paths(root_dir: str) -> Iterator[str]:
+    """Yield z/x/y.webp paths relative to a tile tree root in deterministic order."""
     if not os.path.isdir(root_dir):
-        return relative_paths
-    for current_root, _, filenames in os.walk(root_dir):
-        for filename in filenames:
+        return
+    for current_root, dirnames, filenames in os.walk(root_dir):
+        dirnames.sort()
+        for filename in sorted(filenames):
             if filename.endswith(".webp"):
                 absolute_path = os.path.join(current_root, filename)
-                relative_paths.append(os.path.relpath(absolute_path, root_dir))
-    relative_paths.sort()
-    return relative_paths
+                yield os.path.relpath(absolute_path, root_dir)
 
 
 def merge_webp_trees(
