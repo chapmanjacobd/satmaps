@@ -745,7 +745,7 @@ def test_open_gebco_mask_avoids_update_mode_warning(tmp_path: Path) -> None:
     assert not any("creation ignored in update mode" in message.lower() for message in messages)
 
 
-def test_open_gebco_mask_warps_alpha_band_directly(monkeypatch: object) -> None:
+def test_open_gebco_mask_crops_aligned_alpha_band_without_warp(monkeypatch: object) -> None:
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(32631)
     gebco_ds = gdal.GetDriverByName("MEM").Create("", 4, 3, 4, gdal.GDT_Byte)
@@ -754,18 +754,22 @@ def test_open_gebco_mask_warps_alpha_band_directly(monkeypatch: object) -> None:
     gebco_ds.SetProjection(srs.ExportToWkt())
     gebco_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
 
-    warp_options_calls: list[dict[str, object]] = []
-    warped_mask_ds = gdal.GetDriverByName("MEM").Create("", 4, 3, 1, gdal.GDT_Float32)
-    assert warped_mask_ds is not None
+    translate_options_calls: list[dict[str, object]] = []
+    translated_mask_ds = gdal.GetDriverByName("MEM").Create("", 4, 3, 1, gdal.GDT_Float32)
+    assert translated_mask_ds is not None
 
     monkeypatch.setattr("satmaps.gdal.Open", lambda path: gebco_ds)
     monkeypatch.setattr(
-        "satmaps.gdal.WarpOptions",
-        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+        "satmaps.gdal.TranslateOptions",
+        lambda **kwargs: translate_options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        "satmaps.gdal.Translate",
+        lambda destination, source, options=None: translated_mask_ds,
     )
     monkeypatch.setattr(
         "satmaps.gdal.Warp",
-        lambda destination, source, options=None: warped_mask_ds,
+        lambda destination, source, options=None: (_ for _ in ()).throw(AssertionError("unexpected warp")),
     )
 
     tile_grid = satmaps.TileGrid(
@@ -777,7 +781,62 @@ def test_open_gebco_mask_warps_alpha_band_directly(monkeypatch: object) -> None:
     mask = satmaps.open_gebco_mask("gebco.tif", tile_grid, "31TDF_0_0")
 
     assert mask is not None
-    assert warp_options_calls[0]["srcBands"] == [4]
+    assert translate_options_calls[0]["srcWin"] == (0, 0, 4, 3)
+    assert translate_options_calls[0]["bandList"] == [4]
+    assert translate_options_calls[0]["outputType"] == gdal.GDT_Float32
+
+
+def test_open_gebco_mask_crops_source_before_warp(monkeypatch: object) -> None:
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    gebco_ds = gdal.GetDriverByName("MEM").Create("", 16, 16, 4, gdal.GDT_Byte)
+    assert gebco_ds is not None
+    gebco_ds.SetGeoTransform((0.0, 100.0, 0.0, 1600.0, 0.0, -100.0))
+    gebco_ds.SetProjection(srs.ExportToWkt())
+    gebco_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+
+    translate_options_calls: list[dict[str, object]] = []
+    warp_options_calls: list[dict[str, object]] = []
+    cropped_mask_ds = gdal.GetDriverByName("MEM").Create("", 6, 8, 1, gdal.GDT_Float32)
+    assert cropped_mask_ds is not None
+    warped_mask_ds = gdal.GetDriverByName("MEM").Create("", 4, 3, 1, gdal.GDT_Float32)
+    assert warped_mask_ds is not None
+
+    monkeypatch.setattr("satmaps.gdal.Open", lambda path: gebco_ds)
+    monkeypatch.setattr("satmaps.get_aligned_tile_grid_src_win", lambda dataset, tile_grid: None)
+    monkeypatch.setattr(
+        "satmaps.get_tile_grid_source_src_win",
+        lambda dataset, tile_grid, halo_pixels=0: (2, 3, 6, 8),
+    )
+    monkeypatch.setattr(
+        "satmaps.gdal.TranslateOptions",
+        lambda **kwargs: translate_options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        "satmaps.gdal.Translate",
+        lambda destination, source, options=None: cropped_mask_ds,
+    )
+    monkeypatch.setattr(
+        "satmaps.gdal.WarpOptions",
+        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        "satmaps.gdal.Warp",
+        lambda destination, source, options=None: warped_mask_ds,
+    )
+
+    tile_grid = satmaps.TileGrid(
+        projection=srs.ExportToWkt(),
+        geotransform=(200.0, 100.0, 0.0, 1300.0, 0.0, -100.0),
+        width=4,
+        height=3,
+    )
+    mask = satmaps.open_gebco_mask("gebco.tif", tile_grid, "31TDF_0_0")
+
+    assert mask is not None
+    assert translate_options_calls[0]["srcWin"] == (2, 3, 6, 8)
+    assert translate_options_calls[0]["bandList"] == [4]
+    assert warp_options_calls[0]["srcBands"] == [1]
     assert warp_options_calls[0]["srcAlpha"] is False
     assert warp_options_calls[0]["multithread"] is True
     assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
@@ -3758,6 +3817,40 @@ def test_configure_final_tile_cache_flush_coordinator_uses_precomputed_candidate
         zoom=13,
         contributor_tile_candidates={"31TDF_0_0": ("13/1/2.webp",)},
     )
+
+    satmaps.clear_final_tile_cache_flush_coordinator(unique_id)
+
+
+def test_configure_final_tile_cache_flush_coordinator_prioritizes_lower_sibling_tiles() -> None:
+    unique_id = "prioritized"
+    work_units = (
+        satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
+        satmaps.LandWorkUnit("31TDF_0_1", ("31TDF_0_1",)),
+        satmaps.LandWorkUnit("31TDF_1_0", ("31TDF_1_0",)),
+    )
+    satmaps.configure_final_tile_cache_flush_coordinator(
+        "output.pmtiles",
+        unique_id,
+        work_units,
+        quality=100,
+        zoom=13,
+        contributor_tile_candidates={
+            "31TDF_0_0": ("13/1/1.webp", "13/9/9.webp"),
+            "31TDF_0_1": ("13/2/2.webp", "13/9/9.webp"),
+            "31TDF_1_0": ("13/9/9.webp",),
+        },
+    )
+
+    coordinator = satmaps.FINAL_TILE_CACHE_FLUSH_COORDINATORS[unique_id]
+    assert coordinator._contributor_tile_candidates["31TDF_0_0"] == (
+        "13/1/1.webp",
+        "13/9/9.webp",
+    )
+    assert coordinator._contributor_tile_candidates["31TDF_0_1"] == (
+        "13/2/2.webp",
+        "13/9/9.webp",
+    )
+    assert coordinator._tile_sibling_counts["13/9/9.webp"] == 3
 
     satmaps.clear_final_tile_cache_flush_coordinator(unique_id)
 

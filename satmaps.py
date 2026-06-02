@@ -47,6 +47,7 @@ SENTINEL_NODATA = -32768
 PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
 OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
+OCEAN_MASK_SOURCE_CROP_HALO_PIXELS = 2
 DEFAULT_PREFETCH_IF_LAND = 100.0
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
 MGRS_TILE_SIZE_METERS = 100_000.0
@@ -74,6 +75,7 @@ class LandProcessingPlan:
 class FinalTileFlushJob:
     relative_path: str
     contributor_tile_paths: tuple[tuple[str, str], ...]
+    sibling_count: int
 
 
 @dataclass
@@ -108,7 +110,10 @@ class FinalTileCacheFlushCoordinator:
             contributor_id: index
             for index, contributor_id in enumerate(self._ordered_contributors)
         }
-        self._contributor_tile_candidates = contributor_tile_candidates
+        normalized_tile_candidates = {
+            contributor_id: tuple(dict.fromkeys(contributor_tile_candidates.get(contributor_id, ())))
+            for contributor_id in self._ordered_contributors
+        }
         self._contributor_done: set[str] = set()
         self._contributor_actual_tiles: dict[str, tuple[str, ...]] = {
             contributor_id: ()
@@ -122,7 +127,7 @@ class FinalTileCacheFlushCoordinator:
         self._tile_states: dict[str, FinalTileFlushState] = {}
         self._lock = threading.Lock()
 
-        for contributor_id, tile_relpaths in contributor_tile_candidates.items():
+        for contributor_id, tile_relpaths in normalized_tile_candidates.items():
             for relative_path in tile_relpaths:
                 tile_state = self._tile_states.setdefault(
                     relative_path,
@@ -132,6 +137,14 @@ class FinalTileCacheFlushCoordinator:
                     ),
                 )
                 tile_state.pending_contributors.add(contributor_id)
+        self._tile_sibling_counts = {
+            relative_path: len(tile_state.pending_contributors)
+            for relative_path, tile_state in self._tile_states.items()
+        }
+        self._contributor_tile_candidates = {
+            contributor_id: self._sort_tile_relpaths(tile_relpaths)
+            for contributor_id, tile_relpaths in normalized_tile_candidates.items()
+        }
 
     def cleanup(self) -> None:
         with self._lock:
@@ -203,8 +216,9 @@ class FinalTileCacheFlushCoordinator:
             self._contributor_done.add(contributor_id)
             self._contributor_actual_tiles[contributor_id] = actual_tiles
 
-            for relative_path in set(self._contributor_tile_candidates.get(contributor_id, ())).union(
-                actual_tile_relpaths
+            for relative_path in self._ordered_contributor_tile_relpaths(
+                contributor_id,
+                actual_tile_relpaths,
             ):
                 candidate_tile_state = self._tile_states.get(relative_path)
                 if candidate_tile_state is None:
@@ -236,7 +250,10 @@ class FinalTileCacheFlushCoordinator:
         ready_jobs: list[FinalTileFlushJob] = []
         ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
         with self._lock:
-            for relative_path in impacted_tile_relpaths:
+            for relative_path in self._ordered_contributor_tile_relpaths(
+                contributor_id,
+                impacted_tile_relpaths,
+            ):
                 tile_state = self._tile_states.get(relative_path)
                 if tile_state is None:
                     continue
@@ -266,13 +283,14 @@ class FinalTileCacheFlushCoordinator:
         return FinalTileFlushJob(
             relative_path=relative_path,
             contributor_tile_paths=ordered_tile_paths,
+            sibling_count=self._tile_sibling_counts.get(relative_path, len(ordered_tile_paths)),
         )
 
     def _flush_ready_tiles(self, ready_jobs: Sequence[FinalTileFlushJob]) -> None:
         if not ready_jobs:
             return
 
-        for job in ready_jobs:
+        for job in sorted(ready_jobs, key=lambda ready_job: (ready_job.sibling_count, ready_job.relative_path)):
             self._flush_ready_tile(job)
 
         ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
@@ -364,6 +382,29 @@ class FinalTileCacheFlushCoordinator:
             ),
             relative_path,
         )
+
+    def _sort_tile_relpaths(self, tile_relpaths: Sequence[str]) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                tile_relpaths,
+                key=lambda relative_path: (
+                    self._tile_sibling_counts.get(relative_path, 0),
+                    relative_path,
+                ),
+            )
+        )
+
+    def _ordered_contributor_tile_relpaths(
+        self,
+        contributor_id: str,
+        tile_relpaths: Iterable[str],
+    ) -> tuple[str, ...]:
+        ordered_relpaths = list(self._contributor_tile_candidates.get(contributor_id, ()))
+        seen_relpaths = set(ordered_relpaths)
+        extras = self._sort_tile_relpaths(
+            tuple(relative_path for relative_path in tile_relpaths if relative_path not in seen_relpaths)
+        )
+        return tuple(ordered_relpaths + list(extras))
 
     def _cleanup_contributor_tile_paths(self, tile_paths: Iterable[str]) -> None:
         for tile_path in set(tile_paths):
@@ -938,6 +979,40 @@ def build_bbox_geometry(
         dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
     if not (dataset_srs.IsSameGeogCS(wgs84_srs) and dataset_srs.IsGeographic()):
         polygon.Transform(osr.CoordinateTransformation(wgs84_srs, dataset_srs))
+
+    return polygon
+
+
+def build_tile_grid_geometry(
+    tile_grid: TileGrid,
+    target_srs: Optional[osr.SpatialReference] = None,
+) -> ogr.Geometry:
+    """Build a tile-grid polygon geometry, reprojecting it when a target SRS is supplied."""
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    corners = (
+        (0.0, 0.0),
+        (float(tile_grid.width), 0.0),
+        (float(tile_grid.width), float(tile_grid.height)),
+        (0.0, float(tile_grid.height)),
+        (0.0, 0.0),
+    )
+    for pixel_x, pixel_y in corners:
+        x_coord, y_coord = gdal.ApplyGeoTransform(tile_grid.geotransform, pixel_x, pixel_y)
+        ring.AddPoint(float(x_coord), float(y_coord))
+    polygon = ogr.Geometry(ogr.wkbPolygon)
+    polygon.AddGeometry(ring)
+
+    if target_srs is None:
+        return polygon
+
+    tile_grid_srs = osr.SpatialReference()
+    tile_grid_srs.ImportFromWkt(tile_grid.projection)
+    dataset_srs = target_srs.Clone()
+    if hasattr(tile_grid_srs, "SetAxisMappingStrategy"):
+        tile_grid_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    if not dataset_srs.IsSame(tile_grid_srs):
+        polygon.Transform(osr.CoordinateTransformation(tile_grid_srs, dataset_srs))
 
     return polygon
 
@@ -1648,23 +1723,42 @@ def get_aligned_web_mercator_src_win(
     pixel_size: float,
 ) -> Optional[Tuple[int, int, int, int]]:
     """Return a direct crop window when a source raster already matches the requested 3857 grid."""
+    web_mercator_srs = osr.SpatialReference()
+    web_mercator_srs.ImportFromEPSG(3857)
+    return get_aligned_dataset_src_win(
+        dataset,
+        target_bounds,
+        web_mercator_srs,
+        pixel_width=pixel_size,
+        pixel_height=pixel_size,
+    )
+
+
+def get_aligned_dataset_src_win(
+    dataset: gdal.Dataset,
+    target_bounds: Tuple[float, float, float, float],
+    target_srs: osr.SpatialReference,
+    *,
+    pixel_width: float,
+    pixel_height: float,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Return a direct crop window when a source raster already matches the requested grid."""
     dataset_srs = dataset.GetSpatialRef()
     if dataset_srs is None:
         return None
 
     dataset_srs = dataset_srs.Clone()
-    web_mercator_srs = osr.SpatialReference()
-    web_mercator_srs.ImportFromEPSG(3857)
-    if hasattr(web_mercator_srs, "SetAxisMappingStrategy"):
-        web_mercator_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    resolved_target_srs = target_srs.Clone()
+    if hasattr(resolved_target_srs, "SetAxisMappingStrategy"):
+        resolved_target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
         dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    if not dataset_srs.IsSame(web_mercator_srs):
+    if not dataset_srs.IsSame(resolved_target_srs):
         return None
 
     gt = dataset.GetGeoTransform()
     if abs(gt[2]) > 1e-9 or abs(gt[4]) > 1e-9:
         return None
-    if abs(gt[1] - pixel_size) > 1e-9 or abs(abs(gt[5]) - pixel_size) > 1e-9:
+    if abs(gt[1] - pixel_width) > 1e-9 or abs(abs(gt[5]) - pixel_height) > 1e-9:
         return None
 
     src_win = tiler.te_to_src_win(dataset, target_bounds)
@@ -1681,6 +1775,56 @@ def get_aligned_web_mercator_src_win(
         return None
 
     return src_win
+
+
+def get_aligned_tile_grid_src_win(
+    dataset: gdal.Dataset,
+    tile_grid: TileGrid,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Return a direct crop window when a source raster already matches the tile grid."""
+    tile_grid_srs = osr.SpatialReference()
+    tile_grid_srs.ImportFromWkt(tile_grid.projection)
+    target_geometry = build_tile_grid_geometry(tile_grid)
+    min_x, max_x, min_y, max_y = target_geometry.GetEnvelope()
+    return get_aligned_dataset_src_win(
+        dataset,
+        (min_x, min_y, max_x, max_y),
+        tile_grid_srs,
+        pixel_width=abs(tile_grid.geotransform[1]),
+        pixel_height=abs(tile_grid.geotransform[5]),
+    )
+
+
+def get_tile_grid_source_src_win(
+    dataset: gdal.Dataset,
+    tile_grid: TileGrid,
+    *,
+    halo_pixels: int = 0,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Return the source window covering a tile grid, optionally expanded by a halo."""
+    dataset_srs = dataset.GetSpatialRef()
+    if dataset_srs is None:
+        return None
+
+    gt = dataset.GetGeoTransform()
+    if abs(gt[2]) > 1e-9 or abs(gt[4]) > 1e-9:
+        return None
+
+    target_geometry = build_tile_grid_geometry(tile_grid, dataset_srs)
+    if target_geometry.IsEmpty():
+        return None
+    min_x, max_x, min_y, max_y = target_geometry.GetEnvelope()
+    src_win = tiler.te_to_src_win(dataset, (min_x, min_y, max_x, max_y))
+    if src_win[2] <= 0 or src_win[3] <= 0:
+        return None
+    if halo_pixels <= 0:
+        return src_win
+
+    xoff = max(0, src_win[0] - halo_pixels)
+    yoff = max(0, src_win[1] - halo_pixels)
+    xend = min(dataset.RasterXSize, src_win[0] + src_win[2] + halo_pixels)
+    yend = min(dataset.RasterYSize, src_win[1] + src_win[3] + halo_pixels)
+    return xoff, yoff, max(0, xend - xoff), max(0, yend - yoff)
 
 
 def populate_s3_cache(date_paths: List[str]) -> None:
@@ -1851,8 +1995,52 @@ def open_gebco_mask(
         if band_index is None:
             raise RuntimeError(f"Could not find a usable mask band in: {gebco_src}")
 
+        cropped_mask_ds: Optional[gdal.Dataset] = None
         try:
             mask_nodata = -1.0
+            aligned_src_win = get_aligned_tile_grid_src_win(gebco_ds, tile_grid)
+            if aligned_src_win is not None:
+                translated_mask_ds = gdal.Translate(
+                    "",
+                    gebco_ds,
+                    options=gdal.TranslateOptions(
+                        format="MEM",
+                        srcWin=aligned_src_win,
+                        bandList=[band_index],
+                        outputType=gdal.GDT_Float32,
+                    ),
+                )
+                if translated_mask_ds is None:
+                    raise RuntimeError(f"Could not crop aligned GEBCO mask for {mgrs_subtile}")
+                translated_mask_ds.GetRasterBand(1).SetNoDataValue(mask_nodata)
+                return OceanMaskWarp(
+                    alpha_band=translated_mask_ds.GetRasterBand(1),
+                    dataset=translated_mask_ds,
+                )
+
+            cropped_src_win = get_tile_grid_source_src_win(
+                gebco_ds,
+                tile_grid,
+                halo_pixels=OCEAN_MASK_SOURCE_CROP_HALO_PIXELS,
+            )
+            warp_source: gdal.Dataset | str = gebco_ds
+            warp_band_index = band_index
+            if cropped_src_win is not None:
+                cropped_mask_ds = gdal.Translate(
+                    "",
+                    gebco_ds,
+                    options=gdal.TranslateOptions(
+                        format="MEM",
+                        srcWin=cropped_src_win,
+                        bandList=[band_index],
+                        outputType=gdal.GDT_Float32,
+                    ),
+                )
+                if cropped_mask_ds is None:
+                    raise RuntimeError(f"Could not crop GEBCO mask source for {mgrs_subtile}")
+                warp_source = cropped_mask_ds
+                warp_band_index = 1
+
             min_x = tile_grid.geotransform[0]
             max_y = tile_grid.geotransform[3]
             max_x = min_x + tile_grid.geotransform[1] * tile_grid.width
@@ -1860,7 +2048,7 @@ def open_gebco_mask(
 
             warped_mask_ds = gdal.Warp(
                 "",
-                gebco_ds,
+                warp_source,
                 options=gdal.WarpOptions(
                     format="MEM",
                     dstSRS=tile_grid.projection,
@@ -1868,7 +2056,7 @@ def open_gebco_mask(
                     width=tile_grid.width,
                     height=tile_grid.height,
                     resampleAlg="bilinear",
-                    srcBands=[band_index],
+                    srcBands=[warp_band_index],
                     srcAlpha=False,
                     dstNodata=mask_nodata,
                     workingType=gdal.GDT_Float32,
@@ -1881,6 +2069,7 @@ def open_gebco_mask(
                 raise RuntimeError(f"Could not warp GEBCO mask for {mgrs_subtile}")
             warped_mask_ds.GetRasterBand(1).SetNoDataValue(mask_nodata)
         finally:
+            cropped_mask_ds = None
             gebco_ds = None
 
         return OceanMaskWarp(
