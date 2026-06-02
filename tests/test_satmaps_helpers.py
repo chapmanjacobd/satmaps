@@ -24,7 +24,6 @@ from satmaps import (
     format_progress,
     get_ocean_mask_band_index,
     iter_processing_windows,
-    open_date_band_sets,
     parse_bbox,
     restore_resume_state,
 )
@@ -894,28 +893,3 @@ def test_build_alpha_block_preserves_ocean_alpha_gradient() -> None:
         ),
         np.array([[0, 55, 255]], dtype=np.uint8),
     )
-
-
-def test_open_date_band_sets_raises_clear_error_when_dataset_open_fails(
-    monkeypatch: object,
-) -> None:
-    monkeypatch.setattr(
-        "satmaps.get_tile_paths",
-        lambda folder_name, date_path, cache_dir, download=False: {
-            "red": "/tmp/red.tif",
-            "green": "/tmp/green.tif",
-            "blue": "/tmp/blue.tif",
-        },
-    )
-
-    def fake_open(path: str):
-        if path == "/tmp/green.tif":
-            return None
-        dataset = gdal.GetDriverByName("MEM").Create("", 1, 1, 1, gdal.GDT_Byte)
-        assert dataset is not None
-        return dataset
-
-    monkeypatch.setattr("satmaps.gdal.Open", fake_open)
-
-    with pytest.raises(RuntimeError, match="Could not open green band B03"):
-        open_date_band_sets([("folder", "2025/07/01")], ".cache")

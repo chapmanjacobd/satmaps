@@ -3,7 +3,6 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -11,7 +10,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, cast
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, cast
 
 import mgrs
 from mgrs import core as mgrs_core
@@ -95,369 +94,6 @@ class LandOutputRenderStats:
     skipped_tiles: int
 
 
-@dataclass(frozen=True)
-class FinalTileFlushJob:
-    relative_path: str
-    contributor_tile_paths: tuple[tuple[str, str], ...]
-    sibling_count: int
-
-
-@dataclass
-class FinalTileFlushState:
-    contributor_tile_paths: dict[str, str]
-    flushing: bool = False
-
-
-class FinalTileCacheFlushCoordinator:
-    """Flush max-zoom WebP tiles only after every candidate land contributor is done."""
-
-    def __init__(
-        self,
-        output_path: str,
-        unique_id: str,
-        ordered_contributors: Sequence[str],
-        contributor_tile_candidates: dict[str, tuple[str, ...]],
-        quality: int,
-        tile_size: int = 512,
-        resample_alg: str = "lanczos",
-        prepared_ocean_background: Optional[str] = None,
-    ) -> None:
-        self._output_path = output_path
-        self._unique_id = unique_id
-        self._quality = quality
-        self._tile_size = tile_size
-        self._resample_alg = resample_alg
-        self._prepared_ocean_background = prepared_ocean_background
-        self._ordered_contributors = tuple(ordered_contributors)
-        self._positions = {
-            contributor_id: index
-            for index, contributor_id in enumerate(self._ordered_contributors)
-        }
-        normalized_tile_candidates = {
-            contributor_id: tuple(
-                dict.fromkeys(contributor_tile_candidates.get(contributor_id, ()))
-            )
-            for contributor_id in self._ordered_contributors
-        }
-        self._contributor_done: set[str] = set()
-        self._contributor_actual_tiles: dict[str, tuple[str, ...]] = {
-            contributor_id: ()
-            for contributor_id in self._ordered_contributors
-        }
-        self._contributor_flushed_counts: dict[str, int] = {
-            contributor_id: 0
-            for contributor_id in self._ordered_contributors
-        }
-        self._marker_written: set[str] = set()
-        self._tile_states: dict[str, FinalTileFlushState] = {}
-        self._tile_pending_counts: dict[str, int] = {}
-        self._lock = threading.Lock()
-
-        for contributor_id, tile_relpaths in normalized_tile_candidates.items():
-            for relative_path in tile_relpaths:
-                self._tile_pending_counts[relative_path] = (
-                    self._tile_pending_counts.get(relative_path, 0) + 1
-                )
-        self._tile_sibling_counts = {
-            relative_path: count
-            for relative_path, count in self._tile_pending_counts.items()
-        }
-        self._contributor_tile_candidates = {
-            contributor_id: self._sort_tile_relpaths(tile_relpaths)
-            for contributor_id, tile_relpaths in normalized_tile_candidates.items()
-        }
-
-    def cleanup(self) -> None:
-        with self._lock:
-            self._tile_states.clear()
-            self._tile_pending_counts.clear()
-            self._contributor_tile_candidates.clear()
-        shutil.rmtree(
-            os.path.join(build_tile_cache_root(self._output_path, self._unique_id), "contributors"),
-            ignore_errors=True,
-        )
-
-    def record_contributor_completion(
-        self,
-        contributor_id: str,
-        tile_images: dict[str, Image.Image],
-    ) -> list[str]:
-        """Store contributor tiles and flush any final tiles that are now ready."""
-        return self.record_contributor_tiles(contributor_id, iter(tile_images.items()))
-
-    def record_contributor_tiles(
-        self,
-        contributor_id: str,
-        tile_images: Iterator[tuple[str, Image.Image]],
-    ) -> list[str]:
-        """Stream contributor tiles into the coordinator and flush any final tiles now ready."""
-        if contributor_id not in self._positions:
-            raise RuntimeError(f"Unknown final tile contributor: {contributor_id}")
-
-        actual_tile_relpaths: set[str] = set()
-        try:
-            for relative_path, image in tile_images:
-                try:
-                    contributor_tile_path = self._build_contributor_tile_path(
-                        contributor_id,
-                        relative_path,
-                    )
-                    tiler.save_webp_image(
-                        image,
-                        contributor_tile_path,
-                        self._quality,
-                        lossless=True,
-                    )
-                finally:
-                    image.close()
-
-                actual_tile_relpaths.add(relative_path)
-                with self._lock:
-                    tile_state = self._tile_states.setdefault(
-                        relative_path,
-                        FinalTileFlushState(
-                            contributor_tile_paths={},
-                        ),
-                    )
-                    tile_state.contributor_tile_paths[contributor_id] = contributor_tile_path
-        except Exception:
-            self._discard_contributor_tiles(contributor_id, actual_tile_relpaths)
-            raise
-
-        return self._finish_contributor(contributor_id, actual_tile_relpaths)
-
-    def _finish_contributor(
-        self,
-        contributor_id: str,
-        actual_tile_relpaths: set[str],
-    ) -> list[str]:
-        ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
-        ready_jobs: list[FinalTileFlushJob] = []
-        actual_tiles = tuple(sorted(actual_tile_relpaths))
-        with self._lock:
-            self._contributor_done.add(contributor_id)
-            self._contributor_actual_tiles[contributor_id] = actual_tiles
-
-            ordered_relpaths = self._ordered_contributor_tile_relpaths(
-                contributor_id,
-                actual_tile_relpaths,
-            )
-            self._contributor_tile_candidates.pop(contributor_id, None)
-            for relative_path in ordered_relpaths:
-                remaining_candidates = self._decrement_pending_count_locked(relative_path)
-                tile_state = self._tile_states.get(relative_path)
-                if tile_state is None:
-                    if remaining_candidates > 0:
-                        continue
-                    tile_state = self._tile_states.setdefault(
-                        relative_path,
-                        FinalTileFlushState(contributor_tile_paths={}),
-                    )
-                if remaining_candidates <= 0 and not tile_state.flushing:
-                    tile_state.flushing = True
-                    ready_jobs.append(self._build_flush_job(relative_path, tile_state))
-
-            ready_markers.extend(self._collect_ready_markers_locked())
-
-        self._write_markers(ready_markers)
-        self._flush_ready_tiles(ready_jobs)
-        return list(actual_tiles)
-
-    def _discard_contributor_tiles(
-        self,
-        contributor_id: str,
-        actual_tile_relpaths: set[str],
-    ) -> None:
-        impacted_tile_relpaths = set(self._contributor_tile_candidates.get(contributor_id, ()))
-        impacted_tile_relpaths.update(actual_tile_relpaths)
-        stale_tile_paths: list[str] = []
-        ready_jobs: list[FinalTileFlushJob] = []
-        ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
-        with self._lock:
-            ordered_relpaths = self._ordered_contributor_tile_relpaths(
-                contributor_id,
-                impacted_tile_relpaths,
-            )
-            self._contributor_tile_candidates.pop(contributor_id, None)
-            for relative_path in ordered_relpaths:
-                tile_state = self._tile_states.get(relative_path)
-                stale_tile_path = None
-                if tile_state is not None:
-                    stale_tile_path = tile_state.contributor_tile_paths.pop(contributor_id, None)
-                if stale_tile_path is not None:
-                    stale_tile_paths.append(stale_tile_path)
-                remaining_candidates = self._decrement_pending_count_locked(relative_path)
-                if tile_state is None:
-                    if remaining_candidates > 0:
-                        continue
-                    tile_state = self._tile_states.setdefault(
-                        relative_path,
-                        FinalTileFlushState(contributor_tile_paths={}),
-                    )
-                if remaining_candidates <= 0 and not tile_state.flushing:
-                    tile_state.flushing = True
-                    ready_jobs.append(self._build_flush_job(relative_path, tile_state))
-            ready_markers.extend(self._collect_ready_markers_locked())
-
-        self._cleanup_contributor_tile_paths(stale_tile_paths)
-        self._write_markers(ready_markers)
-        self._flush_ready_tiles(ready_jobs)
-
-    def _build_flush_job(
-        self,
-        relative_path: str,
-        tile_state: FinalTileFlushState,
-    ) -> FinalTileFlushJob:
-        ordered_tile_paths = tuple(
-            (contributor_id, tile_state.contributor_tile_paths[contributor_id])
-            for contributor_id in self._ordered_contributors
-            if contributor_id in tile_state.contributor_tile_paths
-        )
-        return FinalTileFlushJob(
-            relative_path=relative_path,
-            contributor_tile_paths=ordered_tile_paths,
-            sibling_count=self._tile_sibling_counts.get(relative_path, len(ordered_tile_paths)),
-        )
-
-    def _flush_ready_tiles(self, ready_jobs: Sequence[FinalTileFlushJob]) -> None:
-        if not ready_jobs:
-            return
-
-        for job in sorted(ready_jobs, key=lambda ready_job: (ready_job.sibling_count, ready_job.relative_path)):
-            self._flush_ready_tile(job)
-
-        ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
-        stale_tile_paths: list[str] = []
-        with self._lock:
-            for job in ready_jobs:
-                self._tile_states.pop(job.relative_path, None)
-                for contributor_id, contributor_tile_path in job.contributor_tile_paths:
-                    self._contributor_flushed_counts[contributor_id] += 1
-                    stale_tile_paths.append(contributor_tile_path)
-            ready_markers.extend(self._collect_ready_markers_locked())
-
-        self._cleanup_contributor_tile_paths(stale_tile_paths)
-        self._write_markers(ready_markers)
-
-    def _flush_ready_tile(self, job: FinalTileFlushJob) -> None:
-        destination_path = os.path.join(
-            build_final_tile_cache_dir(self._output_path, self._unique_id),
-            job.relative_path,
-        )
-        composed_rgba: Image.Image | None = None
-        if file_has_content(destination_path):
-            with Image.open(destination_path) as destination_image:
-                composed_rgba = destination_image.convert("RGBA")
-        elif self._prepared_ocean_background is not None:
-            ocean_base = render_raster_tile_image(
-                self._prepared_ocean_background,
-                job.relative_path,
-                self._tile_size,
-                self._resample_alg,
-            )
-            if ocean_base is not None:
-                composed_rgba = ocean_base.convert("RGBA")
-
-        for _contributor_id, contributor_tile_path in job.contributor_tile_paths:
-            with Image.open(contributor_tile_path) as source_image:
-                source_rgba = source_image.convert("RGBA")
-            if composed_rgba is None:
-                composed_rgba = source_rgba
-            else:
-                composed_rgba = Image.alpha_composite(composed_rgba, source_rgba)
-
-        if composed_rgba is None:
-            return
-
-        if composed_rgba.getchannel("A").getextrema() == (255, 255):
-            final_image: Image.Image = composed_rgba.convert("RGB")
-        else:
-            final_image = composed_rgba
-        tiler.save_webp_image(final_image, destination_path, self._quality, lossless=False)
-
-    def _collect_ready_markers_locked(self) -> list[tuple[str, str, tuple[str, ...]]]:
-        ready_markers: list[tuple[str, str, tuple[str, ...]]] = []
-        for contributor_id in self._ordered_contributors:
-            if contributor_id in self._marker_written:
-                continue
-            if contributor_id not in self._contributor_done:
-                continue
-            tile_relpaths = self._contributor_actual_tiles[contributor_id]
-            if self._contributor_flushed_counts[contributor_id] != len(tile_relpaths):
-                continue
-            self._marker_written.add(contributor_id)
-            ready_markers.append(
-                (
-                    build_contributor_complete_marker(
-                        self._output_path,
-                        self._unique_id,
-                        contributor_id,
-                    ),
-                    contributor_id,
-                    tile_relpaths,
-                )
-            )
-        return ready_markers
-
-    def _write_markers(
-        self,
-        ready_markers: Sequence[tuple[str, str, tuple[str, ...]]],
-    ) -> None:
-        for marker_path, contributor_id, tile_relpaths in ready_markers:
-            write_tile_cache_marker(marker_path, contributor_id, tile_relpaths)
-
-    def _build_contributor_tile_path(self, contributor_id: str, relative_path: str) -> str:
-        return os.path.join(
-            build_contributor_tile_cache_dir(
-                self._output_path,
-                self._unique_id,
-                contributor_id,
-            ),
-            relative_path,
-        )
-
-    def _sort_tile_relpaths(self, tile_relpaths: Sequence[str]) -> tuple[str, ...]:
-        return tuple(
-            sorted(
-                tile_relpaths,
-                key=lambda relative_path: (
-                    self._tile_sibling_counts.get(relative_path, 0),
-                    relative_path,
-                ),
-            )
-        )
-
-    def _ordered_contributor_tile_relpaths(
-        self,
-        contributor_id: str,
-        tile_relpaths: Iterable[str],
-    ) -> tuple[str, ...]:
-        ordered_relpaths = list(self._contributor_tile_candidates.get(contributor_id, ()))
-        seen_relpaths = set(ordered_relpaths)
-        extras = self._sort_tile_relpaths(
-            tuple(relative_path for relative_path in tile_relpaths if relative_path not in seen_relpaths)
-        )
-        return tuple(ordered_relpaths + list(extras))
-
-    def _cleanup_contributor_tile_paths(self, tile_paths: Iterable[str]) -> None:
-        for tile_path in set(tile_paths):
-            remove_if_exists(tile_path)
-
-    def _decrement_pending_count_locked(self, relative_path: str) -> int:
-        remaining = self._tile_pending_counts.get(relative_path)
-        if remaining is None:
-            return 0
-        if remaining <= 1:
-            self._tile_pending_counts.pop(relative_path, None)
-            return 0
-        remaining -= 1
-        self._tile_pending_counts[relative_path] = remaining
-        return remaining
-
-
-FINAL_TILE_CACHE_FLUSH_COORDINATORS: dict[str, FinalTileCacheFlushCoordinator] = {}
-
-
 def max_in_memory_write_pixels() -> int:
     """Return the live pixel budget for whole-window RGB(A) writes."""
     return tiler.compute_in_memory_pixel_limit(
@@ -492,11 +128,6 @@ def build_temp_mbtiles_path(output_path: str) -> str:
 def build_tile_cache_root(output_path: str, unique_id: str) -> str:
     """Return the run-scoped root directory for cached max-zoom WebP tiles."""
     return f".temp/{temp_basename_from_output(output_path)}_{unique_id}_tilecache"
-
-
-def build_contributor_tile_cache_dir(output_path: str, unique_id: str, contributor_id: str) -> str:
-    """Return the contributor-scoped cache directory for one ocean or land source."""
-    return os.path.join(build_tile_cache_root(output_path, unique_id), "contributors", contributor_id)
 
 
 def build_contributor_complete_marker(
@@ -550,27 +181,6 @@ def update_count_progress(
         f"{label} {format_progress(current, total)}; "
         f"{format_eta(remaining, elapsed_seconds=elapsed)}; {detail}"
     )
-
-
-def build_gdal_progress_callback(
-    progress_line: LiveProgressLine,
-    step_label: str,
-    started_at: float,
-) -> Callable[[float, str, object], int]:
-    """Adapt GDAL progress updates to the live progress renderer."""
-    def callback(complete: float, _message: str, _data: object) -> int:
-        bounded_complete = min(max(complete, 0.0), 1.0)
-        remaining = None
-        elapsed = time.perf_counter() - started_at
-        if bounded_complete > 0.0 and elapsed > 0.0:
-            remaining = elapsed * (1.0 - bounded_complete) / bounded_complete
-        progress_line.update(
-            f"{step_label} {bounded_complete * 100:3.0f}%; "
-            f"{format_eta(remaining, elapsed_seconds=elapsed)}"
-        )
-        return 1
-
-    return callback
 
 
 @dataclass(frozen=True)
@@ -773,27 +383,6 @@ def read_candidate_tile_cache(
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(f"Warning: Could not load candidate tile cache {cache_path}: {exc}")
         return None
-
-def build_processed_tile_paths(mgrs_subtile: str, output_path: str) -> Tuple[str, str]:
-    """Return the deterministic heavyweight TIFF paths for one processed subtile."""
-    stem = temp_basename_from_output(output_path)
-    return (
-        f".temp/{stem}_{mgrs_subtile}_utm.tif",
-        f".temp/{stem}_{mgrs_subtile}_3857.tif",
-    )
-
-
-def build_work_unit_output_path(work_unit: LandWorkUnit, output_path: str) -> str:
-    """Return the deterministic heavyweight TIFF path for one processed work unit."""
-    stem = temp_basename_from_output(output_path)
-    return f".temp/{stem}_{work_unit.unit_id}_3857.tif"
-
-
-def build_tile_prefetch_cache_dir(mgrs_subtile: str, output_path: str) -> str:
-    """Return the tile-scoped cache directory used for one worker's prefetched inputs."""
-    stem = temp_basename_from_output(output_path)
-    return f".temp/{stem}_{mgrs_subtile}_prefetch"
-
 
 def parse_prefetch_if_land(value: str) -> float:
     """Parse a land-percentage threshold for conditional RGB prefetching."""
@@ -1288,37 +877,6 @@ def restore_resume_state(resume_path: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def recover_cached_work_outputs(
-    work_units: tuple[LandWorkUnit, ...],
-    output_path: str,
-    unique_id: str,
-) -> Set[str]:
-    """Collect completed work units from cache markers."""
-    recovered_units: Set[str] = set()
-    final_tile_tree = build_final_tile_cache_dir(output_path, unique_id)
-    for work_unit in work_units:
-        marker_path = build_contributor_complete_marker(
-            output_path,
-            unique_id,
-            work_unit.unit_id,
-        )
-        if not file_has_content(marker_path):
-            continue
-        try:
-            marker_contributor_id, tile_relpaths = read_tile_cache_marker(marker_path)
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-            print(f"Warning: Could not read tile cache marker {marker_path}: {exc}")
-            continue
-        if marker_contributor_id != work_unit.unit_id:
-            continue
-        if all(
-            file_has_content(os.path.join(final_tile_tree, relative_path))
-            for relative_path in tile_relpaths
-        ):
-            recovered_units.add(work_unit.unit_id)
-    return recovered_units
-
-
 def commit_raster_to_final_tile_cache(
     input_raster: str | gdal.Dataset,
     output_path: str,
@@ -1734,66 +1292,6 @@ def resolve_work_unit_candidate_tile_relpaths(
         work_unit.unit_id: merged_candidates[work_unit.unit_id]
         for work_unit in work_units
     }
-
-
-def configure_final_tile_cache_flush_coordinator(
-    output_path: str,
-    unique_id: str,
-    work_units: Sequence[LandWorkUnit],
-    quality: int,
-    zoom: int,
-    tile_size: int = 512,
-    resample_alg: str = "lanczos",
-    prepared_ocean_background: Optional[str] = None,
-    contributor_tile_candidates: Optional[dict[str, tuple[str, ...]]] = None,
-) -> None:
-    """Configure the flush coordinator for one WebP run."""
-    resolved_tile_candidates = contributor_tile_candidates or {
-        work_unit.unit_id: build_work_unit_candidate_tile_relpaths(work_unit, zoom)
-        for work_unit in work_units
-    }
-    FINAL_TILE_CACHE_FLUSH_COORDINATORS[unique_id] = FinalTileCacheFlushCoordinator(
-        output_path,
-        unique_id,
-        [work_unit.unit_id for work_unit in work_units],
-        resolved_tile_candidates,
-        quality,
-        tile_size=tile_size,
-        resample_alg=resample_alg,
-        prepared_ocean_background=prepared_ocean_background,
-    )
-
-
-def clear_final_tile_cache_flush_coordinator(unique_id: str) -> None:
-    """Drop the flush coordinator for a completed or failed run."""
-    coordinator = FINAL_TILE_CACHE_FLUSH_COORDINATORS.pop(unique_id, None)
-    if coordinator is not None:
-        cleanup = getattr(coordinator, "cleanup", None)
-        if callable(cleanup):
-            cleanup()
-
-
-def commit_land_raster_to_final_tile_cache(
-    input_raster: Optional[gdal.Dataset],
-    _output_path: str,
-    unique_id: str,
-    contributor_id: str,
-    args: argparse.Namespace,
-) -> List[str]:
-    """Render one land contributor into streamed tile images and flush when safe."""
-    coordinator = FINAL_TILE_CACHE_FLUSH_COORDINATORS.get(unique_id)
-    if coordinator is None:
-        raise RuntimeError("Land tile cache flush coordinator is not configured")
-
-    tile_images: Iterator[tuple[str, Image.Image]] = iter(())
-    if input_raster is not None:
-        tile_images = tiler.iter_dataset_webp_tile_images(
-            input_raster,
-            args.max_zoom,
-            args.blocksize,
-            args.resample_alg,
-        )
-    return coordinator.record_contributor_tiles(contributor_id, tile_images)
 
 
 def resolve_ocean_mask_source(ocean_background: str) -> Optional[str]:
@@ -2375,14 +1873,6 @@ def prefetch_tile_bands_locally(
     for folder_name, date_path in folders:
         get_tile_paths(folder_name, date_path, cache_dir, download=True, quiet=True)
 
-
-def cleanup_prefetched_tile_bands(cache_dir: Optional[str]) -> None:
-    """Remove the tile-scoped cache after a worker finishes processing."""
-    if cache_dir is None:
-        return
-    shutil.rmtree(cache_dir, ignore_errors=True)
-
-
 def estimate_subtile_land_percentage(
     mask_slabs: Optional[dict[int, OceanMaskSlab]],
     tile_grid: TileGrid,
@@ -2417,43 +1907,6 @@ def should_prefetch_tile_bands(
     if land_percentage is None:
         return True
     return land_percentage >= prefetch_if_land
-
-
-def open_date_band_sets(
-    folders: List[Tuple[str, str]], cache_dir: str
-) -> List[Tuple[List[gdal.Band], List[gdal.Dataset]]]:
-    """Open RGB band handles for every date so block reads stay sequential."""
-    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
-    try:
-        for folder_name, date_path in folders:
-            paths = get_tile_paths(folder_name, date_path, cache_dir, download=False)
-            datasets: List[gdal.Dataset] = []
-            bands: List[gdal.Band] = []
-            for band_id, color_name in RGB_BANDS:
-                try:
-                    dataset = gdal.Open(paths[color_name])
-                except RuntimeError as exc:
-                    raise RuntimeError(
-                        f"Could not open {color_name} band {band_id} for {folder_name} ({date_path}): {exc}"
-                    ) from exc
-                if dataset is None:
-                    raise RuntimeError(
-                        f"Could not open {color_name} band {band_id} for {folder_name} ({date_path})"
-                    )
-                band = dataset.GetRasterBand(1)
-                if band is None:
-                    raise RuntimeError(
-                        f"Could not read raster band 1 from {color_name} band {band_id} for {folder_name} ({date_path})"
-                    )
-                datasets.append(dataset)
-                bands.append(band)
-            date_band_sets.append((bands, datasets))
-        return date_band_sets
-    except RuntimeError:
-        for bands, datasets in date_band_sets:
-            bands.clear()
-            datasets.clear()
-        raise
 
 
 def write_resume_state(
@@ -3235,141 +2688,6 @@ def render_land_output_tiles(
         rendered_tiles=rendered_tiles,
         skipped_tiles=skipped_tiles,
     )
-
-
-def warp_to_web_mercator(
-    source_path: str | gdal.Dataset,
-    destination_path: Optional[str],
-    resample_alg: str,
-    max_zoom: int,
-    blocksize: int,
-) -> gdal.Dataset:
-    """Warp a raster into the final EPSG:3857 grid."""
-    if destination_path is not None:
-        remove_if_exists(destination_path)
-    warp_options = build_web_mercator_warp_options(
-        destination_path,
-        resample_alg,
-        max_zoom,
-        blocksize,
-    )
-    destination = "" if destination_path is None else destination_path
-    warped_ds = gdal.Warp(destination, source_path, options=warp_options)
-    if warped_ds is None:
-        raise RuntimeError("Could not warp raster to Web Mercator")
-    return warped_ds
-
-
-def process_land_work_unit(
-    work_unit: LandWorkUnit,
-    date_paths: List[str],
-    args: argparse.Namespace,
-    gebco_src: Optional[str] = None,
-    unique_id: Optional[str] = None,
-) -> None:
-    """Process one land work unit into the final WebP tile cache."""
-    if unique_id is None:
-        raise RuntimeError("Land processing requires a run unique_id")
-    processed_raster = process_single_tile(
-        work_unit.unit_id,
-        date_paths,
-        args,
-        gebco_src,
-    )
-    commit_land_raster_to_final_tile_cache(
-        processed_raster,
-        args.output,
-        unique_id,
-        work_unit.unit_id,
-        args,
-    )
-    return None
-
-
-def process_single_tile(
-    mgrs_subtile: str,
-    date_paths: List[str],
-    args: argparse.Namespace,
-    gebco_src: Optional[str] = None,
-) -> Optional[gdal.Dataset]:
-    """Process a single MGRS sub-tile: fetch dates, average, tone-map, and warp to Web Mercator."""
-    folders = list_mosaic_folders_for_tile(mgrs_subtile, date_paths, args.cache)
-    if not folders:
-        return None
-
-    if args.download:
-        print(f"Downloading tile {mgrs_subtile} across {len(folders)} date(s)...")
-        for folder_name, date_path in folders:
-            get_tile_paths(folder_name, date_path, args.cache, download=True)
-        return None
-
-    prefetch_cache_dir = build_tile_prefetch_cache_dir(mgrs_subtile, args.output)
-    first_folder, first_date = folders[0]
-    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
-    ocean_mask: Optional[OceanMaskWarp] = None
-    fill_allowed_mask: Optional[np.ndarray] = None
-    try:
-        paths = get_tile_paths(first_folder, first_date, args.cache, download=False)
-        tile_grid = load_tile_grid(paths["red"])
-
-        ocean_mask = open_gebco_mask(gebco_src, tile_grid, mgrs_subtile)
-        processing_window = ProcessingWindow(0, 0, tile_grid.width, tile_grid.height)
-        mask_slabs: Optional[dict[int, OceanMaskSlab]] = None
-        if ocean_mask is not None:
-            collected = collect_ocean_mask_slabs(ocean_mask, tile_grid)
-            if collected is None:
-                return None
-            processing_window, mask_slabs = collected
-
-        prefetch_if_land = float(
-            getattr(args, "prefetch_if_land", DEFAULT_PREFETCH_IF_LAND)
-        )
-        band_cache_dir = args.cache
-        if should_prefetch_tile_bands(prefetch_if_land, mask_slabs, tile_grid):
-            prefetch_tile_bands_locally(folders, prefetch_cache_dir)
-            band_cache_dir = prefetch_cache_dir
-
-        date_band_sets = open_date_band_sets(folders, band_cache_dir)
-        averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
-            date_band_sets,
-            processing_window,
-            mask_slabs,
-            tile_grid=tile_grid,
-            winter=getattr(args, "winter", False),
-        )
-
-        averaged = fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
-        ds_out, color_bands, alpha_band = create_output_dataset(
-            None,
-            tile_grid,
-            driver_name="MEM",
-        )
-        write_processed_blocks(
-            averaged,
-            alpha_mask,
-            processing_window,
-            args,
-            color_bands,
-            alpha_band,
-        )
-        ds_out.FlushCache()
-        warped_ds = warp_to_web_mercator(
-            ds_out,
-            None,
-            args.resample_alg,
-            args.max_zoom,
-            args.blocksize,
-        )
-        ds_out = None
-        return warped_ds
-    finally:
-        for bands, datasets in date_band_sets:
-            bands.clear()
-            datasets.clear()
-        date_band_sets.clear()
-        ocean_mask = None
-        fill_allowed_mask = None
-        cleanup_prefetched_tile_bands(prefetch_cache_dir)
 
 
 def calculate_estimates(args: argparse.Namespace) -> None:

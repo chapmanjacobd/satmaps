@@ -18,9 +18,7 @@ from satmaps import (
     get_tile_paths,
     list_mosaic_folders_for_tile,
     main,
-    process_single_tile,
 )
-
 
 class StubBand:
     def __init__(self, data: np.ndarray) -> None:
@@ -29,14 +27,12 @@ class StubBand:
     def ReadAsArray(self, xoff: int, yoff: int, width: int, height: int) -> np.ndarray:
         return self.data[yoff : yoff + height, xoff : xoff + width]
 
-
 def test_list_mosaic_folders_for_tile_uses_cache(monkeypatch: object) -> None:
     # Pre-populate cache
     satmaps.S3_FOLDER_CACHE = {"2025/07/01": {"Sentinel-2_mosaic_2025_Q3_31TDF_0_0"}}
 
     found = list_mosaic_folders_for_tile("31TDF_0_0", ["2025/07/01"], ".cache")
     assert found == [("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")]
-
 
 def test_get_tile_paths_returns_s3_paths(monkeypatch: object) -> None:
     # Ensure local cache doesn't exist for this test
@@ -56,7 +52,6 @@ def test_get_tile_paths_returns_s3_paths(monkeypatch: object) -> None:
         paths["blue"]
         == "/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/2025/07/01/Sentinel-2_mosaic_2025_Q3_31TDF_0_0/B02.tif"
     )
-
 
 def test_fill_nan_nearest_fills_from_nearest_valid_pixel() -> None:
     arr = np.array(
@@ -80,7 +75,6 @@ def test_fill_nan_nearest_fills_from_nearest_valid_pixel() -> None:
     )
     assert np.array_equal(filled, expected)
 
-
 def test_fill_nan_nearest_uses_explicit_valid_mask() -> None:
     arr = np.array(
         [
@@ -102,7 +96,6 @@ def test_fill_nan_nearest_uses_explicit_valid_mask() -> None:
         dtype=np.float32,
     )
     assert np.array_equal(filled, expected)
-
 
 def test_fill_nan_nearest_respects_fill_mask() -> None:
     arr = np.array(
@@ -127,7 +120,6 @@ def test_fill_nan_nearest_respects_fill_mask() -> None:
         dtype=np.float32,
     )
     assert np.array_equal(filled, expected)
-
 
 def test_create_gebco_ocean_vrt_masks_positive_values(tmp_path: Path) -> None:
     source_path = tmp_path / "gebco_source.tif"
@@ -157,24 +149,20 @@ def test_create_gebco_ocean_vrt_masks_positive_values(tmp_path: Path) -> None:
 
     np.testing.assert_allclose(arr, np.array([[-5.0, 0.0, 0.0005, nodata]], dtype=np.float32))
 
-
 def test_web_mercator_pixel_size_uses_output_zoom() -> None:
     assert satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM) == pytest.approx(
         satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
     )
-
 
 def test_web_mercator_pixel_size_accepts_requested_zoom() -> None:
     assert satmaps.tiler.web_mercator_pixel_size(14) == pytest.approx(
         satmaps.tiler.web_mercator_pixel_size(14)
     )
 
-
 def test_web_mercator_pixel_size_for_tile_size_adjusts_for_512px_tiles() -> None:
     assert satmaps.tiler.web_mercator_pixel_size_for_tile_size(7, 512) == pytest.approx(
         satmaps.tiler.web_mercator_pixel_size(8)
     )
-
 
 def test_compute_in_memory_pixel_limit_uses_available_memory_and_cap(
     monkeypatch: object,
@@ -192,7 +180,6 @@ def test_compute_in_memory_pixel_limit_uses_available_memory_and_cap(
         == 35_000
     )
 
-
 def test_compute_in_memory_pixel_limit_falls_back_when_memory_unknown(
     monkeypatch: object,
 ) -> None:
@@ -207,7 +194,6 @@ def test_compute_in_memory_pixel_limit_falls_back_when_memory_unknown(
         == 123
     )
 
-
 def test_runtime_memory_limits_scale_above_defaults(monkeypatch: object) -> None:
     monkeypatch.setattr(satmaps.tiler, "get_available_memory_bytes", lambda: 12 * 1024**3)
 
@@ -215,7 +201,6 @@ def test_runtime_memory_limits_scale_above_defaults(monkeypatch: object) -> None
     assert ocean.max_in_memory_alpha_pixels() > ocean.DEFAULT_MAX_IN_MEMORY_ALPHA_PIXELS
     assert ocean.max_in_memory_color_pixels() > ocean.DEFAULT_MAX_IN_MEMORY_COLOR_PIXELS
     assert ocean.max_in_memory_sieve_mask_pixels() > ocean.DEFAULT_MAX_IN_MEMORY_SIEVE_MASK_PIXELS
-
 
 def test_should_prefetch_tile_bands_fast_paths_skip_land_percentage_calc(
     monkeypatch: object,
@@ -234,7 +219,6 @@ def test_should_prefetch_tile_bands_fast_paths_skip_land_percentage_calc(
 
     assert satmaps.should_prefetch_tile_bands(100.0, None, tile_grid)
     assert not satmaps.should_prefetch_tile_bands(0.0, None, tile_grid)
-
 
 def test_should_prefetch_tile_bands_uses_land_percentage_threshold() -> None:
     tile_grid = satmaps.TileGrid(
@@ -263,7 +247,6 @@ def test_should_prefetch_tile_bands_uses_land_percentage_threshold() -> None:
     assert satmaps.should_prefetch_tile_bands(20.0, mask_slabs, tile_grid)
     assert not satmaps.should_prefetch_tile_bands(40.0, mask_slabs, tile_grid)
 
-
 def test_snapped_tile_grid_for_bbox_expands_to_tile_pixel_grid() -> None:
     bbox = (-4.0, 50.0, -3.0, 51.0)
 
@@ -280,7 +263,6 @@ def test_snapped_tile_grid_for_bbox_expands_to_tile_pixel_grid() -> None:
     assert snapped_bounds[2] >= mercator_bounds[2]
     assert snapped_bounds[3] >= mercator_bounds[3]
 
-
 def test_snapped_tile_grid_for_bbox_uses_requested_zoom() -> None:
     bbox = (-4.0, 50.0, -3.0, 51.0)
 
@@ -293,7 +275,6 @@ def test_snapped_tile_grid_for_bbox_uses_requested_zoom() -> None:
     assert snapped_bounds[1] <= mercator_bounds[1]
     assert snapped_bounds[2] >= mercator_bounds[2]
     assert snapped_bounds[3] >= mercator_bounds[3]
-
 
 def test_snapped_tile_grid_for_bbox_accepts_zoom_11() -> None:
     bbox = (-4.0, 50.0, -3.0, 51.0)
@@ -308,7 +289,6 @@ def test_snapped_tile_grid_for_bbox_accepts_zoom_11() -> None:
     assert snapped_bounds[2] >= mercator_bounds[2]
     assert snapped_bounds[3] >= mercator_bounds[3]
 
-
 def test_snapped_tile_grid_for_bbox_accepts_zoom_12() -> None:
     bbox = (-4.0, 50.0, -3.0, 51.0)
 
@@ -321,7 +301,6 @@ def test_snapped_tile_grid_for_bbox_accepts_zoom_12() -> None:
     assert snapped_bounds[1] <= mercator_bounds[1]
     assert snapped_bounds[2] >= mercator_bounds[2]
     assert snapped_bounds[3] >= mercator_bounds[3]
-
 
 def test_create_alpha_vrt_handles_near_nodata_and_shallow_values(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
@@ -350,7 +329,6 @@ def test_create_alpha_vrt_handles_near_nodata_and_shallow_values(tmp_path: Path)
         np.array([[0.0, 0.0, 255.0, 0.0]], dtype=np.float32),
     )
 
-
 def test_remove_small_enclosed_ocean_regions_prefers_land() -> None:
     ocean_mask = np.zeros((5, 5), dtype=bool)
     ocean_mask[2, 2] = True
@@ -365,7 +343,6 @@ def test_remove_small_enclosed_ocean_regions_prefers_land() -> None:
     expected = np.zeros((5, 5), dtype=bool)
     expected[0, 0] = True
     np.testing.assert_array_equal(cleaned, expected)
-
 
 def test_average_tile_blocks_skips_horizontal_ocean(monkeypatch: object) -> None:
     from satmaps import OceanMaskSlab, ProcessingWindow, average_tile_blocks
@@ -402,7 +379,6 @@ def test_average_tile_blocks_skips_horizontal_ocean(monkeypatch: object) -> None
     assert len(calls) == 1
     assert calls[0] == (3, 0, 4, 4)
 
-
 def test_build_local_season_date_weights_blends_across_equator() -> None:
     wgs84 = osr.SpatialReference()
     wgs84.ImportFromEPSG(4326)
@@ -423,7 +399,6 @@ def test_build_local_season_date_weights_blends_across_equator() -> None:
     assert 0.0 < weights[0, 2, 0] < 0.5
     np.testing.assert_allclose(weights[:, 3, 0], np.array([0.0, 1.0]), atol=1e-4)
 
-
 def test_build_local_season_date_weights_winter_flips_hemispheres() -> None:
     wgs84 = osr.SpatialReference()
     wgs84.ImportFromEPSG(4326)
@@ -443,7 +418,6 @@ def test_build_local_season_date_weights_winter_flips_hemispheres() -> None:
 
     np.testing.assert_allclose(winter_weights[0], 1.0 - summer_weights[0], atol=1e-6)
     np.testing.assert_allclose(winter_weights[1], 1.0 - summer_weights[1], atol=1e-6)
-
 
 def test_average_block_weighted_blend_falls_back_when_preferred_date_is_missing() -> None:
     north_missing = np.array(
@@ -484,7 +458,6 @@ def test_average_block_weighted_blend_falls_back_when_preferred_date_is_missing(
     np.testing.assert_allclose(averaged[:, 0, 0], np.array([20.0, 20.0, 20.0]))
     np.testing.assert_allclose(averaged[:, 1, 0], np.array([100.0, 100.0, 100.0]))
 
-
 def test_average_tile_blocks_skips_empty_slabs(monkeypatch: object) -> None:
     from satmaps import OceanMaskSlab, ProcessingWindow, average_tile_blocks
 
@@ -523,7 +496,6 @@ def test_average_tile_blocks_skips_empty_slabs(monkeypatch: object) -> None:
     assert len(calls) == 1
     assert calls[0][1] == 24
     assert calls[0][3] == 24
-
 
 def test_average_tile_blocks_masks_out_ocean_holes_inside_processed_slab(
     monkeypatch: object,
@@ -582,7 +554,6 @@ def test_average_tile_blocks_masks_out_ocean_holes_inside_processed_slab(
     np.testing.assert_array_equal(averaged[:, :, 0], np.ones((3, 2), dtype=np.float32))
     assert np.isnan(averaged[:, :, 1]).all()
     np.testing.assert_array_equal(averaged[:, :, 2], np.ones((3, 2), dtype=np.float32))
-
 
 def test_alpha_mask_coastline_seam_pixel_is_filled_opaquely(
     monkeypatch: object,
@@ -657,7 +628,6 @@ def test_alpha_mask_coastline_seam_pixel_is_filled_opaquely(
     np.testing.assert_array_equal(rgba[:, 0, 0], np.array([255, 127, 63, 255], dtype=np.uint8))
     np.testing.assert_array_equal(rgba[:, 0, 1], np.array([255, 127, 63, 255], dtype=np.uint8))
 
-
 def test_write_processed_blocks_block_path_matches_in_memory_path(
     monkeypatch: object,
 ) -> None:
@@ -704,7 +674,6 @@ def test_write_processed_blocks_block_path_matches_in_memory_path(
     np.testing.assert_array_equal(rgba[:, 0, 0], np.array([255, 127, 63, 255], dtype=np.uint8))
     np.testing.assert_array_equal(rgba[:, 0, 1], np.array([255, 127, 63, 255], dtype=np.uint8))
 
-
 def test_open_gebco_mask_avoids_update_mode_warning(tmp_path: Path) -> None:
     gebco_path = tmp_path / "gebco.tif"
     gebco_ds = gdal.GetDriverByName("GTiff").Create(str(gebco_path), 4, 3, 4, gdal.GDT_Byte)
@@ -743,7 +712,6 @@ def test_open_gebco_mask_avoids_update_mode_warning(tmp_path: Path) -> None:
     assert mask.dataset.RasterYSize == tile_grid.height
     assert mask.alpha_band.GetNoDataValue() == -1.0
     assert not any("creation ignored in update mode" in message.lower() for message in messages)
-
 
 def test_open_gebco_mask_crops_aligned_alpha_band_without_warp(monkeypatch: object) -> None:
     srs = osr.SpatialReference()
@@ -784,7 +752,6 @@ def test_open_gebco_mask_crops_aligned_alpha_band_without_warp(monkeypatch: obje
     assert translate_options_calls[0]["srcWin"] == (0, 0, 4, 3)
     assert translate_options_calls[0]["bandList"] == [4]
     assert translate_options_calls[0]["outputType"] == gdal.GDT_Float32
-
 
 def test_open_gebco_mask_crops_source_before_warp(monkeypatch: object) -> None:
     srs = osr.SpatialReference()
@@ -841,7 +808,6 @@ def test_open_gebco_mask_crops_source_before_warp(monkeypatch: object) -> None:
     assert warp_options_calls[0]["multithread"] is True
     assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
 
-
 def test_build_land_output_tile_plan_adds_lanczos_halo() -> None:
     plan = satmaps.build_land_output_tile_plan("13/1/2.webp", 512, "lanczos")
 
@@ -850,7 +816,6 @@ def test_build_land_output_tile_plan_adds_lanczos_halo() -> None:
     assert plan.height == 518
     assert plan.core_src_win == (3, 3, 512, 512)
     assert plan.bounds == pytest.approx(tiler.get_web_mercator_bounds(13, 1, 2))
-
 
 def test_build_output_tile_contributor_index_preserves_work_unit_order() -> None:
     work_units = (
@@ -870,7 +835,6 @@ def test_build_output_tile_contributor_index_preserves_work_unit_order() -> None
         "13/1/2.webp": ("31TDF_1_0", "31TDF_0_0"),
         "13/1/3.webp": ("31TDF_0_0",),
     }
-
 
 def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
@@ -897,7 +861,6 @@ def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None
         gdal.Open(str(alpha_vrt)).ReadAsArray(),
         np.array([[255.0, 0.0, 0.0, 0.0]], dtype=np.float32),
     )
-
 
 def test_create_alpha_vrt_block_path_matches_threshold_output(
     tmp_path: Path,
@@ -928,7 +891,6 @@ def test_create_alpha_vrt_block_path_matches_threshold_output(
         gdal.Open(str(alpha_vrt)).ReadAsArray(),
         np.array([[255.0, 0.0, 0.0, 0.0]], dtype=np.float32),
     )
-
 
 def test_create_alpha_vrt_large_cleanup_removes_small_ocean_regions(
     tmp_path: Path,
@@ -968,7 +930,6 @@ def test_create_alpha_vrt_large_cleanup_removes_small_ocean_regions(
         gdal.Open(str(alpha_vrt)).ReadAsArray(),
         np.zeros((3, 3), dtype=np.uint8),
     )
-
 
 def test_create_alpha_vrt_large_cleanup_preserves_land_holes(
     tmp_path: Path,
@@ -1016,7 +977,6 @@ def test_create_alpha_vrt_large_cleanup_preserves_land_holes(
         ),
     )
 
-
 def test_create_sieve_cleanup_mask_dataset_prefers_mem(tmp_path: Path, monkeypatch: object) -> None:
     monkeypatch.setattr(ocean, "max_in_memory_sieve_mask_pixels", lambda: 9)
     driver = gdal.GetDriverByName("MEM")
@@ -1029,7 +989,6 @@ def test_create_sieve_cleanup_mask_dataset_prefers_mem(tmp_path: Path, monkeypat
 
     assert cleanup_ds.GetDriver().ShortName == "MEM"
     assert cleanup_path is None
-
 
 def test_create_sieve_cleanup_mask_dataset_uses_uncompressed_gtiff(
     tmp_path: Path,
@@ -1049,7 +1008,6 @@ def test_create_sieve_cleanup_mask_dataset_uses_uncompressed_gtiff(
 
     cleanup_ds = None
     ocean.remove_if_exists(cleanup_path)
-
 
 def test_create_ocean_rgb_tif_colorizes_in_blocks(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
@@ -1102,7 +1060,6 @@ def test_create_ocean_rgb_tif_colorizes_in_blocks(tmp_path: Path) -> None:
         np.uint8
     )
     np.testing.assert_array_equal(arr, expected)
-
 
 def test_create_ocean_rgb_tif_block_path_matches_full_read(
     tmp_path: Path,
@@ -1158,7 +1115,6 @@ def test_create_ocean_rgb_tif_block_path_matches_full_read(
         ),
     )
 
-
 def test_create_rgb_with_alpha_vrt_preserves_alpha_values(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
     srs = osr.SpatialReference()
@@ -1195,7 +1151,6 @@ def test_create_rgb_with_alpha_vrt_preserves_alpha_values(tmp_path: Path) -> Non
         rgba_ds.GetRasterBand(4).ReadAsArray(),
         np.array([[255, 0]], dtype=np.uint8),
     )
-
 
 def test_translate_rgba_vrt_preserves_alpha_values(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
@@ -1236,7 +1191,6 @@ def test_translate_rgba_vrt_preserves_alpha_values(tmp_path: Path) -> None:
     )
     assert not (tmp_path / ".temp_out.tif").exists()
 
-
 def test_prepare_ocean_background_publishes_staged_tif_when_warping(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -1272,7 +1226,6 @@ def test_prepare_ocean_background_publishes_staged_tif_when_warping(
     assert not Path(".temp/.temp_output_ocean_bbox.tif").exists()
     assert warp_options_calls[0]["multithread"] is True
     assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
-
 
 def test_prepare_ocean_background_crops_aligned_mercator_source_without_warp(
     monkeypatch: object, tmp_path: Path
@@ -1316,7 +1269,6 @@ def test_prepare_ocean_background_crops_aligned_mercator_source_without_warp(
     )
     prepared_ds = None
 
-
 def test_get_bbox_scan_window_crops_before_scanning(tmp_path: Path) -> None:
     source_path = tmp_path / "scan_window.tif"
     dataset = gdal.GetDriverByName("GTiff").Create(str(source_path), 100, 100, 1, gdal.GDT_Byte)
@@ -1330,7 +1282,6 @@ def test_get_bbox_scan_window_crops_before_scanning(tmp_path: Path) -> None:
 
     assert src_win == (10, 80, 10, 10)
 
-
 def test_get_bbox_scan_window_returns_none_outside_dataset(tmp_path: Path) -> None:
     source_path = tmp_path / "scan_window_outside.tif"
     dataset = gdal.GetDriverByName("GTiff").Create(str(source_path), 100, 100, 1, gdal.GDT_Byte)
@@ -1341,7 +1292,6 @@ def test_get_bbox_scan_window_returns_none_outside_dataset(tmp_path: Path) -> No
     dataset.SetProjection(srs.ExportToWkt())
 
     assert satmaps.get_bbox_scan_window(dataset, (20.0, 20.0, 21.0, 21.0)) is None
-
 
 def test_convert_raster_to_pmtiles_stages_final_output(
     tmp_path: Path, monkeypatch: object
@@ -1385,7 +1335,6 @@ def test_convert_raster_to_pmtiles_stages_final_output(
     assert not Path(".temp_output.pmtiles").exists()
     assert packaged.temp_mbtiles == ".temp/output.mbtiles"
 
-
 def test_convert_raster_to_pmtiles_cleans_inputs_after_mbtiles_before_pmtiles(
     tmp_path: Path, monkeypatch: object
 ) -> None:
@@ -1425,7 +1374,6 @@ def test_convert_raster_to_pmtiles_cleans_inputs_after_mbtiles_before_pmtiles(
     )
 
     assert converted == [["pmtiles", "convert", ".temp/output.mbtiles", ".temp_output.pmtiles"]]
-
 
 def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
     tmp_path: Path, monkeypatch: object
@@ -1485,8 +1433,6 @@ def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
     assert converted == [["pmtiles", "convert", ".temp/output.mbtiles", ".temp_output.pmtiles"]]
     assert temp_mbtiles == ".temp/output.mbtiles"
 
-
-
 def test_create_hillshade_tif_uses_gdal_demprocessing(monkeypatch: object, tmp_path: Path) -> None:
     dem_processing_calls: list[tuple[str, str, str, object]] = []
     options_calls: list[dict[str, object]] = []
@@ -1529,7 +1475,6 @@ def test_create_hillshade_tif_uses_gdal_demprocessing(monkeypatch: object, tmp_p
     ]
     assert output_path.exists()
 
-
 def test_ocean_main_uses_default_positionals(monkeypatch: object) -> None:
     called: dict[str, object] = {}
 
@@ -1567,7 +1512,6 @@ def test_ocean_main_uses_default_positionals(monkeypatch: object) -> None:
     assert called["chunk_size"] == ocean.DEFAULT_OCEAN_CHUNK_SIZE
     assert called["style"] == ocean.OceanStyleOptions()
 
-
 def test_ocean_main_parses_bbox_when_provided(monkeypatch: object) -> None:
     called: dict[str, object] = {}
 
@@ -1599,7 +1543,6 @@ def test_ocean_main_parses_bbox_when_provided(monkeypatch: object) -> None:
 
     assert called["bbox"] == (0.0, 0.0, 1.0, 1.0)
 
-
 def test_ocean_main_enables_vrt_mode(monkeypatch: object) -> None:
     called: dict[str, object] = {}
 
@@ -1627,7 +1570,6 @@ def test_ocean_main_enables_vrt_mode(monkeypatch: object) -> None:
 
     assert called["vrt"] is True
 
-
 def test_ocean_main_passes_parallel_chunk_flags(monkeypatch: object) -> None:
     called: dict[str, object] = {}
 
@@ -1653,7 +1595,6 @@ def test_ocean_main_passes_parallel_chunk_flags(monkeypatch: object) -> None:
     assert called["parallel"] == 4
     assert called["chunk_size"] == 2048
 
-
 def test_ocean_main_passes_zoom4(monkeypatch: object) -> None:
     called: dict[str, object] = {}
 
@@ -1678,7 +1619,6 @@ def test_ocean_main_passes_zoom4(monkeypatch: object) -> None:
 
     assert called["max_zoom"] == 4
 
-
 def test_build_ocean_output_plan_splits_aligned_chunks() -> None:
     bbox = (-4.0, 50.0, -3.0, 51.0)
     plan = ocean.build_ocean_output_plan(bbox, max_zoom=13, chunk_size=1024)
@@ -1697,7 +1637,6 @@ def test_build_ocean_output_plan_splits_aligned_chunks() -> None:
     assert first_chunk.height <= plan.chunk_size
     assert first_chunk.bounds[0] == pytest.approx(plan.bounds[0])
     assert first_chunk.bounds[3] == pytest.approx(plan.bounds[3])
-
 
 def test_generate_ocean_without_bbox_processes_chunk_outputs(monkeypatch: object) -> None:
     plan_calls: list[tuple[tuple[float, float, float, float] | None, int, int]] = []
@@ -1777,7 +1716,6 @@ def test_generate_ocean_without_bbox_processes_chunk_outputs(monkeypatch: object
     assert artifacts.hillshade_tif.endswith("_hillshade_chunks.vrt")
     assert artifacts.color_tif.endswith("_color_chunks.vrt")
     assert artifacts.rgba_vrt.endswith("_rgba.vrt")
-
 
 def test_generate_ocean_reuses_existing_chunk_outputs(
     tmp_path: Path, monkeypatch: object
@@ -1862,7 +1800,6 @@ def test_generate_ocean_reuses_existing_chunk_outputs(
 
     assert translated == [(artifacts.rgba_vrt, str(tmp_path / "ocean.tif"))]
 
-
 def test_generate_ocean_without_bbox_reports_chunk_progress(
     monkeypatch: object, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1941,7 +1878,6 @@ def test_generate_ocean_without_bbox_reports_chunk_progress(
     assert "[6/6] Translating final RGBA GeoTIFF... 100%; Elapsed:" in out
     assert "Ocean build complete: ocean.tif" in out
 
-
 def test_generate_ocean_with_bbox_builds_requested_plan(monkeypatch: object) -> None:
     plan_calls: list[tuple[tuple[float, float, float, float] | None, int, int]] = []
     bbox = (-4.0, 50.0, -3.0, 51.0)
@@ -2004,7 +1940,6 @@ def test_generate_ocean_with_bbox_builds_requested_plan(monkeypatch: object) -> 
 
     assert plan_calls == [(bbox, ocean.DEFAULT_MAX_ZOOM, 512)]
 
-
 def test_generate_ocean_uses_requested_zoom_in_plan(monkeypatch: object) -> None:
     plan_calls: list[tuple[tuple[float, float, float, float] | None, int, int]] = []
     plan = ocean.OceanBuildPlan(
@@ -2066,123 +2001,6 @@ def test_generate_ocean_uses_requested_zoom_in_plan(monkeypatch: object) -> None
 
     assert plan_calls == [(None, 14, 256)]
 
-
-def test_warp_to_web_mercator_uses_shared_zoom13_resolution(monkeypatch: object) -> None:
-    warp_options_calls: list[dict[str, object]] = []
-
-    monkeypatch.setattr(
-        "satmaps.gdal.WarpOptions",
-        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
-    )
-    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: object())
-
-    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 13, 256)
-
-    assert warp_options_calls[0]["dstSRS"] == "EPSG:3857"
-    assert warp_options_calls[0]["xRes"] == pytest.approx(
-        satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
-    )
-    assert warp_options_calls[0]["yRes"] == pytest.approx(
-        satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM)
-    )
-    assert warp_options_calls[0]["targetAlignedPixels"] is True
-    assert warp_options_calls[0]["multithread"] is True
-    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
-
-
-def test_warp_to_web_mercator_respects_requested_zoom(monkeypatch: object) -> None:
-    warp_options_calls: list[dict[str, object]] = []
-
-    monkeypatch.setattr(
-        "satmaps.gdal.WarpOptions",
-        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
-    )
-    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: object())
-
-    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 14, 256)
-
-    assert warp_options_calls[0]["xRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
-    assert warp_options_calls[0]["yRes"] == pytest.approx(satmaps.tiler.web_mercator_pixel_size(14))
-    assert warp_options_calls[0]["targetAlignedPixels"] is True
-    assert warp_options_calls[0]["multithread"] is True
-    assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
-
-
-def test_warp_to_web_mercator_respects_blocksize(monkeypatch: object) -> None:
-    warp_options_calls: list[dict[str, object]] = []
-
-    monkeypatch.setattr(
-        "satmaps.gdal.WarpOptions",
-        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
-    )
-    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: object())
-
-    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 13, 512)
-
-    expected = satmaps.tiler.web_mercator_pixel_size_for_tile_size(13, 512)
-    assert warp_options_calls[0]["xRes"] == pytest.approx(expected)
-    assert warp_options_calls[0]["yRes"] == pytest.approx(expected)
-    assert warp_options_calls[0]["creationOptions"] == [
-        "COMPRESS=ZSTD",
-        "ZSTD_LEVEL=5",
-        "TILED=YES",
-        "BIGTIFF=YES",
-        "BLOCKXSIZE=512",
-        "BLOCKYSIZE=512",
-    ]
-
-
-def test_warp_to_web_mercator_omits_gtiff_creation_options_for_mem_output(
-    monkeypatch: object,
-) -> None:
-    warp_options_calls: list[dict[str, object]] = []
-
-    monkeypatch.setattr(
-        "satmaps.gdal.WarpOptions",
-        lambda **kwargs: warp_options_calls.append(kwargs) or kwargs,
-    )
-    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: object())
-
-    satmaps.warp_to_web_mercator("input.tif", None, "lanczos", 13, 512)
-
-    assert warp_options_calls[0]["format"] == "MEM"
-    assert "creationOptions" not in warp_options_calls[0]
-
-
-def test_warp_to_web_mercator_aligns_adjacent_tiles_to_shared_pixel_grid(
-    tmp_path: Path,
-) -> None:
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(32604)
-    pixel_size = satmaps.tiler.web_mercator_pixel_size(13)
-
-    warped_datasets = []
-    for index, x_origin in enumerate((500000.0, 501920.0), start=1):
-        source_path = tmp_path / f"tile_{index}.tif"
-        dataset = gdal.GetDriverByName("GTiff").Create(str(source_path), 64, 64, 4, gdal.GDT_Byte)
-        assert dataset is not None
-        dataset.SetProjection(srs.ExportToWkt())
-        dataset.SetGeoTransform((x_origin, 30.0, 0.0, 2300.0, 0.0, -30.0))
-        for band_index, value in enumerate((40 * index, 80, 120), start=1):
-            dataset.GetRasterBand(band_index).WriteArray(np.full((64, 64), value, dtype=np.uint8))
-        dataset.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
-        dataset.GetRasterBand(4).WriteArray(np.full((64, 64), 255, dtype=np.uint8))
-        dataset = None
-
-        warped_path = tmp_path / f"tile_{index}_3857.tif"
-        satmaps.warp_to_web_mercator(str(source_path), str(warped_path), "lanczos", 13, 256)
-        warped_dataset = gdal.Open(str(warped_path))
-        assert warped_dataset is not None
-        warped_datasets.append(warped_dataset)
-
-    gt_1 = warped_datasets[0].GetGeoTransform()
-    gt_2 = warped_datasets[1].GetGeoTransform()
-
-    for value in (gt_1[0], gt_1[3], gt_2[0], gt_2[3]):
-        assert (value / pixel_size) == pytest.approx(round(value / pixel_size), abs=1e-6)
-    assert gt_1[3] == pytest.approx(gt_2[3], abs=1e-6)
-
-
 def test_build_source_raster_candidate_tile_relpaths_matches_real_warp(tmp_path: Path) -> None:
     source_path = tmp_path / "source_utm.tif"
     srs = osr.SpatialReference()
@@ -2200,11 +2018,20 @@ def test_build_source_raster_candidate_tile_relpaths_matches_real_warp(tmp_path:
         tile_size=512,
         resample_alg="lanczos",
     )
-    warped = satmaps.warp_to_web_mercator(str(source_path), None, "lanczos", 13, 512)
+    warped = gdal.Warp(
+        "",
+        str(source_path),
+        options=satmaps.build_web_mercator_warp_options(
+            None,
+            "lanczos",
+            13,
+            512,
+        ),
+    )
+    assert warped is not None
     expected = satmaps.build_relpaths_for_tile_bounds(tiler.get_dataset_bounds(warped), 13)
 
     assert actual == expected
-
 
 def test_build_work_unit_candidate_tile_relpaths_from_sources_uses_actual_source_bounds(
     monkeypatch: object, tmp_path: Path
@@ -2248,7 +2075,6 @@ def test_build_work_unit_candidate_tile_relpaths_from_sources_uses_actual_source
     assert actual
     assert actual < conservative
 
-
 def test_build_work_unit_candidate_tile_relpaths_from_sources_falls_back_on_inspection_error(
     monkeypatch: object,
     capsys: pytest.CaptureFixture[str],
@@ -2276,7 +2102,6 @@ def test_build_work_unit_candidate_tile_relpaths_from_sources_falls_back_on_insp
 
     assert actual == satmaps.build_work_unit_candidate_tile_relpaths(work_unit, 13)
     assert "Could not inspect source footprint for 31TDF_0_0" in capsys.readouterr().out
-
 
 def test_resolve_work_unit_candidate_tile_relpaths_reuses_cached_subset_and_persists_missing(
     monkeypatch: object,
@@ -2328,19 +2153,6 @@ def test_resolve_work_unit_candidate_tile_relpaths_reuses_cached_subset_and_pers
         "31TDF_0_1": ("13/2/2.webp",),
     }
     assert satmaps.read_candidate_tile_cache(cache_path) == actual
-
-
-def test_warp_to_web_mercator_removes_existing_destination(monkeypatch: object) -> None:
-    removed: list[str] = []
-
-    monkeypatch.setattr("satmaps.remove_if_exists", lambda path: removed.append(path))
-    monkeypatch.setattr("satmaps.gdal.WarpOptions", lambda **kwargs: kwargs)
-    monkeypatch.setattr("satmaps.gdal.Warp", lambda destination, source, options=None: object())
-
-    satmaps.warp_to_web_mercator("input.tif", "output.tif", "lanczos", 14, 256)
-
-    assert removed == ["output.tif"]
-
 
 def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:
     vrt_outputs: list[tuple[str, str]] = []
@@ -2401,7 +2213,6 @@ def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:
 
     assert artifacts.output_tif == "ocean.vrt"
     assert vrt_outputs == [(artifacts.rgba_vrt, "ocean.vrt")]
-
 
 def test_generate_ocean_deletes_heavy_non_output_tifs(tmp_path: Path, monkeypatch: object) -> None:
     temp_dir = tmp_path / ".temp"
@@ -2477,7 +2288,6 @@ def test_generate_ocean_deletes_heavy_non_output_tifs(tmp_path: Path, monkeypatc
     assert Path(artifacts.masked_vrt).exists()
     assert Path(artifacts.rgba_vrt).exists()
 
-
 def test_generate_ocean_vrt_mode_keeps_output_dependent_tifs(
     tmp_path: Path, monkeypatch: object
 ) -> None:
@@ -2551,7 +2361,6 @@ def test_generate_ocean_vrt_mode_keeps_output_dependent_tifs(
     assert Path(artifacts.source_vrt).exists()
     assert Path(artifacts.rgba_vrt).exists()
 
-
 def test_build_ocean_ramp_colors_respects_style_flags() -> None:
     default_colors = ocean.build_ocean_ramp_colors(
         ocean.OceanStyleOptions()
@@ -2567,480 +2376,6 @@ def test_build_ocean_ramp_colors_respects_style_flags() -> None:
     )
     assert np.all((default_colors >= 0.0) & (default_colors <= 1.0))
     assert np.all((ungraded_colors >= 0.0) & (ungraded_colors <= 1.0))
-
-
-def test_process_single_tile_full_pipeline(
-    monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    # Mock data discovery
-    monkeypatch.setattr(
-        "satmaps.list_mosaic_folders_for_tile",
-        lambda tile, dates, cache: [
-            ("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")
-        ],
-    )
-
-    # Create fake input TIFs
-    def fake_get_tile_paths(folder, date, cache, download=False, quiet=False):
-        p = {}
-        for b in ["red", "green", "blue"]:
-            path = tmp_path / f"{b}.tif"
-            if not path.exists():
-                driver = gdal.GetDriverByName("GTiff")
-                ds = driver.Create(str(path), 10, 10, 1, gdal.GDT_Int16)
-                ds.SetGeoTransform((0, 1, 0, 10, 0, -1))
-                srs = osr.SpatialReference()
-                srs.ImportFromEPSG(32631)  # UTM zone 31N
-                ds.SetProjection(srs.ExportToWkt())
-                ds.GetRasterBand(1).Fill(1000)
-                ds = None
-            p[b] = str(path)
-        return p
-
-    monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
-
-    args = argparse.Namespace(
-        cache=".cache",
-        download=False,
-        stats_min=0,
-        stats_max=10000,
-        tonemap=True,
-        grade=True,
-        sb=0.3,
-        hb=0.75,
-        ss=1.4,
-        ms=0.9,
-        hs=0.5,
-        exposure=1.0,
-        gamma=1.0,
-        sat=0.9,
-        db=0.7,
-        ls=0.7,
-        ghb=None,
-        gms=1.0,
-        ghs=None,
-        resample_alg="bilinear",
-        max_zoom=13,
-        blocksize=256,
-        output="render.pmtiles",
-    )
-
-    ds = process_single_tile("31TDF_0_0", ["2025/07/01"], args, None)
-
-    assert ds is not None
-    assert ds.RasterCount == 4
-    assert ds.GetDriver().ShortName == "MEM"
-    assert ds.GetRasterBand(1).DataType == gdal.GDT_Byte
-    assert ds.GetRasterBand(4).GetColorInterpretation() == gdal.GCI_AlphaBand
-    # Check projection is 3857
-    srs = osr.SpatialReference(ds.GetProjection())
-    assert srs.GetAttrValue("AUTHORITY", 1) == "3857"
-    assert not (tmp_path / ".temp" / "render_31TDF_0_0_utm.tif").exists()
-    assert not (tmp_path / ".temp" / "render_31TDF_0_0_3857.tif").exists()
-    out = capsys.readouterr().out
-    assert "Processing tile 31TDF_0_0" not in out
-    assert "Finished tile 31TDF_0_0" not in out
-
-
-def test_process_single_tile_with_gebco_mask(monkeypatch: object, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    raster_size = 100
-    pixel_size = 100.0
-
-    monkeypatch.setattr(
-        "satmaps.list_mosaic_folders_for_tile",
-        lambda tile, dates, cache: [
-            ("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")
-        ],
-    )
-
-    def fake_get_tile_paths(folder, date, cache, download=False, quiet=False):
-        p = {}
-        for b in ["red", "green", "blue"]:
-            path = tmp_path / f"{b}.tif"
-            if not path.exists():
-                driver = gdal.GetDriverByName("GTiff")
-                ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
-                ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
-                srs = osr.SpatialReference()
-                srs.ImportFromEPSG(32631)
-                ds.SetProjection(srs.ExportToWkt())
-                ds.GetRasterBand(1).Fill(1000)
-                ds = None
-            p[b] = str(path)
-        return p
-
-    monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
-
-    gebco_path = tmp_path / "gebco.tif"
-    gebco_ds = gdal.GetDriverByName("GTiff").Create(
-        str(gebco_path), raster_size, raster_size, 4, gdal.GDT_Byte
-    )
-    gebco_ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(32631)
-    gebco_ds.SetProjection(srs.ExportToWkt())
-    gebco_values = np.full((raster_size, raster_size), 255, dtype=np.uint8)
-    gebco_values[0, 0] = 0
-    gebco_values[0, 1] = 0
-    gebco_alpha_band = gebco_ds.GetRasterBand(4)
-    gebco_alpha_band.SetColorInterpretation(gdal.GCI_AlphaBand)
-    gebco_alpha_band.WriteArray(gebco_values)
-    gebco_ds = None
-
-    args = argparse.Namespace(
-        cache=".cache",
-        download=False,
-        stats_min=0,
-        stats_max=10000,
-        tonemap=True,
-        grade=True,
-        sb=0.3,
-        hb=0.75,
-        ss=1.4,
-        ms=0.9,
-        hs=0.5,
-        exposure=1.0,
-        gamma=1.0,
-        sat=0.9,
-        db=0.7,
-        ls=0.7,
-        ghb=None,
-        gms=1.0,
-        ghs=None,
-        resample_alg="near",
-        max_zoom=13,
-        blocksize=256,
-        output="render.pmtiles",
-    )
-
-    out_ds = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(gebco_path))
-    assert out_ds is not None
-    alpha = out_ds.GetRasterBand(4).ReadAsArray()
-    assert np.any(alpha == 0)
-    assert np.any(alpha == 255)
-
-
-def test_process_single_tile_with_rgba_ocean_alpha_mask(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    raster_size = 100
-    pixel_size = 100.0
-
-    monkeypatch.setattr(
-        "satmaps.list_mosaic_folders_for_tile",
-        lambda tile, dates, cache: [
-            ("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")
-        ],
-    )
-
-    def fake_get_tile_paths(folder, date, cache, download=False, quiet=False):
-        p = {}
-        for b in ["red", "green", "blue"]:
-            path = tmp_path / f"{b}.tif"
-            if not path.exists():
-                driver = gdal.GetDriverByName("GTiff")
-                ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
-                ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
-                srs = osr.SpatialReference()
-                srs.ImportFromEPSG(32631)
-                ds.SetProjection(srs.ExportToWkt())
-                ds.GetRasterBand(1).Fill(1000)
-                ds = None
-            p[b] = str(path)
-        return p
-
-    monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
-
-    ocean_path = tmp_path / "ocean_rgba.tif"
-    ocean_ds = gdal.GetDriverByName("GTiff").Create(
-        str(ocean_path), raster_size, raster_size, 4, gdal.GDT_Byte
-    )
-    ocean_ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(32631)
-    ocean_ds.SetProjection(srs.ExportToWkt())
-    for band_index in range(1, 4):
-        ocean_ds.GetRasterBand(band_index).Fill(0)
-    alpha_values = np.full((raster_size, raster_size), 255, dtype=np.uint8)
-    alpha_values[:, : raster_size // 2] = 0
-    ocean_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
-    ocean_ds.GetRasterBand(4).WriteArray(alpha_values)
-    ocean_ds = None
-
-    args = argparse.Namespace(
-        cache=".cache",
-        download=False,
-        stats_min=0,
-        stats_max=10000,
-        tonemap=True,
-        grade=True,
-        sb=0.3,
-        hb=0.75,
-        ss=1.4,
-        ms=0.9,
-        hs=0.5,
-        exposure=1.0,
-        gamma=1.0,
-        sat=0.9,
-        db=0.7,
-        ls=0.7,
-        ghb=None,
-        gms=1.0,
-        ghs=None,
-        resample_alg="near",
-        max_zoom=13,
-        blocksize=256,
-        output="render.pmtiles",
-    )
-
-    out_ds = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(ocean_path))
-    assert out_ds is not None
-    alpha = out_ds.GetRasterBand(4).ReadAsArray()
-    assert np.any(alpha == 255)
-    assert np.any(alpha == 0)
-
-
-def test_process_single_tile_prefetches_all_requested_dates_and_cleans_up(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    raster_size = 100
-    pixel_size = 100.0
-    band_requests: list[tuple[str, str, bool, bool]] = []
-    prefetched_cache_dir: Path | None = None
-
-    monkeypatch.setattr(
-        "satmaps.list_mosaic_folders_for_tile",
-        lambda tile, dates, cache: [
-            ("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01"),
-            ("Sentinel-2_mosaic_2025_Q4_31TDF_0_0", "2025/10/01"),
-        ],
-    )
-
-    source_paths: dict[str, dict[str, str]] = {}
-    for date in ["2025/07/01", "2025/10/01"]:
-        source_paths[date] = {}
-        for band_name in ["red", "green", "blue"]:
-            path = tmp_path / f"source_{date.replace('/', '-')}_{band_name}.tif"
-            driver = gdal.GetDriverByName("GTiff")
-            ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
-            ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
-            srs = osr.SpatialReference()
-            srs.ImportFromEPSG(32631)
-            ds.SetProjection(srs.ExportToWkt())
-            ds.GetRasterBand(1).Fill(1000)
-            ds = None
-            source_paths[date][band_name] = str(path)
-
-    def fake_get_tile_paths(folder, date, cache, download=False, quiet=False):
-        nonlocal prefetched_cache_dir
-        band_requests.append((str(cache), date, download, quiet))
-        cache_path = Path(cache) if cache is not None else None
-        if download and cache_path is not None:
-            prefetched_cache_dir = cache_path
-        paths = {}
-        for band_name in ["red", "green", "blue"]:
-            if cache_path is not None:
-                cache_prefix = "_".join(folder.split("_")[4:])
-                band_id = {"red": "B04", "green": "B03", "blue": "B02"}[band_name]
-                path = cache_path / date.replace("/", "-") / f"{cache_prefix}_{band_id}.tif"
-                if download:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    driver = gdal.GetDriverByName("GTiff")
-                    ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
-                    ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
-                    srs = osr.SpatialReference()
-                    srs.ImportFromEPSG(32631)
-                    ds.SetProjection(srs.ExportToWkt())
-                    ds.GetRasterBand(1).Fill(1000)
-                    ds = None
-                if path.exists():
-                    paths[band_name] = str(path)
-                    continue
-            paths[band_name] = source_paths[date][band_name]
-        return paths
-
-    monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
-
-    ocean_path = tmp_path / "ocean_rgba.tif"
-    ocean_ds = gdal.GetDriverByName("GTiff").Create(
-        str(ocean_path), raster_size, raster_size, 4, gdal.GDT_Byte
-    )
-    ocean_ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(32631)
-    ocean_ds.SetProjection(srs.ExportToWkt())
-    alpha_values = np.full((raster_size, raster_size), 255, dtype=np.uint8)
-    alpha_values[:30, :] = 0
-    ocean_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
-    ocean_ds.GetRasterBand(4).WriteArray(alpha_values)
-    ocean_ds = None
-
-    args = argparse.Namespace(
-        cache=".cache",
-        download=False,
-        prefetch_if_land=100.0,
-        stats_min=0,
-        stats_max=10000,
-        tonemap=True,
-        grade=True,
-        sb=0.3,
-        hb=0.75,
-        ss=1.4,
-        ms=0.9,
-        hs=0.5,
-        exposure=1.0,
-        gamma=1.0,
-        sat=0.9,
-        db=0.7,
-        ls=0.7,
-        ghb=None,
-        gms=1.0,
-        ghs=None,
-        resample_alg="near",
-        max_zoom=13,
-        blocksize=256,
-        output="render.pmtiles",
-    )
-
-    out_ds = process_single_tile(
-        "31TDF_0_0",
-        ["2025/07/01", "2025/10/01"],
-        args,
-        str(ocean_path),
-    )
-
-    assert out_ds is not None
-    assert [download for _cache, _date, download, _quiet in band_requests] == [
-        False,
-        True,
-        True,
-        False,
-        False,
-    ]
-    assert [date for _cache, date, download, _quiet in band_requests if download] == [
-        "2025/07/01",
-        "2025/10/01",
-    ]
-    assert prefetched_cache_dir is not None
-    assert not prefetched_cache_dir.exists()
-
-
-def test_process_single_tile_skips_prefetch_when_land_percentage_below_threshold(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-    raster_size = 100
-    pixel_size = 100.0
-    band_requests: list[tuple[str, bool, bool]] = []
-    prefetched_cache_dir: Path | None = None
-
-    monkeypatch.setattr(
-        "satmaps.list_mosaic_folders_for_tile",
-        lambda tile, dates, cache: [
-            ("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")
-        ],
-    )
-
-    source_paths = {}
-    for band_name in ["red", "green", "blue"]:
-        path = tmp_path / f"source_{band_name}.tif"
-        driver = gdal.GetDriverByName("GTiff")
-        ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
-        ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
-        srs = osr.SpatialReference()
-        srs.ImportFromEPSG(32631)
-        ds.SetProjection(srs.ExportToWkt())
-        ds.GetRasterBand(1).Fill(1000)
-        ds = None
-        source_paths[band_name] = str(path)
-
-    def fake_get_tile_paths(folder, date, cache, download=False, quiet=False):
-        nonlocal prefetched_cache_dir
-        band_requests.append((str(cache), download, quiet))
-        cache_path = Path(cache) if cache is not None else None
-        if download and cache_path is not None:
-            prefetched_cache_dir = cache_path
-        paths = {}
-        for band_name in ["red", "green", "blue"]:
-            if cache_path is not None:
-                cache_prefix = "_".join(folder.split("_")[4:])
-                band_id = {"red": "B04", "green": "B03", "blue": "B02"}[band_name]
-                path = cache_path / date.replace("/", "-") / f"{cache_prefix}_{band_id}.tif"
-                if download:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    driver = gdal.GetDriverByName("GTiff")
-                    ds = driver.Create(str(path), raster_size, raster_size, 1, gdal.GDT_Int16)
-                    ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
-                    srs = osr.SpatialReference()
-                    srs.ImportFromEPSG(32631)
-                    ds.SetProjection(srs.ExportToWkt())
-                    ds.GetRasterBand(1).Fill(1000)
-                    ds = None
-                if path.exists():
-                    paths[band_name] = str(path)
-                    continue
-            paths[band_name] = source_paths[band_name]
-        return paths
-
-    monkeypatch.setattr("satmaps.get_tile_paths", fake_get_tile_paths)
-
-    ocean_path = tmp_path / "ocean_rgba.tif"
-    ocean_ds = gdal.GetDriverByName("GTiff").Create(
-        str(ocean_path), raster_size, raster_size, 4, gdal.GDT_Byte
-    )
-    ocean_ds.SetGeoTransform((0, pixel_size, 0, raster_size * pixel_size, 0, -pixel_size))
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(32631)
-    ocean_ds.SetProjection(srs.ExportToWkt())
-    alpha_values = np.full((raster_size, raster_size), 255, dtype=np.uint8)
-    alpha_values[:10, :] = 0
-    ocean_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
-    ocean_ds.GetRasterBand(4).WriteArray(alpha_values)
-    ocean_ds = None
-
-    args = argparse.Namespace(
-        cache=".cache",
-        download=False,
-        prefetch_if_land=20.0,
-        stats_min=0,
-        stats_max=10000,
-        tonemap=True,
-        grade=True,
-        sb=0.3,
-        hb=0.75,
-        ss=1.4,
-        ms=0.9,
-        hs=0.5,
-        exposure=1.0,
-        gamma=1.0,
-        sat=0.9,
-        db=0.7,
-        ls=0.7,
-        ghb=None,
-        gms=1.0,
-        ghs=None,
-        resample_alg="near",
-        max_zoom=13,
-        blocksize=256,
-        output="render.pmtiles",
-    )
-
-    out_ds = process_single_tile("31TDF_0_0", ["2025/07/01"], args, str(ocean_path))
-
-    assert out_ds is not None
-    assert [download for _cache, download, _quiet in band_requests] == [False, False]
-    assert prefetched_cache_dir is None
-
 
 def test_build_land_run_token_changes_with_winter_flag() -> None:
     common_args = dict(
@@ -3081,7 +2416,6 @@ def test_build_land_run_token_changes_with_winter_flag() -> None:
 
     assert summer_token != winter_token
 
-
 def configure_main_defaults(
     monkeypatch: object,
     tmp_path: Path,
@@ -3101,7 +2435,6 @@ def configure_main_defaults(
         "satmaps.discover_mgrs_bases",
         lambda bbox, gebco_src, land_mgrs_list_path=None: mgrs_bases,
     )
-
 
 def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
     configure_main_defaults(
@@ -3169,7 +2502,6 @@ def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
     ]
     assert list(tmp_path.glob(".temp/master_*.vrt")) == []
 
-
 def test_main_reports_land_progress(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3210,7 +2542,6 @@ def test_main_reports_land_progress(
     assert "Rendered 4 land tile(s); skipped 0 tile(s)." in out
     assert "Building master VRT" not in out
 
-
 def test_main_low_zoom_uses_subtile_processing_strategy(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3249,7 +2580,6 @@ def test_main_low_zoom_uses_subtile_processing_strategy(
     assert "Starting output-tile rendering for 4 sub-tile(s) with 1 worker(s)." in out
     assert "Land tile progress: 4/4 (100%); Elapsed:" in out
     assert "Rendered 4 land tile(s); skipped 0 tile(s)." in out
-
 
 def test_main_passes_ocean_path_to_tile_processing(
     monkeypatch: object, tmp_path: Path
@@ -3302,7 +2632,6 @@ def test_main_passes_ocean_path_to_tile_processing(
     assert gebco_sources
     assert set(gebco_sources) == {str(custom_ocean_path)}
 
-
 def test_main_passes_winter_flag_to_tile_processing(monkeypatch: object, tmp_path: Path) -> None:
     configure_main_defaults(
         monkeypatch,
@@ -3336,7 +2665,6 @@ def test_main_passes_winter_flag_to_tile_processing(monkeypatch: object, tmp_pat
 
     assert winter_flags
     assert set(winter_flags) == {True}
-
 
 def test_main_bbox_prepares_and_commits_ocean_background(
     monkeypatch: object, tmp_path: Path
@@ -3386,7 +2714,6 @@ def test_main_bbox_prepares_and_commits_ocean_background(
             "requested_bbox": (0.0, 0.0, 1.0, 1.0),
         }
     ]
-
 
 def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eager_commit(
     monkeypatch: object, tmp_path: Path
@@ -3480,7 +2807,6 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
         }
     ]
 
-
 def test_main_reuses_cached_candidate_tile_footprints(
     monkeypatch: object,
     tmp_path: Path,
@@ -3535,7 +2861,6 @@ def test_main_reuses_cached_candidate_tile_footprints(
     assert render_calls[0]["contributor_tile_candidates"] == cached_candidates
     assert "Reusing cached candidate tile footprints for 4 sub-tile(s)." in capsys.readouterr().out
 
-
 @pytest.mark.parametrize("max_zoom", [ocean.DEFAULT_MAX_ZOOM, 14, 11, 12, 4])
 def test_main_passes_requested_zoom_to_webp_pipeline(
     monkeypatch: object, tmp_path: Path, max_zoom: int
@@ -3571,7 +2896,6 @@ def test_main_passes_requested_zoom_to_webp_pipeline(
 
     assert ocean_zooms == [max_zoom]
     assert package_zooms == [max_zoom]
-
 
 def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
     monkeypatch: object, tmp_path: Path
@@ -3625,7 +2949,6 @@ def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
     with Image.open(new_tile_path) as new_image:
         assert new_image.size == (8, 8)
 
-
 def test_main_keeps_ocean_after_processing(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -3651,120 +2974,6 @@ def test_main_keeps_ocean_after_processing(
     main()
 
     assert ocean_path.exists()
-
-
-def test_process_single_tile_returns_none_when_no_folders(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    args = argparse.Namespace(cache=".cache", download=False)
-    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
-
-    result = process_single_tile("31TDF_0_0", ["2025/07/01"], args)
-
-    assert result is None
-    assert not list(tmp_path.rglob("*.json"))
-
-
-def test_process_land_work_unit_commits_in_memory_raster(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    args = argparse.Namespace(
-        output="output.pmtiles",
-        cache=".cache",
-        max_zoom=13,
-        blocksize=512,
-        quality=74,
-        resample_alg="bilinear",
-    )
-    work_unit = satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))
-    rendered_raster = object()
-    seen_calls: list[tuple[object, str, str]] = []
-
-    def fake_process_single_tile(*args, **kwargs):
-        return rendered_raster
-
-    def fake_commit(
-        input_raster: object,
-        output_path: str,
-        unique_id: str,
-        contributor_id: str,
-        args: argparse.Namespace,
-    ) -> list[str]:
-        seen_calls.append((input_raster, output_path, contributor_id))
-        return ["13/1/2.webp"]
-
-    monkeypatch.setattr("satmaps.process_single_tile", fake_process_single_tile)
-    monkeypatch.setattr("satmaps.commit_land_raster_to_final_tile_cache", fake_commit)
-
-    result = satmaps.process_land_work_unit(
-        work_unit,
-        ["2025/07/01"],
-        args,
-        unique_id="webpworker",
-    )
-
-    assert result is None
-    assert seen_calls == [(rendered_raster, "output.pmtiles", work_unit.unit_id)]
-
-
-def test_commit_land_raster_to_final_tile_cache_streams_tile_images(monkeypatch: object) -> None:
-    args = argparse.Namespace(
-        max_zoom=13,
-        blocksize=512,
-        resample_alg="bilinear",
-    )
-    fake_dataset = object()
-    seen_calls: list[tuple[str, list[str]]] = []
-
-    class FakeCoordinator:
-        def record_contributor_tiles(
-            self,
-            contributor_id: str,
-            tile_images: object,
-        ) -> list[str]:
-            relpaths = [relative_path for relative_path, _image in tile_images]
-            seen_calls.append((contributor_id, relpaths))
-            return relpaths
-
-    satmaps.FINAL_TILE_CACHE_FLUSH_COORDINATORS["streamcommit"] = FakeCoordinator()  # type: ignore[assignment]
-
-    def fake_iter_dataset_webp_tile_images(dataset, zoom, tile_size, resample_alg):
-        assert dataset is fake_dataset
-        assert zoom == 13
-        assert tile_size == 512
-        assert resample_alg == "bilinear"
-        return iter(
-            [
-                ("13/1/2.webp", Image.new("RGB", (8, 8), (10, 20, 30))),
-                ("13/1/3.webp", Image.new("RGB", (8, 8), (40, 50, 60))),
-            ]
-        )
-
-    monkeypatch.setattr(
-        "satmaps.tiler.render_raster_to_webp_tile_images",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("expected streamed tile rendering, not eager dict rendering")
-        ),
-    )
-    monkeypatch.setattr("satmaps.tiler.iter_dataset_webp_tile_images", fake_iter_dataset_webp_tile_images)
-
-    try:
-        relpaths = satmaps.commit_land_raster_to_final_tile_cache(
-            fake_dataset,
-            "output.pmtiles",
-            "streamcommit",
-            "31TDF_0_0",
-            args,
-        )
-    finally:
-        satmaps.clear_final_tile_cache_flush_coordinator("streamcommit")
-
-    assert relpaths == ["13/1/2.webp", "13/1/3.webp"]
-    assert seen_calls == [("31TDF_0_0", ["13/1/2.webp", "13/1/3.webp"])]
-
 
 def test_commit_raster_to_final_tile_cache_streams_tile_images(
     monkeypatch: object, tmp_path: Path
@@ -3819,7 +3028,6 @@ def test_commit_raster_to_final_tile_cache_streams_tile_images(
         assert (
             Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "streamraster")) / relative_path
         ).exists()
-
 
 def test_render_final_output_tile_composites_ocean_and_ordered_contributors(
     monkeypatch: object, tmp_path: Path
@@ -3884,7 +3092,6 @@ def test_render_final_output_tile_composites_ocean_and_ordered_contributors(
     expected_pixel = expected.getpixel((0, 0))
     assert all(abs(actual - expected_channel) <= 10 for actual, expected_channel in zip(final_pixel, expected_pixel))
 
-
 def test_render_final_output_tile_skips_existing_tile(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
@@ -3914,205 +3121,6 @@ def test_render_final_output_tile_skips_existing_tile(monkeypatch: object, tmp_p
 
     assert not wrote_tile
 
-
-def test_final_tile_flush_coordinator_waits_for_all_candidate_contributors(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    relative_tile = "13/1/2.webp"
-    coordinator = satmaps.FinalTileCacheFlushCoordinator(
-        "output.pmtiles",
-        "flush123",
-        ("31TDF_0_0", "31TDF_0_1"),
-        {
-            "31TDF_0_0": (relative_tile,),
-            "31TDF_0_1": (relative_tile,),
-        },
-        quality=100,
-    )
-    final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "flush123")) / relative_tile
-    first_contributor_tile_path = (
-        Path(satmaps.build_contributor_tile_cache_dir("output.pmtiles", "flush123", "31TDF_0_0"))
-        / relative_tile
-    )
-    second_contributor_tile_path = (
-        Path(satmaps.build_contributor_tile_cache_dir("output.pmtiles", "flush123", "31TDF_0_1"))
-        / relative_tile
-    )
-
-    coordinator.record_contributor_completion(
-        "31TDF_0_0",
-        {relative_tile: Image.new("RGBA", (8, 8), (255, 0, 0, 255))},
-    )
-
-    assert not final_tile_path.exists()
-    assert first_contributor_tile_path.exists()
-    assert not Path(
-        satmaps.build_contributor_complete_marker("output.pmtiles", "flush123", "31TDF_0_0")
-    ).exists()
-    assert coordinator._tile_states[relative_tile].contributor_tile_paths == {
-        "31TDF_0_0": str(first_contributor_tile_path)
-    }
-
-    coordinator.record_contributor_completion(
-        "31TDF_0_1",
-        {relative_tile: Image.new("RGBA", (8, 8), (0, 255, 0, 255))},
-    )
-
-    assert final_tile_path.exists()
-    assert not first_contributor_tile_path.exists()
-    assert not second_contributor_tile_path.exists()
-    assert Path(
-        satmaps.build_contributor_complete_marker("output.pmtiles", "flush123", "31TDF_0_0")
-    ).exists()
-    assert Path(
-        satmaps.build_contributor_complete_marker("output.pmtiles", "flush123", "31TDF_0_1")
-    ).exists()
-
-
-def test_final_tile_flush_coordinator_rolls_back_partial_stream_on_error(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    relative_tile = "13/1/2.webp"
-    coordinator = satmaps.FinalTileCacheFlushCoordinator(
-        "output.pmtiles",
-        "flushrollback",
-        ("31TDF_0_0",),
-        {"31TDF_0_0": (relative_tile,)},
-        quality=100,
-    )
-    final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "flushrollback")) / relative_tile
-    contributor_tile_path = (
-        Path(
-            satmaps.build_contributor_tile_cache_dir(
-                "output.pmtiles",
-                "flushrollback",
-                "31TDF_0_0",
-            )
-        )
-        / relative_tile
-    )
-
-    def failing_stream():
-        yield (relative_tile, Image.new("RGBA", (8, 8), (255, 0, 0, 255)))
-        raise RuntimeError("stream exploded")
-
-    with pytest.raises(RuntimeError, match="stream exploded"):
-        coordinator.record_contributor_tiles("31TDF_0_0", failing_stream())
-
-    assert relative_tile not in coordinator._tile_states
-    assert not final_tile_path.exists()
-    assert not contributor_tile_path.exists()
-    assert "31TDF_0_0" not in coordinator._contributor_done
-    assert not Path(
-        satmaps.build_contributor_complete_marker("output.pmtiles", "flushrollback", "31TDF_0_0")
-    ).exists()
-
-
-def test_final_tile_flush_coordinator_flushes_waiting_tiles_when_peer_fails(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    relative_tile = "13/1/2.webp"
-    coordinator = satmaps.FinalTileCacheFlushCoordinator(
-        "output.pmtiles",
-        "flushpeerfail",
-        ("31TDF_0_0", "31TDF_0_1"),
-        {
-            "31TDF_0_0": (relative_tile,),
-            "31TDF_0_1": (relative_tile,),
-        },
-        quality=100,
-    )
-    final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "flushpeerfail")) / relative_tile
-    waiting_tile_path = (
-        Path(
-            satmaps.build_contributor_tile_cache_dir(
-                "output.pmtiles",
-                "flushpeerfail",
-                "31TDF_0_0",
-            )
-        )
-        / relative_tile
-    )
-
-    coordinator.record_contributor_completion(
-        "31TDF_0_0",
-        {relative_tile: Image.new("RGBA", (8, 8), (255, 0, 0, 255))},
-    )
-
-    def failing_stream():
-        if False:
-            yield (relative_tile, Image.new("RGBA", (8, 8), (0, 255, 0, 255)))
-        raise RuntimeError("stream exploded")
-
-    with pytest.raises(RuntimeError, match="stream exploded"):
-        coordinator.record_contributor_tiles("31TDF_0_1", failing_stream())
-
-    assert final_tile_path.exists()
-    assert not waiting_tile_path.exists()
-    assert relative_tile not in coordinator._tile_states
-    assert Path(
-        satmaps.build_contributor_complete_marker("output.pmtiles", "flushpeerfail", "31TDF_0_0")
-    ).exists()
-    assert not Path(
-        satmaps.build_contributor_complete_marker("output.pmtiles", "flushpeerfail", "31TDF_0_1")
-    ).exists()
-    with Image.open(final_tile_path) as final_tile:
-        pixel = final_tile.convert("RGBA").getpixel((0, 0))
-    assert pixel[0] > 200
-    assert pixel[1] < 80
-    assert pixel[2] < 80
-
-
-def test_final_tile_flush_coordinator_lazily_composites_ocean_base(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    relative_tile = "13/1/2.webp"
-    ocean_calls: list[str] = []
-    coordinator = satmaps.FinalTileCacheFlushCoordinator(
-        "output.pmtiles",
-        "flushocean",
-        ("31TDF_0_0",),
-        {"31TDF_0_0": (relative_tile,)},
-        quality=100,
-        prepared_ocean_background="ocean.tif",
-    )
-    final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "flushocean")) / relative_tile
-
-    def fake_render_ocean(
-        input_raster: str,
-        tile_relpath: str,
-        tile_size: int,
-        resample_alg: str,
-    ) -> Image.Image:
-        ocean_calls.append(f"{input_raster}:{tile_relpath}:{tile_size}:{resample_alg}")
-        return Image.new("RGBA", (8, 8), (0, 0, 255, 255))
-
-    monkeypatch.setattr("satmaps.render_raster_tile_image", fake_render_ocean)
-
-    coordinator.record_contributor_completion(
-        "31TDF_0_0",
-        {relative_tile: Image.new("RGBA", (8, 8), (255, 0, 0, 128))},
-    )
-
-    assert ocean_calls == ["ocean.tif:13/1/2.webp:512:lanczos"]
-    with Image.open(final_tile_path) as final_tile:
-        pixel = final_tile.convert("RGBA").getpixel((0, 0))
-    assert pixel[0] > 0
-    assert pixel[2] > 0
-
-
 def test_envelopes_overlap_rejects_touching_edges() -> None:
     assert not land_mgrs.envelopes_overlap(
         (0.0, 10.0, 0.0, 10.0),
@@ -4122,65 +3130,6 @@ def test_envelopes_overlap_rejects_touching_edges() -> None:
         (0.0, 10.0, 0.0, 10.0),
         (9.999, 20.0, 0.0, 10.0),
     )
-
-
-def test_configure_final_tile_cache_flush_coordinator_uses_precomputed_candidates(
-    monkeypatch: object,
-) -> None:
-    unique_id = "precomputed"
-    work_units = (satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),)
-    monkeypatch.setattr(
-        "satmaps.build_work_unit_candidate_tile_relpaths",
-        lambda work_unit, zoom: (_ for _ in ()).throw(
-            AssertionError("expected precomputed candidates to bypass conservative builder")
-        ),
-    )
-
-    satmaps.configure_final_tile_cache_flush_coordinator(
-        "output.pmtiles",
-        unique_id,
-        work_units,
-        quality=100,
-        zoom=13,
-        contributor_tile_candidates={"31TDF_0_0": ("13/1/2.webp",)},
-    )
-
-    satmaps.clear_final_tile_cache_flush_coordinator(unique_id)
-
-
-def test_configure_final_tile_cache_flush_coordinator_prioritizes_lower_sibling_tiles() -> None:
-    unique_id = "prioritized"
-    work_units = (
-        satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
-        satmaps.LandWorkUnit("31TDF_0_1", ("31TDF_0_1",)),
-        satmaps.LandWorkUnit("31TDF_1_0", ("31TDF_1_0",)),
-    )
-    satmaps.configure_final_tile_cache_flush_coordinator(
-        "output.pmtiles",
-        unique_id,
-        work_units,
-        quality=100,
-        zoom=13,
-        contributor_tile_candidates={
-            "31TDF_0_0": ("13/1/1.webp", "13/9/9.webp"),
-            "31TDF_0_1": ("13/2/2.webp", "13/9/9.webp"),
-            "31TDF_1_0": ("13/9/9.webp",),
-        },
-    )
-
-    coordinator = satmaps.FINAL_TILE_CACHE_FLUSH_COORDINATORS[unique_id]
-    assert coordinator._contributor_tile_candidates["31TDF_0_0"] == (
-        "13/1/1.webp",
-        "13/9/9.webp",
-    )
-    assert coordinator._contributor_tile_candidates["31TDF_0_1"] == (
-        "13/2/2.webp",
-        "13/9/9.webp",
-    )
-    assert coordinator._tile_sibling_counts["13/9/9.webp"] == 3
-
-    satmaps.clear_final_tile_cache_flush_coordinator(unique_id)
-
 
 def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallback(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -4239,48 +3188,6 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
     out = capsys.readouterr().out
     assert "All land output tiles already rendered." in out
 
-
-def test_recover_cached_work_outputs_requires_final_tiles_for_marker_reuse(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".temp").mkdir()
-
-    output_path = "output.pmtiles"
-    unique_id = "recover123"
-    contributor_id = "31TDF_0_0"
-    relative_tile = "13/1/2.webp"
-    marker_path = satmaps.build_contributor_complete_marker(
-        output_path,
-        unique_id,
-        contributor_id,
-    )
-    satmaps.write_tile_cache_marker(marker_path, contributor_id, [relative_tile])
-
-    recovered_without_final_tile = satmaps.recover_cached_work_outputs(
-        (satmaps.LandWorkUnit(contributor_id, (contributor_id,)),),
-        output_path,
-        unique_id,
-    )
-
-    assert recovered_without_final_tile == set()
-
-    final_tile_path = Path(satmaps.build_final_tile_cache_dir(output_path, unique_id)) / relative_tile
-    tiler.save_webp_image(
-        Image.new("RGB", (8, 8), (10, 20, 30)),
-        str(final_tile_path),
-        quality=100,
-    )
-
-    recovered_with_final_tile = satmaps.recover_cached_work_outputs(
-        (satmaps.LandWorkUnit(contributor_id, (contributor_id,)),),
-        output_path,
-        unique_id,
-    )
-
-    assert recovered_with_final_tile == {contributor_id}
-
-
 def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -4324,7 +3231,6 @@ def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
         ocean_mask_source=ocean.DEFAULT_GEBCO_ZIP,
     ) == {"05QFJ"}
     assert list(tmp_path.glob(".temp/master_*.vrt")) == []
-
 
 def test_main_refresh_land_mgrs_list_requires_mask_source(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
