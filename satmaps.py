@@ -2098,7 +2098,13 @@ def warp_band_dataset_to_tile_grid(
             translated_dataset.GetRasterBand(1).SetNoDataValue(float(SENTINEL_NODATA))
             return translated_dataset
 
-        cropped_src_win = get_tile_grid_source_src_win(source_dataset, tile_grid)
+        # Resampling kernels need source pixels beyond the exact tile footprint; otherwise
+        # separately rendered neighboring tiles can diverge along shared borders.
+        cropped_src_win = get_tile_grid_source_src_win(
+            source_dataset,
+            tile_grid,
+            halo_pixels=compute_land_output_tile_halo_pixels(resample_alg),
+        )
         warp_source: gdal.Dataset | str = source_dataset
         if cropped_src_win is not None:
             cropped_dataset = gdal.Translate(

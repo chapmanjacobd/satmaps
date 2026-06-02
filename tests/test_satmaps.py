@@ -809,6 +809,47 @@ def test_open_gebco_mask_crops_source_before_warp(monkeypatch: object) -> None:
     assert warp_options_calls[0]["multithread"] is True
     assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
 
+def test_warp_band_dataset_to_tile_grid_keeps_lanczos_neighbors_continuous(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source_3857_shifted.tif"
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset = gdal.GetDriverByName("GTiff").Create(
+        str(source_path),
+        64,
+        64,
+        1,
+        gdal.GDT_Float32,
+    )
+    assert dataset is not None
+    dataset.SetProjection(srs.ExportToWkt())
+    dataset.SetGeoTransform((0.0, 10.0, 0.0, 640.0, 0.0, -10.0))
+    dataset.GetRasterBand(1).WriteArray(
+        np.add.outer(np.arange(64, dtype=np.float32) * 10.0, np.arange(64, dtype=np.float32))
+    )
+    dataset = None
+
+    def render_neighbor(tile_index: int) -> np.ndarray:
+        # Offset the target grid by half a source pixel so the warp path, not the aligned crop
+        # path, renders each tile independently.
+        tile_grid = satmaps.TileGrid(
+            projection=srs.ExportToWkt(),
+            geotransform=(5.0 + tile_index * 160.0, 10.0, 0.0, 635.0, 0.0, -10.0),
+            width=16,
+            height=16,
+        )
+        warped = satmaps.warp_band_dataset_to_tile_grid(str(source_path), tile_grid, "lanczos")
+        array = warped.ReadAsArray()
+        assert array is not None
+        return array.astype(np.float32)
+
+    left = render_neighbor(0)
+    right = render_neighbor(1)
+    seam_diff = right[:, 0] - left[:, -1]
+
+    np.testing.assert_allclose(seam_diff, np.ones_like(seam_diff), atol=1e-5)
+
 def test_build_land_output_tile_plan_adds_lanczos_halo() -> None:
     plan = satmaps.build_land_output_tile_plan("13/1/2.webp", 512, "lanczos")
 
