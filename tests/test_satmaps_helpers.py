@@ -787,22 +787,22 @@ def test_discover_mgrs_tiles_from_ocean_mask_targets_candidate_row_blocks(
     monkeypatch.setattr(land_mgrs, "get_bbox_scan_window", lambda ds, bbox: (7, 0, 53, 40))
     monkeypatch.setattr(
         land_mgrs,
-        "build_candidate_ocean_mask_scan_envelopes",
+        "build_candidate_scan_envelopes",
         lambda dataset, candidate_tiles, bbox=None: [
             (7.0, 17.0, -10.0, 0.0),
             (7.0, 17.0, -20.0, -10.0),
         ],
     )
 
-    def fake_build_dataset_to_wgs84_transform(ds: object) -> None:
+    def fake_build_wgs84_transform(ds: object) -> None:
         nonlocal transform_builds
         transform_builds += 1
         return None
 
     monkeypatch.setattr(
         land_mgrs,
-        "build_dataset_to_wgs84_transform",
-        fake_build_dataset_to_wgs84_transform,
+        "build_wgs84_transform",
+        fake_build_wgs84_transform,
     )
     monkeypatch.setattr(
         land_mgrs,

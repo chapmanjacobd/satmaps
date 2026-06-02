@@ -3338,7 +3338,7 @@ def test_commit_raster_to_final_tile_cache_streams_tile_images(
 
     assert relpaths == ["13/1/2.webp", "13/1/3.webp"]
     marker_path = Path(
-        satmaps.build_contributor_complete_marker("output.pmtiles", "streamraster", "31TDF_0_0")
+        satmaps.build_tile_cache_marker_path("output.pmtiles", "streamraster", "31TDF_0_0")
     )
     assert marker_path.exists()
     assert satmaps.read_tile_cache_marker(str(marker_path)) == ("31TDF_0_0", relpaths)

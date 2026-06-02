@@ -141,7 +141,7 @@ def build_tile_cache_root(output_path: str, unique_id: str) -> str:
     return f".temp/{temp_basename_from_output(output_path)}_{unique_id}_tilecache"
 
 
-def build_contributor_complete_marker(
+def build_tile_cache_marker_path(
     output_path: str, unique_id: str, contributor_id: str
 ) -> str:
     """Return the completion marker path for one cached tile contributor."""
@@ -194,7 +194,12 @@ def update_count_progress(
     )
 
 
-def format_land_tile_progress_detail(
+def _join_progress_detail(parts: list[str]) -> str:
+    """Return a compact detail string used in live progress updates."""
+    return ", ".join(parts) + "."
+
+
+def land_tile_progress_detail(
     rendered_tiles: int,
     cached_tiles: int,
     empty_tiles: int,
@@ -202,36 +207,36 @@ def format_land_tile_progress_detail(
     active_tiles: int = 0,
 ) -> str:
     """Return a concise progress detail string for output-tile rendering."""
-    detail_parts = [f"{rendered_tiles} rendered", f"{cached_tiles} cached"]
+    parts = [f"{rendered_tiles} rendered", f"{cached_tiles} cached"]
     if empty_tiles > 0:
-        detail_parts.append(f"{empty_tiles} empty")
+        parts.append(f"{empty_tiles} empty")
     if active_tiles > 0:
-        detail_parts.append(f"{active_tiles} active")
-    return ", ".join(detail_parts) + "."
+        parts.append(f"{active_tiles} active")
+    return _join_progress_detail(parts)
 
 
-def format_candidate_tile_progress_detail(
+def candidate_tile_progress_detail(
     candidate_tiles: int,
     *,
     active_work_units: int = 0,
 ) -> str:
     """Return a concise progress detail string for candidate-footprint discovery."""
-    detail_parts = [f"{candidate_tiles} candidate tiles"]
+    parts = [f"{candidate_tiles} candidate tiles"]
     if active_work_units > 0:
-        detail_parts.append(f"{active_work_units} active")
-    return ", ".join(detail_parts) + "."
+        parts.append(f"{active_work_units} active")
+    return _join_progress_detail(parts)
 
 
-def format_ocean_backfill_progress_detail(
+def ocean_backfill_progress_detail(
     written_tiles: int,
     existing_tiles: int,
     empty_tiles: int,
 ) -> str:
     """Return a concise progress detail string for ocean-only tile backfills."""
-    detail_parts = [f"{written_tiles} written", f"{existing_tiles} present"]
+    parts = [f"{written_tiles} written", f"{existing_tiles} present"]
     if empty_tiles > 0:
-        detail_parts.append(f"{empty_tiles} empty")
-    return ", ".join(detail_parts) + "."
+        parts.append(f"{empty_tiles} empty")
+    return _join_progress_detail(parts)
 
 
 @dataclass(frozen=True)
@@ -981,7 +986,7 @@ def commit_raster_to_final_tile_cache(
 ) -> List[str]:
     """Render and write one contributor directly into the shared final WebP tree."""
     final_tile_tree = build_final_tile_cache_dir(output_path, unique_id)
-    marker_path = build_contributor_complete_marker(output_path, unique_id, contributor_id)
+    marker_path = build_tile_cache_marker_path(output_path, unique_id, contributor_id)
     close_dataset = False
     if isinstance(input_raster, str):
         dataset = gdal.Open(input_raster)
@@ -1042,7 +1047,7 @@ def commit_ocean_to_final_tile_cache(
     args: argparse.Namespace,
 ) -> bool:
     """Seed or repair the final WebP tree with the ocean background beneath land tiles."""
-    marker_path = build_contributor_complete_marker(
+    marker_path = build_tile_cache_marker_path(
         output_path,
         unique_id,
         OCEAN_TILE_CACHE_CONTRIBUTOR_ID,
@@ -1101,7 +1106,7 @@ def fill_missing_ocean_to_final_tile_cache(
                 processed_tiles,
                 total_tiles,
                 started_at,
-                format_ocean_backfill_progress_detail(
+                ocean_backfill_progress_detail(
                     written_tiles,
                     existing_tiles,
                     empty_tiles,
@@ -1396,7 +1401,7 @@ def precompute_work_unit_candidate_row_slabs_from_sources(
             processed_work_units,
             len(work_units),
             started_at,
-            format_candidate_tile_progress_detail(
+            candidate_tile_progress_detail(
                 candidate_tile_count,
                 active_work_units=len(future_to_work_unit),
             ),
@@ -1415,7 +1420,7 @@ def precompute_work_unit_candidate_row_slabs_from_sources(
                     processed_work_units,
                     len(work_units),
                     started_at,
-                    format_candidate_tile_progress_detail(
+                    candidate_tile_progress_detail(
                         candidate_tile_count,
                         active_work_units=len(future_to_work_unit),
                     ),
@@ -1435,7 +1440,7 @@ def precompute_work_unit_candidate_row_slabs_from_sources(
                 processed_work_units,
                 len(work_units),
                 started_at,
-                format_candidate_tile_progress_detail(
+                candidate_tile_progress_detail(
                     candidate_tile_count,
                     active_work_units=len(future_to_work_unit),
                 ),
@@ -2987,7 +2992,7 @@ def render_land_output_tiles(
                     processed_tiles,
                     total_tiles,
                     started_at,
-                    format_land_tile_progress_detail(
+                    land_tile_progress_detail(
                         rendered_tiles,
                         cached_tiles,
                         empty_tiles,
@@ -3019,7 +3024,7 @@ def render_land_output_tiles(
                 processed_tiles,
                 total_tiles,
                 started_at,
-                format_land_tile_progress_detail(
+                land_tile_progress_detail(
                     rendered_tiles,
                     cached_tiles,
                     empty_tiles,

@@ -13,6 +13,7 @@ import mgrs
 from mgrs import core as mgrs_core
 import numpy as np
 import ocean
+from common import file_has_content
 from osgeo import gdal, ogr, osr
 
 import tiler
@@ -36,6 +37,23 @@ class _NoopProgressLine:
         return
 
 
+def _build_wgs84_srs() -> osr.SpatialReference:
+    """Return a WGS84 SRS configured for traditional GIS axis ordering."""
+    wgs84_srs = osr.SpatialReference()
+    wgs84_srs.ImportFromEPSG(4326)
+    if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
+        wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    return wgs84_srs
+
+
+def _clone_target_srs(target_srs: osr.SpatialReference) -> osr.SpatialReference:
+    """Clone a target SRS and normalize axis ordering to match GDAL raster usage."""
+    cloned_srs = target_srs.Clone()
+    if hasattr(cloned_srs, "SetAxisMappingStrategy"):
+        cloned_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    return cloned_srs
+
+
 def build_bbox_geometry(
     bbox: BBox,
     target_srs: Optional[osr.SpatialReference] = None,
@@ -54,12 +72,8 @@ def build_bbox_geometry(
     if target_srs is None:
         return polygon
 
-    dataset_srs = target_srs.Clone()
-    wgs84_srs = osr.SpatialReference()
-    wgs84_srs.ImportFromEPSG(4326)
-    if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
-        wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    dataset_srs = _clone_target_srs(target_srs)
+    wgs84_srs = _build_wgs84_srs()
     if not (dataset_srs.IsSameGeogCS(wgs84_srs) and dataset_srs.IsGeographic()):
         polygon.Transform(osr.CoordinateTransformation(wgs84_srs, dataset_srs))
 
@@ -94,19 +108,15 @@ def build_mgrs_tile_geometry(
     polygon.AddGeometry(ring)
 
     if target_srs is not None:
-        dataset_srs = target_srs.Clone()
-        wgs84_srs = osr.SpatialReference()
-        wgs84_srs.ImportFromEPSG(4326)
-        if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
-            wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-            dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        dataset_srs = _clone_target_srs(target_srs)
+        wgs84_srs = _build_wgs84_srs()
         if not (dataset_srs.IsSameGeogCS(wgs84_srs) and dataset_srs.IsGeographic()):
             polygon.Transform(osr.CoordinateTransformation(wgs84_srs, dataset_srs))
 
     return polygon
 
 
-def build_candidate_ocean_mask_scan_envelopes(
+def build_candidate_scan_envelopes(
     dataset: gdal.Dataset,
     candidate_tiles: Set[str],
     bbox: Optional[BBox] = None,
@@ -114,7 +124,7 @@ def build_candidate_ocean_mask_scan_envelopes(
     """Build candidate tile envelopes in dataset coordinates for block prefiltering."""
     dataset_srs = dataset.GetSpatialRef()
     bbox_geometry = build_bbox_geometry(bbox, dataset_srs) if bbox is not None else None
-    scan_envelopes: List[Envelope] = []
+    envelopes: List[Envelope] = []
 
     for mgrs_tile in sorted(candidate_tiles):
         tile_geometry = build_mgrs_tile_geometry(mgrs_tile, dataset_srs)
@@ -129,9 +139,9 @@ def build_candidate_ocean_mask_scan_envelopes(
         min_x, max_x, min_y, max_y = tile_geometry.GetEnvelope()
         if min_x >= max_x or min_y >= max_y:
             continue
-        scan_envelopes.append((min_x, max_x, min_y, max_y))
+        envelopes.append((min_x, max_x, min_y, max_y))
 
-    return scan_envelopes
+    return envelopes
 
 
 def source_window_envelope(
@@ -180,19 +190,14 @@ def get_ocean_mask_band_index(dataset: gdal.Dataset) -> Optional[int]:
     return None
 
 
-def build_dataset_to_wgs84_transform(dataset: gdal.Dataset) -> Optional[osr.CoordinateTransformation]:
+def build_wgs84_transform(dataset: gdal.Dataset) -> Optional[osr.CoordinateTransformation]:
     """Build a dataset-to-lon/lat transform when the raster is not already in WGS84."""
     dataset_srs = dataset.GetSpatialRef()
     if dataset_srs is None:
         return None
 
-    dataset_srs = dataset_srs.Clone()
-    wgs84_srs = osr.SpatialReference()
-    wgs84_srs.ImportFromEPSG(4326)
-
-    if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
-        wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    dataset_srs = _clone_target_srs(dataset_srs)
+    wgs84_srs = _build_wgs84_srs()
 
     if dataset_srs.IsSameGeogCS(wgs84_srs) and dataset_srs.IsGeographic():
         return None
@@ -399,9 +404,9 @@ def discover_mgrs_tiles_from_ocean_mask(
     row_block_height = max(block_y, 1)
     process_block_width = max(block_x, 1)
     nodata = band.GetNoDataValue()
-    to_wgs84 = build_dataset_to_wgs84_transform(ds)
+    to_wgs84 = build_wgs84_transform(ds)
     geotransform = ds.GetGeoTransform()
-    m = mgrs.MGRS()
+    mgrs_converter = mgrs.MGRS()
     scan_window = get_bbox_scan_window(ds, bbox)
     if scan_window is None:
         ds = None
@@ -423,7 +428,7 @@ def discover_mgrs_tiles_from_ocean_mask(
     started_at = time.perf_counter()
 
     if candidate_tiles is not None:
-        candidate_scan_envelopes = build_candidate_ocean_mask_scan_envelopes(
+        candidate_scan_envelopes = build_candidate_scan_envelopes(
             ds,
             candidate_tiles,
             bbox=bbox,
@@ -467,7 +472,7 @@ def discover_mgrs_tiles_from_ocean_mask(
                         geotransform,
                         nodata,
                         to_wgs84,
-                        m,
+                        mgrs_converter,
                         bbox,
                         candidate_tiles,
                         depth_mode=depth_mode,
@@ -509,7 +514,7 @@ def discover_mgrs_tiles_from_ocean_mask(
                         geotransform,
                         nodata,
                         to_wgs84,
-                        m,
+                        mgrs_converter,
                         bbox,
                         None,
                         depth_mode=depth_mode,
@@ -537,14 +542,6 @@ def discover_mgrs_tiles_from_ocean_mask(
 def build_land_mgrs_list_path() -> str:
     """Return the cached land-MGRS list path used to skip repeat ocean scans."""
     return "land_mgrs.list"
-
-
-def _file_has_content(path: str) -> bool:
-    """Return True when a path exists and has non-zero size."""
-    try:
-        return os.path.isfile(path) and os.path.getsize(path) > 0
-    except OSError:
-        return False
 
 
 def build_land_mgrs_cache_metadata(
@@ -628,7 +625,7 @@ def load_saved_land_mgrs_list(
 ) -> Optional[Set[str]]:
     """Load a cached land-MGRS list, treating bbox scope as the only strict cache key."""
     del ocean_mask_source
-    if land_mgrs_list_path is None or not _file_has_content(land_mgrs_list_path):
+    if land_mgrs_list_path is None or not file_has_content(land_mgrs_list_path):
         return None
 
     try:
