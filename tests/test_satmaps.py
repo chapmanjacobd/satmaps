@@ -3207,7 +3207,7 @@ def test_main_passes_requested_zoom_to_webp_pipeline(
     assert package_zooms == [max_zoom]
 
 def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
-    monkeypatch: object, tmp_path: Path
+    monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
     final_tile_tree = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "oceanfill"))
@@ -3219,6 +3219,7 @@ def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
     fake_dataset = object()
     seen_dataset: list[object] = []
     rendered_bounds: list[tuple[float, float, float, float]] = []
+    perf_counter_values = iter(range(100, 120))
 
     def fake_iter_dataset_tile_relpaths(dataset, zoom):
         seen_dataset.append(dataset)
@@ -3230,8 +3231,11 @@ def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
             ]
         )
 
+    monkeypatch.setattr(satmaps.time, "perf_counter", lambda: float(next(perf_counter_values)))
     monkeypatch.setattr("satmaps.gdal.Open", lambda path: fake_dataset)
     monkeypatch.setattr("satmaps.tiler.iter_dataset_tile_relpaths", fake_iter_dataset_tile_relpaths)
+    monkeypatch.setattr("satmaps.tiler.get_dataset_bounds", lambda dataset: (0.0, 0.0, 1.0, 1.0))
+    monkeypatch.setattr("satmaps.tiler.get_chunk_tile_range", lambda bounds, zoom: (1, 2, 1, 3))
 
     def fake_render_dataset_tile(dataset, bounds, tile_size, resample_alg):
         assert dataset is fake_dataset
@@ -3257,6 +3261,11 @@ def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
     assert new_tile_path.exists()
     with Image.open(new_tile_path) as new_image:
         assert new_image.size == (8, 8)
+    out = capsys.readouterr().out
+    assert "Ocean backfill progress: 0/2 (0%);" in out
+    assert "0 written, 0 present." in out
+    assert "Ocean backfill progress: 2/2 (100%);" in out
+    assert "1 written, 1 present." in out
 
 def test_main_keeps_ocean_after_processing(
     monkeypatch: object, tmp_path: Path

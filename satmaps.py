@@ -222,6 +222,18 @@ def format_candidate_tile_progress_detail(
     return ", ".join(detail_parts) + "."
 
 
+def format_ocean_backfill_progress_detail(
+    written_tiles: int,
+    existing_tiles: int,
+    empty_tiles: int,
+) -> str:
+    """Return a concise progress detail string for ocean-only tile backfills."""
+    detail_parts = [f"{written_tiles} written", f"{existing_tiles} present"]
+    if empty_tiles > 0:
+        detail_parts.append(f"{empty_tiles} empty")
+    return ", ".join(detail_parts) + "."
+
+
 @dataclass(frozen=True)
 class PackagedPMTiles:
     temp_mbtiles: str
@@ -1063,10 +1075,47 @@ def fill_missing_ocean_to_final_tile_cache(
         raise RuntimeError(f"Could not open raster for tile rendering: {input_raster}")
 
     written_tiles = 0
+    existing_tiles = 0
+    empty_tiles = 0
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
+    next_progress_at = started_at
     try:
+        total_tiles = sum(
+            tx_max - tx_min + 1
+            for _ty, tx_min, tx_max in build_row_slabs_for_tile_bounds(
+                tiler.get_dataset_bounds(dataset),
+                args.max_zoom,
+            )
+        )
+        processed_tiles = 0
+
+        def update_progress(*, force: bool = False) -> None:
+            nonlocal next_progress_at
+            now = time.perf_counter()
+            if not force and now < next_progress_at:
+                return
+            update_count_progress(
+                progress_line,
+                "Ocean backfill progress:",
+                processed_tiles,
+                total_tiles,
+                started_at,
+                format_ocean_backfill_progress_detail(
+                    written_tiles,
+                    existing_tiles,
+                    empty_tiles,
+                ),
+            )
+            next_progress_at = now + LAND_PROGRESS_HEARTBEAT_SECONDS
+
+        update_progress(force=True)
         for relative_path in tiler.iter_dataset_tile_relpaths(dataset, args.max_zoom):
             destination_path = os.path.join(final_tile_tree, relative_path)
             if file_has_content(destination_path):
+                existing_tiles += 1
+                processed_tiles += 1
+                update_progress(force=processed_tiles >= total_tiles)
                 continue
             zoom, tx, ty = parse_tile_tree_relpath(relative_path)
             tile_array = tiler.render_dataset_tile(
@@ -1077,10 +1126,19 @@ def fill_missing_ocean_to_final_tile_cache(
             )
             image = tiler.tile_array_to_image(tile_array)
             if image is None:
+                empty_tiles += 1
+                processed_tiles += 1
+                update_progress(force=processed_tiles >= total_tiles)
                 continue
-            tiler.save_webp_image(image, destination_path, args.quality, lossless=False)
+            try:
+                tiler.save_webp_image(image, destination_path, args.quality, lossless=False)
+            finally:
+                image.close()
             written_tiles += 1
+            processed_tiles += 1
+            update_progress(force=processed_tiles >= total_tiles)
     finally:
+        progress_line.finish()
         dataset = None
 
     return written_tiles
