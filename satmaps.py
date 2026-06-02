@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import warnings
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, cast
@@ -42,6 +42,7 @@ DATE_PATH_QUARTERS = (
     ("01/01", "Q1"),
 )
 RGB_BANDS = (("B04", "red"), ("B03", "green"), ("B02", "blue"))
+DEFAULT_CANDIDATE_FOOTPRINT_BAND_ID = "B04"
 SUBTILE_OFFSETS = ((0, 0), (0, 1), (1, 0), (1, 1))
 SENTINEL_NODATA = -32768
 PROCESS_SLAB_HEIGHT = 24
@@ -206,6 +207,18 @@ def format_land_tile_progress_detail(
         detail_parts.append(f"{empty_tiles} empty")
     if active_tiles > 0:
         detail_parts.append(f"{active_tiles} active")
+    return ", ".join(detail_parts) + "."
+
+
+def format_candidate_tile_progress_detail(
+    candidate_tiles: int,
+    *,
+    active_work_units: int = 0,
+) -> str:
+    """Return a concise progress detail string for candidate-footprint discovery."""
+    detail_parts = [f"{candidate_tiles} candidate tiles"]
+    if active_work_units > 0:
+        detail_parts.append(f"{active_work_units} active")
     return ", ".join(detail_parts) + "."
 
 
@@ -410,6 +423,7 @@ def read_candidate_tile_cache(
         print(f"Warning: Could not load candidate tile cache {cache_path}: {exc}")
         return None
 
+
 def parse_prefetch_if_land(value: str) -> float:
     """Parse a land-percentage threshold for conditional RGB prefetching."""
     try:
@@ -511,6 +525,20 @@ def build_land_run_token(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
 
 
+def build_candidate_tile_cache_token(args: argparse.Namespace) -> str:
+    """Return a stable token for the reusable candidate-footprint cache."""
+    payload = json.dumps(
+        {
+            "max_zoom": args.max_zoom,
+            "resample_alg": args.resample_alg,
+            "blocksize": args.blocksize,
+            "footprint_band": DEFAULT_CANDIDATE_FOOTPRINT_BAND_ID,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+
+
 @dataclass(frozen=True)
 class TileGrid:
     projection: str
@@ -565,7 +593,11 @@ S3_FOLDER_CACHE: Dict[str, set[str]] = {}
 
 
 def list_mosaic_folders_for_tile(
-    mgrs_tile: str, date_paths: List[str], cache_dir: str
+    mgrs_tile: str,
+    date_paths: List[str],
+    cache_dir: str,
+    *,
+    first_match_only: bool = False,
 ) -> List[Tuple[str, str]]:
     """Find all S3 folders for a specific MGRS sub-tile across multiple dates using the pre-populated cache."""
     mgrs_id, x, y = mgrs_tile.split("_")
@@ -586,18 +618,24 @@ def list_mosaic_folders_for_tile(
         )
         if os.path.exists(local_b04):
             found.append((folder, date_path))
+            if first_match_only:
+                return found
             continue
 
         # 2. Check pre-populated S3 cache
         if date_path in S3_FOLDER_CACHE:
             if folder in S3_FOLDER_CACHE[date_path]:
                 found.append((folder, date_path))
+                if first_match_only:
+                    return found
         else:
             # Fallback when the shared S3 cache was not pre-populated: check this folder directly.
             s3_path = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder}"
             try:
                 if gdal.ReadDir(s3_path):
                     found.append((folder, date_path))
+                    if first_match_only:
+                        return found
             except RuntimeError as exc:
                 print(f"Warning: Could not inspect remote folder {s3_path}: {exc}")
 
@@ -613,42 +651,56 @@ def get_tile_paths(
     quiet: bool = False,
 ) -> Dict[str, str]:
     """Construct local or S3 paths for RGB bands. Only downloads if 'download' is True."""
+    paths = {}
+    for band_id, color_name in RGB_BANDS:
+        paths[color_name] = get_tile_band_path(
+            folder_name,
+            date_path,
+            band_id,
+            cache_dir,
+            download=download,
+            quiet=quiet,
+        )
+
+    return paths
+
+
+def get_tile_band_path(
+    folder_name: str,
+    date_path: str,
+    band_id: str,
+    cache_dir: Optional[str] = None,
+    download: bool = False,
+    *,
+    quiet: bool = False,
+) -> str:
+    """Construct a local or S3 path for one Sentinel band."""
     cache_prefix = "_".join(folder_name.split("_")[4:])
     base_s3 = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder_name}"
-    paths = {}
-
     date_cache_dir = (
         os.path.join(cache_dir, date_path.replace("/", "-")) if cache_dir else None
     )
-    for band_id, color_name in RGB_BANDS:
-        local_path = (
-            os.path.join(date_cache_dir, f"{cache_prefix}_{band_id}.tif")
-            if date_cache_dir
-            else None
-        )
+    local_path = (
+        os.path.join(date_cache_dir, f"{cache_prefix}_{band_id}.tif")
+        if date_cache_dir
+        else None
+    )
 
-        # Use local if it exists
-        if local_path and os.path.exists(local_path):
-            paths[color_name] = local_path
-            continue
+    if local_path and os.path.exists(local_path):
+        return local_path
 
-        # Download if requested and local_path is valid
-        if download and local_path:
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            s3_path = f"{base_s3}/{band_id}.tif"
-            if not quiet:
-                print(f"Downloading {s3_path} to {local_path}...")
-            src_ds = gdal.Open(s3_path)
-            if src_ds is None:
-                raise RuntimeError(f"Could not open {s3_path}")
-            gdal.GetDriverByName("GTiff").CreateCopy(local_path, src_ds, callback=None)
-            paths[color_name] = local_path
-            continue
+    s3_path = f"{base_s3}/{band_id}.tif"
+    if download and local_path:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        if not quiet:
+            print(f"Downloading {s3_path} to {local_path}...")
+        src_ds = gdal.Open(s3_path)
+        if src_ds is None:
+            raise RuntimeError(f"Could not open {s3_path}")
+        gdal.GetDriverByName("GTiff").CreateCopy(local_path, src_ds, callback=None)
+        return local_path
 
-        # Fallback to streaming
-        paths[color_name] = f"{base_s3}/{band_id}.tif"
-
-    return paths
+    return s3_path
 
 
 def parse_bbox(bbox: str) -> Tuple[float, float, float, float]:
@@ -1178,19 +1230,25 @@ def build_work_unit_candidate_tile_relpaths_from_sources(
     inspected_any_source = False
 
     for source_subtile in work_unit.source_subtiles:
-        folders = list_mosaic_folders_for_tile(source_subtile, date_paths, cache_dir)
+        folders = list_mosaic_folders_for_tile(
+            source_subtile,
+            date_paths,
+            cache_dir,
+            first_match_only=True,
+        )
         if not folders:
             continue
 
         folder_name, date_path = folders[0]
         try:
-            source_path = get_tile_paths(
+            source_path = get_tile_band_path(
                 folder_name,
                 date_path,
+                DEFAULT_CANDIDATE_FOOTPRINT_BAND_ID,
                 cache_dir,
                 download=False,
                 quiet=True,
-            )["red"]
+            )
             candidate_relpaths.update(
                 build_source_raster_candidate_tile_relpaths(
                     source_path,
@@ -1227,23 +1285,20 @@ def precompute_work_unit_candidate_tile_relpaths_from_sources(
         return {}
 
     max_workers = max(1, min(parallel, len(work_units)))
-    if max_workers == 1:
-        return {
-            work_unit.unit_id: build_work_unit_candidate_tile_relpaths_from_sources(
-                work_unit,
-                date_paths,
-                cache_dir,
-                zoom,
-                tile_size=tile_size,
-                resample_alg=resample_alg,
-            )
-            for work_unit in work_units
-        }
-
     candidate_relpaths_by_work_unit: dict[str, tuple[str, ...]] = {}
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
+    processed_work_units = 0
+    candidate_tile_count = 0
+    work_unit_iter = iter(work_units)
+    future_to_work_unit: dict[Future[tuple[str, ...]], LandWorkUnit] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_work_unit = {
-            executor.submit(
+        def submit_next_inspection() -> bool:
+            try:
+                work_unit = next(work_unit_iter)
+            except StopIteration:
+                return False
+            future = executor.submit(
                 build_work_unit_candidate_tile_relpaths_from_sources,
                 work_unit,
                 date_paths,
@@ -1251,12 +1306,64 @@ def precompute_work_unit_candidate_tile_relpaths_from_sources(
                 zoom,
                 tile_size=tile_size,
                 resample_alg=resample_alg,
-            ): work_unit
-            for work_unit in work_units
-        }
-        for future in as_completed(future_to_work_unit):
-            work_unit = future_to_work_unit[future]
-            candidate_relpaths_by_work_unit[work_unit.unit_id] = future.result()
+            )
+            future_to_work_unit[future] = work_unit
+            return True
+
+        while len(future_to_work_unit) < max_workers and submit_next_inspection():
+            pass
+
+        update_count_progress(
+            progress_line,
+            "Candidate footprint progress:",
+            processed_work_units,
+            len(work_units),
+            started_at,
+            format_candidate_tile_progress_detail(
+                candidate_tile_count,
+                active_work_units=len(future_to_work_unit),
+            ),
+        )
+
+        while future_to_work_unit:
+            done_futures, _pending = wait(
+                set(future_to_work_unit),
+                timeout=LAND_PROGRESS_HEARTBEAT_SECONDS,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done_futures:
+                update_count_progress(
+                    progress_line,
+                    "Candidate footprint progress:",
+                    processed_work_units,
+                    len(work_units),
+                    started_at,
+                    format_candidate_tile_progress_detail(
+                        candidate_tile_count,
+                        active_work_units=len(future_to_work_unit),
+                    ),
+                )
+                continue
+            for future in done_futures:
+                work_unit = future_to_work_unit.pop(future)
+                candidate_relpaths = future.result()
+                candidate_relpaths_by_work_unit[work_unit.unit_id] = candidate_relpaths
+                processed_work_units += 1
+                candidate_tile_count += len(candidate_relpaths)
+            while len(future_to_work_unit) < max_workers and submit_next_inspection():
+                pass
+            update_count_progress(
+                progress_line,
+                "Candidate footprint progress:",
+                processed_work_units,
+                len(work_units),
+                started_at,
+                format_candidate_tile_progress_detail(
+                    candidate_tile_count,
+                    active_work_units=len(future_to_work_unit),
+                ),
+            )
+    progress_line.finish()
     return candidate_relpaths_by_work_unit
 
 
@@ -1267,6 +1374,7 @@ def resolve_work_unit_candidate_tile_relpaths(
     zoom: int,
     *,
     cache_path: str,
+    fallback_cache_path: Optional[str] = None,
     tile_size: int = 512,
     resample_alg: str = "lanczos",
     parallel: int = 1,
@@ -1275,7 +1383,24 @@ def resolve_work_unit_candidate_tile_relpaths(
     if not work_units:
         return {}
 
-    cached_candidates = read_candidate_tile_cache(cache_path) or {}
+    loaded_candidates = read_candidate_tile_cache(cache_path)
+    loaded_cache_path = cache_path if loaded_candidates is not None else None
+    if (
+        loaded_candidates is None
+        and fallback_cache_path is not None
+        and fallback_cache_path != cache_path
+    ):
+        loaded_candidates = read_candidate_tile_cache(fallback_cache_path)
+        if loaded_candidates is not None:
+            loaded_cache_path = fallback_cache_path
+    if loaded_candidates is None:
+        print(f"No usable candidate tile cache found at {cache_path}; computing source footprints.")
+    else:
+        print(
+            f"Loaded candidate tile cache from {loaded_cache_path} "
+            f"with {len(loaded_candidates)} sub-tile(s)."
+        )
+    cached_candidates = loaded_candidates or {}
     requested_work_units = {work_unit.unit_id: work_unit for work_unit in work_units}
     reused_candidates = {
         work_unit_id: cached_candidates[work_unit_id]
@@ -1289,6 +1414,8 @@ def resolve_work_unit_candidate_tile_relpaths(
     ]
 
     if reused_candidates and not missing_work_units:
+        if loaded_cache_path and loaded_cache_path != cache_path:
+            write_candidate_tile_cache(cache_path, cached_candidates)
         print(
             f"Reusing cached candidate tile footprints for "
             f"{len(reused_candidates)} sub-tile(s)."
@@ -3024,7 +3151,9 @@ def main() -> None:
 
     unique_id = build_land_run_token(args, date_paths, requested_bbox, gebco_vrt_source)
     state_file = build_state_file_path(unique_id)
-    candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
+    candidate_tile_cache_token = build_candidate_tile_cache_token(args)
+    candidate_tile_cache_path = build_candidate_tile_cache_path(candidate_tile_cache_token)
+    legacy_candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
     if args.resume:
         resume_path = find_resume_path(
             args.resume,
@@ -3035,7 +3164,6 @@ def main() -> None:
             if resume_state:
                 state_file = cast(str, resume_state["state_file"])
                 unique_id = cast(str, resume_state["unique_id"])
-                candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
                 cast(Set[str], resume_state["completed_units"])
 
     mgrs_bases = discover_mgrs_bases(
@@ -3090,6 +3218,7 @@ def main() -> None:
                 args.cache,
                 args.max_zoom,
                 cache_path=candidate_tile_cache_path,
+                fallback_cache_path=legacy_candidate_tile_cache_path,
                 tile_size=args.blocksize,
                 resample_alg=args.resample_alg,
                 parallel=args.parallel,

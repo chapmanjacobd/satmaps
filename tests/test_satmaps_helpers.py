@@ -18,6 +18,7 @@ from satmaps import (
     build_alpha_block,
     build_fill_allowed_mask,
     build_bbox_geometry,
+    build_candidate_tile_cache_token,
     build_land_run_token,
     expand_subtiles,
     find_resume_path,
@@ -387,6 +388,33 @@ def test_build_land_run_token_is_stable_for_matching_inputs() -> None:
         "ocean.tif",
     )
 
+    assert token_a == token_b
+    assert token_a != token_c
+
+
+def test_build_candidate_tile_cache_token_ignores_output_path() -> None:
+    args_a = satmaps.argparse.Namespace(
+        output="render-a.pmtiles",
+        max_zoom=13,
+        blocksize=256,
+        resample_alg="lanczos",
+    )
+    args_b = satmaps.argparse.Namespace(
+        output="render-b.pmtiles",
+        max_zoom=13,
+        blocksize=256,
+        resample_alg="lanczos",
+    )
+    args_c = satmaps.argparse.Namespace(
+        output="render-a.pmtiles",
+        max_zoom=14,
+        blocksize=256,
+        resample_alg="lanczos",
+    )
+
+    token_a = build_candidate_tile_cache_token(args_a)
+    token_b = build_candidate_tile_cache_token(args_b)
+    token_c = build_candidate_tile_cache_token(args_c)
     assert token_a == token_b
     assert token_a != token_c
 

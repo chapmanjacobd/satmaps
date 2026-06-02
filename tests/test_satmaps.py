@@ -35,6 +35,30 @@ def test_list_mosaic_folders_for_tile_uses_cache(monkeypatch: object) -> None:
     found = list_mosaic_folders_for_tile("31TDF_0_0", ["2025/07/01"], ".cache")
     assert found == [("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")]
 
+
+def test_list_mosaic_folders_for_tile_first_match_only_short_circuits(monkeypatch: object) -> None:
+    satmaps.S3_FOLDER_CACHE = {
+        "2025/07/01": {"Sentinel-2_mosaic_2025_Q3_31TDF_0_0"},
+        "2025/10/01": {"Sentinel-2_mosaic_2025_Q4_31TDF_0_0"},
+    }
+    checked_paths: list[str] = []
+
+    def fail_if_called(path: str) -> list[str]:
+        checked_paths.append(path)
+        raise AssertionError("unexpected remote lookup")
+
+    monkeypatch.setattr(satmaps.gdal, "ReadDir", fail_if_called)
+
+    found = list_mosaic_folders_for_tile(
+        "31TDF_0_0",
+        ["2025/07/01", "2025/10/01"],
+        ".cache",
+        first_match_only=True,
+    )
+
+    assert found == [("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")]
+    assert checked_paths == []
+
 def test_get_tile_paths_returns_s3_paths(monkeypatch: object) -> None:
     # Ensure local cache doesn't exist for this test
     monkeypatch.setattr("os.path.exists", lambda path: False)
@@ -2169,11 +2193,11 @@ def test_build_work_unit_candidate_tile_relpaths_from_sources_uses_actual_source
 
     monkeypatch.setattr(
         "satmaps.list_mosaic_folders_for_tile",
-        lambda mgrs_tile, date_paths, cache_dir: [("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")],
+        lambda mgrs_tile, date_paths, cache_dir, **kwargs: [("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")],
     )
     monkeypatch.setattr(
-        "satmaps.get_tile_paths",
-        lambda folder_name, date_path, cache_dir, download=False, quiet=False: {"red": str(source_path)},
+        "satmaps.get_tile_band_path",
+        lambda folder_name, date_path, band_id, cache_dir, download=False, quiet=False: str(source_path),
     )
 
     actual = set(
@@ -2196,11 +2220,11 @@ def test_build_work_unit_candidate_tile_relpaths_from_sources_falls_back_on_insp
     work_unit = satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))
     monkeypatch.setattr(
         "satmaps.list_mosaic_folders_for_tile",
-        lambda mgrs_tile, date_paths, cache_dir: [("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")],
+        lambda mgrs_tile, date_paths, cache_dir, **kwargs: [("Sentinel-2_mosaic_2025_Q3_31TDF_0_0", "2025/07/01")],
     )
     monkeypatch.setattr(
-        "satmaps.get_tile_paths",
-        lambda folder_name, date_path, cache_dir, download=False, quiet=False: {"red": "broken.tif"},
+        "satmaps.get_tile_band_path",
+        lambda folder_name, date_path, band_id, cache_dir, download=False, quiet=False: "broken.tif",
     )
     monkeypatch.setattr(
         "satmaps.gdal.Open",
@@ -2220,6 +2244,7 @@ def test_build_work_unit_candidate_tile_relpaths_from_sources_falls_back_on_insp
 def test_resolve_work_unit_candidate_tile_relpaths_reuses_cached_subset_and_persists_missing(
     monkeypatch: object,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
@@ -2267,6 +2292,46 @@ def test_resolve_work_unit_candidate_tile_relpaths_reuses_cached_subset_and_pers
         "31TDF_0_1": ("13/2/2.webp",),
     }
     assert satmaps.read_candidate_tile_cache(cache_path) == actual
+    out = capsys.readouterr().out
+    assert f"Loaded candidate tile cache from {cache_path} with 1 sub-tile(s)." in out
+    assert "Reusing cached candidate tile footprints for 1 sub-tile(s); computing 1 missing." in out
+
+
+def test_precompute_work_unit_candidate_tile_relpaths_reports_progress(
+    monkeypatch: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    work_units = (
+        satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
+        satmaps.LandWorkUnit("31TDF_0_1", ("31TDF_0_1",)),
+    )
+    monkeypatch.setattr(satmaps, "LAND_PROGRESS_HEARTBEAT_SECONDS", 0.01)
+
+    def slow_build(*args: object, **kwargs: object) -> tuple[str, ...]:
+        time.sleep(0.03)
+        return ("13/1/1.webp", "13/1/2.webp")
+
+    monkeypatch.setattr(
+        "satmaps.build_work_unit_candidate_tile_relpaths_from_sources",
+        slow_build,
+    )
+
+    actual = satmaps.precompute_work_unit_candidate_tile_relpaths_from_sources(
+        work_units,
+        ["2025/07/01"],
+        ".cache",
+        13,
+        parallel=1,
+    )
+
+    assert actual == {
+        "31TDF_0_0": ("13/1/1.webp", "13/1/2.webp"),
+        "31TDF_0_1": ("13/1/1.webp", "13/1/2.webp"),
+    }
+    out = capsys.readouterr().out
+    assert "Candidate footprint progress: 0/2 (0%);" in out
+    assert "0 candidate tiles, 1 active." in out
+    assert "Candidate footprint progress: 2/2 (100%); Elapsed:" in out
+    assert "4 candidate tiles." in out
 
 def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:
     vrt_outputs: list[tuple[str, str]] = []
@@ -2545,6 +2610,10 @@ def configure_main_defaults(
     monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
     monkeypatch.setattr(satmaps, "S3_FOLDER_CACHE", {})
     monkeypatch.setattr("satmaps.build_land_run_token", lambda *args, **kwargs: unique_id)
+    monkeypatch.setattr(
+        "satmaps.build_candidate_tile_cache_token",
+        lambda *args, **kwargs: unique_id,
+    )
     monkeypatch.setattr(
         "satmaps.discover_mgrs_bases",
         lambda bbox, gebco_src, land_mgrs_list_path=None: mgrs_bases,
@@ -3037,6 +3106,10 @@ def test_main_reuses_cached_candidate_tile_footprints(
         mgrs_bases=["31TDF"],
         unique_id="cachedcandidates",
     )
+    monkeypatch.setattr(
+        "satmaps.build_candidate_tile_cache_token",
+        lambda *args, **kwargs: "sharedcandidates",
+    )
     cached_candidates = {
         "31TDF_0_0": ("13/1/1.webp",),
         "31TDF_0_1": ("13/1/2.webp",),
@@ -3077,7 +3150,12 @@ def test_main_reuses_cached_candidate_tile_footprints(
 
     assert len(render_calls) == 1
     assert render_calls[0]["contributor_tile_candidates"] == cached_candidates
-    assert "Reusing cached candidate tile footprints for 4 sub-tile(s)." in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Loaded candidate tile cache from .temp/candidate_tiles_cachedcandidates.json with 4 sub-tile(s)." in out
+    assert "Reusing cached candidate tile footprints for 4 sub-tile(s)." in out
+    assert satmaps.read_candidate_tile_cache(
+        satmaps.build_candidate_tile_cache_path("sharedcandidates")
+    ) == cached_candidates
 
 @pytest.mark.parametrize("max_zoom", [ocean.DEFAULT_MAX_ZOOM, 14, 11, 12, 4])
 def test_main_passes_requested_zoom_to_webp_pipeline(
