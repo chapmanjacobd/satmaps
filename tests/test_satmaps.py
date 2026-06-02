@@ -837,6 +837,28 @@ def test_build_output_tile_contributor_index_preserves_work_unit_order() -> None
         "13/1/3.webp": ("31TDF_0_0",),
     }
 
+def test_build_output_tile_contributor_index_can_consume_candidates() -> None:
+    work_units = (
+        satmaps.LandWorkUnit("31TDF_1_0", ("31TDF_1_0",)),
+        satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
+    )
+    contributor_tile_candidates = {
+        "31TDF_1_0": ("13/1/2.webp",),
+        "31TDF_0_0": ("13/1/2.webp", "13/1/3.webp"),
+    }
+
+    contributors_by_tile = satmaps.build_output_tile_contributor_index(
+        work_units,
+        contributor_tile_candidates,
+        consume_candidates=True,
+    )
+
+    assert contributors_by_tile == {
+        "13/1/2.webp": ("31TDF_1_0", "31TDF_0_0"),
+        "13/1/3.webp": ("31TDF_0_0",),
+    }
+    assert contributor_tile_candidates == {}
+
 def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
 
@@ -2578,6 +2600,74 @@ def test_render_land_output_tiles_emits_heartbeat_and_cached_counts(
     out = capsys.readouterr().out
     assert "0 rendered, 0 cached, 1 active." in out
     assert "0 rendered, 1 cached." in out
+
+def test_render_land_output_tiles_submits_only_active_work(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles")
+    work_units = [satmaps.LandWorkUnit(unit_id="31TDF_0_0", source_subtiles=("31TDF_0_0",))]
+    contributor_tile_candidates = {
+        "31TDF_0_0": ("13/1/1.webp", "13/1/2.webp", "13/1/3.webp")
+    }
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+
+    outstanding_submissions = 0
+    max_outstanding_submissions = 0
+
+    class FakeFuture:
+        def __init__(self, status: satmaps.LandTileRenderStatus) -> None:
+            self._status = status
+
+        def result(self) -> satmaps.LandTileRenderStatus:
+            return self._status
+
+    class FakeExecutor:
+        def __init__(self, max_workers: int) -> None:
+            assert max_workers == 1
+
+        def __enter__(self) -> "FakeExecutor":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+        def submit(self, fn: object, *args: object, **kwargs: object) -> FakeFuture:
+            nonlocal outstanding_submissions, max_outstanding_submissions
+            outstanding_submissions += 1
+            max_outstanding_submissions = max(
+                max_outstanding_submissions,
+                outstanding_submissions,
+            )
+            return FakeFuture(satmaps.LandTileRenderStatus.RENDERED)
+
+    def fake_wait(
+        pending_futures: set[FakeFuture], timeout: float, return_when: object
+    ) -> tuple[set[FakeFuture], set[FakeFuture]]:
+        nonlocal outstanding_submissions
+        completed = next(iter(pending_futures))
+        outstanding_submissions -= 1
+        return {completed}, {future for future in pending_futures if future is not completed}
+
+    monkeypatch.setattr(satmaps, "ThreadPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(satmaps, "wait", fake_wait)
+
+    stats = satmaps.render_land_output_tiles(
+        work_units,
+        ["2025/07/01"],
+        args,
+        "testrun",
+        contributor_tile_candidates,
+    )
+
+    assert stats == satmaps.LandOutputRenderStats(
+        total_tiles=3,
+        rendered_tiles=3,
+        skipped_tiles=0,
+        cached_tiles=0,
+        empty_tiles=0,
+    )
+    assert max_outstanding_submissions == 1
 
 def test_main_low_zoom_uses_subtile_processing_strategy(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]

@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import warnings
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, cast
@@ -2043,11 +2043,18 @@ def build_land_output_tile_grid(tile_plan: LandOutputTilePlan) -> TileGrid:
 def build_output_tile_contributor_index(
     work_units: Sequence[LandWorkUnit],
     contributor_tile_candidates: dict[str, tuple[str, ...]],
+    *,
+    consume_candidates: bool = False,
 ) -> dict[str, tuple[str, ...]]:
     """Invert contributor candidate footprints into ordered final-tile contributors."""
     contributors_by_tile: dict[str, list[str]] = {}
     for work_unit in work_units:
-        for relative_path in contributor_tile_candidates.get(work_unit.unit_id, ()):
+        candidate_relpaths = (
+            contributor_tile_candidates.pop(work_unit.unit_id, ())
+            if consume_candidates
+            else contributor_tile_candidates.get(work_unit.unit_id, ())
+        )
+        for relative_path in candidate_relpaths:
             contributors_by_tile.setdefault(relative_path, []).append(work_unit.unit_id)
     return {
         relative_path: tuple(contributor_ids)
@@ -2663,6 +2670,7 @@ def render_land_output_tiles(
     contributors_by_tile = build_output_tile_contributor_index(
         work_units,
         contributor_tile_candidates,
+        consume_candidates=True,
     )
     total_tiles = len(contributors_by_tile)
     if total_tiles <= 0:
@@ -2680,22 +2688,34 @@ def render_land_output_tiles(
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
     processed_tiles = 0
-    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-        future_to_tile = {
-            executor.submit(
-                render_final_output_tile,
-                relative_path,
-                contributor_ids,
-                work_units_by_id,
-                folders_by_work_unit,
-                args,
-                unique_id,
-                gebco_src=gebco_src,
-                prepared_ocean_background=prepared_ocean_background,
-            ): relative_path
-            for relative_path, contributor_ids in contributors_by_tile.items()
-        }
-        pending_futures = set(future_to_tile)
+    max_workers = max(1, min(args.parallel, total_tiles))
+    contributor_items = iter(contributors_by_tile.items())
+    pending_futures: set[Future[LandTileRenderStatus]] = set()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+
+        def submit_next_render() -> bool:
+            try:
+                relative_path, contributor_ids = next(contributor_items)
+            except StopIteration:
+                return False
+            pending_futures.add(
+                executor.submit(
+                    render_final_output_tile,
+                    relative_path,
+                    contributor_ids,
+                    work_units_by_id,
+                    folders_by_work_unit,
+                    args,
+                    unique_id,
+                    gebco_src=gebco_src,
+                    prepared_ocean_background=prepared_ocean_background,
+                )
+            )
+            return True
+
+        while len(pending_futures) < max_workers and submit_next_render():
+            pass
+
         while pending_futures:
             done_futures, pending_futures = wait(
                 pending_futures,
@@ -2726,6 +2746,8 @@ def render_land_output_tiles(
                     cached_tiles += 1
                 else:
                     empty_tiles += 1
+            while len(pending_futures) < max_workers and submit_next_render():
+                pass
             update_count_progress(
                 progress_line,
                 "Land tile progress:",
