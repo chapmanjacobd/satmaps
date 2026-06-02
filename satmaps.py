@@ -435,6 +435,11 @@ def build_state_file_path(unique_id: str) -> str:
     return f".temp/state_{unique_id}.json"
 
 
+def build_candidate_tile_cache_path(unique_id: str) -> str:
+    """Return the persistent JSON cache path for candidate final-tile footprints."""
+    return f".temp/candidate_tiles_{unique_id}.json"
+
+
 def build_temp_mbtiles_path(output_path: str) -> str:
     """Return the deterministic heavyweight MBTiles path."""
     return f".temp/{temp_basename_from_output(output_path)}.mbtiles"
@@ -656,6 +661,74 @@ def read_tile_cache_marker(marker_path: str) -> Tuple[str, List[str]]:
     contributor_id = cast(str, payload["contributor_id"])
     tile_relpaths = [cast(str, tile_path) for tile_path in payload.get("tiles", [])]
     return contributor_id, tile_relpaths
+
+
+def write_candidate_tile_cache(
+    cache_path: str,
+    contributor_tile_candidates: dict[str, tuple[str, ...]],
+) -> None:
+    """Persist precomputed final-tile candidates atomically for future runs."""
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    temp_cache_path = f"{cache_path}.tmp"
+    with open(temp_cache_path, "w") as cache_file:
+        json.dump(
+            {
+                "work_units": sorted(contributor_tile_candidates),
+                "contributor_tile_candidates": {
+                    contributor_id: list(tile_relpaths)
+                    for contributor_id, tile_relpaths in sorted(
+                        contributor_tile_candidates.items()
+                    )
+                },
+            },
+            cache_file,
+            indent=2,
+            sort_keys=True,
+        )
+    os.replace(temp_cache_path, cache_path)
+
+
+def read_candidate_tile_cache(
+    cache_path: str,
+) -> Optional[dict[str, tuple[str, ...]]]:
+    """Load previously precomputed final-tile candidates from disk."""
+    if not os.path.exists(cache_path):
+        return None
+
+    try:
+        with open(cache_path) as cache_file:
+            payload = json.load(cache_file)
+        if not isinstance(payload, dict):
+            raise ValueError("candidate tile cache must contain a JSON object")
+        cached_work_units = payload.get("work_units")
+        raw_candidates = payload.get("contributor_tile_candidates")
+        if not isinstance(cached_work_units, list) or not all(
+            isinstance(work_unit_id, str) for work_unit_id in cached_work_units
+        ):
+            raise ValueError("candidate tile cache work_units must be a list of strings")
+        if not isinstance(raw_candidates, dict):
+            raise ValueError(
+                "candidate tile cache contributor_tile_candidates must be an object"
+            )
+        normalized_candidates = {
+            contributor_id: tuple(tile_relpaths)
+            for contributor_id, tile_relpaths in raw_candidates.items()
+            if isinstance(contributor_id, str)
+            and isinstance(tile_relpaths, list)
+            and all(isinstance(tile_relpath, str) for tile_relpath in tile_relpaths)
+        }
+        if len(normalized_candidates) != len(raw_candidates):
+            raise ValueError(
+                "candidate tile cache contributor_tile_candidates entries must be string lists"
+            )
+        if set(cached_work_units) != set(normalized_candidates):
+            raise ValueError(
+                "candidate tile cache work_units must match contributor_tile_candidates keys"
+            )
+        return normalized_candidates
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Warning: Could not load candidate tile cache {cache_path}: {exc}")
+        return None
 
 def build_processed_tile_paths(mgrs_subtile: str, output_path: str) -> Tuple[str, str]:
     """Return the deterministic heavyweight TIFF paths for one processed subtile."""
@@ -1531,6 +1604,66 @@ def precompute_work_unit_candidate_tile_relpaths_from_sources(
             work_unit = future_to_work_unit[future]
             candidate_relpaths_by_work_unit[work_unit.unit_id] = future.result()
     return candidate_relpaths_by_work_unit
+
+
+def resolve_work_unit_candidate_tile_relpaths(
+    work_units: Sequence[LandWorkUnit],
+    date_paths: List[str],
+    cache_dir: str,
+    zoom: int,
+    *,
+    cache_path: str,
+    tile_size: int = 512,
+    resample_alg: str = "lanczos",
+    parallel: int = 1,
+) -> dict[str, tuple[str, ...]]:
+    """Reuse cached candidate footprints when possible, computing and persisting only missing work."""
+    if not work_units:
+        return {}
+
+    cached_candidates = read_candidate_tile_cache(cache_path) or {}
+    requested_work_units = {work_unit.unit_id: work_unit for work_unit in work_units}
+    reused_candidates = {
+        work_unit_id: cached_candidates[work_unit_id]
+        for work_unit_id in requested_work_units
+        if work_unit_id in cached_candidates
+    }
+    missing_work_units = [
+        work_unit
+        for work_unit in work_units
+        if work_unit.unit_id not in reused_candidates
+    ]
+
+    if reused_candidates and not missing_work_units:
+        print(
+            f"Reusing cached candidate tile footprints for "
+            f"{len(reused_candidates)} sub-tile(s)."
+        )
+        return reused_candidates
+
+    if reused_candidates:
+        print(
+            f"Reusing cached candidate tile footprints for "
+            f"{len(reused_candidates)} sub-tile(s); "
+            f"computing {len(missing_work_units)} missing."
+        )
+
+    computed_candidates = precompute_work_unit_candidate_tile_relpaths_from_sources(
+        missing_work_units,
+        date_paths,
+        cache_dir,
+        zoom,
+        tile_size=tile_size,
+        resample_alg=resample_alg,
+        parallel=parallel,
+    )
+    merged_candidates = dict(cached_candidates)
+    merged_candidates.update(computed_candidates)
+    write_candidate_tile_cache(cache_path, merged_candidates)
+    return {
+        work_unit.unit_id: merged_candidates[work_unit.unit_id]
+        for work_unit in work_units
+    }
 
 
 def configure_final_tile_cache_flush_coordinator(
@@ -2982,6 +3115,7 @@ def main() -> None:
 
     unique_id = build_land_run_token(args, date_paths, requested_bbox, gebco_vrt_source)
     state_file = build_state_file_path(unique_id)
+    candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
     completed_units: Set[str] = set()
 
     if args.resume:
@@ -2994,6 +3128,7 @@ def main() -> None:
             if resume_state:
                 state_file = cast(str, resume_state["state_file"])
                 unique_id = cast(str, resume_state["unique_id"])
+                candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
                 completed_units = cast(Set[str], resume_state["completed_units"])
 
     mgrs_bases = discover_mgrs_bases(
@@ -3055,11 +3190,12 @@ def main() -> None:
             )
             progress_line = LiveProgressLine()
             started_at = time.perf_counter()
-            contributor_tile_candidates = precompute_work_unit_candidate_tile_relpaths_from_sources(
+            contributor_tile_candidates = resolve_work_unit_candidate_tile_relpaths(
                 work_units_to_process,
                 date_paths,
                 args.cache,
                 args.max_zoom,
+                cache_path=candidate_tile_cache_path,
                 tile_size=args.blocksize,
                 resample_alg=args.resample_alg,
                 parallel=args.parallel,

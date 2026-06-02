@@ -2248,6 +2248,58 @@ def test_build_work_unit_candidate_tile_relpaths_from_sources_falls_back_on_insp
     assert "Could not inspect source footprint for 31TDF_0_0" in capsys.readouterr().out
 
 
+def test_resolve_work_unit_candidate_tile_relpaths_reuses_cached_subset_and_persists_missing(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    work_units = (
+        satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
+        satmaps.LandWorkUnit("31TDF_0_1", ("31TDF_0_1",)),
+    )
+    cache_path = satmaps.build_candidate_tile_cache_path("candidatecache")
+    satmaps.write_candidate_tile_cache(
+        cache_path,
+        {"31TDF_0_0": ("13/1/1.webp",)},
+    )
+    seen_missing_units: list[str] = []
+
+    def fake_precompute(
+        missing_work_units,
+        date_paths,
+        cache_dir,
+        zoom,
+        *,
+        tile_size=512,
+        resample_alg="lanczos",
+        parallel=1,
+    ):
+        del date_paths, cache_dir, zoom, tile_size, resample_alg, parallel
+        seen_missing_units.extend(work_unit.unit_id for work_unit in missing_work_units)
+        return {"31TDF_0_1": ("13/2/2.webp",)}
+
+    monkeypatch.setattr(
+        "satmaps.precompute_work_unit_candidate_tile_relpaths_from_sources",
+        fake_precompute,
+    )
+
+    actual = satmaps.resolve_work_unit_candidate_tile_relpaths(
+        work_units,
+        ["2025/07/01"],
+        ".cache",
+        13,
+        cache_path=cache_path,
+    )
+
+    assert seen_missing_units == ["31TDF_0_1"]
+    assert actual == {
+        "31TDF_0_0": ("13/1/1.webp",),
+        "31TDF_0_1": ("13/2/2.webp",),
+    }
+    assert satmaps.read_candidate_tile_cache(cache_path) == actual
+
+
 def test_warp_to_web_mercator_removes_existing_destination(monkeypatch: object) -> None:
     removed: list[str] = []
 
@@ -3356,6 +3408,65 @@ def test_main_land_run_passes_prepared_ocean_to_flush_coordinator_without_eager_
             "requested_bbox": (0.0, 0.0, 1.0, 1.0),
         }
     ]
+
+
+def test_main_reuses_cached_candidate_tile_footprints(
+    monkeypatch: object,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
+        unique_id="cachedcandidates",
+    )
+    cached_candidates = {
+        "31TDF_0_0": ("13/1/1.webp",),
+        "31TDF_0_1": ("13/1/2.webp",),
+        "31TDF_1_0": ("13/1/3.webp",),
+        "31TDF_1_1": ("13/1/4.webp",),
+    }
+    satmaps.write_candidate_tile_cache(
+        satmaps.build_candidate_tile_cache_path("cachedcandidates"),
+        cached_candidates,
+    )
+    configure_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "satmaps.precompute_work_unit_candidate_tile_relpaths_from_sources",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("expected candidate footprints to come from the cache")
+        ),
+    )
+    monkeypatch.setattr(
+        "satmaps.configure_final_tile_cache_flush_coordinator",
+        lambda output_path, unique_id, work_units, quality, zoom, **kwargs: configure_calls.append(
+            {
+                "output_path": output_path,
+                "unique_id": unique_id,
+                "work_unit_count": len(work_units),
+                "quality": quality,
+                "zoom": zoom,
+                **kwargs,
+            }
+        ),
+    )
+    monkeypatch.setattr("satmaps.process_land_work_unit", lambda *args, **kwargs: None)
+    monkeypatch.setattr("satmaps.clear_final_tile_cache_flush_coordinator", lambda *args, **kwargs: None)
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    assert len(configure_calls) == 1
+    assert configure_calls[0]["contributor_tile_candidates"] == cached_candidates
+    assert "Reusing cached candidate tile footprints for 4 sub-tile(s)." in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("max_zoom", [ocean.DEFAULT_MAX_ZOOM, 14, 11, 12, 4])
