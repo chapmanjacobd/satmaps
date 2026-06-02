@@ -56,6 +56,8 @@ LOCAL_SEASON_TRANSITION_HALF_LATITUDE_DEGREES = (
     (LOCAL_SEASON_TRANSITION_TILES * MGRS_TILE_SIZE_METERS) / 2.0
 ) / 111_320.0
 FINAL_TILE_CACHE_COMMIT_LOCK = threading.Lock()
+WORK_UNIT_PREFETCH_LOCKS_LOCK = threading.Lock()
+WORK_UNIT_PREFETCH_LOCKS: dict[str, threading.Lock] = {}
 OCEAN_TILE_CACHE_CONTRIBUTOR_ID = "__ocean__"
 
 
@@ -69,6 +71,28 @@ class LandWorkUnit:
 class LandProcessingPlan:
     mgrs_bases: tuple[str, ...]
     work_units: tuple[LandWorkUnit, ...]
+
+
+@dataclass(frozen=True)
+class LandOutputTilePlan:
+    relative_path: str
+    zoom: int
+    tx: int
+    ty: int
+    tile_size: int
+    halo_pixels: int
+    width: int
+    height: int
+    bounds: tuple[float, float, float, float]
+    expanded_bounds: tuple[float, float, float, float]
+    core_src_win: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class LandOutputRenderStats:
+    total_tiles: int
+    rendered_tiles: int
+    skipped_tiles: int
 
 
 @dataclass(frozen=True)
@@ -2464,6 +2488,214 @@ def parse_tile_tree_relpath(relative_path: str) -> Tuple[int, int, int]:
         return zoom, tx, ty
 
 
+def compute_land_output_tile_halo_pixels(resample_alg: str) -> int:
+    """Return the output-pixel halo needed to safely crop one rendered land tile."""
+    halo_pixels_by_alg = {
+        "average": 1,
+        "bilinear": 1,
+        "gauss": 2,
+        "lanczos": 3,
+    }
+    if resample_alg not in halo_pixels_by_alg:
+        raise ValueError(f"Unsupported output-tile resample algorithm: {resample_alg}")
+    return halo_pixels_by_alg[resample_alg]
+
+
+def build_land_output_tile_plan(
+    relative_path: str,
+    tile_size: int,
+    resample_alg: str,
+) -> LandOutputTilePlan:
+    """Return the expanded output-grid plan for one final z/x/y.webp tile."""
+    zoom, tx, ty = parse_tile_tree_relpath(relative_path)
+    halo_pixels = compute_land_output_tile_halo_pixels(resample_alg)
+    full_world_width = (1 << zoom) * tile_size
+    full_world_height = full_world_width
+    xoff = tx * tile_size
+    yoff = ty * tile_size
+    expanded_xoff = max(0, xoff - halo_pixels)
+    expanded_yoff = max(0, yoff - halo_pixels)
+    expanded_xend = min(full_world_width, xoff + tile_size + halo_pixels)
+    expanded_yend = min(full_world_height, yoff + tile_size + halo_pixels)
+    expanded_width = expanded_xend - expanded_xoff
+    expanded_height = expanded_yend - expanded_yoff
+    pixel_size = tiler.web_mercator_pixel_size_for_tile_size(zoom, tile_size)
+    world_bounds = ocean.WEB_MERCATOR_WORLD_BOUNDS
+    expanded_minx = world_bounds[0] + expanded_xoff * pixel_size
+    expanded_maxx = world_bounds[0] + expanded_xend * pixel_size
+    expanded_maxy = world_bounds[3] - expanded_yoff * pixel_size
+    expanded_miny = world_bounds[3] - expanded_yend * pixel_size
+    return LandOutputTilePlan(
+        relative_path=relative_path,
+        zoom=zoom,
+        tx=tx,
+        ty=ty,
+        tile_size=tile_size,
+        halo_pixels=halo_pixels,
+        width=expanded_width,
+        height=expanded_height,
+        bounds=tiler.get_web_mercator_bounds(zoom, tx, ty),
+        expanded_bounds=(expanded_minx, expanded_miny, expanded_maxx, expanded_maxy),
+        core_src_win=(
+            xoff - expanded_xoff,
+            yoff - expanded_yoff,
+            tile_size,
+            tile_size,
+        ),
+    )
+
+
+def build_land_output_tile_grid(tile_plan: LandOutputTilePlan) -> TileGrid:
+    """Build the expanded EPSG:3857 grid metadata used to render one final tile."""
+    web_mercator_srs = build_web_mercator_srs()
+    min_x, _min_y, _max_x, max_y = tile_plan.expanded_bounds
+    pixel_size = tiler.web_mercator_pixel_size_for_tile_size(
+        tile_plan.zoom,
+        tile_plan.tile_size,
+    )
+    return TileGrid(
+        projection=web_mercator_srs.ExportToWkt(),
+        geotransform=(min_x, pixel_size, 0.0, max_y, 0.0, -pixel_size),
+        width=tile_plan.width,
+        height=tile_plan.height,
+    )
+
+
+def build_output_tile_contributor_index(
+    work_units: Sequence[LandWorkUnit],
+    contributor_tile_candidates: dict[str, tuple[str, ...]],
+) -> dict[str, tuple[str, ...]]:
+    """Invert contributor candidate footprints into ordered final-tile contributors."""
+    contributors_by_tile: dict[str, list[str]] = {}
+    for work_unit in work_units:
+        for relative_path in contributor_tile_candidates.get(work_unit.unit_id, ()):
+            contributors_by_tile.setdefault(relative_path, []).append(work_unit.unit_id)
+    return {
+        relative_path: tuple(contributor_ids)
+        for relative_path, contributor_ids in sorted(contributors_by_tile.items())
+    }
+
+
+def get_work_unit_prefetch_lock(work_unit_id: str) -> threading.Lock:
+    """Return the shared lock protecting one contributor's persistent RGB prefetches."""
+    with WORK_UNIT_PREFETCH_LOCKS_LOCK:
+        return WORK_UNIT_PREFETCH_LOCKS.setdefault(work_unit_id, threading.Lock())
+
+
+def warp_band_dataset_to_tile_grid(
+    source_path: str,
+    tile_grid: TileGrid,
+    resample_alg: str,
+) -> gdal.Dataset:
+    """Open one source band and warp just the needed output-tile grid into memory."""
+    source_dataset = gdal.Open(source_path)
+    if source_dataset is None:
+        raise RuntimeError(f"Could not open raster band for tile rendering: {source_path}")
+
+    cropped_dataset: Optional[gdal.Dataset] = None
+    try:
+        aligned_src_win = get_aligned_tile_grid_src_win(source_dataset, tile_grid)
+        if aligned_src_win is not None:
+            translated_dataset = gdal.Translate(
+                "",
+                source_dataset,
+                options=gdal.TranslateOptions(
+                    format="MEM",
+                    srcWin=aligned_src_win,
+                    outputType=gdal.GDT_Float32,
+                ),
+            )
+            if translated_dataset is None:
+                raise RuntimeError(
+                    f"Could not crop aligned source band for tile rendering: {source_path}"
+                )
+            translated_dataset.GetRasterBand(1).SetNoDataValue(float(SENTINEL_NODATA))
+            return translated_dataset
+
+        cropped_src_win = get_tile_grid_source_src_win(source_dataset, tile_grid)
+        warp_source: gdal.Dataset | str = source_dataset
+        if cropped_src_win is not None:
+            cropped_dataset = gdal.Translate(
+                "",
+                source_dataset,
+                options=gdal.TranslateOptions(
+                    format="MEM",
+                    srcWin=cropped_src_win,
+                    outputType=gdal.GDT_Float32,
+                ),
+            )
+            if cropped_dataset is None:
+                raise RuntimeError(f"Could not crop source band for tile rendering: {source_path}")
+            cropped_dataset.GetRasterBand(1).SetNoDataValue(float(SENTINEL_NODATA))
+            warp_source = cropped_dataset
+
+        min_x, min_y, max_x, max_y = tile_grid.geotransform[0], (
+            tile_grid.geotransform[3] + tile_grid.geotransform[5] * tile_grid.height
+        ), (
+            tile_grid.geotransform[0] + tile_grid.geotransform[1] * tile_grid.width
+        ), tile_grid.geotransform[3]
+        warped_dataset = gdal.Warp(
+            "",
+            warp_source,
+            options=gdal.WarpOptions(
+                format="MEM",
+                dstSRS=tile_grid.projection,
+                outputBounds=(min_x, min_y, max_x, max_y),
+                width=tile_grid.width,
+                height=tile_grid.height,
+                resampleAlg=resample_alg,
+                srcNodata=float(SENTINEL_NODATA),
+                dstNodata=float(SENTINEL_NODATA),
+                workingType=gdal.GDT_Float32,
+                outputType=gdal.GDT_Float32,
+                multithread=True,
+                warpOptions=["NUM_THREADS=ALL_CPUS"],
+            ),
+        )
+        if warped_dataset is None:
+            raise RuntimeError(f"Could not warp source band for tile rendering: {source_path}")
+        warped_dataset.GetRasterBand(1).SetNoDataValue(float(SENTINEL_NODATA))
+        return warped_dataset
+    finally:
+        cropped_dataset = None
+        source_dataset = None
+
+
+def open_warped_date_band_sets(
+    folders: List[Tuple[str, str]],
+    cache_dir: str,
+    tile_grid: TileGrid,
+    resample_alg: str,
+) -> List[Tuple[List[gdal.Band], List[gdal.Dataset]]]:
+    """Open RGB bands for each date, already warped to the expanded output tile grid."""
+    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
+    try:
+        for folder_name, date_path in folders:
+            paths = get_tile_paths(folder_name, date_path, cache_dir, download=False)
+            datasets: List[gdal.Dataset] = []
+            bands: List[gdal.Band] = []
+            for _band_id, color_name in RGB_BANDS:
+                dataset = warp_band_dataset_to_tile_grid(
+                    paths[color_name],
+                    tile_grid,
+                    resample_alg,
+                )
+                band = dataset.GetRasterBand(1)
+                if band is None:
+                    raise RuntimeError(
+                        f"Could not read warped {color_name} band for {folder_name} ({date_path})"
+                    )
+                datasets.append(dataset)
+                bands.append(band)
+            date_band_sets.append((bands, datasets))
+        return date_band_sets
+    except RuntimeError:
+        for bands, datasets in date_band_sets:
+            bands.clear()
+            datasets.clear()
+        raise
+
+
 def iter_processing_windows(tile_grid: TileGrid) -> Iterator[Tuple[int, int, int, int]]:
     """Yield full-width row slabs that match the striped source TIFF layout."""
     for yoff in range(0, tile_grid.height, PROCESS_SLAB_HEIGHT):
@@ -2787,6 +3019,222 @@ def tone_mapped_byte_block(
         )
 
     return np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
+
+
+def render_land_contributor_output_tile(
+    work_unit: LandWorkUnit,
+    folders: List[Tuple[str, str]],
+    tile_plan: LandOutputTilePlan,
+    args: argparse.Namespace,
+    gebco_src: Optional[str] = None,
+) -> Optional[Image.Image]:
+    """Render one contributor directly into a single final output tile."""
+    if not folders:
+        return None
+
+    tile_grid = build_land_output_tile_grid(tile_plan)
+    ocean_mask: Optional[OceanMaskWarp] = None
+    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
+    ds_out: Optional[gdal.Dataset] = None
+    try:
+        ocean_mask = open_gebco_mask(gebco_src, tile_grid, work_unit.unit_id)
+        processing_window = ProcessingWindow(0, 0, tile_grid.width, tile_grid.height)
+        mask_slabs: Optional[dict[int, OceanMaskSlab]] = None
+        if ocean_mask is not None:
+            collected = collect_ocean_mask_slabs(ocean_mask, tile_grid)
+            if collected is None:
+                return None
+            processing_window, mask_slabs = collected
+
+        prefetch_if_land = float(
+            getattr(args, "prefetch_if_land", DEFAULT_PREFETCH_IF_LAND)
+        )
+        if should_prefetch_tile_bands(prefetch_if_land, mask_slabs, tile_grid):
+            with get_work_unit_prefetch_lock(work_unit.unit_id):
+                prefetch_tile_bands_locally(folders, args.cache)
+
+        date_band_sets = open_warped_date_band_sets(
+            folders,
+            args.cache,
+            tile_grid,
+            args.resample_alg,
+        )
+        averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
+            date_band_sets,
+            processing_window,
+            mask_slabs,
+            tile_grid=tile_grid,
+            winter=getattr(args, "winter", False),
+        )
+        averaged = fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
+        ds_out, color_bands, alpha_band = create_output_dataset(
+            None,
+            tile_grid,
+            driver_name="MEM",
+        )
+        write_processed_blocks(
+            averaged,
+            alpha_mask,
+            processing_window,
+            args,
+            color_bands,
+            alpha_band,
+        )
+        ds_out.FlushCache()
+        tile_array = ds_out.ReadAsArray(*tile_plan.core_src_win)
+        if tile_array is None:
+            raise RuntimeError(
+                f"Could not read rendered output tile crop for {work_unit.unit_id} ({tile_plan.relative_path})"
+            )
+        return tiler.tile_array_to_image(tile_array)
+    finally:
+        for bands, datasets in date_band_sets:
+            bands.clear()
+            datasets.clear()
+        date_band_sets.clear()
+        ocean_mask = None
+        ds_out = None
+
+
+def render_final_output_tile(
+    relative_path: str,
+    contributor_ids: Sequence[str],
+    work_units_by_id: dict[str, LandWorkUnit],
+    folders_by_work_unit: dict[str, List[Tuple[str, str]]],
+    args: argparse.Namespace,
+    unique_id: str,
+    *,
+    gebco_src: Optional[str] = None,
+    prepared_ocean_background: Optional[str] = None,
+) -> bool:
+    """Render one final output tile directly from its ordered contributors."""
+    destination_path = os.path.join(
+        build_final_tile_cache_dir(args.output, unique_id),
+        relative_path,
+    )
+    if file_has_content(destination_path):
+        return False
+
+    tile_plan = build_land_output_tile_plan(
+        relative_path,
+        args.blocksize,
+        args.resample_alg,
+    )
+    composed_rgba: Optional[Image.Image] = None
+    if prepared_ocean_background is not None:
+        ocean_image = render_raster_tile_image(
+            prepared_ocean_background,
+            relative_path,
+            args.blocksize,
+            args.resample_alg,
+        )
+        if ocean_image is not None:
+            composed_rgba = ocean_image.convert("RGBA")
+            ocean_image.close()
+
+    for contributor_id in contributor_ids:
+        contributor_image = render_land_contributor_output_tile(
+            work_units_by_id[contributor_id],
+            folders_by_work_unit.get(contributor_id, []),
+            tile_plan,
+            args,
+            gebco_src=gebco_src,
+        )
+        if contributor_image is None:
+            continue
+        try:
+            source_rgba = contributor_image.convert("RGBA")
+        finally:
+            contributor_image.close()
+        if composed_rgba is None:
+            composed_rgba = source_rgba
+        else:
+            previous_composed = composed_rgba
+            composed_rgba = Image.alpha_composite(previous_composed, source_rgba)
+            previous_composed.close()
+            source_rgba.close()
+
+    if composed_rgba is None:
+        return False
+
+    if composed_rgba.getchannel("A").getextrema() == (255, 255):
+        final_image: Image.Image = composed_rgba.convert("RGB")
+    else:
+        final_image = composed_rgba
+    try:
+        tiler.save_webp_image(final_image, destination_path, args.quality, lossless=False)
+    finally:
+        if final_image is not composed_rgba:
+            final_image.close()
+        composed_rgba.close()
+    return True
+
+
+def render_land_output_tiles(
+    work_units: Sequence[LandWorkUnit],
+    date_paths: List[str],
+    args: argparse.Namespace,
+    unique_id: str,
+    contributor_tile_candidates: dict[str, tuple[str, ...]],
+    *,
+    gebco_src: Optional[str] = None,
+    prepared_ocean_background: Optional[str] = None,
+) -> LandOutputRenderStats:
+    """Render the final max-zoom land tile tree directly, one output tile per worker task."""
+    contributors_by_tile = build_output_tile_contributor_index(
+        work_units,
+        contributor_tile_candidates,
+    )
+    total_tiles = len(contributors_by_tile)
+    if total_tiles <= 0:
+        return LandOutputRenderStats(total_tiles=0, rendered_tiles=0, skipped_tiles=0)
+
+    work_units_by_id = {work_unit.unit_id: work_unit for work_unit in work_units}
+    folders_by_work_unit = {
+        work_unit.unit_id: list_mosaic_folders_for_tile(work_unit.unit_id, date_paths, args.cache)
+        for work_unit in work_units
+    }
+
+    rendered_tiles = 0
+    skipped_tiles = 0
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
+    processed_tiles = 0
+    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+        future_to_tile = {
+            executor.submit(
+                render_final_output_tile,
+                relative_path,
+                contributor_ids,
+                work_units_by_id,
+                folders_by_work_unit,
+                args,
+                unique_id,
+                gebco_src=gebco_src,
+                prepared_ocean_background=prepared_ocean_background,
+            ): relative_path
+            for relative_path, contributor_ids in contributors_by_tile.items()
+        }
+        for future in as_completed(future_to_tile):
+            processed_tiles += 1
+            if future.result():
+                rendered_tiles += 1
+            else:
+                skipped_tiles += 1
+            update_count_progress(
+                progress_line,
+                "Land tile progress:",
+                processed_tiles,
+                total_tiles,
+                started_at,
+                f"{rendered_tiles} rendered, {skipped_tiles} skipped.",
+            )
+    progress_line.finish()
+    return LandOutputRenderStats(
+        total_tiles=total_tiles,
+        rendered_tiles=rendered_tiles,
+        skipped_tiles=skipped_tiles,
+    )
 
 
 def warp_to_web_mercator(
@@ -3162,8 +3610,6 @@ def main() -> None:
     unique_id = build_land_run_token(args, date_paths, requested_bbox, gebco_vrt_source)
     state_file = build_state_file_path(unique_id)
     candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
-    completed_units: Set[str] = set()
-
     if args.resume:
         resume_path = find_resume_path(
             args.resume,
@@ -3175,7 +3621,7 @@ def main() -> None:
                 state_file = cast(str, resume_state["state_file"])
                 unique_id = cast(str, resume_state["unique_id"])
                 candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
-                completed_units = cast(Set[str], resume_state["completed_units"])
+                cast(Set[str], resume_state["completed_units"])
 
     mgrs_bases = discover_mgrs_bases(
         requested_bbox,
@@ -3189,11 +3635,6 @@ def main() -> None:
             discover_available_subtiles_from_s3_cache(mgrs_bases),
         ),
     )
-    recovered_units = recover_cached_work_outputs(plan.work_units, args.output, unique_id)
-    if recovered_units:
-        print(f"Reusing {len(recovered_units)} completed WebP contributor(s).")
-    completed_units &= recovered_units
-    completed_units.update(recovered_units)
     print(describe_land_processing_plan(plan, len(date_paths)))
 
     prepared_ocean_background: Optional[str] = None
@@ -3222,22 +3663,14 @@ def main() -> None:
             print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
 
     if args.land:
-        work_units_to_process = [
-            work_unit
-            for work_unit in plan.work_units
-            if work_unit.unit_id not in completed_units
-        ]
-        if work_units_to_process:
-            completed_before_start = len(completed_units)
+        if plan.work_units:
             print(
-                f"Starting sub-tile processing for "
-                f"{len(work_units_to_process)} sub-tile(s) "
-                f"with {args.parallel} worker(s); {len(completed_units)} already complete."
+                f"Starting output-tile rendering for "
+                f"{len(plan.work_units)} sub-tile(s) "
+                f"with {args.parallel} worker(s)."
             )
-            progress_line = LiveProgressLine()
-            started_at = time.perf_counter()
             contributor_tile_candidates = resolve_work_unit_candidate_tile_relpaths(
-                work_units_to_process,
+                plan.work_units,
                 date_paths,
                 args.cache,
                 args.max_zoom,
@@ -3246,55 +3679,30 @@ def main() -> None:
                 resample_alg=args.resample_alg,
                 parallel=args.parallel,
             )
-            configure_final_tile_cache_flush_coordinator(
-                args.output,
+            write_resume_state(
+                state_file,
                 unique_id,
-                work_units_to_process,
-                args.quality,
-                args.max_zoom,
-                tile_size=args.blocksize,
-                resample_alg=args.resample_alg,
-                prepared_ocean_background=prepared_ocean_background,
-                contributor_tile_candidates=contributor_tile_candidates,
+                set(),
+                args,
             )
-            try:
-                with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-                    future_to_work_unit = {
-                        executor.submit(
-                            process_land_work_unit,
-                            work_unit,
-                            date_paths,
-                            args,
-                            gebco_vrt_source,
-                            unique_id,
-                        ): work_unit
-                        for work_unit in work_units_to_process
-                    }
-                    for future in as_completed(future_to_work_unit):
-                        work_unit = future_to_work_unit[future]
-                        future.result()
-                        completed_units.add(work_unit.unit_id)
-                        status_message = (
-                            f"{len(completed_units) - completed_before_start} contributor(s) committed."
-                        )
-                        update_count_progress(
-                            progress_line,
-                            "Land processing progress:",
-                            len(completed_units),
-                            len(plan.work_units),
-                            started_at,
-                            status_message,
-                            completed_before_start=completed_before_start,
-                        )
-                        write_resume_state(
-                            state_file,
-                            unique_id,
-                            completed_units,
-                            args,
-                        )
-            finally:
-                clear_final_tile_cache_flush_coordinator(unique_id)
-            progress_line.finish()
+            tile_stats = render_land_output_tiles(
+                plan.work_units,
+                date_paths,
+                args,
+                unique_id,
+                contributor_tile_candidates,
+                gebco_src=gebco_vrt_source,
+                prepared_ocean_background=prepared_ocean_background,
+            )
+            if tile_stats.total_tiles <= 0:
+                print("No candidate land output tiles were found.")
+            elif tile_stats.rendered_tiles <= 0 and tile_stats.skipped_tiles == tile_stats.total_tiles:
+                print("All land output tiles already rendered.")
+            else:
+                print(
+                    f"Rendered {tile_stats.rendered_tiles} land tile(s); "
+                    f"skipped {tile_stats.skipped_tiles} tile(s)."
+                )
         else:
             print("All sub-tiles already processed.")
     else:
