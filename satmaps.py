@@ -358,7 +358,7 @@ def read_tile_cache_marker(marker_path: str) -> Tuple[str, List[str]]:
 
 def write_candidate_tile_cache(
     cache_path: str,
-    contributor_tile_candidates: dict[str, tuple[str, ...]],
+    contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]],
 ) -> None:
     """Persist precomputed final-tile candidates atomically for future runs."""
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -366,11 +366,11 @@ def write_candidate_tile_cache(
     with open(temp_cache_path, "w") as cache_file:
         json.dump(
             {
-                "work_units": sorted(contributor_tile_candidates),
-                "contributor_tile_candidates": {
-                    contributor_id: list(tile_relpaths)
-                    for contributor_id, tile_relpaths in sorted(
-                        contributor_tile_candidates.items()
+                "work_units": sorted(contributor_row_slabs),
+                "contributor_row_slabs": {
+                    contributor_id: [list(slab) for slab in row_slabs]
+                    for contributor_id, row_slabs in sorted(
+                        contributor_row_slabs.items()
                     )
                 },
             },
@@ -383,7 +383,7 @@ def write_candidate_tile_cache(
 
 def read_candidate_tile_cache(
     cache_path: str,
-) -> Optional[dict[str, tuple[str, ...]]]:
+) -> Optional[dict[str, tuple[tuple[int, int, int], ...]]]:
     """Load previously precomputed final-tile candidates from disk."""
     if not os.path.exists(cache_path):
         return None
@@ -394,29 +394,34 @@ def read_candidate_tile_cache(
         if not isinstance(payload, dict):
             raise ValueError("candidate tile cache must contain a JSON object")
         cached_work_units = payload.get("work_units")
-        raw_candidates = payload.get("contributor_tile_candidates")
+        raw_candidates = payload.get("contributor_row_slabs")
         if not isinstance(cached_work_units, list) or not all(
             isinstance(work_unit_id, str) for work_unit_id in cached_work_units
         ):
             raise ValueError("candidate tile cache work_units must be a list of strings")
         if not isinstance(raw_candidates, dict):
             raise ValueError(
-                "candidate tile cache contributor_tile_candidates must be an object"
+                "candidate tile cache contributor_row_slabs must be an object"
             )
         normalized_candidates = {
-            contributor_id: tuple(tile_relpaths)
-            for contributor_id, tile_relpaths in raw_candidates.items()
+            contributor_id: tuple(tuple(slab) for slab in row_slabs)
+            for contributor_id, row_slabs in raw_candidates.items()
             if isinstance(contributor_id, str)
-            and isinstance(tile_relpaths, list)
-            and all(isinstance(tile_relpath, str) for tile_relpath in tile_relpaths)
+            and isinstance(row_slabs, list)
+            and all(
+                isinstance(slab, list)
+                and len(slab) == 3
+                and all(isinstance(x, int) for x in slab)
+                for slab in row_slabs
+            )
         }
         if len(normalized_candidates) != len(raw_candidates):
             raise ValueError(
-                "candidate tile cache contributor_tile_candidates entries must be string lists"
+                "candidate tile cache contributor_row_slabs entries must be lists of [ty, tx_min, tx_max]"
             )
         if set(cached_work_units) != set(normalized_candidates):
             raise ValueError(
-                "candidate tile cache work_units must match contributor_tile_candidates keys"
+                "candidate tile cache work_units must match contributor_row_slabs keys"
             )
         return normalized_candidates
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1116,16 +1121,32 @@ def build_web_mercator_srs() -> osr.SpatialReference:
     return web_mercator_srs
 
 
-def build_relpaths_for_tile_bounds(
+
+def merge_row_slabs(
+    slabs: Sequence[tuple[int, int, int]],
+) -> tuple[tuple[int, int, int], ...]:
+    """Merge and sorted row slabs to ensure uniqueness and non-overlapping tx ranges."""
+    row_bounds: dict[int, list[int]] = {}
+    for ty, tx_min, tx_max in slabs:
+        if ty not in row_bounds:
+            row_bounds[ty] = [tx_min, tx_max]
+        else:
+            row_bounds[ty][0] = min(row_bounds[ty][0], tx_min)
+            row_bounds[ty][1] = max(row_bounds[ty][1], tx_max)
+    return tuple(
+        (ty, bounds[0], bounds[1])
+        for ty, bounds in sorted(row_bounds.items())
+    )
+
+def build_row_slabs_for_tile_bounds(
     bounds: tuple[float, float, float, float],
     zoom: int,
-) -> tuple[str, ...]:
-    """Return max-zoom z/x/y.webp paths covering one bounds envelope."""
+) -> tuple[tuple[int, int, int], ...]:
+    """Return max-zoom (ty, tx_min, tx_max) row slabs covering one bounds envelope."""
     tx_min, ty_min, tx_max, ty_max = tiler.get_chunk_tile_range(bounds, zoom)
     return tuple(
-        os.path.join(str(zoom), str(tx), f"{ty}.webp")
+        (ty, tx_min, tx_max)
         for ty in range(ty_min, ty_max + 1)
-        for tx in range(tx_min, tx_max + 1)
     )
 
 
@@ -1162,33 +1183,33 @@ def build_web_mercator_warp_options(
     return gdal.WarpOptions(**warp_kwargs)
 
 
-def build_work_unit_candidate_tile_relpaths(
+def build_work_unit_candidate_row_slabs(
     work_unit: LandWorkUnit,
     zoom: int,
-) -> tuple[str, ...]:
-    """Return a conservative set of final tiles a work unit may affect."""
+) -> tuple[tuple[int, int, int], ...]:
+    """Return a conservative set of final row slabs a work unit may affect."""
     web_mercator_srs = build_web_mercator_srs()
-    candidate_relpaths: set[str] = set()
+    candidate_slabs: list[tuple[int, int, int]] = []
     for source_subtile in work_unit.source_subtiles:
         mgrs_base, _x_index, _y_index = source_subtile.rsplit("_", 2)
         tile_geometry = build_mgrs_tile_geometry(mgrs_base, web_mercator_srs)
         if tile_geometry is None or tile_geometry.IsEmpty():
             raise RuntimeError(f"Could not build geometry for work unit {work_unit.unit_id}")
         min_x, max_x, min_y, max_y = tile_geometry.GetEnvelope()
-        candidate_relpaths.update(
-            build_relpaths_for_tile_bounds((min_x, min_y, max_x, max_y), zoom)
+        candidate_slabs.extend(
+            build_row_slabs_for_tile_bounds((min_x, min_y, max_x, max_y), zoom)
         )
-    return tuple(sorted(candidate_relpaths))
+    return merge_row_slabs(candidate_slabs)
 
 
-def build_source_raster_candidate_tile_relpaths(
+def build_source_raster_candidate_row_slabs(
     source_path: str,
     zoom: int,
     *,
     tile_size: int = 512,
     resample_alg: str = "lanczos",
-) -> tuple[str, ...]:
-    """Inspect one source raster and return the max-zoom tiles its aligned 3857 warp can touch."""
+) -> tuple[tuple[int, int, int], ...]:
+    """Inspect one source raster and return the max-zoom row slabs its aligned 3857 warp can touch."""
     dataset = gdal.Open(source_path)
     if dataset is None:
         raise RuntimeError(f"Could not open source raster for footprint inspection: {source_path}")
@@ -1210,13 +1231,13 @@ def build_source_raster_candidate_tile_relpaths(
             raise RuntimeError(
                 f"Could not derive Web Mercator footprint for source raster: {source_path}"
             )
-        return build_relpaths_for_tile_bounds(tiler.get_dataset_bounds(warped_vrt), zoom)
+        return build_row_slabs_for_tile_bounds(tiler.get_dataset_bounds(warped_vrt), zoom)
     finally:
         warped_vrt = None
         dataset = None
 
 
-def build_work_unit_candidate_tile_relpaths_from_sources(
+def build_work_unit_candidate_row_slabs_from_sources(
     work_unit: LandWorkUnit,
     date_paths: List[str],
     cache_dir: str,
@@ -1224,9 +1245,9 @@ def build_work_unit_candidate_tile_relpaths_from_sources(
     *,
     tile_size: int = 512,
     resample_alg: str = "lanczos",
-) -> tuple[str, ...]:
+) -> tuple[tuple[int, int, int], ...]:
     """Inspect actual source rasters for one work unit, with a conservative MGRS fallback."""
-    candidate_relpaths: set[str] = set()
+    candidate_slabs: list[tuple[int, int, int]] = []
     inspected_any_source = False
 
     for source_subtile in work_unit.source_subtiles:
@@ -1249,8 +1270,8 @@ def build_work_unit_candidate_tile_relpaths_from_sources(
                 download=False,
                 quiet=True,
             )
-            candidate_relpaths.update(
-                build_source_raster_candidate_tile_relpaths(
+            candidate_slabs.extend(
+                build_source_raster_candidate_row_slabs(
                     source_path,
                     zoom,
                     tile_size=tile_size,
@@ -1263,14 +1284,14 @@ def build_work_unit_candidate_tile_relpaths_from_sources(
                 f"Warning: Could not inspect source footprint for {source_subtile} "
                 f"({folder_name}): {exc}"
             )
-            return build_work_unit_candidate_tile_relpaths(work_unit, zoom)
+            return build_work_unit_candidate_row_slabs(work_unit, zoom)
 
-    if inspected_any_source and candidate_relpaths:
-        return tuple(sorted(candidate_relpaths))
-    return build_work_unit_candidate_tile_relpaths(work_unit, zoom)
+    if inspected_any_source and candidate_slabs:
+        return merge_row_slabs(candidate_slabs)
+    return build_work_unit_candidate_row_slabs(work_unit, zoom)
 
 
-def precompute_work_unit_candidate_tile_relpaths_from_sources(
+def precompute_work_unit_candidate_row_slabs_from_sources(
     work_units: Sequence[LandWorkUnit],
     date_paths: List[str],
     cache_dir: str,
@@ -1279,19 +1300,19 @@ def precompute_work_unit_candidate_tile_relpaths_from_sources(
     tile_size: int = 512,
     resample_alg: str = "lanczos",
     parallel: int = 1,
-) -> dict[str, tuple[str, ...]]:
+) -> dict[str, tuple[tuple[int, int, int], ...]]:
     """Inspect source footprints for all work units before final-tile flushing starts."""
     if not work_units:
         return {}
 
     max_workers = max(1, min(parallel, len(work_units)))
-    candidate_relpaths_by_work_unit: dict[str, tuple[str, ...]] = {}
+    candidate_slabs_by_work_unit: dict[str, tuple[tuple[int, int, int], ...]] = {}
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
     processed_work_units = 0
     candidate_tile_count = 0
     work_unit_iter = iter(work_units)
-    future_to_work_unit: dict[Future[tuple[str, ...]], LandWorkUnit] = {}
+    future_to_work_unit: dict[Future[tuple[tuple[int, int, int], ...]], LandWorkUnit] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         def submit_next_inspection() -> bool:
             try:
@@ -1299,7 +1320,7 @@ def precompute_work_unit_candidate_tile_relpaths_from_sources(
             except StopIteration:
                 return False
             future = executor.submit(
-                build_work_unit_candidate_tile_relpaths_from_sources,
+                build_work_unit_candidate_row_slabs_from_sources,
                 work_unit,
                 date_paths,
                 cache_dir,
@@ -1346,10 +1367,10 @@ def precompute_work_unit_candidate_tile_relpaths_from_sources(
                 continue
             for future in done_futures:
                 work_unit = future_to_work_unit.pop(future)
-                candidate_relpaths = future.result()
-                candidate_relpaths_by_work_unit[work_unit.unit_id] = candidate_relpaths
+                candidate_slabs = future.result()
+                candidate_slabs_by_work_unit[work_unit.unit_id] = candidate_slabs
                 processed_work_units += 1
-                candidate_tile_count += len(candidate_relpaths)
+                candidate_tile_count += sum(slab[2] - slab[1] + 1 for slab in candidate_slabs)
             while len(future_to_work_unit) < max_workers and submit_next_inspection():
                 pass
             update_count_progress(
@@ -1364,10 +1385,10 @@ def precompute_work_unit_candidate_tile_relpaths_from_sources(
                 ),
             )
     progress_line.finish()
-    return candidate_relpaths_by_work_unit
+    return candidate_slabs_by_work_unit
 
 
-def resolve_work_unit_candidate_tile_relpaths(
+def resolve_work_unit_candidate_row_slabs(
     work_units: Sequence[LandWorkUnit],
     date_paths: List[str],
     cache_dir: str,
@@ -1378,7 +1399,7 @@ def resolve_work_unit_candidate_tile_relpaths(
     tile_size: int = 512,
     resample_alg: str = "lanczos",
     parallel: int = 1,
-) -> dict[str, tuple[str, ...]]:
+) -> dict[str, tuple[tuple[int, int, int], ...]]:
     """Reuse cached candidate footprints when possible, computing and persisting only missing work."""
     if not work_units:
         return {}
@@ -1429,7 +1450,7 @@ def resolve_work_unit_candidate_tile_relpaths(
             f"computing {len(missing_work_units)} missing."
         )
 
-    computed_candidates = precompute_work_unit_candidate_tile_relpaths_from_sources(
+    computed_candidates = precompute_work_unit_candidate_row_slabs_from_sources(
         missing_work_units,
         date_paths,
         cache_dir,
@@ -2167,26 +2188,43 @@ def build_land_output_tile_grid(tile_plan: LandOutputTilePlan) -> TileGrid:
     )
 
 
-def build_output_tile_contributor_index(
+def build_output_tile_contributor_iterator(
     work_units: Sequence[LandWorkUnit],
-    contributor_tile_candidates: dict[str, tuple[str, ...]],
+    contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]],
+    zoom: int,
     *,
     consume_candidates: bool = False,
-) -> dict[str, tuple[str, ...]]:
-    """Invert contributor candidate footprints into ordered final-tile contributors."""
-    contributors_by_tile: dict[str, list[str]] = {}
+) -> tuple[int, Iterator[tuple[str, tuple[str, ...]]]]:
+    """Yield inverted contributor final-tile footprint relationships row by row."""
+    ty_to_slabs: dict[int, list[tuple[int, int, str]]] = {}
     for work_unit in work_units:
-        candidate_relpaths = (
-            contributor_tile_candidates.pop(work_unit.unit_id, ())
+        slabs = (
+            contributor_row_slabs.pop(work_unit.unit_id, ())
             if consume_candidates
-            else contributor_tile_candidates.get(work_unit.unit_id, ())
+            else contributor_row_slabs.get(work_unit.unit_id, ())
         )
-        for relative_path in candidate_relpaths:
-            contributors_by_tile.setdefault(relative_path, []).append(work_unit.unit_id)
-    return {
-        relative_path: tuple(contributor_ids)
-        for relative_path, contributor_ids in sorted(contributors_by_tile.items())
-    }
+        for ty, tx_min, tx_max in slabs:
+            ty_to_slabs.setdefault(ty, []).append((tx_min, tx_max, work_unit.unit_id))
+
+    total_tiles = 0
+    for ty, ty_slabs in ty_to_slabs.items():
+        tx_set: set[int] = set()
+        for tx_min, tx_max, _ in ty_slabs:
+            tx_set.update(range(tx_min, tx_max + 1))
+        total_tiles += len(tx_set)
+
+    def iterator() -> Iterator[tuple[str, tuple[str, ...]]]:
+        for ty in sorted(ty_to_slabs.keys()):
+            slabs_for_ty = ty_to_slabs[ty]
+            tx_to_units: dict[int, list[str]] = {}
+            for tx_min, tx_max, unit_id in slabs_for_ty:
+                for tx in range(tx_min, tx_max + 1):
+                    tx_to_units.setdefault(tx, []).append(unit_id)
+            for tx in sorted(tx_to_units.keys()):
+                relpath = os.path.join(str(zoom), str(tx), f"{ty}.webp")
+                yield relpath, tuple(tx_to_units[tx])
+
+    return total_tiles, iterator()
 
 
 def get_work_unit_prefetch_lock(work_unit_id: str) -> threading.Lock:
@@ -2804,18 +2842,18 @@ def render_land_output_tiles(
     date_paths: List[str],
     args: argparse.Namespace,
     unique_id: str,
-    contributor_tile_candidates: dict[str, tuple[str, ...]],
+    contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]],
     *,
     gebco_src: Optional[str] = None,
     prepared_ocean_background: Optional[str] = None,
 ) -> LandOutputRenderStats:
     """Render the final max-zoom land tile tree directly, one output tile per worker task."""
-    contributors_by_tile = build_output_tile_contributor_index(
+    total_tiles, contributor_items = build_output_tile_contributor_iterator(
         work_units,
-        contributor_tile_candidates,
+        contributor_row_slabs,
+        args.max_zoom,
         consume_candidates=True,
     )
-    total_tiles = len(contributors_by_tile)
     if total_tiles <= 0:
         return LandOutputRenderStats(total_tiles=0, rendered_tiles=0, skipped_tiles=0)
 
@@ -2832,7 +2870,6 @@ def render_land_output_tiles(
     started_at = time.perf_counter()
     processed_tiles = 0
     max_workers = max(1, min(args.parallel, total_tiles))
-    contributor_items = iter(contributors_by_tile.items())
     pending_futures: set[Future[LandTileRenderStatus]] = set()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
 
@@ -3212,7 +3249,7 @@ def main() -> None:
                 f"{len(plan.work_units)} sub-tile(s) "
                 f"with {args.parallel} worker(s)."
             )
-            contributor_tile_candidates = resolve_work_unit_candidate_tile_relpaths(
+            contributor_row_slabs = resolve_work_unit_candidate_row_slabs(
                 plan.work_units,
                 date_paths,
                 args.cache,
@@ -3234,7 +3271,7 @@ def main() -> None:
                 date_paths,
                 args,
                 unique_id,
-                contributor_tile_candidates,
+                contributor_row_slabs,
                 gebco_src=gebco_vrt_source,
                 prepared_ocean_background=prepared_ocean_background,
             )

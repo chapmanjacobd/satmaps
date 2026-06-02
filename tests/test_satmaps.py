@@ -933,46 +933,50 @@ def test_build_land_output_tile_plan_adds_lanczos_halo() -> None:
     assert plan.core_src_win == (3, 3, 512, 512)
     assert plan.bounds == pytest.approx(tiler.get_web_mercator_bounds(13, 1, 2))
 
-def test_build_output_tile_contributor_index_preserves_work_unit_order() -> None:
+def test_build_output_tile_contributor_iterator_preserves_work_unit_order() -> None:
     work_units = (
         satmaps.LandWorkUnit("31TDF_1_0", ("31TDF_1_0",)),
         satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
     )
 
-    contributors_by_tile = satmaps.build_output_tile_contributor_index(
+    _, iterator = satmaps.build_output_tile_contributor_iterator(
         work_units,
         {
-            "31TDF_1_0": ("13/1/2.webp",),
-            "31TDF_0_0": ("13/1/2.webp", "13/1/3.webp"),
+            "31TDF_1_0": ((2, 1, 1),),
+            "31TDF_0_0": ((2, 1, 1), (3, 1, 1)),
         },
+        zoom=13,
     )
+    contributors_by_tile = dict(iterator)
 
     assert contributors_by_tile == {
         "13/1/2.webp": ("31TDF_1_0", "31TDF_0_0"),
         "13/1/3.webp": ("31TDF_0_0",),
     }
 
-def test_build_output_tile_contributor_index_can_consume_candidates() -> None:
+def test_build_output_tile_contributor_iterator_can_consume_candidates() -> None:
     work_units = (
         satmaps.LandWorkUnit("31TDF_1_0", ("31TDF_1_0",)),
         satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
     )
-    contributor_tile_candidates = {
-        "31TDF_1_0": ("13/1/2.webp",),
-        "31TDF_0_0": ("13/1/2.webp", "13/1/3.webp"),
+    contributor_row_slabs = {
+        "31TDF_1_0": ((2, 1, 1),),
+        "31TDF_0_0": ((2, 1, 1), (3, 1, 1)),
     }
 
-    contributors_by_tile = satmaps.build_output_tile_contributor_index(
+    _, iterator = satmaps.build_output_tile_contributor_iterator(
         work_units,
-        contributor_tile_candidates,
+        contributor_row_slabs,
+        zoom=13,
         consume_candidates=True,
     )
+    contributors_by_tile = dict(iterator)
 
     assert contributors_by_tile == {
         "13/1/2.webp": ("31TDF_1_0", "31TDF_0_0"),
         "13/1/3.webp": ("31TDF_0_0",),
     }
-    assert contributor_tile_candidates == {}
+    assert contributor_row_slabs == {}
 
 def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
@@ -2139,7 +2143,7 @@ def test_generate_ocean_uses_requested_zoom_in_plan(monkeypatch: object) -> None
 
     assert plan_calls == [(None, 14, 256)]
 
-def test_build_source_raster_candidate_tile_relpaths_matches_real_warp(tmp_path: Path) -> None:
+def test_build_source_raster_candidate_row_slabs_matches_real_warp(tmp_path: Path) -> None:
     source_path = tmp_path / "source_utm.tif"
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(32604)
@@ -2150,7 +2154,7 @@ def test_build_source_raster_candidate_tile_relpaths_matches_real_warp(tmp_path:
     dataset.GetRasterBand(1).WriteArray(np.full((64, 64), 255, dtype=np.uint8))
     dataset = None
 
-    actual = satmaps.build_source_raster_candidate_tile_relpaths(
+    actual = satmaps.build_source_raster_candidate_row_slabs(
         str(source_path),
         13,
         tile_size=512,
@@ -2167,11 +2171,11 @@ def test_build_source_raster_candidate_tile_relpaths_matches_real_warp(tmp_path:
         ),
     )
     assert warped is not None
-    expected = satmaps.build_relpaths_for_tile_bounds(tiler.get_dataset_bounds(warped), 13)
+    expected = satmaps.build_row_slabs_for_tile_bounds(tiler.get_dataset_bounds(warped), 13)
 
     assert actual == expected
 
-def test_build_work_unit_candidate_tile_relpaths_from_sources_uses_actual_source_bounds(
+def test_build_work_unit_candidate_row_slabs_from_sources_uses_actual_source_bounds(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     work_unit = satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))
@@ -2201,19 +2205,28 @@ def test_build_work_unit_candidate_tile_relpaths_from_sources_uses_actual_source
     )
 
     actual = set(
-        satmaps.build_work_unit_candidate_tile_relpaths_from_sources(
+        satmaps.build_work_unit_candidate_row_slabs_from_sources(
             work_unit,
             ["2025/07/01"],
             ".cache",
             13,
         )
     )
-    conservative = set(satmaps.build_work_unit_candidate_tile_relpaths(work_unit, 13))
+    conservative = set(satmaps.build_work_unit_candidate_row_slabs(work_unit, 13))
 
     assert actual
-    assert actual < conservative
+    # Verify that the actual bounds are tighter than or equal to conservative
+    conservative_by_ty = {ty: (tx_min, tx_max) for ty, tx_min, tx_max in conservative}
+    for ty, tx_min, tx_max in actual:
+        assert ty in conservative_by_ty
+        c_min, c_max = conservative_by_ty[ty]
+        assert tx_min >= c_min
+        assert tx_max <= c_max
+    
+    # And verify they are not exactly the same (meaning we did trim it)
+    assert actual != conservative
 
-def test_build_work_unit_candidate_tile_relpaths_from_sources_falls_back_on_inspection_error(
+def test_build_work_unit_candidate_row_slabs_from_sources_falls_back_on_inspection_error(
     monkeypatch: object,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2231,17 +2244,17 @@ def test_build_work_unit_candidate_tile_relpaths_from_sources_falls_back_on_insp
         lambda path: (_ for _ in ()).throw(RuntimeError("boom")),
     )
 
-    actual = satmaps.build_work_unit_candidate_tile_relpaths_from_sources(
+    actual = satmaps.build_work_unit_candidate_row_slabs_from_sources(
         work_unit,
         ["2025/07/01"],
         ".cache",
         13,
     )
 
-    assert actual == satmaps.build_work_unit_candidate_tile_relpaths(work_unit, 13)
+    assert actual == satmaps.build_work_unit_candidate_row_slabs(work_unit, 13)
     assert "Could not inspect source footprint for 31TDF_0_0" in capsys.readouterr().out
 
-def test_resolve_work_unit_candidate_tile_relpaths_reuses_cached_subset_and_persists_missing(
+def test_resolve_work_unit_candidate_row_slabs_reuses_cached_subset_and_persists_missing(
     monkeypatch: object,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -2255,7 +2268,7 @@ def test_resolve_work_unit_candidate_tile_relpaths_reuses_cached_subset_and_pers
     cache_path = satmaps.build_candidate_tile_cache_path("candidatecache")
     satmaps.write_candidate_tile_cache(
         cache_path,
-        {"31TDF_0_0": ("13/1/1.webp",)},
+        {"31TDF_0_0": ((1, 1, 1),)},
     )
     seen_missing_units: list[str] = []
 
@@ -2271,14 +2284,14 @@ def test_resolve_work_unit_candidate_tile_relpaths_reuses_cached_subset_and_pers
     ):
         del date_paths, cache_dir, zoom, tile_size, resample_alg, parallel
         seen_missing_units.extend(work_unit.unit_id for work_unit in missing_work_units)
-        return {"31TDF_0_1": ("13/2/2.webp",)}
+        return {"31TDF_0_1": ((2, 2, 2),)}
 
     monkeypatch.setattr(
-        "satmaps.precompute_work_unit_candidate_tile_relpaths_from_sources",
+        "satmaps.precompute_work_unit_candidate_row_slabs_from_sources",
         fake_precompute,
     )
 
-    actual = satmaps.resolve_work_unit_candidate_tile_relpaths(
+    actual = satmaps.resolve_work_unit_candidate_row_slabs(
         work_units,
         ["2025/07/01"],
         ".cache",
@@ -2288,8 +2301,8 @@ def test_resolve_work_unit_candidate_tile_relpaths_reuses_cached_subset_and_pers
 
     assert seen_missing_units == ["31TDF_0_1"]
     assert actual == {
-        "31TDF_0_0": ("13/1/1.webp",),
-        "31TDF_0_1": ("13/2/2.webp",),
+        "31TDF_0_0": ((1, 1, 1),),
+        "31TDF_0_1": ((2, 2, 2),),
     }
     assert satmaps.read_candidate_tile_cache(cache_path) == actual
     out = capsys.readouterr().out
@@ -2306,16 +2319,16 @@ def test_precompute_work_unit_candidate_tile_relpaths_reports_progress(
     )
     monkeypatch.setattr(satmaps, "LAND_PROGRESS_HEARTBEAT_SECONDS", 0.01)
 
-    def slow_build(*args: object, **kwargs: object) -> tuple[str, ...]:
+    def slow_build(*args: object, **kwargs: object) -> tuple[tuple[int, int, int], ...]:
         time.sleep(0.03)
-        return ("13/1/1.webp", "13/1/2.webp")
+        return ((1, 1, 1), (2, 1, 1))
 
     monkeypatch.setattr(
-        "satmaps.build_work_unit_candidate_tile_relpaths_from_sources",
+        "satmaps.build_work_unit_candidate_row_slabs_from_sources",
         slow_build,
     )
 
-    actual = satmaps.precompute_work_unit_candidate_tile_relpaths_from_sources(
+    actual = satmaps.precompute_work_unit_candidate_row_slabs_from_sources(
         work_units,
         ["2025/07/01"],
         ".cache",
@@ -2324,8 +2337,8 @@ def test_precompute_work_unit_candidate_tile_relpaths_reports_progress(
     )
 
     assert actual == {
-        "31TDF_0_0": ("13/1/1.webp", "13/1/2.webp"),
-        "31TDF_0_1": ("13/1/1.webp", "13/1/2.webp"),
+        "31TDF_0_0": ((1, 1, 1), (2, 1, 1)),
+        "31TDF_0_1": ((1, 1, 1), (2, 1, 1)),
     }
     out = capsys.readouterr().out
     assert "Candidate footprint progress: 0/2 (0%);" in out
@@ -2636,19 +2649,19 @@ def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
         return str(tmp_path / ".temp" / "output.mbtiles")
 
     monkeypatch.setattr(
-        "satmaps.resolve_work_unit_candidate_tile_relpaths",
+        "satmaps.resolve_work_unit_candidate_row_slabs",
         lambda work_units, *args, **kwargs: {
-            work_unit.unit_id: ("13/1/2.webp",)
+            work_unit.unit_id: ((2, 1, 1),)
             for work_unit in work_units
         },
     )
     monkeypatch.setattr(
         "satmaps.render_land_output_tiles",
-        lambda work_units, date_paths, args, unique_id, contributor_tile_candidates, **kwargs: render_calls.append(
+        lambda work_units, date_paths, args, unique_id, contributor_row_slabs, **kwargs: render_calls.append(
             {
                 "work_units": tuple(work_unit.unit_id for work_unit in work_units),
                 "unique_id": unique_id,
-                "contributor_tile_candidates": contributor_tile_candidates,
+                "contributor_row_slabs": contributor_row_slabs,
             }
         )
         or satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0),
@@ -2662,11 +2675,11 @@ def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
         {
             "work_units": ("31TDF_0_0", "31TDF_0_1", "31TDF_1_0", "31TDF_1_1"),
             "unique_id": "mainwebp",
-            "contributor_tile_candidates": {
-                "31TDF_0_0": ("13/1/2.webp",),
-                "31TDF_0_1": ("13/1/2.webp",),
-                "31TDF_1_0": ("13/1/2.webp",),
-                "31TDF_1_1": ("13/1/2.webp",),
+            "contributor_row_slabs": {
+                "31TDF_0_0": ((2, 1, 1),),
+                "31TDF_0_1": ((2, 1, 1),),
+                "31TDF_1_0": ((2, 1, 1),),
+                "31TDF_1_1": ((2, 1, 1),),
             },
         }
     ]
@@ -2696,9 +2709,9 @@ def test_main_reports_land_progress(
     )
     monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        "satmaps.resolve_work_unit_candidate_tile_relpaths",
+        "satmaps.resolve_work_unit_candidate_row_slabs",
         lambda work_units, *args, **kwargs: {
-            work_unit.unit_id: (f"13/1/{index + 1}.webp",)
+            work_unit.unit_id: ((index + 1, 1, 1),)
             for index, work_unit in enumerate(work_units)
         },
     )
@@ -2729,9 +2742,9 @@ def test_render_land_output_tiles_emits_heartbeat_and_cached_counts(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles")
+    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles", max_zoom=14)
     work_units = [satmaps.LandWorkUnit(unit_id="31TDF_0_0", source_subtiles=("31TDF_0_0",))]
-    contributor_tile_candidates = {"31TDF_0_0": ("13/1/1.webp",)}
+    contributor_row_slabs = {"31TDF_0_0": ((1, 1, 1),)}
 
     monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
     monkeypatch.setattr(satmaps, "LAND_PROGRESS_HEARTBEAT_SECONDS", 0.01)
@@ -2747,7 +2760,7 @@ def test_render_land_output_tiles_emits_heartbeat_and_cached_counts(
         ["2025/07/01"],
         args,
         "testrun",
-        contributor_tile_candidates,
+        contributor_row_slabs,
     )
 
     assert stats == satmaps.LandOutputRenderStats(
@@ -2765,10 +2778,10 @@ def test_render_land_output_tiles_submits_only_active_work(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles")
+    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles", max_zoom=14)
     work_units = [satmaps.LandWorkUnit(unit_id="31TDF_0_0", source_subtiles=("31TDF_0_0",))]
-    contributor_tile_candidates = {
-        "31TDF_0_0": ("13/1/1.webp", "13/1/2.webp", "13/1/3.webp")
+    contributor_row_slabs = {
+        "31TDF_0_0": ((1, 1, 1), (2, 1, 1), (3, 1, 1))
     }
     monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
 
@@ -2817,7 +2830,7 @@ def test_render_land_output_tiles_submits_only_active_work(
         ["2025/07/01"],
         args,
         "testrun",
-        contributor_tile_candidates,
+        contributor_row_slabs,
     )
 
     assert stats == satmaps.LandOutputRenderStats(
@@ -2840,9 +2853,9 @@ def test_main_low_zoom_uses_subtile_processing_strategy(
     )
     monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        "satmaps.resolve_work_unit_candidate_tile_relpaths",
+        "satmaps.resolve_work_unit_candidate_row_slabs",
         lambda work_units, *args, **kwargs: {
-            work_unit.unit_id: (f"4/1/{index + 1}.webp",)
+            work_unit.unit_id: ((index + 1, 1, 1),)
             for index, work_unit in enumerate(work_units)
         },
     )
@@ -2895,15 +2908,15 @@ def test_main_passes_ocean_path_to_tile_processing(
     monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
     gebco_sources: list[str | None] = []
     monkeypatch.setattr(
-        "satmaps.resolve_work_unit_candidate_tile_relpaths",
+        "satmaps.resolve_work_unit_candidate_row_slabs",
         lambda work_units, *args, **kwargs: {
-            work_unit.unit_id: ("13/1/2.webp",)
+            work_unit.unit_id: ((2, 1, 1),)
             for work_unit in work_units
         },
     )
     monkeypatch.setattr(
         "satmaps.render_land_output_tiles",
-        lambda work_units, date_paths, args, unique_id, contributor_tile_candidates, **kwargs: gebco_sources.append(
+        lambda work_units, date_paths, args, unique_id, contributor_row_slabs, **kwargs: gebco_sources.append(
             kwargs.get("gebco_src")
         )
         or satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0),
@@ -2929,15 +2942,15 @@ def test_main_passes_winter_flag_to_tile_processing(monkeypatch: object, tmp_pat
     monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
     winter_flags: list[bool] = []
     monkeypatch.setattr(
-        "satmaps.resolve_work_unit_candidate_tile_relpaths",
+        "satmaps.resolve_work_unit_candidate_row_slabs",
         lambda work_units, *args, **kwargs: {
-            work_unit.unit_id: ("13/1/2.webp",)
+            work_unit.unit_id: ((2, 1, 1),)
             for work_unit in work_units
         },
     )
     monkeypatch.setattr(
         "satmaps.render_land_output_tiles",
-        lambda work_units, date_paths, args, unique_id, contributor_tile_candidates, **kwargs: winter_flags.append(
+        lambda work_units, date_paths, args, unique_id, contributor_row_slabs, **kwargs: winter_flags.append(
             args.winter
         )
         or satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0),
@@ -3028,7 +3041,7 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
     )
     monkeypatch.setattr(
         "satmaps.render_land_output_tiles",
-        lambda work_units, date_paths, args, unique_id, contributor_tile_candidates, **kwargs: render_calls.append(
+        lambda work_units, date_paths, args, unique_id, contributor_row_slabs, **kwargs: render_calls.append(
             {
                 "unique_id": unique_id,
                 "work_unit_count": len(work_units),
@@ -3036,16 +3049,16 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
                 "quality": args.quality,
                 "zoom": args.max_zoom,
                 "date_paths": tuple(date_paths),
-                "contributor_tile_candidates": contributor_tile_candidates,
+                "contributor_row_slabs": contributor_row_slabs,
                 **kwargs,
             }
         )
         or satmaps.LandOutputRenderStats(total_tiles=4, rendered_tiles=4, skipped_tiles=0),
     )
     monkeypatch.setattr(
-        "satmaps.resolve_work_unit_candidate_tile_relpaths",
+        "satmaps.resolve_work_unit_candidate_row_slabs",
         lambda work_units, *args, **kwargs: {
-            work_unit.unit_id: ("13/1/2.webp",)
+            work_unit.unit_id: ((2, 1, 1),)
             for work_unit in work_units
         },
     )
@@ -3072,15 +3085,15 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
     assert render_calls[0]["quality"] == 74
     assert render_calls[0]["zoom"] == ocean.DEFAULT_MAX_ZOOM
     assert render_calls[0]["prepared_ocean_background"] == ".temp/output_ocean_bbox.tif"
-    contributor_tile_candidates = render_calls[0]["contributor_tile_candidates"]
-    assert isinstance(contributor_tile_candidates, dict)
-    assert set(contributor_tile_candidates) == {
+    contributor_row_slabs = render_calls[0]["contributor_row_slabs"]
+    assert isinstance(contributor_row_slabs, dict)
+    assert set(contributor_row_slabs) == {
         "31TDF_0_0",
         "31TDF_0_1",
         "31TDF_1_0",
         "31TDF_1_1",
     }
-    assert all(candidate_relpaths for candidate_relpaths in contributor_tile_candidates.values())
+    assert all(candidate_relpaths for candidate_relpaths in contributor_row_slabs.values())
     assert backfill_calls == [
         (".temp/output_ocean_bbox.tif", "output.pmtiles", "lazyocean")
     ]
@@ -3111,10 +3124,10 @@ def test_main_reuses_cached_candidate_tile_footprints(
         lambda *args, **kwargs: "sharedcandidates",
     )
     cached_candidates = {
-        "31TDF_0_0": ("13/1/1.webp",),
-        "31TDF_0_1": ("13/1/2.webp",),
-        "31TDF_1_0": ("13/1/3.webp",),
-        "31TDF_1_1": ("13/1/4.webp",),
+        "31TDF_0_0": ((1, 1, 1),),
+        "31TDF_0_1": ((2, 1, 1),),
+        "31TDF_1_0": ((3, 1, 1),),
+        "31TDF_1_1": ((4, 1, 1),),
     }
     satmaps.write_candidate_tile_cache(
         satmaps.build_candidate_tile_cache_path("cachedcandidates"),
@@ -3124,18 +3137,18 @@ def test_main_reuses_cached_candidate_tile_footprints(
 
     monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        "satmaps.precompute_work_unit_candidate_tile_relpaths_from_sources",
+        "satmaps.precompute_work_unit_candidate_row_slabs_from_sources",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("expected candidate footprints to come from the cache")
         ),
     )
     monkeypatch.setattr(
         "satmaps.render_land_output_tiles",
-        lambda work_units, date_paths, args, unique_id, contributor_tile_candidates, **kwargs: render_calls.append(
+        lambda work_units, date_paths, args, unique_id, contributor_row_slabs, **kwargs: render_calls.append(
             {
                 "unique_id": unique_id,
                 "work_unit_count": len(work_units),
-                "contributor_tile_candidates": contributor_tile_candidates,
+                "contributor_row_slabs": contributor_row_slabs,
             }
         )
         or satmaps.LandOutputRenderStats(total_tiles=4, rendered_tiles=4, skipped_tiles=0),
@@ -3149,7 +3162,7 @@ def test_main_reuses_cached_candidate_tile_footprints(
     main()
 
     assert len(render_calls) == 1
-    assert render_calls[0]["contributor_tile_candidates"] == cached_candidates
+    assert render_calls[0]["contributor_row_slabs"] == cached_candidates
     out = capsys.readouterr().out
     assert "Loaded candidate tile cache from .temp/candidate_tiles_cachedcandidates.json with 4 sub-tile(s)." in out
     assert "Reusing cached candidate tile footprints for 4 sub-tile(s)." in out
@@ -3458,19 +3471,20 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
     )
 
     work_units = satmaps.plan_subtile_work_units(["31TDF"])
-    contributor_tile_candidates = {
-        work_unit.unit_id: (f"13/1/{index + 1}.webp",)
+    contributor_row_slabs = {
+        work_unit.unit_id: ((index + 1, 1, 1),)
         for index, work_unit in enumerate(work_units)
     }
     monkeypatch.setattr(
-        "satmaps.resolve_work_unit_candidate_tile_relpaths",
-        lambda *args, **kwargs: contributor_tile_candidates,
+        "satmaps.resolve_work_unit_candidate_row_slabs",
+        lambda *args, **kwargs: contributor_row_slabs,
     )
     monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
-    for tile_relpaths in contributor_tile_candidates.values():
+    for tile_slabs in contributor_row_slabs.values():
+        ty, tx_min, tx_max = tile_slabs[0]
         final_tile = (
             Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "webpresume"))
-            / tile_relpaths[0]
+            / f"13/{tx_min}/{ty}.webp"
         )
         tiler.save_webp_image(Image.new("RGB", (8, 8), (0, 0, 255)), str(final_tile), quality=100)
 
