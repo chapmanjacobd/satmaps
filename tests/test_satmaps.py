@@ -1,5 +1,6 @@
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -2539,8 +2540,44 @@ def test_main_reports_land_progress(
     assert "Expanded 1 MGRS tiles into 4 sub-tiles across 1 date(s)." in out
     assert "Starting output-tile rendering for 4 sub-tile(s) with 1 worker(s)." in out
     assert "Land tile progress: 4/4 (100%); Elapsed:" in out
-    assert "Rendered 4 land tile(s); skipped 0 tile(s)." in out
+    assert "Rendered 4 land tile(s); reused 0 cached tile(s)." in out
     assert "Building master VRT" not in out
+
+def test_render_land_output_tiles_emits_heartbeat_and_cached_counts(
+    monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles")
+    work_units = [satmaps.LandWorkUnit(unit_id="31TDF_0_0", source_subtiles=("31TDF_0_0",))]
+    contributor_tile_candidates = {"31TDF_0_0": ("13/1/1.webp",)}
+
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+    monkeypatch.setattr(satmaps, "LAND_PROGRESS_HEARTBEAT_SECONDS", 0.01)
+
+    def slow_render(*args: object, **kwargs: object) -> satmaps.LandTileRenderStatus:
+        time.sleep(0.03)
+        return satmaps.LandTileRenderStatus.CACHED
+
+    monkeypatch.setattr("satmaps.render_final_output_tile", slow_render)
+
+    stats = satmaps.render_land_output_tiles(
+        work_units,
+        ["2025/07/01"],
+        args,
+        "testrun",
+        contributor_tile_candidates,
+    )
+
+    assert stats == satmaps.LandOutputRenderStats(
+        total_tiles=1,
+        rendered_tiles=0,
+        skipped_tiles=1,
+        cached_tiles=1,
+        empty_tiles=0,
+    )
+    out = capsys.readouterr().out
+    assert "0 rendered, 0 cached, 1 active." in out
+    assert "0 rendered, 1 cached." in out
 
 def test_main_low_zoom_uses_subtile_processing_strategy(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -2579,7 +2616,7 @@ def test_main_low_zoom_uses_subtile_processing_strategy(
     assert "Expanded 1 MGRS tiles into 4 sub-tiles across 1 date(s)." in out
     assert "Starting output-tile rendering for 4 sub-tile(s) with 1 worker(s)." in out
     assert "Land tile progress: 4/4 (100%); Elapsed:" in out
-    assert "Rendered 4 land tile(s); skipped 0 tile(s)." in out
+    assert "Rendered 4 land tile(s); reused 0 cached tile(s)." in out
 
 def test_main_passes_ocean_path_to_tile_processing(
     monkeypatch: object, tmp_path: Path
@@ -3110,7 +3147,7 @@ def test_render_final_output_tile_skips_existing_tile(monkeypatch: object, tmp_p
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("existing tiles should skip rendering")),
     )
 
-    wrote_tile = satmaps.render_final_output_tile(
+    render_status = satmaps.render_final_output_tile(
         "13/1/2.webp",
         ("31TDF_0_0",),
         {"31TDF_0_0": satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))},
@@ -3119,7 +3156,7 @@ def test_render_final_output_tile_skips_existing_tile(monkeypatch: object, tmp_p
         "tileskip",
     )
 
-    assert not wrote_tile
+    assert render_status == satmaps.LandTileRenderStatus.CACHED
 
 def test_envelopes_overlap_rejects_touching_edges() -> None:
     assert not land_mgrs.envelopes_overlap(
@@ -3186,7 +3223,7 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
     main()
 
     out = capsys.readouterr().out
-    assert "All land output tiles already rendered." in out
+    assert "All land output tiles already rendered (reused from cache)." in out
 
 def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
     monkeypatch: object, tmp_path: Path

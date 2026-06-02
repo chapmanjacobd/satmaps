@@ -8,8 +8,9 @@ import sys
 import threading
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, cast
 
 import mgrs
@@ -49,6 +50,7 @@ OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
 OCEAN_MASK_SOURCE_CROP_HALO_PIXELS = 2
 DEFAULT_PREFETCH_IF_LAND = 100.0
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
+LAND_PROGRESS_HEARTBEAT_SECONDS = 5.0
 MGRS_TILE_SIZE_METERS = 100_000.0
 LOCAL_SEASON_TRANSITION_TILES = 3.0
 LOCAL_SEASON_TRANSITION_HALF_LATITUDE_DEGREES = (
@@ -92,6 +94,14 @@ class LandOutputRenderStats:
     total_tiles: int
     rendered_tiles: int
     skipped_tiles: int
+    cached_tiles: int = 0
+    empty_tiles: int = 0
+
+
+class LandTileRenderStatus(Enum):
+    RENDERED = "rendered"
+    CACHED = "cached"
+    EMPTY = "empty"
 
 
 def max_in_memory_write_pixels() -> int:
@@ -181,6 +191,22 @@ def update_count_progress(
         f"{label} {format_progress(current, total)}; "
         f"{format_eta(remaining, elapsed_seconds=elapsed)}; {detail}"
     )
+
+
+def format_land_tile_progress_detail(
+    rendered_tiles: int,
+    cached_tiles: int,
+    empty_tiles: int,
+    *,
+    active_tiles: int = 0,
+) -> str:
+    """Return a concise progress detail string for output-tile rendering."""
+    detail_parts = [f"{rendered_tiles} rendered", f"{cached_tiles} cached"]
+    if empty_tiles > 0:
+        detail_parts.append(f"{empty_tiles} empty")
+    if active_tiles > 0:
+        detail_parts.append(f"{active_tiles} active")
+    return ", ".join(detail_parts) + "."
 
 
 @dataclass(frozen=True)
@@ -2559,14 +2585,14 @@ def render_final_output_tile(
     *,
     gebco_src: Optional[str] = None,
     prepared_ocean_background: Optional[str] = None,
-) -> bool:
+) -> LandTileRenderStatus:
     """Render one final output tile directly from its ordered contributors."""
     destination_path = os.path.join(
         build_final_tile_cache_dir(args.output, unique_id),
         relative_path,
     )
     if file_has_content(destination_path):
-        return False
+        return LandTileRenderStatus.CACHED
 
     tile_plan = build_land_output_tile_plan(
         relative_path,
@@ -2608,7 +2634,7 @@ def render_final_output_tile(
             source_rgba.close()
 
     if composed_rgba is None:
-        return False
+        return LandTileRenderStatus.EMPTY
 
     if composed_rgba.getchannel("A").getextrema() == (255, 255):
         final_image: Image.Image = composed_rgba.convert("RGB")
@@ -2620,7 +2646,7 @@ def render_final_output_tile(
         if final_image is not composed_rgba:
             final_image.close()
         composed_rgba.close()
-    return True
+    return LandTileRenderStatus.RENDERED
 
 
 def render_land_output_tiles(
@@ -2649,7 +2675,8 @@ def render_land_output_tiles(
     }
 
     rendered_tiles = 0
-    skipped_tiles = 0
+    cached_tiles = 0
+    empty_tiles = 0
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
     processed_tiles = 0
@@ -2668,25 +2695,57 @@ def render_land_output_tiles(
             ): relative_path
             for relative_path, contributor_ids in contributors_by_tile.items()
         }
-        for future in as_completed(future_to_tile):
-            processed_tiles += 1
-            if future.result():
-                rendered_tiles += 1
-            else:
-                skipped_tiles += 1
+        pending_futures = set(future_to_tile)
+        while pending_futures:
+            done_futures, pending_futures = wait(
+                pending_futures,
+                timeout=LAND_PROGRESS_HEARTBEAT_SECONDS,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done_futures:
+                update_count_progress(
+                    progress_line,
+                    "Land tile progress:",
+                    processed_tiles,
+                    total_tiles,
+                    started_at,
+                    format_land_tile_progress_detail(
+                        rendered_tiles,
+                        cached_tiles,
+                        empty_tiles,
+                        active_tiles=len(pending_futures),
+                    ),
+                )
+                continue
+            for future in done_futures:
+                processed_tiles += 1
+                render_status: object = future.result()
+                if render_status is True or render_status == LandTileRenderStatus.RENDERED:
+                    rendered_tiles += 1
+                elif render_status == LandTileRenderStatus.CACHED:
+                    cached_tiles += 1
+                else:
+                    empty_tiles += 1
             update_count_progress(
                 progress_line,
                 "Land tile progress:",
                 processed_tiles,
                 total_tiles,
                 started_at,
-                f"{rendered_tiles} rendered, {skipped_tiles} skipped.",
+                format_land_tile_progress_detail(
+                    rendered_tiles,
+                    cached_tiles,
+                    empty_tiles,
+                    active_tiles=len(pending_futures),
+                ),
             )
     progress_line.finish()
     return LandOutputRenderStats(
         total_tiles=total_tiles,
         rendered_tiles=rendered_tiles,
-        skipped_tiles=skipped_tiles,
+        skipped_tiles=cached_tiles + empty_tiles,
+        cached_tiles=cached_tiles,
+        empty_tiles=empty_tiles,
     )
 
 
@@ -3014,13 +3073,20 @@ def main() -> None:
             )
             if tile_stats.total_tiles <= 0:
                 print("No candidate land output tiles were found.")
-            elif tile_stats.rendered_tiles <= 0 and tile_stats.skipped_tiles == tile_stats.total_tiles:
-                print("All land output tiles already rendered.")
+            elif (
+                tile_stats.rendered_tiles <= 0
+                and tile_stats.cached_tiles == tile_stats.total_tiles
+                and tile_stats.empty_tiles == 0
+            ):
+                print("All land output tiles already rendered (reused from cache).")
             else:
-                print(
+                land_summary = (
                     f"Rendered {tile_stats.rendered_tiles} land tile(s); "
-                    f"skipped {tile_stats.skipped_tiles} tile(s)."
+                    f"reused {tile_stats.cached_tiles} cached tile(s)."
                 )
+                if tile_stats.empty_tiles > 0:
+                    land_summary += f" Skipped {tile_stats.empty_tiles} empty tile(s)."
+                print(land_summary)
         else:
             print("All sub-tiles already processed.")
     else:
