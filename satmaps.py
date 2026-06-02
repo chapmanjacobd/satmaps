@@ -670,6 +670,12 @@ def get_tile_paths(
     return paths
 
 
+def build_band_cache_path(folder_name: str, date_path: str, band_id: str, cache_dir: str) -> str:
+    """Return the local cache path for one Sentinel band file."""
+    cache_prefix = "_".join(folder_name.split("_")[4:])
+    return os.path.join(cache_dir, date_path.replace("/", "-"), f"{cache_prefix}_{band_id}.tif")
+
+
 def get_tile_band_path(
     folder_name: str,
     date_path: str,
@@ -680,16 +686,8 @@ def get_tile_band_path(
     quiet: bool = False,
 ) -> str:
     """Construct a local or S3 path for one Sentinel band."""
-    cache_prefix = "_".join(folder_name.split("_")[4:])
     base_s3 = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder_name}"
-    date_cache_dir = (
-        os.path.join(cache_dir, date_path.replace("/", "-")) if cache_dir else None
-    )
-    local_path = (
-        os.path.join(date_cache_dir, f"{cache_prefix}_{band_id}.tif")
-        if date_cache_dir
-        else None
-    )
+    local_path = build_band_cache_path(folder_name, date_path, band_id, cache_dir) if cache_dir else None
 
     if local_path and os.path.exists(local_path):
         return local_path
@@ -2047,6 +2045,22 @@ def prefetch_tile_bands_locally(
     for folder_name, date_path in folders:
         get_tile_paths(folder_name, date_path, cache_dir, download=True, quiet=True)
 
+
+def cleanup_work_unit_cache_files(
+    folders: List[Tuple[str, str]],
+    cache_dir: str,
+) -> None:
+    """Delete local band cache files for a work unit whose last output tile has been rendered."""
+    for folder_name, date_path in folders:
+        for band_id, _ in RGB_BANDS:
+            path = build_band_cache_path(folder_name, date_path, band_id, cache_dir)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(f"Warning: Could not remove cache file {path}: {exc}")
+
 def estimate_subtile_land_percentage(
     mask_slabs: Optional[dict[int, OceanMaskSlab]],
     tile_grid: TileGrid,
@@ -2848,6 +2862,13 @@ def render_land_output_tiles(
     prepared_ocean_background: Optional[str] = None,
 ) -> LandOutputRenderStats:
     """Render the final max-zoom land tile tree directly, one output tile per worker task."""
+    work_unit_refcounts: dict[str, int] = {}
+    for work_unit in work_units:
+        for ty, tx_min, tx_max in contributor_row_slabs.get(work_unit.unit_id, ()):
+            work_unit_refcounts[work_unit.unit_id] = (
+                work_unit_refcounts.get(work_unit.unit_id, 0) + (tx_max - tx_min + 1)
+            )
+
     total_tiles, contributor_items = build_output_tile_contributor_iterator(
         work_units,
         contributor_row_slabs,
@@ -2870,7 +2891,7 @@ def render_land_output_tiles(
     started_at = time.perf_counter()
     processed_tiles = 0
     max_workers = max(1, min(args.parallel, total_tiles))
-    pending_futures: set[Future[LandTileRenderStatus]] = set()
+    future_to_contributors: dict[Future[LandTileRenderStatus], tuple[str, ...]] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
 
         def submit_next_render() -> bool:
@@ -2878,27 +2899,26 @@ def render_land_output_tiles(
                 relative_path, contributor_ids = next(contributor_items)
             except StopIteration:
                 return False
-            pending_futures.add(
-                executor.submit(
-                    render_final_output_tile,
-                    relative_path,
-                    contributor_ids,
-                    work_units_by_id,
-                    folders_by_work_unit,
-                    args,
-                    unique_id,
-                    gebco_src=gebco_src,
-                    prepared_ocean_background=prepared_ocean_background,
-                )
+            future = executor.submit(
+                render_final_output_tile,
+                relative_path,
+                contributor_ids,
+                work_units_by_id,
+                folders_by_work_unit,
+                args,
+                unique_id,
+                gebco_src=gebco_src,
+                prepared_ocean_background=prepared_ocean_background,
             )
+            future_to_contributors[future] = contributor_ids
             return True
 
-        while len(pending_futures) < max_workers and submit_next_render():
+        while len(future_to_contributors) < max_workers and submit_next_render():
             pass
 
-        while pending_futures:
-            done_futures, pending_futures = wait(
-                pending_futures,
+        while future_to_contributors:
+            done_futures, _ = wait(
+                set(future_to_contributors),
                 timeout=LAND_PROGRESS_HEARTBEAT_SECONDS,
                 return_when=FIRST_COMPLETED,
             )
@@ -2913,11 +2933,12 @@ def render_land_output_tiles(
                         rendered_tiles,
                         cached_tiles,
                         empty_tiles,
-                        active_tiles=len(pending_futures),
+                        active_tiles=len(future_to_contributors),
                     ),
                 )
                 continue
             for future in done_futures:
+                contributor_ids = future_to_contributors.pop(future)
                 processed_tiles += 1
                 render_status: object = future.result()
                 if render_status is True or render_status == LandTileRenderStatus.RENDERED:
@@ -2926,7 +2947,13 @@ def render_land_output_tiles(
                     cached_tiles += 1
                 else:
                     empty_tiles += 1
-            while len(pending_futures) < max_workers and submit_next_render():
+                for contributor_id in contributor_ids:
+                    work_unit_refcounts[contributor_id] -= 1
+                    if work_unit_refcounts[contributor_id] == 0:
+                        folders = folders_by_work_unit.get(contributor_id, [])
+                        if folders:
+                            cleanup_work_unit_cache_files(folders, args.cache)
+            while len(future_to_contributors) < max_workers and submit_next_render():
                 pass
             update_count_progress(
                 progress_line,
@@ -2938,7 +2965,7 @@ def render_land_output_tiles(
                     rendered_tiles,
                     cached_tiles,
                     empty_tiles,
-                    active_tiles=len(pending_futures),
+                    active_tiles=len(future_to_contributors),
                 ),
             )
     progress_line.finish()
