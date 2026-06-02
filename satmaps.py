@@ -2347,6 +2347,16 @@ def average_tile_blocks(
         if fill_allowed_mask is not None and allowed_block is not None:
             fill_allowed_mask[row_slice, col_slice] = allowed_block
 
+    if fill_allowed_mask is not None:
+        # Restrict seam interpolation to a small neighborhood around real source pixels after
+        # all slabs have been assembled so slab boundaries do not introduce new seams.
+        source_halo_mask = binary_dilation(
+            source_valid_mask,
+            structure=np.ones((3, 3), dtype=bool),
+        )
+        fill_allowed_mask &= source_halo_mask
+        alpha_mask = np.where(source_halo_mask, alpha_mask, 0).astype(np.uint8)
+
     return averaged, source_valid_mask, alpha_mask, fill_allowed_mask
 
 
@@ -2363,7 +2373,7 @@ def fill_missing_pixels(
         return fill_nan_nearest(
             averaged,
             valid_mask=source_valid_mask,
-            fill_mask=fill_allowed_mask,
+            fill_mask=fill_mask,
         )
     return averaged
 

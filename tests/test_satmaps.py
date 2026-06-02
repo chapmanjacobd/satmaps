@@ -629,6 +629,56 @@ def test_alpha_mask_coastline_seam_pixel_is_filled_opaquely(
     np.testing.assert_array_equal(rgba[:, 0, 0], np.array([255, 127, 63, 255], dtype=np.uint8))
     np.testing.assert_array_equal(rgba[:, 0, 1], np.array([255, 127, 63, 255], dtype=np.uint8))
 
+def test_average_tile_blocks_limits_land_fill_to_nearby_source_pixels(
+    monkeypatch: object,
+) -> None:
+    from satmaps import OceanMaskSlab, ProcessingWindow, average_tile_blocks
+
+    processing_window = ProcessingWindow(xoff=0, yoff=0, width=6, height=1)
+    mask_slabs = {
+        0: OceanMaskSlab(
+            xoff=0,
+            yoff=0,
+            width=6,
+            height=1,
+            alpha_block=np.zeros((1, 6), dtype=np.float32),
+            coverage_block=np.ones((1, 6), dtype=bool),
+            fill_allowed_block=np.ones((1, 6), dtype=bool),
+        )
+    }
+
+    def mock_average_block(date_band_sets, xoff, yoff, width, height):
+        assert (xoff, yoff, width, height) == (0, 0, 6, 1)
+        averaged_block = np.array(
+            [[[1.0, np.nan, np.nan, np.nan, np.nan, 2.0]]] * 3,
+            dtype=np.float32,
+        )
+        source_valid = np.array([[True, False, False, False, False, True]], dtype=bool)
+        return averaged_block, source_valid
+
+    monkeypatch.setattr("satmaps.average_block", mock_average_block)
+
+    averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
+        [],
+        processing_window,
+        mask_slabs,
+    )
+    filled = satmaps.fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
+
+    assert fill_allowed_mask is not None
+    np.testing.assert_array_equal(
+        fill_allowed_mask,
+        np.array([[True, True, False, False, True, True]], dtype=bool),
+    )
+    np.testing.assert_array_equal(
+        alpha_mask,
+        np.array([[255, 255, 0, 0, 255, 255]], dtype=np.uint8),
+    )
+    np.testing.assert_allclose(filled[:, 0, 1], np.array([1.0, 1.0, 1.0], dtype=np.float32))
+    assert np.isnan(filled[:, 0, 2]).all()
+    assert np.isnan(filled[:, 0, 3]).all()
+    np.testing.assert_allclose(filled[:, 0, 4], np.array([2.0, 2.0, 2.0], dtype=np.float32))
+
 def test_write_processed_blocks_block_path_matches_in_memory_path(
     monkeypatch: object,
 ) -> None:
