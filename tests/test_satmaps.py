@@ -3442,6 +3442,138 @@ def test_render_final_output_tile_skips_existing_tile(monkeypatch: object, tmp_p
 
     assert render_status == satmaps.LandTileRenderStatus.CACHED
 
+
+def test_render_final_output_tile_marks_and_resumes_empty_tile(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    args = argparse.Namespace(
+        output="output.pmtiles",
+        blocksize=8,
+        resample_alg="lanczos",
+        quality=74,
+    )
+    work_units_by_id = {"31TDF_0_0": satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))}
+
+    render_calls = 0
+
+    def fake_render_land_contributor_output_tile(*args: object, **kwargs: object) -> None:
+        nonlocal render_calls
+        render_calls += 1
+        return None
+
+    monkeypatch.setattr(
+        "satmaps.render_land_contributor_output_tile",
+        fake_render_land_contributor_output_tile,
+    )
+
+    # No contributor data and no ocean background -> the tile is empty.
+    status = satmaps.render_final_output_tile(
+        "13/1/2.webp",
+        ("31TDF_0_0",),
+        work_units_by_id,
+        {"31TDF_0_0": []},
+        args,
+        "tileempty",
+    )
+    assert status == satmaps.LandTileRenderStatus.EMPTY
+    assert render_calls == 1
+
+    final_dir = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "tileempty"))
+    destination_path = str(final_dir / "13/1/2.webp")
+    assert not Path(destination_path).exists()
+    assert Path(satmaps.build_empty_tile_marker_path(destination_path)).exists()
+
+    # A resumed render sees the marker and short-circuits without re-reading contributors.
+    status = satmaps.render_final_output_tile(
+        "13/1/2.webp",
+        ("31TDF_0_0",),
+        work_units_by_id,
+        {"31TDF_0_0": []},
+        args,
+        "tileempty",
+    )
+    assert status == satmaps.LandTileRenderStatus.EMPTY
+    assert render_calls == 1
+
+
+def test_render_final_output_tile_clears_stale_empty_marker_on_render(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    final_tile_tree = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "oceanstale"))
+    destination_path = str(final_tile_tree / "13/1/3.webp")
+    satmaps.mark_tile_empty(destination_path)
+    assert Path(satmaps.build_empty_tile_marker_path(destination_path)).exists()
+
+    args = argparse.Namespace(max_zoom=13, blocksize=512, resample_alg="lanczos", quality=74)
+    fake_dataset = object()
+
+    monkeypatch.setattr("satmaps.gdal.Open", lambda path: fake_dataset)
+    monkeypatch.setattr(
+        "satmaps.tiler.iter_dataset_tile_relpaths",
+        lambda dataset, zoom: iter(["13/1/3.webp"]),
+    )
+    monkeypatch.setattr("satmaps.tiler.get_dataset_bounds", lambda dataset: (0.0, 0.0, 1.0, 1.0))
+    monkeypatch.setattr(
+        "satmaps.tiler.render_dataset_tile",
+        lambda dataset, bounds, tile_size, resample_alg: np.full((3, 8, 8), 60, dtype=np.uint8),
+    )
+
+    written_tiles = satmaps.fill_missing_ocean_to_final_tile_cache(
+        "ocean.tif",
+        "output.pmtiles",
+        "oceanstale",
+        args,
+    )
+
+    assert written_tiles == 1
+    assert Path(destination_path).exists()
+    # Backfilling a real tile drops the now-stale empty marker.
+    assert not Path(satmaps.build_empty_tile_marker_path(destination_path)).exists()
+
+
+def test_render_land_output_tiles_fast_forwards_empty_marked_tiles(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    args = argparse.Namespace(parallel=4, cache=".cache", output="output.pmtiles", max_zoom=14)
+    work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
+    # ty=5, tx 1..3 -> three output tiles; mark the first two empty on disk.
+    contributor_row_slabs = {"31TDF_0_0": ((5, 1, 3),)}
+
+    final_dir = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "ffempty"))
+    for tx in (1, 2):
+        satmaps.mark_tile_empty(str(final_dir / f"14/{tx}/5.webp"))
+
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+    dispatched: list[str] = []
+
+    def fake_render(relative_path: str, *args: object, **kwargs: object) -> satmaps.LandTileRenderStatus:
+        dispatched.append(relative_path)
+        return satmaps.LandTileRenderStatus.RENDERED
+
+    monkeypatch.setattr("satmaps.render_final_output_tile", fake_render)
+
+    stats = satmaps.render_land_output_tiles(
+        work_units,
+        ["2025/07/01"],
+        args,
+        "ffempty",
+        contributor_row_slabs,
+    )
+
+    # The two empty-marked tiles are fast-forwarded in the producer and never dispatched.
+    assert dispatched == [os.path.join("14", "3", "5.webp")]
+    assert stats.total_tiles == 3
+    assert stats.empty_tiles == 2
+    assert stats.cached_tiles == 0
+    assert stats.rendered_tiles == 1
+
+
 def test_envelopes_overlap_rejects_touching_edges() -> None:
     assert not land_mgrs.envelopes_overlap(
         (0.0, 10.0, 0.0, 10.0),

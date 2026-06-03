@@ -186,6 +186,32 @@ def build_final_tile_cache_dir(output_path: str, unique_id: str) -> str:
     return os.path.join(build_tile_cache_root(output_path, unique_id), "final")
 
 
+def build_empty_tile_marker_path(destination_path: str) -> str:
+    """Return the sentinel path recording that a final tile rendered empty (no data)."""
+    return f"{destination_path}.empty"
+
+
+def mark_tile_empty(destination_path: str) -> None:
+    """Persist a sentinel so resumed runs skip re-rendering a known-empty tile.
+
+    Empty tiles write no .webp, so on-disk content alone cannot distinguish a tile
+    that is genuinely data-free from one that has not been processed yet. The marker
+    lets the resume fast-forward skip the (still non-trivial) contributor/ocean reads
+    instead of re-rendering the tile only to discover it is empty again.
+    """
+    marker_path = build_empty_tile_marker_path(destination_path)
+    os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+    staged_path = build_staged_path(marker_path)
+    with open(staged_path, "w") as marker_file:
+        marker_file.write("empty\n")
+    os.replace(staged_path, marker_path)
+
+
+def clear_tile_empty_marker(destination_path: str) -> None:
+    """Drop any stale empty marker once a real tile is written for that path."""
+    remove_if_exists(build_empty_tile_marker_path(destination_path))
+
+
 def build_land_mgrs_list_path() -> str:
     """Return the cached land-MGRS list path used to skip repeat ocean scans."""
     return land_mgrs_module.build_land_mgrs_list_path()
@@ -1181,6 +1207,7 @@ def fill_missing_ocean_to_final_tile_cache(
                 tiler.save_webp_image(image, destination_path, args.quality, lossless=False)
             finally:
                 image.close()
+            clear_tile_empty_marker(destination_path)
             written_tiles += 1
             processed_tiles += 1
             update_progress(force=processed_tiles >= total_tiles)
@@ -2949,6 +2976,8 @@ def render_final_output_tile(
     )
     if file_has_content(destination_path):
         return LandTileRenderStatus.CACHED
+    if file_has_content(build_empty_tile_marker_path(destination_path)):
+        return LandTileRenderStatus.EMPTY
 
     tile_plan = build_land_output_tile_plan(
         relative_path,
@@ -3005,6 +3034,7 @@ def render_final_output_tile(
                 ocean_rgba.close()
 
     if composed_rgba is None:
+        mark_tile_empty(destination_path)
         return LandTileRenderStatus.EMPTY
 
     if composed_rgba.getchannel("A").getextrema() == (255, 255):
@@ -3143,7 +3173,17 @@ def render_land_output_tiles(
                 # Fast-forward over output tiles already present on disk so resumed runs
                 # only dispatch genuine rendering work to the worker pool instead of
                 # round-tripping every cached tile through a worker thread.
-                nonlocal processed_tiles, cached_tiles, last_progress_at
+                nonlocal processed_tiles, cached_tiles, empty_tiles, last_progress_at
+
+                def account_fast_forwarded(contributor_ids: Sequence[str]) -> None:
+                    nonlocal last_progress_at
+                    release_contributors(contributor_ids)
+                    now = time.perf_counter()
+                    if now - last_progress_at >= LAND_PROGRESS_HEARTBEAT_SECONDS:
+                        last_progress_at = now
+                        emit_progress()
+                        flush_state()
+
                 while True:
                     if shutdown_requested.is_set():
                         return False
@@ -3155,12 +3195,12 @@ def render_land_output_tiles(
                     if file_has_content(destination_path):
                         processed_tiles += 1
                         cached_tiles += 1
-                        release_contributors(contributor_ids)
-                        now = time.perf_counter()
-                        if now - last_progress_at >= LAND_PROGRESS_HEARTBEAT_SECONDS:
-                            last_progress_at = now
-                            emit_progress()
-                            flush_state()
+                        account_fast_forwarded(contributor_ids)
+                        continue
+                    if file_has_content(build_empty_tile_marker_path(destination_path)):
+                        processed_tiles += 1
+                        empty_tiles += 1
+                        account_fast_forwarded(contributor_ids)
                         continue
                     future = executor.submit(
                         render_final_output_tile,
