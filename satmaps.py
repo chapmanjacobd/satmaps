@@ -619,6 +619,7 @@ def list_mosaic_folders_for_tile(
     date_paths: List[str],
     cache_dir: str,
     *,
+    ephemeral_cache_dir: Optional[str] = None,
     first_match_only: bool = False,
 ) -> List[Tuple[str, str]]:
     """Find all S3 folders for a specific MGRS sub-tile across multiple dates using the pre-populated cache."""
@@ -634,11 +635,16 @@ def list_mosaic_folders_for_tile(
         year = date_path.split("/")[0]
         folder = f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs_id}_{x}_{y}"
 
-        # 1. Check local cache first
-        local_b04 = os.path.join(
-            cache_dir, date_path.replace("/", "-"), f"{mgrs_id}_{x}_{y}_B04.tif"
+        # 1. Check local cache first (persistent, then ephemeral)
+        date_subdir = date_path.replace("/", "-")
+        b04_filename = f"{mgrs_id}_{x}_{y}_B04.tif"
+        local_b04 = os.path.join(cache_dir, date_subdir, b04_filename)
+        ephemeral_b04 = (
+            os.path.join(ephemeral_cache_dir, date_subdir, b04_filename)
+            if ephemeral_cache_dir
+            else None
         )
-        if os.path.exists(local_b04):
+        if os.path.exists(local_b04) or (ephemeral_b04 and os.path.exists(ephemeral_b04)):
             found.append((folder, date_path))
             if first_match_only:
                 return found
@@ -670,6 +676,7 @@ def get_tile_paths(
     cache_dir: Optional[str] = None,
     download: bool = False,
     *,
+    ephemeral_cache_dir: Optional[str] = None,
     quiet: bool = False,
 ) -> Dict[str, str]:
     """Construct local or S3 paths for RGB bands. Only downloads if 'download' is True."""
@@ -681,6 +688,7 @@ def get_tile_paths(
             band_id,
             cache_dir,
             download=download,
+            ephemeral_cache_dir=ephemeral_cache_dir,
             quiet=quiet,
         )
 
@@ -700,25 +708,30 @@ def get_tile_band_path(
     cache_dir: Optional[str] = None,
     download: bool = False,
     *,
+    ephemeral_cache_dir: Optional[str] = None,
     quiet: bool = False,
 ) -> str:
     """Construct a local or S3 path for one Sentinel band."""
     base_s3 = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder_name}"
-    local_path = build_band_cache_path(folder_name, date_path, band_id, cache_dir) if cache_dir else None
+    persistent_path = build_band_cache_path(folder_name, date_path, band_id, cache_dir) if cache_dir else None
+    ephemeral_path = build_band_cache_path(folder_name, date_path, band_id, ephemeral_cache_dir) if ephemeral_cache_dir else None
 
-    if local_path and os.path.exists(local_path):
-        return local_path
+    if persistent_path and os.path.exists(persistent_path):
+        return persistent_path
+    if ephemeral_path and os.path.exists(ephemeral_path):
+        return ephemeral_path
 
     s3_path = f"{base_s3}/{band_id}.tif"
-    if download and local_path:
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    download_path = ephemeral_path or persistent_path
+    if download and download_path:
+        os.makedirs(os.path.dirname(download_path), exist_ok=True)
         if not quiet:
-            print(f"Downloading {s3_path} to {local_path}...")
+            print(f"Downloading {s3_path} to {download_path}...")
         src_ds = gdal.Open(s3_path)
         if src_ds is None:
             raise RuntimeError(f"Could not open {s3_path}")
-        gdal.GetDriverByName("GTiff").CreateCopy(local_path, src_ds, callback=None)
-        return local_path
+        gdal.GetDriverByName("GTiff").CreateCopy(download_path, src_ds, callback=None)
+        return download_path
 
     return s3_path
 
@@ -2102,11 +2115,11 @@ def collect_ocean_mask_slabs(
 
 def prefetch_tile_bands_locally(
     folders: List[Tuple[str, str]],
-    cache_dir: str,
+    ephemeral_cache_dir: str,
 ) -> None:
-    """Download all RGB inputs needed by one worker into a tile-scoped cache."""
+    """Download all RGB inputs needed by one worker into the ephemeral tile cache."""
     for folder_name, date_path in folders:
-        get_tile_paths(folder_name, date_path, cache_dir, download=True, quiet=True)
+        get_tile_paths(folder_name, date_path, ephemeral_cache_dir, download=True, quiet=True)
 
 
 def cleanup_work_unit_cache_files(
@@ -2400,12 +2413,14 @@ def open_warped_date_band_sets(
     cache_dir: str,
     tile_grid: TileGrid,
     resample_alg: str,
+    *,
+    ephemeral_cache_dir: Optional[str] = None,
 ) -> List[Tuple[List[gdal.Band], List[gdal.Dataset]]]:
     """Open RGB bands for each date, already warped to the expanded output tile grid."""
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
     try:
         for folder_name, date_path in folders:
-            paths = get_tile_paths(folder_name, date_path, cache_dir, download=False)
+            paths = get_tile_paths(folder_name, date_path, cache_dir, download=False, ephemeral_cache_dir=ephemeral_cache_dir)
             datasets: List[gdal.Dataset] = []
             bands: List[gdal.Band] = []
             for _band_id, color_name in RGB_BANDS:
@@ -2793,15 +2808,17 @@ def render_land_contributor_output_tile(
         prefetch_if_land = float(
             getattr(args, "prefetch_if_land", DEFAULT_PREFETCH_IF_LAND)
         )
+        prefetch_cache_dir = args.cache + ".temp"
         if should_prefetch_tile_bands(prefetch_if_land, mask_slabs, tile_grid):
             with get_work_unit_prefetch_lock(work_unit.unit_id):
-                prefetch_tile_bands_locally(folders, args.cache)
+                prefetch_tile_bands_locally(folders, prefetch_cache_dir)
 
         date_band_sets = open_warped_date_band_sets(
             folders,
             args.cache,
             tile_grid,
             args.resample_alg,
+            ephemeral_cache_dir=prefetch_cache_dir,
         )
         averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
             date_band_sets,
@@ -2957,8 +2974,11 @@ def render_land_output_tiles(
         return LandOutputRenderStats(total_tiles=0, rendered_tiles=0, skipped_tiles=0)
 
     work_units_by_id = {work_unit.unit_id: work_unit for work_unit in work_units}
+    prefetch_cache_dir = args.cache + ".temp"
     folders_by_work_unit = {
-        work_unit.unit_id: list_mosaic_folders_for_tile(work_unit.unit_id, date_paths, args.cache)
+        work_unit.unit_id: list_mosaic_folders_for_tile(
+            work_unit.unit_id, date_paths, args.cache, ephemeral_cache_dir=prefetch_cache_dir
+        )
         for work_unit in work_units
     }
 
@@ -3030,7 +3050,7 @@ def render_land_output_tiles(
                     if work_unit_refcounts[contributor_id] == 0:
                         folders = folders_by_work_unit.get(contributor_id, [])
                         if folders:
-                            cleanup_work_unit_cache_files(folders, args.cache)
+                            cleanup_work_unit_cache_files(folders, prefetch_cache_dir)
             while len(future_to_contributors) < max_workers and submit_next_render():
                 pass
             update_count_progress(
