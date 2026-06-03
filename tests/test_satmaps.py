@@ -81,6 +81,41 @@ def test_get_tile_paths_returns_s3_paths(monkeypatch: object) -> None:
         == "/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/2025/07/01/Sentinel-2_mosaic_2025_Q3_31TDF_0_0/B02.tif"
     )
 
+
+def test_prefetch_tile_bands_locally_reuses_persistent_cache(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    folder_name = "Sentinel-2_mosaic_2025_Q3_31TDF_0_0"
+    date_path = "2025/07/01"
+    persistent_cache_dir = tmp_path / ".cache"
+    ephemeral_cache_dir = tmp_path / ".cache.temp"
+
+    for band_id, _ in satmaps.RGB_BANDS:
+        band_path = Path(
+            satmaps.build_band_cache_path(
+                folder_name, date_path, band_id, str(persistent_cache_dir)
+            )
+        )
+        band_path.parent.mkdir(parents=True, exist_ok=True)
+        band_path.write_text("cached")
+
+    monkeypatch.setattr(
+        satmaps.gdal,
+        "Open",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError(f"unexpected download for {path}")
+        ),
+    )
+
+    satmaps.prefetch_tile_bands_locally(
+        [(folder_name, date_path)],
+        str(persistent_cache_dir),
+        str(ephemeral_cache_dir),
+    )
+
+    assert not ephemeral_cache_dir.exists()
+
+
 def test_fill_nan_nearest_fills_from_nearest_valid_pixel() -> None:
     arr = np.array(
         [

@@ -2289,11 +2289,23 @@ def collect_ocean_mask_slabs(
 
 def prefetch_tile_bands_locally(
     folders: List[Tuple[str, str]],
+    cache_dir: str,
     ephemeral_cache_dir: str,
 ) -> None:
-    """Download all RGB inputs needed by one worker into the ephemeral tile cache."""
+    """Download all RGB inputs needed by one worker into the ephemeral tile cache.
+
+    The persistent cache remains authoritative for cache hits; the ephemeral cache is
+    only the download destination for missing bands.
+    """
     for folder_name, date_path in folders:
-        get_tile_paths(folder_name, date_path, ephemeral_cache_dir, download=True, quiet=True)
+        get_tile_paths(
+            folder_name,
+            date_path,
+            cache_dir,
+            download=True,
+            ephemeral_cache_dir=ephemeral_cache_dir,
+            quiet=True,
+        )
 
 
 def cleanup_work_unit_cache_files(
@@ -3127,7 +3139,7 @@ def render_land_contributor_output_tile(
         prefetch_cache_dir = getattr(args, "prefetch_cache", None) or args.cache + ".temp"
         if should_prefetch_tile_bands(prefetch_if_land, mask_slabs, tile_grid):
             with get_work_unit_prefetch_lock(work_unit.unit_id):
-                prefetch_tile_bands_locally(folders, prefetch_cache_dir)
+                prefetch_tile_bands_locally(folders, args.cache, prefetch_cache_dir)
 
         date_band_sets = open_warped_date_band_sets(
             folders,
@@ -3204,7 +3216,7 @@ def render_land_contributor_output_batch(
         prefetch_cache_dir = getattr(args, "prefetch_cache", None) or args.cache + ".temp"
         if should_prefetch_tile_bands(prefetch_if_land, mask_slabs, tile_grid):
             with get_work_unit_prefetch_lock(work_unit.unit_id):
-                prefetch_tile_bands_locally(folders, prefetch_cache_dir)
+                prefetch_tile_bands_locally(folders, args.cache, prefetch_cache_dir)
 
         date_band_sets = open_warped_date_band_sets(
             folders,
