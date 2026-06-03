@@ -905,3 +905,39 @@ def test_build_alpha_block_preserves_ocean_alpha_gradient() -> None:
         ),
         np.array([[0, 55, 255]], dtype=np.uint8),
     )
+
+
+def test_per_worker_warp_threads_splits_cores_across_workers(monkeypatch: object) -> None:
+    monkeypatch.setattr(common.os, "cpu_count", lambda: 16)
+    assert common.per_worker_warp_threads(4) == 4
+    assert common.per_worker_warp_threads(1) == 16
+
+
+def test_per_worker_warp_threads_floors_at_one_when_oversubscribed(monkeypatch: object) -> None:
+    monkeypatch.setattr(common.os, "cpu_count", lambda: 8)
+    assert common.per_worker_warp_threads(12) == 1
+    assert common.per_worker_warp_threads(0) == 8
+
+
+def test_per_worker_warp_threads_handles_unknown_cpu_count(monkeypatch: object) -> None:
+    monkeypatch.setattr(common.os, "cpu_count", lambda: None)
+    assert common.per_worker_warp_threads(4) == 1
+
+
+def test_warp_thread_options_defaults_to_all_cpus() -> None:
+    assert common.warp_thread_options() == ["NUM_THREADS=ALL_CPUS"]
+
+
+def test_warp_thread_budget_scopes_and_restores_num_threads() -> None:
+    assert common.warp_thread_options() == ["NUM_THREADS=ALL_CPUS"]
+    with common.warp_thread_budget(3):
+        assert common.warp_thread_options() == ["NUM_THREADS=3"]
+    assert common.warp_thread_options() == ["NUM_THREADS=ALL_CPUS"]
+
+
+def test_warp_thread_budget_restores_after_exception() -> None:
+    with pytest.raises(RuntimeError):
+        with common.warp_thread_budget(2):
+            assert common.warp_thread_options() == ["NUM_THREADS=2"]
+            raise RuntimeError("boom")
+    assert common.warp_thread_options() == ["NUM_THREADS=ALL_CPUS"]

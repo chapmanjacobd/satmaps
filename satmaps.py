@@ -28,8 +28,11 @@ from common import (
     build_staged_path,
     file_has_content,
     format_eta,
+    per_worker_warp_threads,
     publish_staged_path,
     remove_if_exists,
+    warp_thread_budget,
+    warp_thread_options,
 )
 import land_mgrs as land_mgrs_module
 import ocean
@@ -1287,7 +1290,7 @@ def build_web_mercator_warp_options(
         "resampleAlg": resample_alg,
         "targetAlignedPixels": True,
         "multithread": True,
-        "warpOptions": ["NUM_THREADS=ALL_CPUS"],
+        "warpOptions": warp_thread_options(),
     }
     if destination_path is not None and resolved_format == "GTiff":
         warp_kwargs["creationOptions"] = [
@@ -1431,7 +1434,9 @@ def precompute_work_unit_candidate_row_slabs_from_sources(
     candidate_tile_count = 0
     work_unit_iter = iter(work_units)
     future_to_work_unit: dict[Future[tuple[tuple[int, int, int], ...]], LandWorkUnit] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with warp_thread_budget(per_worker_warp_threads(max_workers)), ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
         def submit_next_inspection() -> bool:
             try:
                 work_unit = next(work_unit_iter)
@@ -2100,7 +2105,7 @@ def open_gebco_mask(
                     workingType=gdal.GDT_Float32,
                     outputType=gdal.GDT_Float32,
                     multithread=True,
-                    warpOptions=["NUM_THREADS=ALL_CPUS"],
+                    warpOptions=warp_thread_options(),
                 ),
             )
             if warped_mask_ds is None:
@@ -2485,7 +2490,7 @@ def warp_band_dataset_to_tile_grid(
                 workingType=gdal.GDT_Float32,
                 outputType=gdal.GDT_Float32,
                 multithread=True,
-                warpOptions=["NUM_THREADS=ALL_CPUS"],
+                warpOptions=warp_thread_options(),
             ),
         )
         if warped_dataset is None:
@@ -3155,7 +3160,9 @@ def render_land_output_tiles(
             handler_installed = False
 
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with warp_thread_budget(per_worker_warp_threads(max_workers)), ThreadPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
 
             def submit_next_render() -> bool:
                 # Fast-forward over output tiles already present on disk so resumed runs

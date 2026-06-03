@@ -1,7 +1,48 @@
+import contextlib
 import math
 import os
+from typing import Iterator
 
 from osgeo import gdal
+
+# Active GDAL warp NUM_THREADS budget. Defaults to "ALL_CPUS" so sequential warps
+# use the whole machine; worker pools temporarily lower it (see warp_thread_budget)
+# so an outer pool of N workers each running an ALL_CPUS warp doesn't oversubscribe
+# the CPU (N x ALL_CPUS threads = context-switch thrash, not speedup).
+_WARP_NUM_THREADS = "ALL_CPUS"
+
+
+def warp_thread_options() -> list[str]:
+    """gdal.Warp ``warpOptions`` entry honoring the active per-worker thread budget."""
+    return [f"NUM_THREADS={_WARP_NUM_THREADS}"]
+
+
+def per_worker_warp_threads(parallel: int) -> int:
+    """Split the machine's cores across ``parallel`` outer workers.
+
+    Keeps the total warp thread count near the core count instead of
+    ``parallel x cpu_count``. When ``parallel`` exceeds the core count this
+    floors at 1 thread per warp, bounding contention to roughly ``parallel``.
+    """
+    cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count // max(1, parallel))
+
+
+@contextlib.contextmanager
+def warp_thread_budget(num_threads: "int | str") -> Iterator[None]:
+    """Scope the warp NUM_THREADS budget for the duration of a worker pool.
+
+    The budget is set by the calling (main) thread before workers start and
+    restored after the pool's ``with`` block joins all workers, so worker
+    threads only ever read a stable value.
+    """
+    global _WARP_NUM_THREADS
+    previous = _WARP_NUM_THREADS
+    _WARP_NUM_THREADS = str(num_threads)
+    try:
+        yield
+    finally:
+        _WARP_NUM_THREADS = previous
 
 
 def format_eta(

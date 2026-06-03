@@ -4,7 +4,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, cast
 
@@ -1132,7 +1132,7 @@ def process_chunk(args: ChunkTask) -> str:
         )
 
         if format.lower() == "webp":
-            gdal.SetConfigOption("WEBP_LEVEL", str(options["quality"]))
+            gdal.SetThreadLocalConfigOption("WEBP_LEVEL", str(options["quality"]))
 
         remove_if_exists(staged_chunk_file)
         gdal.Translate(staged_chunk_file, chunk_source, options=translate_options)
@@ -1326,7 +1326,7 @@ def run_tiling_simplified(
             f"Processing {len(tasks)} chunk(s) at zoom {chunk_zoom} with {num_workers} worker(s)..."
         )
         if num_workers > 1:
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 list(executor.map(process_chunk, tasks))
         else:
             for task in tasks:

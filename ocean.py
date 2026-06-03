@@ -17,8 +17,11 @@ from common import (
     build_staged_path,
     file_has_content,
     format_eta,
+    per_worker_warp_threads,
     publish_staged_path,
     remove_if_exists,
+    warp_thread_budget,
+    warp_thread_options,
 )
 from osgeo import gdal
 from scipy.ndimage import label
@@ -1031,7 +1034,7 @@ def materialize_warped_ocean_chunk(
             resampleAlg=resample_alg,
             outputType=gdal.GDT_Float32,
             multithread=True,
-            warpOptions=["NUM_THREADS=ALL_CPUS"],
+            warpOptions=warp_thread_options(),
             creationOptions=list(GTIFF_CREATION_OPTIONS),
         ),
     )
@@ -1239,7 +1242,9 @@ def generate_ocean_background(
                 completed += 1
                 update_chunk_progress(completed)
         else:
-            with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
+            with warp_thread_budget(
+                per_worker_warp_threads(chunk_workers)
+            ), ThreadPoolExecutor(max_workers=chunk_workers) as executor:
                 future_to_chunk = {
                     executor.submit(
                         process_ocean_chunk,
