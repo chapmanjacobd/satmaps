@@ -2865,17 +2865,6 @@ def render_final_output_tile(
         args.resample_alg,
     )
     composed_rgba: Optional[Image.Image] = None
-    if prepared_ocean_background is not None:
-        ocean_image = render_raster_tile_image(
-            prepared_ocean_background,
-            relative_path,
-            args.blocksize,
-            args.resample_alg,
-        )
-        if ocean_image is not None:
-            composed_rgba = ocean_image.convert("RGBA")
-            ocean_image.close()
-
     for contributor_id in contributor_ids:
         contributor_image = render_land_contributor_output_tile(
             work_units_by_id[contributor_id],
@@ -2897,6 +2886,32 @@ def render_final_output_tile(
             composed_rgba = Image.alpha_composite(previous_composed, source_rgba)
             previous_composed.close()
             source_rgba.close()
+
+    # Only render and underlay the ocean background when the land contributors do not
+    # already fully cover the tile. Opaque interior land tiles skip the ocean render
+    # (and its per-tile raster open) entirely. "over" is associative, so underlaying
+    # the ocean once beneath the combined land composite matches rendering it as the base.
+    needs_ocean = prepared_ocean_background is not None and (
+        composed_rgba is None or composed_rgba.getchannel("A").getextrema() != (255, 255)
+    )
+    if needs_ocean:
+        assert prepared_ocean_background is not None
+        ocean_image = render_raster_tile_image(
+            prepared_ocean_background,
+            relative_path,
+            args.blocksize,
+            args.resample_alg,
+        )
+        if ocean_image is not None:
+            ocean_rgba = ocean_image.convert("RGBA")
+            ocean_image.close()
+            if composed_rgba is None:
+                composed_rgba = ocean_rgba
+            else:
+                previous_composed = composed_rgba
+                composed_rgba = Image.alpha_composite(ocean_rgba, previous_composed)
+                previous_composed.close()
+                ocean_rgba.close()
 
     if composed_rgba is None:
         return LandTileRenderStatus.EMPTY
