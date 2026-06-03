@@ -61,6 +61,14 @@ OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
 OCEAN_MASK_SOURCE_CROP_HALO_PIXELS = 2
 DEFAULT_PREFETCH_IF_LAND = 100.0
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
+DEFAULT_TEMP_DIR = ".temp"
+TEMP_DIR = DEFAULT_TEMP_DIR
+
+
+def set_temp_dir(temp_dir: str) -> None:
+    """Set the process-wide working directory for heavyweight temporary files."""
+    global TEMP_DIR
+    TEMP_DIR = temp_dir
 LAND_PROGRESS_HEARTBEAT_SECONDS = 5.0
 MGRS_TILE_SIZE_METERS = 100_000.0
 LOCAL_SEASON_TRANSITION_TILES = 3.0
@@ -155,22 +163,22 @@ def temp_basename_from_output(output_path: str) -> str:
 
 def build_state_file_path(unique_id: str) -> str:
     """Return the lightweight JSON resume state path."""
-    return f".temp/state_{unique_id}.json"
+    return f"{TEMP_DIR}/state_{unique_id}.json"
 
 
 def build_candidate_tile_cache_path(unique_id: str) -> str:
     """Return the persistent JSON cache path for candidate final-tile footprints."""
-    return f".temp/candidate_tiles_{unique_id}.json"
+    return f"{TEMP_DIR}/candidate_tiles_{unique_id}.json"
 
 
 def build_temp_mbtiles_path(output_path: str) -> str:
     """Return the deterministic heavyweight MBTiles path."""
-    return f".temp/{temp_basename_from_output(output_path)}.mbtiles"
+    return f"{TEMP_DIR}/{temp_basename_from_output(output_path)}.mbtiles"
 
 
 def build_tile_cache_root(output_path: str, unique_id: str) -> str:
     """Return the run-scoped root directory for cached max-zoom WebP tiles."""
-    return f".temp/{temp_basename_from_output(output_path)}_{unique_id}_tilecache"
+    return f"{TEMP_DIR}/{temp_basename_from_output(output_path)}_{unique_id}_tilecache"
 
 
 def build_tile_cache_marker_path(
@@ -398,7 +406,7 @@ def cleanup_temporary_files(paths: Sequence[str]) -> None:
 
 def build_prepared_ocean_path(output_path: str) -> str:
     """Return the deterministic heavyweight bbox-clipped ocean TIFF path."""
-    return f".temp/{temp_basename_from_output(output_path)}_ocean_bbox.tif"
+    return f"{TEMP_DIR}/{temp_basename_from_output(output_path)}_ocean_bbox.tif"
 
 
 def write_tile_cache_marker(
@@ -2902,7 +2910,7 @@ def render_land_contributor_output_tile(
         prefetch_if_land = float(
             getattr(args, "prefetch_if_land", DEFAULT_PREFETCH_IF_LAND)
         )
-        prefetch_cache_dir = args.cache + ".temp"
+        prefetch_cache_dir = getattr(args, "prefetch_cache", None) or args.cache + ".temp"
         if should_prefetch_tile_bands(prefetch_if_land, mask_slabs, tile_grid):
             with get_work_unit_prefetch_lock(work_unit.unit_id):
                 prefetch_tile_bands_locally(folders, prefetch_cache_dir)
@@ -3073,7 +3081,7 @@ def render_land_output_tiles(
         return LandOutputRenderStats(total_tiles=0, rendered_tiles=0, skipped_tiles=0)
 
     work_units_by_id = {work_unit.unit_id: work_unit for work_unit in work_units}
-    prefetch_cache_dir = args.cache + ".temp"
+    prefetch_cache_dir = getattr(args, "prefetch_cache", None) or args.cache + ".temp"
     folders_by_work_unit = WorkUnitFolderCache(
         lambda unit_id: list_mosaic_folders_for_tile(
             unit_id, date_paths, args.cache, ephemeral_cache_dir=prefetch_cache_dir
@@ -3421,6 +3429,16 @@ def main() -> None:
     parser.add_argument("--blocksize", type=int, default=512)
     parser.add_argument("--cache", default=".cache", help="Cache directory")
     parser.add_argument(
+        "--prefetch-cache",
+        default=None,
+        help="Ephemeral cache directory for prefetched RGB bands (default: <cache>.temp)",
+    )
+    parser.add_argument(
+        "--temp-dir",
+        default=DEFAULT_TEMP_DIR,
+        help="Directory for heavyweight intermediary files",
+    )
+    parser.add_argument(
         "--prefetch-if-land",
         type=parse_prefetch_if_land,
         default=DEFAULT_PREFETCH_IF_LAND,
@@ -3469,7 +3487,11 @@ def main() -> None:
         calculate_estimates(args)
         return
 
-    os.makedirs(".temp", exist_ok=True)
+    set_temp_dir(args.temp_dir)
+    if not args.prefetch_cache:
+        args.prefetch_cache = args.cache + ".temp"
+
+    os.makedirs(TEMP_DIR, exist_ok=True)
 
     requested_bbox = parse_bbox(args.bbox) if args.bbox else None
     date_paths = [date_path.strip() for date_path in args.date.split(",")]

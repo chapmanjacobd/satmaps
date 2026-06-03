@@ -140,8 +140,11 @@ satmaps --estimate
 - `--grade` / `--no-grade`: Enable or disable final land grading.
 - `--exposure`: Global brightness multiplier.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
+- `--prefetch-cache`: Ephemeral cache directory for prefetched RGB bands (default: `<cache>.temp`).
+- `--temp-dir`: Directory for heavyweight intermediary files, resume state, and the staged MBTiles (default: `.temp`).
+- `--output` / `-o`: Final output PMTiles path (default: `output.pmtiles`).
 - `--download`: Download source tiles into the cache and exit without building output tiles.
-- Runs always resume automatically: `satmaps` reuses any matching `.temp/state_*.json` and on-disk tiles from a previous run with the same parameters, so interrupted runs continue where they left off.
+- Runs always resume automatically: `satmaps` reuses any matching `<temp-dir>/state_*.json` and on-disk tiles from a previous run with the same parameters, so interrupted runs continue where they left off.
 - `--refresh-land-mgrs-list`: Rebuild `land_mgrs.list` in the repository root from `gebco_2025_sub_ice_topo_geotiff.zip` using the same generator as `land-mgrs --refresh`, then exit.
 - `--estimate`: Print estimated time, RAM, disk, and network usage, then exit.
 
