@@ -1,5 +1,7 @@
 import argparse
 import json
+import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -3734,3 +3736,94 @@ def test_main_resume_skips_completed_work_units(
 
     assert captured["resolved"] == ("31TDF_0_1", "31TDF_1_0")
     assert captured["rendered"] == ("31TDF_0_1", "31TDF_1_0")
+
+
+def test_render_land_output_tiles_fast_forwards_existing_tiles_without_dispatch(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    args = argparse.Namespace(parallel=4, cache=".cache", output="output.pmtiles", max_zoom=14)
+    work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
+    # ty=5, tx 1..3 -> three output tiles; pre-render the first two on disk.
+    contributor_row_slabs = {"31TDF_0_0": ((5, 1, 3),)}
+
+    final_dir = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "ffrun"))
+    for tx in (1, 2):
+        tiler.save_webp_image(
+            Image.new("RGB", (8, 8), (1, 2, 3)),
+            str(final_dir / f"14/{tx}/5.webp"),
+            quality=100,
+        )
+
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+    dispatched: list[str] = []
+
+    def fake_render(relative_path: str, *args: object, **kwargs: object) -> satmaps.LandTileRenderStatus:
+        dispatched.append(relative_path)
+        return satmaps.LandTileRenderStatus.RENDERED
+
+    monkeypatch.setattr("satmaps.render_final_output_tile", fake_render)
+
+    stats = satmaps.render_land_output_tiles(
+        work_units,
+        ["2025/07/01"],
+        args,
+        "ffrun",
+        contributor_row_slabs,
+    )
+
+    # Only the single un-rendered tile is dispatched to a worker; the two cached
+    # tiles are fast-forwarded in the producer and never reach render_final_output_tile.
+    assert dispatched == [os.path.join("14", "3", "5.webp")]
+    assert stats.total_tiles == 3
+    assert stats.cached_tiles == 2
+    assert stats.rendered_tiles == 1
+
+
+def test_render_land_output_tiles_graceful_sigint_saves_state_and_exits(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles", max_zoom=14)
+    work_units = [
+        satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
+        satmaps.LandWorkUnit("31TDF_0_1", ("31TDF_0_1",)),
+    ]
+    contributor_row_slabs = {
+        "31TDF_0_0": ((1, 1, 1),),
+        "31TDF_0_1": ((2, 1, 1),),
+    }
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+
+    state_file = str(tmp_path / ".temp" / "state.json")
+    completed: set[str] = set()
+    rendered: list[str] = []
+
+    def fake_render(relative_path: str, *args: object, **kwargs: object) -> satmaps.LandTileRenderStatus:
+        rendered.append(relative_path)
+        # Trip the interrupt while the first tile renders.
+        os.kill(os.getpid(), signal.SIGINT)
+        return satmaps.LandTileRenderStatus.RENDERED
+
+    monkeypatch.setattr("satmaps.render_final_output_tile", fake_render)
+
+    with pytest.raises(SystemExit) as excinfo:
+        satmaps.render_land_output_tiles(
+            work_units,
+            ["2025/07/01"],
+            args,
+            "sigintrun",
+            contributor_row_slabs,
+            state_file=state_file,
+            completed_units=completed,
+        )
+
+    assert excinfo.value.code == 130
+    # First tile finished and was persisted; the run stopped before the second.
+    assert "31TDF_0_0" in completed
+    assert len(rendered) < 2
+    with open(state_file) as state_handle:
+        persisted = json.load(state_handle)
+    assert "31TDF_0_0" in persisted["completed_units"]

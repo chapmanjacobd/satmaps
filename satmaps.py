@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -3062,94 +3063,138 @@ def render_land_output_tiles(
     empty_tiles = 0
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
+    last_progress_at = started_at
     processed_tiles = 0
+    final_tile_dir = build_final_tile_cache_dir(args.output, unique_id)
     max_workers = max(1, min(args.parallel, total_tiles))
     future_to_contributors: dict[Future[LandTileRenderStatus], tuple[str, ...]] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    shutdown_requested = threading.Event()
 
-        def submit_next_render() -> bool:
-            try:
-                relative_path, contributor_ids = next(contributor_items)
-            except StopIteration:
-                return False
-            future = executor.submit(
-                render_final_output_tile,
-                relative_path,
-                contributor_ids,
-                work_units_by_id,
-                folders_by_work_unit,
-                args,
-                unique_id,
-                gebco_src=gebco_src,
-                prepared_ocean_background=prepared_ocean_background,
+    def release_contributors(contributor_ids: Sequence[str]) -> None:
+        """Drop one tile's hold on each contributor; clean up and persist completed units."""
+        for contributor_id in contributor_ids:
+            work_unit_refcounts[contributor_id] -= 1
+            if work_unit_refcounts[contributor_id] == 0:
+                folders = folders_by_work_unit.get(contributor_id)
+                if folders:
+                    cleanup_work_unit_cache_files(folders, prefetch_cache_dir)
+                if state_file is not None:
+                    persisted_completed_units.add(contributor_id)
+                    write_resume_state(
+                        state_file,
+                        unique_id,
+                        persisted_completed_units,
+                        args,
+                    )
+
+    def emit_progress() -> None:
+        update_count_progress(
+            progress_line,
+            "Land tile progress:",
+            processed_tiles,
+            total_tiles,
+            started_at,
+            land_tile_progress_detail(
+                rendered_tiles,
+                cached_tiles,
+                empty_tiles,
+                active_tiles=len(future_to_contributors),
+            ),
+        )
+
+    previous_sigint_handler: Any = None
+    handler_installed = False
+
+    def handle_interrupt(_signum: int, _frame: object) -> None:
+        if not shutdown_requested.is_set():
+            shutdown_requested.set()
+            progress_line.finish()
+            print(
+                "Interrupt received; finishing in-flight tiles and saving resume state. "
+                "Re-run with --resume to continue."
             )
-            future_to_contributors[future] = contributor_ids
-            return True
 
-        while len(future_to_contributors) < max_workers and submit_next_render():
-            pass
+    if threading.current_thread() is threading.main_thread():
+        try:
+            previous_sigint_handler = signal.signal(signal.SIGINT, handle_interrupt)
+            handler_installed = True
+        except ValueError:
+            handler_installed = False
 
-        while future_to_contributors:
-            done_futures, _ = wait(
-                set(future_to_contributors),
-                timeout=LAND_PROGRESS_HEARTBEAT_SECONDS,
-                return_when=FIRST_COMPLETED,
-            )
-            if not done_futures:
-                update_count_progress(
-                    progress_line,
-                    "Land tile progress:",
-                    processed_tiles,
-                    total_tiles,
-                    started_at,
-                    land_tile_progress_detail(
-                        rendered_tiles,
-                        cached_tiles,
-                        empty_tiles,
-                        active_tiles=len(future_to_contributors),
-                    ),
-                )
-                continue
-            for future in done_futures:
-                contributor_ids = future_to_contributors.pop(future)
-                processed_tiles += 1
-                render_status: object = future.result()
-                if render_status is True or render_status == LandTileRenderStatus.RENDERED:
-                    rendered_tiles += 1
-                elif render_status == LandTileRenderStatus.CACHED:
-                    cached_tiles += 1
-                else:
-                    empty_tiles += 1
-                for contributor_id in contributor_ids:
-                    work_unit_refcounts[contributor_id] -= 1
-                    if work_unit_refcounts[contributor_id] == 0:
-                        folders = folders_by_work_unit.get(contributor_id)
-                        if folders:
-                            cleanup_work_unit_cache_files(folders, prefetch_cache_dir)
-                        if state_file is not None:
-                            persisted_completed_units.add(contributor_id)
-                            write_resume_state(
-                                state_file,
-                                unique_id,
-                                persisted_completed_units,
-                                args,
-                            )
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+
+            def submit_next_render() -> bool:
+                # Fast-forward over output tiles already present on disk so resumed runs
+                # only dispatch genuine rendering work to the worker pool instead of
+                # round-tripping every cached tile through a worker thread.
+                nonlocal processed_tiles, cached_tiles, last_progress_at
+                while True:
+                    if shutdown_requested.is_set():
+                        return False
+                    try:
+                        relative_path, contributor_ids = next(contributor_items)
+                    except StopIteration:
+                        return False
+                    destination_path = os.path.join(final_tile_dir, relative_path)
+                    if file_has_content(destination_path):
+                        processed_tiles += 1
+                        cached_tiles += 1
+                        release_contributors(contributor_ids)
+                        now = time.perf_counter()
+                        if now - last_progress_at >= LAND_PROGRESS_HEARTBEAT_SECONDS:
+                            last_progress_at = now
+                            emit_progress()
+                        continue
+                    future = executor.submit(
+                        render_final_output_tile,
+                        relative_path,
+                        contributor_ids,
+                        work_units_by_id,
+                        folders_by_work_unit,
+                        args,
+                        unique_id,
+                        gebco_src=gebco_src,
+                        prepared_ocean_background=prepared_ocean_background,
+                    )
+                    future_to_contributors[future] = contributor_ids
+                    return True
+
             while len(future_to_contributors) < max_workers and submit_next_render():
                 pass
-            update_count_progress(
-                progress_line,
-                "Land tile progress:",
-                processed_tiles,
-                total_tiles,
-                started_at,
-                land_tile_progress_detail(
-                    rendered_tiles,
-                    cached_tiles,
-                    empty_tiles,
-                    active_tiles=len(future_to_contributors),
-                ),
-            )
-    progress_line.finish()
+
+            while future_to_contributors:
+                done_futures, _ = wait(
+                    set(future_to_contributors),
+                    timeout=LAND_PROGRESS_HEARTBEAT_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done_futures:
+                    emit_progress()
+                    continue
+                for future in done_futures:
+                    contributor_ids = future_to_contributors.pop(future)
+                    processed_tiles += 1
+                    render_status: object = future.result()
+                    if render_status is True or render_status == LandTileRenderStatus.RENDERED:
+                        rendered_tiles += 1
+                    elif render_status == LandTileRenderStatus.CACHED:
+                        cached_tiles += 1
+                    else:
+                        empty_tiles += 1
+                    release_contributors(contributor_ids)
+                if not shutdown_requested.is_set():
+                    while len(future_to_contributors) < max_workers and submit_next_render():
+                        pass
+                last_progress_at = time.perf_counter()
+                emit_progress()
+        progress_line.finish()
+    finally:
+        if handler_installed:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+
+    if shutdown_requested.is_set():
+        sys.exit(130)
     return LandOutputRenderStats(
         total_tiles=total_tiles,
         rendered_tiles=rendered_tiles,
