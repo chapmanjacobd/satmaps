@@ -1,5 +1,4 @@
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -21,7 +20,6 @@ from satmaps import (
     build_candidate_tile_cache_token,
     build_land_run_token,
     expand_subtiles,
-    find_resume_path,
     format_progress,
     get_ocean_mask_band_index,
     iter_processing_windows,
@@ -316,7 +314,7 @@ def test_discover_mgrs_bases_force_refreshes_saved_land_mgrs_list(
     ) == {"05QFJ"}
 
 
-def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: object) -> None:
+def test_expand_subtiles() -> None:
     assert expand_subtiles(["31TDF", "32TLP"]) == [
         "31TDF_0_0",
         "31TDF_0_1",
@@ -327,20 +325,6 @@ def test_expand_subtiles_and_find_resume_path(tmp_path: Path, monkeypatch: objec
         "32TLP_1_0",
         "32TLP_1_1",
     ]
-
-    monkeypatch.chdir(tmp_path)
-    state_dir = tmp_path / ".temp"
-    state_dir.mkdir()
-    older = state_dir / "state_old.json"
-    newer = state_dir / "state_new.json"
-    older.write_text("{}")
-    newer.write_text("{}")
-    os.utime(older, (1, 1))
-    os.utime(newer, (2, 2))
-
-    assert find_resume_path(str(newer)) == str(newer)
-    assert find_resume_path(True, preferred_path=str(older)) == str(older)
-    assert find_resume_path(True) is None
 
 
 def test_build_land_run_token_is_stable_for_matching_inputs() -> None:

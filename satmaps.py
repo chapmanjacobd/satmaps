@@ -972,18 +972,6 @@ def expand_subtiles(mgrs_bases: List[str]) -> List[str]:
     ]
 
 
-def find_resume_path(
-    resume_arg: object,
-    preferred_path: Optional[str] = None,
-) -> Optional[str]:
-    """Resolve the explicit or current-run state file path for --resume."""
-    if isinstance(resume_arg, str) and os.path.exists(resume_arg):
-        return resume_arg
-    if preferred_path and os.path.exists(preferred_path):
-        return preferred_path
-    return None
-
-
 def load_saved_land_mgrs_list(
     land_mgrs_list_path: Optional[str],
     *,
@@ -3156,7 +3144,7 @@ def render_land_output_tiles(
             progress_line.finish()
             print(
                 "Interrupt received; finishing in-flight tiles and saving resume state. "
-                "Re-run with --resume to continue."
+                "Re-run to continue."
             )
 
     if threading.current_thread() is threading.main_thread():
@@ -3461,12 +3449,6 @@ def main() -> None:
         help="Print estimated time, RAM, disk space, and network size then exit",
     )
     parser.add_argument(
-        "--resume",
-        nargs="?",
-        const=True,
-        help="Resume from a previous run if a state file exists",
-    )
-    parser.add_argument(
         "--winter",
         action="store_true",
         help="Swap the two-date equator blend so the first date favors the south and the second the north",
@@ -3504,17 +3486,12 @@ def main() -> None:
     candidate_tile_cache_path = build_candidate_tile_cache_path(candidate_tile_cache_token)
     legacy_candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
     completed_units: Set[str] = set()
-    if args.resume:
-        resume_path = find_resume_path(
-            args.resume,
-            preferred_path=state_file,
-        )
-        if resume_path:
-            resume_state = restore_resume_state(resume_path)
-            if resume_state:
-                state_file = cast(str, resume_state["state_file"])
-                unique_id = cast(str, resume_state["unique_id"])
-                completed_units = cast(Set[str], resume_state["completed_units"])
+    if os.path.exists(state_file):
+        resume_state = restore_resume_state(state_file)
+        if resume_state:
+            state_file = cast(str, resume_state["state_file"])
+            unique_id = cast(str, resume_state["unique_id"])
+            completed_units = cast(Set[str], resume_state["completed_units"])
 
     mgrs_bases = discover_mgrs_bases(
         requested_bbox,

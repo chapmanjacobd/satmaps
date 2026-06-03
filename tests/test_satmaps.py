@@ -3593,7 +3593,7 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
     monkeypatch.setattr(
         sys,
         "argv",
-        ["satmaps.py", "--resume", "--parallel", "1", "--date", "2025/07/01"],
+        ["satmaps.py", "--parallel", "1", "--date", "2025/07/01"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
@@ -3823,7 +3823,7 @@ def test_main_resume_skips_completed_work_units(
     configure_main_defaults(
         monkeypatch,
         tmp_path,
-        ["--resume", "--parallel", "1", "--date", "2025/07/01"],
+        ["--parallel", "1", "--date", "2025/07/01"],
         mgrs_bases=["31TDF"],
         unique_id="resumefilter",
     )

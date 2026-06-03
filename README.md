@@ -141,7 +141,7 @@ satmaps --estimate
 - `--exposure`: Global brightness multiplier.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
 - `--download`: Download source tiles into the cache and exit without building output tiles.
-- `--resume [STATE_FILE]`: Resume a previous run from a saved `.temp/state_*.json`; without a path, `satmaps` only resumes the matching current-run state file if it exists.
+- Runs always resume automatically: `satmaps` reuses any matching `.temp/state_*.json` and on-disk tiles from a previous run with the same parameters, so interrupted runs continue where they left off.
 - `--refresh-land-mgrs-list`: Rebuild `land_mgrs.list` in the repository root from `gebco_2025_sub_ice_topo_geotiff.zip` using the same generator as `land-mgrs --refresh`, then exit.
 - `--estimate`: Print estimated time, RAM, disk, and network usage, then exit.
 
