@@ -971,6 +971,59 @@ def test_build_land_output_tile_plan_adds_lanczos_halo() -> None:
     assert plan.core_src_win == (3, 3, 512, 512)
     assert plan.bounds == pytest.approx(tiler.get_web_mercator_bounds(13, 1, 2))
 
+def test_render_raster_batch_image_uses_expanded_batch_plan(monkeypatch: object) -> None:
+    batch_plan = satmaps.LandOutputBatchPlan(
+        relative_paths=("13/1/2.webp", "13/2/2.webp"),
+        zoom=13,
+        ty=2,
+        tx_start=1,
+        tx_end=2,
+        tile_size=8,
+        halo_pixels=3,
+        width=22,
+        height=14,
+        bounds=(10.0, 20.0, 30.0, 40.0),
+        expanded_bounds=(1.0, 2.0, 3.0, 4.0),
+        tile_core_src_wins=((3, 3, 8, 8), (11, 3, 8, 8)),
+    )
+    dataset = object()
+    rendered: dict[str, object] = {}
+
+    monkeypatch.setattr(satmaps.gdal, "Open", lambda path: dataset)
+
+    def fake_render_dataset_bounds(
+        dataset_arg: object,
+        bounds: tuple[float, float, float, float],
+        width: int,
+        height: int,
+        resample_alg: str,
+    ) -> np.ndarray:
+        rendered.update(
+            dataset=dataset_arg,
+            bounds=bounds,
+            width=width,
+            height=height,
+            resample_alg=resample_alg,
+        )
+        return np.zeros((3, height, width), dtype=np.uint8)
+
+    monkeypatch.setattr(satmaps.tiler, "render_dataset_bounds", fake_render_dataset_bounds)
+
+    image = satmaps.render_raster_batch_image("ocean.tif", batch_plan, "lanczos")
+
+    assert image is not None
+    try:
+        assert image.size == (22, 14)
+    finally:
+        image.close()
+    assert rendered == {
+        "dataset": dataset,
+        "bounds": batch_plan.expanded_bounds,
+        "width": batch_plan.width,
+        "height": batch_plan.height,
+        "resample_alg": "lanczos",
+    }
+
 def test_build_output_tile_contributor_iterator_preserves_work_unit_order() -> None:
     work_units = (
         satmaps.LandWorkUnit("31TDF_1_0", ("31TDF_1_0",)),

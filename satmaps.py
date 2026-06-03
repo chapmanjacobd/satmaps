@@ -1303,9 +1303,9 @@ def render_raster_batch_image(
     try:
         tile_array = tiler.render_dataset_bounds(
             dataset,
-            batch_plan.bounds,
-            (batch_plan.tx_end - batch_plan.tx_start + 1) * batch_plan.tile_size,
-            batch_plan.tile_size,
+            batch_plan.expanded_bounds,
+            batch_plan.width,
+            batch_plan.height,
             resample_alg,
         )
         return tiler.tile_array_to_image(tile_array)
