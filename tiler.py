@@ -554,68 +554,72 @@ def save_webp_image(
     return publish_staged_path(staged_output_path, output_path)
 
 
-def render_dataset_tile(
+def render_dataset_bounds(
     dataset: gdal.Dataset,
     bounds: TEBounds,
-    tile_size: int,
+    width: int,
+    height: int,
     resample_alg: str,
 ) -> np.ndarray:
-    """Read one Web Mercator XYZ tile from a dataset into a byte array."""
-    def normalize_tile_array(tile_array: np.ndarray) -> np.ndarray:
-        output = np.asarray(tile_array, dtype=np.uint8)
+    """Read arbitrary Web Mercator bounds from a dataset into a byte array."""
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height must be positive")
+
+    def normalize_rendered_array(rendered_array: np.ndarray) -> np.ndarray:
+        output = np.asarray(rendered_array, dtype=np.uint8)
         if output.ndim == 2:
             output = output[np.newaxis, :, :]
         if output.shape[0] < 3:
-            raise RuntimeError("Rendered tile must contain at least RGB bands")
+            raise RuntimeError("Rendered output must contain at least RGB bands")
         if output.shape[0] > 4:
             output = output[:4]
         return output
 
-    def blank_tile(band_count: int) -> np.ndarray:
-        return np.zeros((band_count, tile_size, tile_size), dtype=np.uint8)
+    def blank_output(band_count: int) -> np.ndarray:
+        return np.zeros((band_count, height, width), dtype=np.uint8)
 
-    def overlap_to_tile_window(
+    def overlap_to_output_window(
         full_bounds: TEBounds,
         overlap_bounds: TEBounds,
     ) -> Tuple[int, int, int, int]:
         minx, miny, maxx, maxy = full_bounds
         overlap_minx, overlap_miny, overlap_maxx, overlap_maxy = overlap_bounds
-        tile_width = maxx - minx
-        tile_height = maxy - miny
-        if tile_width <= 0.0 or tile_height <= 0.0:
-            raise ValueError("Tile bounds must have positive width and height")
+        bounds_width = maxx - minx
+        bounds_height = maxy - miny
+        if bounds_width <= 0.0 or bounds_height <= 0.0:
+            raise ValueError("Bounds must have positive width and height")
 
-        xoff = int(round((overlap_minx - minx) * tile_size / tile_width))
-        xend = int(round((overlap_maxx - minx) * tile_size / tile_width))
-        yoff = int(round((maxy - overlap_maxy) * tile_size / tile_height))
-        yend = int(round((maxy - overlap_miny) * tile_size / tile_height))
+        xoff = int(round((overlap_minx - minx) * width / bounds_width))
+        xend = int(round((overlap_maxx - minx) * width / bounds_width))
+        yoff = int(round((maxy - overlap_maxy) * height / bounds_height))
+        yend = int(round((maxy - overlap_miny) * height / bounds_height))
 
-        xoff = max(0, min(tile_size, xoff))
-        xend = max(0, min(tile_size, xend))
-        yoff = max(0, min(tile_size, yoff))
-        yend = max(0, min(tile_size, yend))
+        xoff = max(0, min(width, xoff))
+        xend = max(0, min(width, xend))
+        yoff = max(0, min(height, yoff))
+        yend = max(0, min(height, yend))
         return xoff, yoff, max(0, xend - xoff), max(0, yend - yoff)
 
     minx, miny, maxx, maxy = bounds
     overlap_bounds = intersect_te_bounds(bounds, get_dataset_bounds(dataset))
     default_band_count = min(max(dataset.RasterCount, 3), 4)
     if overlap_bounds is None:
-        return blank_tile(default_band_count)
+        return blank_output(default_band_count)
 
     dest_xoff = 0
     dest_yoff = 0
-    dest_width = tile_size
-    dest_height = tile_size
+    dest_width = width
+    dest_height = height
     if overlap_bounds != bounds:
-        dest_xoff, dest_yoff, dest_width, dest_height = overlap_to_tile_window(
+        dest_xoff, dest_yoff, dest_width, dest_height = overlap_to_output_window(
             bounds,
             overlap_bounds,
         )
         if dest_width <= 0 or dest_height <= 0:
-            return blank_tile(default_band_count)
+            return blank_output(default_band_count)
         minx, miny, maxx, maxy = overlap_bounds
 
-    tile_ds = gdal.Translate(
+    rendered_ds = gdal.Translate(
         "",
         dataset,
         options=gdal.TranslateOptions(
@@ -626,23 +630,33 @@ def render_dataset_tile(
             resampleAlg=resample_alg if resample_alg != "gauss" else "bilinear",
         ),
     )
-    if tile_ds is None:
-        raise RuntimeError("Could not render tile into memory")
-    tile_array = tile_ds.ReadAsArray()
-    tile_ds = None
-    if tile_array is None:
-        raise RuntimeError("Could not read rendered tile data")
-    output = normalize_tile_array(tile_array)
+    if rendered_ds is None:
+        raise RuntimeError("Could not render bounds into memory")
+    rendered_array = rendered_ds.ReadAsArray()
+    rendered_ds = None
+    if rendered_array is None:
+        raise RuntimeError("Could not read rendered output data")
+    output = normalize_rendered_array(rendered_array)
     if overlap_bounds == bounds:
         return output
 
-    padded_output = blank_tile(output.shape[0])
+    padded_output = blank_output(output.shape[0])
     padded_output[
         :,
         dest_yoff : dest_yoff + output.shape[1],
         dest_xoff : dest_xoff + output.shape[2],
     ] = output
     return padded_output
+
+
+def render_dataset_tile(
+    dataset: gdal.Dataset,
+    bounds: TEBounds,
+    tile_size: int,
+    resample_alg: str,
+) -> np.ndarray:
+    """Read one Web Mercator XYZ tile from a dataset into a byte array."""
+    return render_dataset_bounds(dataset, bounds, tile_size, tile_size, resample_alg)
 
 
 def tile_array_to_image(tile_array: np.ndarray) -> Optional[Image.Image]:

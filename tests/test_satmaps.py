@@ -981,6 +981,40 @@ def test_build_output_tile_contributor_iterator_can_consume_candidates() -> None
     }
     assert contributor_row_slabs == {}
 
+def test_build_output_tile_batch_iterator_groups_contiguous_same_contributors() -> None:
+    work_units = (
+        satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
+        satmaps.LandWorkUnit("31TDF_0_1", ("31TDF_0_1",)),
+    )
+
+    total_tiles, iterator = satmaps.build_output_tile_batch_iterator(
+        work_units,
+        {
+            "31TDF_0_0": ((2, 1, 5),),
+            "31TDF_0_1": ((2, 4, 5),),
+        },
+        zoom=13,
+        batch_width=2,
+    )
+
+    batches = list(iterator)
+
+    assert total_tiles == 5
+    assert batches == [
+        satmaps.LandOutputTileBatch(
+            relative_paths=("13/1/2.webp", "13/2/2.webp"),
+            contributor_ids=("31TDF_0_0",),
+        ),
+        satmaps.LandOutputTileBatch(
+            relative_paths=("13/3/2.webp",),
+            contributor_ids=("31TDF_0_0",),
+        ),
+        satmaps.LandOutputTileBatch(
+            relative_paths=("13/4/2.webp", "13/5/2.webp"),
+            contributor_ids=("31TDF_0_0", "31TDF_0_1"),
+        ),
+    ]
+
 def test_create_alpha_vrt_masks_nodata_and_shallow_ocean(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
 
@@ -2741,6 +2775,72 @@ def test_main_reports_land_progress(
     assert "Rendered 4 land tile(s); reused 0 cached tile(s)." in out
     assert "Building master VRT" not in out
 
+def test_main_uses_default_tile_batch_width(monkeypatch: object, tmp_path: Path) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
+    )
+    batch_widths: list[int] = []
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "satmaps.resolve_work_unit_candidate_row_slabs",
+        lambda work_units, *args, **kwargs: {
+            work_unit.unit_id: ((2, 1, 1),)
+            for work_unit in work_units
+        },
+    )
+    monkeypatch.setattr(
+        "satmaps.render_land_output_tiles",
+        lambda work_units, date_paths, args, unique_id, contributor_row_slabs, **kwargs: batch_widths.append(
+            args.tile_batch_width
+        )
+        or satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0),
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    assert batch_widths == [satmaps.DEFAULT_TILE_BATCH_WIDTH]
+
+def test_main_parses_ty_alias_as_tile_batch_width(monkeypatch: object, tmp_path: Path) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--parallel", "1", "--date", "2025/07/01", "--ty", "7"],
+        mgrs_bases=["31TDF"],
+    )
+    batch_widths: list[int] = []
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "satmaps.resolve_work_unit_candidate_row_slabs",
+        lambda work_units, *args, **kwargs: {
+            work_unit.unit_id: ((2, 1, 1),)
+            for work_unit in work_units
+        },
+    )
+    monkeypatch.setattr(
+        "satmaps.render_land_output_tiles",
+        lambda work_units, date_paths, args, unique_id, contributor_row_slabs, **kwargs: batch_widths.append(
+            args.tile_batch_width
+        )
+        or satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0),
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    assert batch_widths == [7]
+
 def test_render_land_output_tiles_emits_heartbeat_and_cached_counts(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2844,6 +2944,51 @@ def test_render_land_output_tiles_submits_only_active_work(
         empty_tiles=0,
     )
     assert max_outstanding_submissions == 1
+
+def test_render_land_output_tiles_dispatches_strip_batches_when_requested(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    args = argparse.Namespace(
+        parallel=1,
+        cache=".cache",
+        output="output.pmtiles",
+        max_zoom=14,
+        tile_batch_width=32,
+    )
+    work_units = [satmaps.LandWorkUnit(unit_id="31TDF_0_0", source_subtiles=("31TDF_0_0",))]
+    contributor_row_slabs = {"31TDF_0_0": ((5, 1, 3),)}
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+    dispatched_batches: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        "satmaps.render_final_output_tile",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("strip batching should not fall back to per-tile rendering")
+        ),
+    )
+    monkeypatch.setattr(
+        "satmaps.render_final_output_tile_batch",
+        lambda batch, *args, **kwargs: dispatched_batches.append(batch.relative_paths)
+        or satmaps.LandOutputBatchRenderResult(rendered_tiles=len(batch.relative_paths)),
+    )
+
+    stats = satmaps.render_land_output_tiles(
+        work_units,
+        ["2025/07/01"],
+        args,
+        "batchrun",
+        contributor_row_slabs,
+    )
+
+    assert dispatched_batches == [(os.path.join("14", "1", "5.webp"), os.path.join("14", "2", "5.webp"), os.path.join("14", "3", "5.webp"))]
+    assert stats == satmaps.LandOutputRenderStats(
+        total_tiles=3,
+        rendered_tiles=3,
+        skipped_tiles=0,
+        cached_tiles=0,
+        empty_tiles=0,
+    )
 
 def test_main_low_zoom_uses_subtile_processing_strategy(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]

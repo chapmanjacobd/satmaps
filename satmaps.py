@@ -61,6 +61,7 @@ OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
 OCEAN_MASK_SOURCE_CROP_HALO_PIXELS = 2
 DEFAULT_PREFETCH_IF_LAND = 100.0
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
+DEFAULT_TILE_BATCH_WIDTH = 32
 DEFAULT_TEMP_DIR = ".temp"
 TEMP_DIR = DEFAULT_TEMP_DIR
 
@@ -109,12 +110,49 @@ class LandOutputTilePlan:
 
 
 @dataclass(frozen=True)
+class LandOutputBatchPlan:
+    relative_paths: tuple[str, ...]
+    zoom: int
+    ty: int
+    tx_start: int
+    tx_end: int
+    tile_size: int
+    halo_pixels: int
+    width: int
+    height: int
+    bounds: tuple[float, float, float, float]
+    expanded_bounds: tuple[float, float, float, float]
+    tile_core_src_wins: tuple[tuple[int, int, int, int], ...]
+
+
+@dataclass(frozen=True)
+class LandOutputTileBatch:
+    relative_paths: tuple[str, ...]
+    contributor_ids: tuple[str, ...]
+
+    @property
+    def tile_count(self) -> int:
+        return len(self.relative_paths)
+
+
+@dataclass(frozen=True)
 class LandOutputRenderStats:
     total_tiles: int
     rendered_tiles: int
     skipped_tiles: int
     cached_tiles: int = 0
     empty_tiles: int = 0
+
+
+@dataclass(frozen=True)
+class LandOutputBatchRenderResult:
+    rendered_tiles: int = 0
+    cached_tiles: int = 0
+    empty_tiles: int = 0
+
+    @property
+    def total_tiles(self) -> int:
+        return self.rendered_tiles + self.cached_tiles + self.empty_tiles
 
 
 class LandTileRenderStatus(Enum):
@@ -524,6 +562,17 @@ def parse_prefetch_if_land(value: str) -> float:
         raise argparse.ArgumentTypeError(
             f"prefetch-if-land percentage must be between 0 and 100: {value}"
         )
+    return parsed
+
+
+def parse_positive_int(value: str) -> int:
+    """Parse a positive integer CLI value."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid positive integer: {value}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"value must be a positive integer: {value}")
     return parsed
 
 
@@ -1234,6 +1283,29 @@ def render_raster_tile_image(
             dataset,
             tiler.get_web_mercator_bounds(zoom, tx, ty),
             tile_size,
+            resample_alg,
+        )
+        return tiler.tile_array_to_image(tile_array)
+    finally:
+        dataset = None
+
+
+def render_raster_batch_image(
+    input_raster: str,
+    batch_plan: LandOutputBatchPlan,
+    resample_alg: str,
+) -> Optional[Image.Image]:
+    """Render one contiguous final-tile batch from a raster into memory."""
+    dataset = gdal.Open(input_raster)
+    if dataset is None:
+        raise RuntimeError(f"Could not open raster for tile rendering: {input_raster}")
+
+    try:
+        tile_array = tiler.render_dataset_bounds(
+            dataset,
+            batch_plan.bounds,
+            (batch_plan.tx_end - batch_plan.tx_start + 1) * batch_plan.tile_size,
+            batch_plan.tile_size,
             resample_alg,
         )
         return tiler.tile_array_to_image(tile_array)
@@ -2364,6 +2436,71 @@ def build_land_output_tile_plan(
     )
 
 
+def build_land_output_batch_plan(
+    relative_paths: Sequence[str],
+    tile_size: int,
+    resample_alg: str,
+) -> LandOutputBatchPlan:
+    """Return the expanded output-grid plan for one contiguous final-tile batch."""
+    if not relative_paths:
+        raise ValueError("relative_paths must contain at least one tile")
+
+    parsed_paths = [parse_tile_tree_relpath(relative_path) for relative_path in relative_paths]
+    zoom, tx_start, ty = parsed_paths[0]
+    tx_end = tx_start
+    for index, (candidate_zoom, candidate_tx, candidate_ty) in enumerate(parsed_paths):
+        if candidate_zoom != zoom or candidate_ty != ty:
+            raise ValueError("batched output tiles must share the same zoom and ty")
+        expected_tx = tx_start + index
+        if candidate_tx != expected_tx:
+            raise ValueError("batched output tiles must be contiguous in tx order")
+        tx_end = candidate_tx
+
+    halo_pixels = compute_land_output_tile_halo_pixels(resample_alg)
+    full_world_width = (1 << zoom) * tile_size
+    full_world_height = full_world_width
+    xoff = tx_start * tile_size
+    yoff = ty * tile_size
+    xend = (tx_end + 1) * tile_size
+    expanded_xoff = max(0, xoff - halo_pixels)
+    expanded_yoff = max(0, yoff - halo_pixels)
+    expanded_xend = min(full_world_width, xend + halo_pixels)
+    expanded_yend = min(full_world_height, yoff + tile_size + halo_pixels)
+    expanded_width = expanded_xend - expanded_xoff
+    expanded_height = expanded_yend - expanded_yoff
+    pixel_size = tiler.web_mercator_pixel_size_for_tile_size(zoom, tile_size)
+    world_bounds = ocean.WEB_MERCATOR_WORLD_BOUNDS
+    first_bounds = tiler.get_web_mercator_bounds(zoom, tx_start, ty)
+    last_bounds = tiler.get_web_mercator_bounds(zoom, tx_end, ty)
+    expanded_minx = world_bounds[0] + expanded_xoff * pixel_size
+    expanded_maxx = world_bounds[0] + expanded_xend * pixel_size
+    expanded_maxy = world_bounds[3] - expanded_yoff * pixel_size
+    expanded_miny = world_bounds[3] - expanded_yend * pixel_size
+    tile_core_src_wins = tuple(
+        (
+            (tx * tile_size) - expanded_xoff,
+            yoff - expanded_yoff,
+            tile_size,
+            tile_size,
+        )
+        for _zoom, tx, _ty in parsed_paths
+    )
+    return LandOutputBatchPlan(
+        relative_paths=tuple(relative_paths),
+        zoom=zoom,
+        ty=ty,
+        tx_start=tx_start,
+        tx_end=tx_end,
+        tile_size=tile_size,
+        halo_pixels=halo_pixels,
+        width=expanded_width,
+        height=expanded_height,
+        bounds=(first_bounds[0], first_bounds[1], last_bounds[2], last_bounds[3]),
+        expanded_bounds=(expanded_minx, expanded_miny, expanded_maxx, expanded_maxy),
+        tile_core_src_wins=tile_core_src_wins,
+    )
+
+
 def build_land_output_tile_grid(tile_plan: LandOutputTilePlan) -> TileGrid:
     """Build the expanded EPSG:3857 grid metadata used to render one final tile."""
     web_mercator_srs = build_web_mercator_srs()
@@ -2380,14 +2517,29 @@ def build_land_output_tile_grid(tile_plan: LandOutputTilePlan) -> TileGrid:
     )
 
 
-def build_output_tile_contributor_iterator(
+def build_land_output_batch_grid(batch_plan: LandOutputBatchPlan) -> TileGrid:
+    """Build the expanded EPSG:3857 grid metadata used to render one final-tile batch."""
+    web_mercator_srs = build_web_mercator_srs()
+    min_x, _min_y, _max_x, max_y = batch_plan.expanded_bounds
+    pixel_size = tiler.web_mercator_pixel_size_for_tile_size(
+        batch_plan.zoom,
+        batch_plan.tile_size,
+    )
+    return TileGrid(
+        projection=web_mercator_srs.ExportToWkt(),
+        geotransform=(min_x, pixel_size, 0.0, max_y, 0.0, -pixel_size),
+        width=batch_plan.width,
+        height=batch_plan.height,
+    )
+
+
+def build_output_tile_contributor_rows(
     work_units: Sequence[LandWorkUnit],
     contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]],
-    zoom: int,
     *,
     consume_candidates: bool = False,
-) -> tuple[int, Iterator[tuple[str, tuple[str, ...]]]]:
-    """Yield inverted contributor final-tile footprint relationships row by row."""
+) -> tuple[int, dict[int, tuple[tuple[int, tuple[str, ...]], ...]]]:
+    """Resolve contributor relationships row-by-row for final output tiles."""
     ty_to_slabs: dict[int, list[tuple[int, int, str]]] = {}
     for work_unit in work_units:
         slabs = (
@@ -2399,22 +2551,84 @@ def build_output_tile_contributor_iterator(
             ty_to_slabs.setdefault(ty, []).append((tx_min, tx_max, work_unit.unit_id))
 
     total_tiles = 0
-    for ty, ty_slabs in ty_to_slabs.items():
-        tx_set: set[int] = set()
-        for tx_min, tx_max, _ in ty_slabs:
-            tx_set.update(range(tx_min, tx_max + 1))
-        total_tiles += len(tx_set)
+    rows: dict[int, tuple[tuple[int, tuple[str, ...]], ...]] = {}
+    for ty in sorted(ty_to_slabs.keys()):
+        tx_to_units: dict[int, list[str]] = {}
+        for tx_min, tx_max, unit_id in ty_to_slabs[ty]:
+            for tx in range(tx_min, tx_max + 1):
+                tx_to_units.setdefault(tx, []).append(unit_id)
+        ordered_row = tuple(
+            (tx, tuple(tx_to_units[tx]))
+            for tx in sorted(tx_to_units.keys())
+        )
+        rows[ty] = ordered_row
+        total_tiles += len(ordered_row)
+    return total_tiles, rows
+
+
+def build_output_tile_contributor_iterator(
+    work_units: Sequence[LandWorkUnit],
+    contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]],
+    zoom: int,
+    *,
+    consume_candidates: bool = False,
+) -> tuple[int, Iterator[tuple[str, tuple[str, ...]]]]:
+    """Yield inverted contributor final-tile footprint relationships row by row."""
+    total_tiles, rows = build_output_tile_contributor_rows(
+        work_units,
+        contributor_row_slabs,
+        consume_candidates=consume_candidates,
+    )
 
     def iterator() -> Iterator[tuple[str, tuple[str, ...]]]:
-        for ty in sorted(ty_to_slabs.keys()):
-            slabs_for_ty = ty_to_slabs[ty]
-            tx_to_units: dict[int, list[str]] = {}
-            for tx_min, tx_max, unit_id in slabs_for_ty:
-                for tx in range(tx_min, tx_max + 1):
-                    tx_to_units.setdefault(tx, []).append(unit_id)
-            for tx in sorted(tx_to_units.keys()):
+        for ty in sorted(rows.keys()):
+            for tx, contributor_ids in rows[ty]:
                 relpath = os.path.join(str(zoom), str(tx), f"{ty}.webp")
-                yield relpath, tuple(tx_to_units[tx])
+                yield relpath, contributor_ids
+
+    return total_tiles, iterator()
+
+
+def build_output_tile_batch_iterator(
+    work_units: Sequence[LandWorkUnit],
+    contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]],
+    zoom: int,
+    *,
+    batch_width: int,
+    consume_candidates: bool = False,
+) -> tuple[int, Iterator[LandOutputTileBatch]]:
+    """Yield contiguous same-contributor final-tile batches row by row."""
+    if batch_width <= 0:
+        raise ValueError("batch_width must be positive")
+
+    total_tiles, rows = build_output_tile_contributor_rows(
+        work_units,
+        contributor_row_slabs,
+        consume_candidates=consume_candidates,
+    )
+
+    def iterator() -> Iterator[LandOutputTileBatch]:
+        for ty in sorted(rows.keys()):
+            row = rows[ty]
+            index = 0
+            while index < len(row):
+                tx, contributor_ids = row[index]
+                relative_paths = [os.path.join(str(zoom), str(tx), f"{ty}.webp")]
+                index += 1
+                while index < len(row):
+                    next_tx, next_contributor_ids = row[index]
+                    if next_contributor_ids != contributor_ids:
+                        break
+                    if next_tx != tx + len(relative_paths):
+                        break
+                    if len(relative_paths) >= batch_width:
+                        break
+                    relative_paths.append(os.path.join(str(zoom), str(next_tx), f"{ty}.webp"))
+                    index += 1
+                yield LandOutputTileBatch(
+                    relative_paths=tuple(relative_paths),
+                    contributor_ids=contributor_ids,
+                )
 
     return total_tiles, iterator()
 
@@ -2959,6 +3173,212 @@ def render_land_contributor_output_tile(
         ds_out = None
 
 
+def render_land_contributor_output_batch(
+    work_unit: LandWorkUnit,
+    folders: List[Tuple[str, str]],
+    batch_plan: LandOutputBatchPlan,
+    args: argparse.Namespace,
+    gebco_src: Optional[str] = None,
+) -> Optional[Image.Image]:
+    """Render one contributor directly into a contiguous final-tile batch image."""
+    if not folders:
+        return None
+
+    tile_grid = build_land_output_batch_grid(batch_plan)
+    ocean_mask: Optional[OceanMaskWarp] = None
+    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
+    ds_out: Optional[gdal.Dataset] = None
+    try:
+        ocean_mask = open_gebco_mask(gebco_src, tile_grid, work_unit.unit_id)
+        processing_window = ProcessingWindow(0, 0, tile_grid.width, tile_grid.height)
+        mask_slabs: Optional[dict[int, OceanMaskSlab]] = None
+        if ocean_mask is not None:
+            collected = collect_ocean_mask_slabs(ocean_mask, tile_grid)
+            if collected is None:
+                return None
+            processing_window, mask_slabs = collected
+
+        prefetch_if_land = float(
+            getattr(args, "prefetch_if_land", DEFAULT_PREFETCH_IF_LAND)
+        )
+        prefetch_cache_dir = getattr(args, "prefetch_cache", None) or args.cache + ".temp"
+        if should_prefetch_tile_bands(prefetch_if_land, mask_slabs, tile_grid):
+            with get_work_unit_prefetch_lock(work_unit.unit_id):
+                prefetch_tile_bands_locally(folders, prefetch_cache_dir)
+
+        date_band_sets = open_warped_date_band_sets(
+            folders,
+            args.cache,
+            tile_grid,
+            args.resample_alg,
+            ephemeral_cache_dir=prefetch_cache_dir,
+        )
+        averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
+            date_band_sets,
+            processing_window,
+            mask_slabs,
+            tile_grid=tile_grid,
+            winter=getattr(args, "winter", False),
+        )
+        averaged = fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
+        ds_out, color_bands, alpha_band = create_output_dataset(
+            None,
+            tile_grid,
+            driver_name="MEM",
+        )
+        write_processed_blocks(
+            averaged,
+            alpha_mask,
+            processing_window,
+            args,
+            color_bands,
+            alpha_band,
+        )
+        ds_out.FlushCache()
+        batch_array = ds_out.ReadAsArray()
+        if batch_array is None:
+            raise RuntimeError(
+                f"Could not read rendered output tile batch for {work_unit.unit_id} "
+                f"({batch_plan.relative_paths[0]}..{batch_plan.relative_paths[-1]})"
+            )
+        return tiler.tile_array_to_image(batch_array)
+    finally:
+        for bands, datasets in date_band_sets:
+            bands.clear()
+            datasets.clear()
+        date_band_sets.clear()
+        ocean_mask = None
+        ds_out = None
+
+
+def render_final_output_tile_batch(
+    batch: LandOutputTileBatch,
+    work_units_by_id: dict[str, LandWorkUnit],
+    folders_by_work_unit: dict[str, List[Tuple[str, str]]],
+    args: argparse.Namespace,
+    unique_id: str,
+    *,
+    gebco_src: Optional[str] = None,
+    prepared_ocean_background: Optional[str] = None,
+) -> LandOutputBatchRenderResult:
+    """Render one contiguous final-tile batch directly from its ordered contributors."""
+    final_tile_dir = build_final_tile_cache_dir(args.output, unique_id)
+    destination_paths = {
+        relative_path: os.path.join(final_tile_dir, relative_path)
+        for relative_path in batch.relative_paths
+    }
+    pending_relative_paths: list[str] = []
+    cached_tiles = 0
+    empty_tiles = 0
+    for relative_path, destination_path in destination_paths.items():
+        if file_has_content(destination_path):
+            cached_tiles += 1
+        elif file_has_content(build_empty_tile_marker_path(destination_path)):
+            empty_tiles += 1
+        else:
+            pending_relative_paths.append(relative_path)
+    if not pending_relative_paths:
+        return LandOutputBatchRenderResult(cached_tiles=cached_tiles, empty_tiles=empty_tiles)
+
+    batch_plan = build_land_output_batch_plan(
+        batch.relative_paths,
+        args.blocksize,
+        args.resample_alg,
+    )
+    pending_relative_path_set = set(pending_relative_paths)
+    composed_rgba: Optional[Image.Image] = None
+    rendered_tiles = 0
+    try:
+        for contributor_id in batch.contributor_ids:
+            contributor_image = render_land_contributor_output_batch(
+                work_units_by_id[contributor_id],
+                folders_by_work_unit[contributor_id],
+                batch_plan,
+                args,
+                gebco_src=gebco_src,
+            )
+            if contributor_image is None:
+                continue
+            try:
+                source_rgba = contributor_image.convert("RGBA")
+            finally:
+                contributor_image.close()
+            if composed_rgba is None:
+                composed_rgba = source_rgba
+            else:
+                previous_composed = composed_rgba
+                composed_rgba = Image.alpha_composite(previous_composed, source_rgba)
+                previous_composed.close()
+                source_rgba.close()
+
+        needs_ocean = prepared_ocean_background is not None and (
+            composed_rgba is None or composed_rgba.getchannel("A").getextrema() != (255, 255)
+        )
+        if needs_ocean:
+            assert prepared_ocean_background is not None
+            ocean_image = render_raster_batch_image(
+                prepared_ocean_background,
+                batch_plan,
+                args.resample_alg,
+            )
+            if ocean_image is not None:
+                ocean_rgba = ocean_image.convert("RGBA")
+                ocean_image.close()
+                if composed_rgba is None:
+                    composed_rgba = ocean_rgba
+                else:
+                    previous_composed = composed_rgba
+                    composed_rgba = Image.alpha_composite(ocean_rgba, previous_composed)
+                    previous_composed.close()
+                    ocean_rgba.close()
+
+        if composed_rgba is None:
+            for relative_path in pending_relative_paths:
+                mark_tile_empty(destination_paths[relative_path])
+            return LandOutputBatchRenderResult(
+                rendered_tiles=0,
+                cached_tiles=cached_tiles,
+                empty_tiles=empty_tiles + len(pending_relative_paths),
+            )
+
+        for relative_path, core_src_win in zip(batch_plan.relative_paths, batch_plan.tile_core_src_wins):
+            if relative_path not in pending_relative_path_set:
+                continue
+            destination_path = destination_paths[relative_path]
+            xoff, yoff, width, height = core_src_win
+            tile_image = composed_rgba.crop((xoff, yoff, xoff + width, yoff + height))
+            try:
+                tile_rgba = tile_image.convert("RGBA")
+                if tile_rgba.getchannel("A").getextrema() == (0, 0):
+                    mark_tile_empty(destination_path)
+                    empty_tiles += 1
+                    continue
+                clear_tile_empty_marker(destination_path)
+                if tile_rgba.getchannel("A").getextrema() == (255, 255):
+                    final_image: Image.Image = tile_rgba.convert("RGB")
+                else:
+                    final_image = tile_rgba
+                try:
+                    tiler.save_webp_image(final_image, destination_path, args.quality, lossless=False)
+                finally:
+                    if final_image is not tile_rgba:
+                        final_image.close()
+                rendered_tiles += 1
+            finally:
+                tile_image.close()
+                if "tile_rgba" in locals():
+                    tile_rgba.close()
+                    del tile_rgba
+        return LandOutputBatchRenderResult(
+            rendered_tiles=rendered_tiles,
+            cached_tiles=cached_tiles,
+            empty_tiles=empty_tiles,
+        )
+    finally:
+        if composed_rgba is not None:
+            composed_rgba.close()
+
+
 def render_final_output_tile(
     relative_path: str,
     contributor_ids: Sequence[str],
@@ -3071,10 +3491,12 @@ def render_land_output_tiles(
                 work_unit_refcounts.get(work_unit.unit_id, 0) + (tx_max - tx_min + 1)
             )
 
-    total_tiles, contributor_items = build_output_tile_contributor_iterator(
+    batch_width = max(1, int(getattr(args, "tile_batch_width", 1)))
+    total_tiles, contributor_batches = build_output_tile_batch_iterator(
         work_units,
         contributor_row_slabs,
         args.max_zoom,
+        batch_width=batch_width,
         consume_candidates=True,
     )
     if total_tiles <= 0:
@@ -3100,14 +3522,14 @@ def render_land_output_tiles(
     processed_tiles = 0
     final_tile_dir = build_final_tile_cache_dir(args.output, unique_id)
     max_workers = max(1, min(args.parallel, total_tiles))
-    future_to_contributors: dict[Future[LandTileRenderStatus], tuple[str, ...]] = {}
+    future_to_batches: dict[Future[object], LandOutputTileBatch] = {}
     shutdown_requested = threading.Event()
 
-    def release_contributors(contributor_ids: Sequence[str]) -> None:
-        """Drop one tile's hold on each contributor; clean up and mark completed units."""
+    def release_contributors(batch: LandOutputTileBatch) -> None:
+        """Drop one batch's held tiles on each contributor; clean up and mark completed units."""
         nonlocal state_dirty
-        for contributor_id in contributor_ids:
-            work_unit_refcounts[contributor_id] -= 1
+        for contributor_id in batch.contributor_ids:
+            work_unit_refcounts[contributor_id] -= batch.tile_count
             if work_unit_refcounts[contributor_id] == 0:
                 folders = folders_by_work_unit.get(contributor_id)
                 if folders:
@@ -3144,7 +3566,7 @@ def render_land_output_tiles(
                 rendered_tiles,
                 cached_tiles,
                 empty_tiles,
-                active_tiles=len(future_to_contributors),
+                active_tiles=sum(batch.tile_count for batch in future_to_batches.values()),
             ),
         )
 
@@ -3178,9 +3600,17 @@ def render_land_output_tiles(
                 # round-tripping every cached tile through a worker thread.
                 nonlocal processed_tiles, cached_tiles, empty_tiles, last_progress_at
 
-                def account_fast_forwarded(contributor_ids: Sequence[str]) -> None:
-                    nonlocal last_progress_at
-                    release_contributors(contributor_ids)
+                def account_fast_forwarded(
+                    batch: LandOutputTileBatch,
+                    *,
+                    cached_count: int,
+                    empty_count: int,
+                ) -> None:
+                    nonlocal processed_tiles, cached_tiles, empty_tiles, last_progress_at
+                    processed_tiles += batch.tile_count
+                    cached_tiles += cached_count
+                    empty_tiles += empty_count
+                    release_contributors(batch)
                     now = time.perf_counter()
                     if now - last_progress_at >= LAND_PROGRESS_HEARTBEAT_SECONDS:
                         last_progress_at = now
@@ -3191,40 +3621,65 @@ def render_land_output_tiles(
                     if shutdown_requested.is_set():
                         return False
                     try:
-                        relative_path, contributor_ids = next(contributor_items)
+                        batch = next(contributor_batches)
                     except StopIteration:
                         return False
-                    destination_path = os.path.join(final_tile_dir, relative_path)
-                    if file_has_content(destination_path):
-                        processed_tiles += 1
-                        cached_tiles += 1
-                        account_fast_forwarded(contributor_ids)
+                    batch_cached_tiles = 0
+                    batch_empty_tiles = 0
+                    pending_relative_paths: list[str] = []
+                    for relative_path in batch.relative_paths:
+                        destination_path = os.path.join(final_tile_dir, relative_path)
+                        if file_has_content(destination_path):
+                            batch_cached_tiles += 1
+                        elif file_has_content(build_empty_tile_marker_path(destination_path)):
+                            batch_empty_tiles += 1
+                        else:
+                            pending_relative_paths.append(relative_path)
+                    if not pending_relative_paths:
+                        account_fast_forwarded(
+                            batch,
+                            cached_count=batch_cached_tiles,
+                            empty_count=batch_empty_tiles,
+                        )
                         continue
-                    if file_has_content(build_empty_tile_marker_path(destination_path)):
-                        processed_tiles += 1
-                        empty_tiles += 1
-                        account_fast_forwarded(contributor_ids)
-                        continue
-                    future = executor.submit(
-                        render_final_output_tile,
-                        relative_path,
-                        contributor_ids,
-                        work_units_by_id,
-                        folders_by_work_unit,
-                        args,
-                        unique_id,
-                        gebco_src=gebco_src,
-                        prepared_ocean_background=prepared_ocean_background,
-                    )
-                    future_to_contributors[future] = contributor_ids
+                    if batch.tile_count == 1:
+                        future = cast(
+                            Future[object],
+                            executor.submit(
+                                render_final_output_tile,
+                                batch.relative_paths[0],
+                                batch.contributor_ids,
+                                work_units_by_id,
+                                folders_by_work_unit,
+                                args,
+                                unique_id,
+                                gebco_src=gebco_src,
+                                prepared_ocean_background=prepared_ocean_background,
+                            ),
+                        )
+                    else:
+                        future = cast(
+                            Future[object],
+                            executor.submit(
+                                render_final_output_tile_batch,
+                                batch,
+                                work_units_by_id,
+                                folders_by_work_unit,
+                                args,
+                                unique_id,
+                                gebco_src=gebco_src,
+                                prepared_ocean_background=prepared_ocean_background,
+                            ),
+                        )
+                    future_to_batches[future] = batch
                     return True
 
-            while len(future_to_contributors) < max_workers and submit_next_render():
+            while len(future_to_batches) < max_workers and submit_next_render():
                 pass
 
-            while future_to_contributors:
+            while future_to_batches:
                 done_futures, _ = wait(
-                    set(future_to_contributors),
+                    set(future_to_batches),
                     timeout=LAND_PROGRESS_HEARTBEAT_SECONDS,
                     return_when=FIRST_COMPLETED,
                 )
@@ -3233,18 +3688,24 @@ def render_land_output_tiles(
                     flush_state()
                     continue
                 for future in done_futures:
-                    contributor_ids = future_to_contributors.pop(future)
-                    processed_tiles += 1
+                    batch = future_to_batches.pop(future)
                     render_status: object = future.result()
-                    if render_status is True or render_status == LandTileRenderStatus.RENDERED:
-                        rendered_tiles += 1
-                    elif render_status == LandTileRenderStatus.CACHED:
-                        cached_tiles += 1
+                    if isinstance(render_status, LandOutputBatchRenderResult):
+                        processed_tiles += render_status.total_tiles
+                        rendered_tiles += render_status.rendered_tiles
+                        cached_tiles += render_status.cached_tiles
+                        empty_tiles += render_status.empty_tiles
                     else:
-                        empty_tiles += 1
-                    release_contributors(contributor_ids)
+                        processed_tiles += 1
+                        if render_status is True or render_status == LandTileRenderStatus.RENDERED:
+                            rendered_tiles += 1
+                        elif render_status == LandTileRenderStatus.CACHED:
+                            cached_tiles += 1
+                        else:
+                            empty_tiles += 1
+                    release_contributors(batch)
                 if not shutdown_requested.is_set():
-                    while len(future_to_contributors) < max_workers and submit_next_render():
+                    while len(future_to_batches) < max_workers and submit_next_render():
                         pass
                 last_progress_at = time.perf_counter()
                 emit_progress()
@@ -3360,6 +3821,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--parallel", type=int, default=12, help="Number of parallel processes"
+    )
+    parser.add_argument(
+        "--tile-batch-width",
+        "--ty",
+        dest="tile_batch_width",
+        type=parse_positive_int,
+        default=DEFAULT_TILE_BATCH_WIDTH,
+        help=(
+            "Target number of contiguous output tiles to render together within one row "
+            "(default: 32)"
+        ),
     )
     parser.add_argument("--stats-min", type=float, help="Hardcoded source min")
     parser.add_argument("--stats-max", type=float, help="Hardcoded source max")
