@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -3573,3 +3574,163 @@ def test_main_refresh_land_mgrs_list_requires_mask_source(
         f"Error: --refresh-land-mgrs-list requires {ocean.DEFAULT_GEBCO_ZIP} in the current directory."
         in capsys.readouterr().out
     )
+
+
+def test_download_source_tiles_to_cache_downloads_deduped_folders(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    work_units = [
+        satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
+        satmaps.LandWorkUnit("31TDF_0_1", ("31TDF_0_1",)),
+    ]
+    folders_by_unit = {
+        "31TDF_0_0": [("folderA", "2025/07/01")],
+        "31TDF_0_1": [("folderA", "2025/07/01"), ("folderB", "2025/07/01")],
+    }
+    monkeypatch.setattr(
+        "satmaps.list_mosaic_folders_for_tile",
+        lambda unit_id, date_paths, cache_dir, **kwargs: folders_by_unit[unit_id],
+    )
+    downloaded: list[tuple[str, str, str, bool]] = []
+    monkeypatch.setattr(
+        "satmaps.get_tile_paths",
+        lambda folder_name, date_path, cache_dir, download=False, quiet=False, **kwargs: downloaded.append(
+            (folder_name, date_path, cache_dir, download)
+        ),
+    )
+
+    count = satmaps.download_source_tiles_to_cache(
+        work_units, ["2025/07/01"], ".cache", 2
+    )
+
+    assert count == 2  # folderA is deduplicated across the two work units
+    assert sorted(entry[0] for entry in downloaded) == ["folderA", "folderB"]
+    assert all(entry[2] == ".cache" and entry[3] is True for entry in downloaded)
+
+
+def test_main_download_flag_downloads_source_tiles_and_exits(
+    monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--download", "--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
+        unique_id="dl",
+    )
+    monkeypatch.setattr("satmaps.resolve_ocean_mask_source", lambda path: None)
+    monkeypatch.setattr("satmaps.resolve_land_mgrs_source", lambda: None)
+
+    download_calls: list[tuple[tuple[str, ...], str, int]] = []
+    monkeypatch.setattr(
+        "satmaps.download_source_tiles_to_cache",
+        lambda work_units, date_paths, cache_dir, parallel: download_calls.append(
+            (tuple(w.unit_id for w in work_units), cache_dir, parallel)
+        )
+        or len(work_units),
+    )
+
+    def _forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("rendering/packaging must not run on --download")
+
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", _forbidden)
+    monkeypatch.setattr("satmaps.render_land_output_tiles", _forbidden)
+    monkeypatch.setattr("satmaps.convert_tile_tree_to_pmtiles", _forbidden)
+
+    main()
+
+    out = capsys.readouterr().out
+    assert download_calls
+    captured_units, cache_dir, parallel = download_calls[0]
+    assert cache_dir == ".cache"
+    assert parallel == 1
+    assert captured_units == ("31TDF_0_0", "31TDF_0_1", "31TDF_1_0", "31TDF_1_1")
+    assert "Download complete." in out
+
+
+def test_render_land_output_tiles_persists_completed_units(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles", max_zoom=14)
+    work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
+    contributor_row_slabs = {"31TDF_0_0": ((1, 1, 2),)}  # ty=1, tx 1..2 => two tiles
+
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "satmaps.render_final_output_tile",
+        lambda *args, **kwargs: satmaps.LandTileRenderStatus.RENDERED,
+    )
+
+    state_file = str(tmp_path / ".temp" / "state.json")
+    completed: set[str] = set()
+
+    satmaps.render_land_output_tiles(
+        work_units,
+        ["2025/07/01"],
+        args,
+        "runid",
+        contributor_row_slabs,
+        state_file=state_file,
+        completed_units=completed,
+    )
+
+    assert completed == {"31TDF_0_0"}
+    with open(state_file) as state_handle:
+        persisted = json.load(state_handle)
+    assert persisted["unique_id"] == "runid"
+    assert persisted["completed_units"] == ["31TDF_0_0"]
+
+
+def test_main_resume_skips_completed_work_units(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--resume", "--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
+        unique_id="resumefilter",
+    )
+    monkeypatch.setattr("satmaps.resolve_ocean_mask_source", lambda path: None)
+    monkeypatch.setattr("satmaps.resolve_land_mgrs_source", lambda: None)
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    captured: dict[str, tuple[str, ...]] = {}
+    monkeypatch.setattr(
+        "satmaps.resolve_work_unit_candidate_row_slabs",
+        lambda work_units, *args, **kwargs: (
+            captured.__setitem__("resolved", tuple(w.unit_id for w in work_units))
+            or {w.unit_id: ((2, 1, 1),) for w in work_units}
+        ),
+    )
+    monkeypatch.setattr(
+        "satmaps.render_land_output_tiles",
+        lambda work_units, *args, **kwargs: (
+            captured.__setitem__("rendered", tuple(w.unit_id for w in work_units))
+            or satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0)
+        ),
+    )
+
+    state_file = tmp_path / ".temp" / "state_resumefilter.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "unique_id": "resumefilter",
+                "completed_units": ["31TDF_0_0", "31TDF_1_1"],
+                "args": {},
+            }
+        )
+    )
+
+    main()
+
+    assert captured["resolved"] == ("31TDF_0_1", "31TDF_1_0")
+    assert captured["rendered"] == ("31TDF_0_1", "31TDF_1_0")

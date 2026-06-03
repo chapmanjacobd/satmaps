@@ -8,10 +8,16 @@ import sys
 import threading
 import time
 import warnings
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, cast
 
 import mgrs
 from mgrs import core as mgrs_core
@@ -103,6 +109,28 @@ class LandTileRenderStatus(Enum):
     RENDERED = "rendered"
     CACHED = "cached"
     EMPTY = "empty"
+
+
+class WorkUnitFolderCache(dict[str, List[Tuple[str, str]]]):
+    """Lazy, thread-safe mapping of work-unit id -> mosaic folders, computed on first access.
+
+    Folder discovery (local/S3 listing) is deferred until a work unit is actually rendered,
+    so fully cached output tiles that short-circuit rendering never pay the lookup cost.
+    """
+
+    def __init__(self, loader: "Callable[[str], List[Tuple[str, str]]]") -> None:
+        super().__init__()
+        self._loader = loader
+        self._lock = threading.Lock()
+
+    def __missing__(self, unit_id: str) -> List[Tuple[str, str]]:
+        with self._lock:
+            existing = dict.get(self, unit_id)
+            if existing is not None:
+                return existing
+            folders = self._loader(unit_id)
+            self[unit_id] = folders
+            return folders
 
 
 def max_in_memory_write_pixels() -> int:
@@ -1806,6 +1834,51 @@ def populate_s3_cache(date_paths: List[str]) -> None:
     )
 
 
+def download_source_tiles_to_cache(
+    work_units: Sequence[LandWorkUnit],
+    date_paths: List[str],
+    cache_dir: str,
+    parallel: int,
+) -> int:
+    """Download all RGB source bands for the planned work units into the persistent cache."""
+    folders: List[Tuple[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for work_unit in work_units:
+        for folder in list_mosaic_folders_for_tile(work_unit.unit_id, date_paths, cache_dir):
+            if folder not in seen:
+                seen.add(folder)
+                folders.append(folder)
+    if not folders:
+        print("No source tiles found to download.")
+        return 0
+
+    print(f"Downloading source tiles for {len(folders)} folder(s) into {cache_dir}...")
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
+    completed = 0
+    max_workers = max(1, min(parallel, len(folders)))
+
+    def download_folder(folder: Tuple[str, str]) -> None:
+        folder_name, date_path = folder
+        get_tile_paths(folder_name, date_path, cache_dir, download=True, quiet=True)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(download_folder, folder) for folder in folders]
+        for future in as_completed(futures):
+            future.result()
+            completed += 1
+            update_count_progress(
+                progress_line,
+                "Download progress:",
+                completed,
+                len(folders),
+                started_at,
+                f"{completed} folder(s)",
+            )
+    progress_line.finish()
+    return len(folders)
+
+
 # --- Processing Layer (NumPy Manipulation) ---
 
 
@@ -2885,7 +2958,7 @@ def render_final_output_tile(
     for contributor_id in contributor_ids:
         contributor_image = render_land_contributor_output_tile(
             work_units_by_id[contributor_id],
-            folders_by_work_unit.get(contributor_id, []),
+            folders_by_work_unit[contributor_id],
             tile_plan,
             args,
             gebco_src=gebco_src,
@@ -2955,6 +3028,8 @@ def render_land_output_tiles(
     *,
     gebco_src: Optional[str] = None,
     prepared_ocean_background: Optional[str] = None,
+    state_file: Optional[str] = None,
+    completed_units: Optional[Set[str]] = None,
 ) -> LandOutputRenderStats:
     """Render the final max-zoom land tile tree directly, one output tile per worker task."""
     work_unit_refcounts: dict[str, int] = {}
@@ -2975,12 +3050,12 @@ def render_land_output_tiles(
 
     work_units_by_id = {work_unit.unit_id: work_unit for work_unit in work_units}
     prefetch_cache_dir = args.cache + ".temp"
-    folders_by_work_unit = {
-        work_unit.unit_id: list_mosaic_folders_for_tile(
-            work_unit.unit_id, date_paths, args.cache, ephemeral_cache_dir=prefetch_cache_dir
+    folders_by_work_unit = WorkUnitFolderCache(
+        lambda unit_id: list_mosaic_folders_for_tile(
+            unit_id, date_paths, args.cache, ephemeral_cache_dir=prefetch_cache_dir
         )
-        for work_unit in work_units
-    }
+    )
+    persisted_completed_units = completed_units if completed_units is not None else set()
 
     rendered_tiles = 0
     cached_tiles = 0
@@ -3048,9 +3123,17 @@ def render_land_output_tiles(
                 for contributor_id in contributor_ids:
                     work_unit_refcounts[contributor_id] -= 1
                     if work_unit_refcounts[contributor_id] == 0:
-                        folders = folders_by_work_unit.get(contributor_id, [])
+                        folders = folders_by_work_unit.get(contributor_id)
                         if folders:
                             cleanup_work_unit_cache_files(folders, prefetch_cache_dir)
+                        if state_file is not None:
+                            persisted_completed_units.add(contributor_id)
+                            write_resume_state(
+                                state_file,
+                                unique_id,
+                                persisted_completed_units,
+                                args,
+                            )
             while len(future_to_contributors) < max_workers and submit_next_render():
                 pass
             update_count_progress(
@@ -3316,6 +3399,7 @@ def main() -> None:
     candidate_tile_cache_token = build_candidate_tile_cache_token(args)
     candidate_tile_cache_path = build_candidate_tile_cache_path(candidate_tile_cache_token)
     legacy_candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
+    completed_units: Set[str] = set()
     if args.resume:
         resume_path = find_resume_path(
             args.resume,
@@ -3326,7 +3410,7 @@ def main() -> None:
             if resume_state:
                 state_file = cast(str, resume_state["state_file"])
                 unique_id = cast(str, resume_state["unique_id"])
-                cast(Set[str], resume_state["completed_units"])
+                completed_units = cast(Set[str], resume_state["completed_units"])
 
     mgrs_bases = discover_mgrs_bases(
         requested_bbox,
@@ -3342,40 +3426,52 @@ def main() -> None:
     )
     print(describe_land_processing_plan(plan, len(date_paths)))
 
+    if args.download:
+        downloaded = download_source_tiles_to_cache(
+            plan.work_units, date_paths, args.cache, args.parallel
+        )
+        print(f"Download complete. Cached {downloaded} folder(s).")
+        return
+
+    pending_work_units = tuple(
+        work_unit
+        for work_unit in plan.work_units
+        if work_unit.unit_id not in completed_units
+    )
+
     prepared_ocean_background: Optional[str] = None
     ocean_cleanup_paths: List[str] = []
-    if not args.download:
-        prepared_ocean_background = prepare_ocean_background_for_output(
-            args.ocean_background,
-            requested_bbox,
+    prepared_ocean_background = prepare_ocean_background_for_output(
+        args.ocean_background,
+        requested_bbox,
+        args.output,
+        args.resample_alg,
+        args.max_zoom,
+        args.blocksize,
+    )
+    if prepared_ocean_background:
+        print(f"Using ocean background: {prepared_ocean_background}")
+        if os.path.abspath(prepared_ocean_background) != os.path.abspath(args.ocean_background):
+            ocean_cleanup_paths.append(prepared_ocean_background)
+        if (not args.land or not plan.work_units) and commit_ocean_to_final_tile_cache(
+            prepared_ocean_background,
             args.output,
-            args.resample_alg,
-            args.max_zoom,
-            args.blocksize,
-        )
-        if prepared_ocean_background:
-            print(f"Using ocean background: {prepared_ocean_background}")
-            if os.path.abspath(prepared_ocean_background) != os.path.abspath(args.ocean_background):
-                ocean_cleanup_paths.append(prepared_ocean_background)
-            if (not args.land or not plan.work_units) and commit_ocean_to_final_tile_cache(
-                prepared_ocean_background,
-                args.output,
-                unique_id,
-                args,
-            ):
-                print("Committed ocean background to final WebP tiles.")
-        elif args.bbox:
-            print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
+            unique_id,
+            args,
+        ):
+            print("Committed ocean background to final WebP tiles.")
+    elif args.bbox:
+        print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
 
     if args.land:
-        if plan.work_units:
+        if pending_work_units:
             print(
                 f"Starting output-tile rendering for "
-                f"{len(plan.work_units)} sub-tile(s) "
+                f"{len(pending_work_units)} sub-tile(s) "
                 f"with {args.parallel} worker(s)."
             )
             contributor_row_slabs = resolve_work_unit_candidate_row_slabs(
-                plan.work_units,
+                pending_work_units,
                 date_paths,
                 args.cache,
                 args.max_zoom,
@@ -3388,17 +3484,19 @@ def main() -> None:
             write_resume_state(
                 state_file,
                 unique_id,
-                set(),
+                completed_units,
                 args,
             )
             tile_stats = render_land_output_tiles(
-                plan.work_units,
+                pending_work_units,
                 date_paths,
                 args,
                 unique_id,
                 contributor_row_slabs,
                 gebco_src=gebco_vrt_source,
                 prepared_ocean_background=prepared_ocean_background,
+                state_file=state_file,
+                completed_units=completed_units,
             )
             if tile_stats.total_tiles <= 0:
                 print("No candidate land output tiles were found.")
@@ -3421,10 +3519,6 @@ def main() -> None:
     else:
         print("Skipping land tile processing (--no-land).")
 
-    if args.download:
-        print("Download complete.")
-        return
-
     if args.land and prepared_ocean_background:
         backfilled_ocean_tiles = fill_missing_ocean_to_final_tile_cache(
             prepared_ocean_background,
@@ -3436,8 +3530,8 @@ def main() -> None:
             print(f"Backfilled {backfilled_ocean_tiles} ocean-only tile(s).")
 
     final_tile_tree = build_final_tile_cache_dir(args.output, unique_id)
-    final_tile_count = sum(1 for _ in tiler.iter_tile_tree_paths(final_tile_tree))
-    if final_tile_count <= 0:
+    has_final_tiles = next(iter(tiler.iter_tile_tree_paths(final_tile_tree)), None) is not None
+    if not has_final_tiles:
         print("Error: No max-zoom tiles were generated.")
         sys.exit(1)
 
