@@ -3064,6 +3064,8 @@ def render_land_output_tiles(
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
     last_progress_at = started_at
+    last_state_write_at = started_at
+    state_dirty = False
     processed_tiles = 0
     final_tile_dir = build_final_tile_cache_dir(args.output, unique_id)
     max_workers = max(1, min(args.parallel, total_tiles))
@@ -3071,7 +3073,8 @@ def render_land_output_tiles(
     shutdown_requested = threading.Event()
 
     def release_contributors(contributor_ids: Sequence[str]) -> None:
-        """Drop one tile's hold on each contributor; clean up and persist completed units."""
+        """Drop one tile's hold on each contributor; clean up and mark completed units."""
+        nonlocal state_dirty
         for contributor_id in contributor_ids:
             work_unit_refcounts[contributor_id] -= 1
             if work_unit_refcounts[contributor_id] == 0:
@@ -3080,12 +3083,24 @@ def render_land_output_tiles(
                     cleanup_work_unit_cache_files(folders, prefetch_cache_dir)
                 if state_file is not None:
                     persisted_completed_units.add(contributor_id)
-                    write_resume_state(
-                        state_file,
-                        unique_id,
-                        persisted_completed_units,
-                        args,
-                    )
+                    state_dirty = True
+
+    def flush_state(force: bool = False) -> None:
+        """Persist resume state, throttled so tight fast-forward scans don't sync per unit.
+
+        On-disk tiles are the source of truth for resume, so losing a few seconds of
+        completed-unit state on a hard kill only costs a cheap re-stat, never a
+        re-render or re-download. We therefore batch writes and force a final flush.
+        """
+        nonlocal state_dirty, last_state_write_at
+        if state_file is None or not state_dirty:
+            return
+        now = time.perf_counter()
+        if not force and now - last_state_write_at < LAND_PROGRESS_HEARTBEAT_SECONDS:
+            return
+        write_resume_state(state_file, unique_id, persisted_completed_units, args)
+        last_state_write_at = now
+        state_dirty = False
 
     def emit_progress() -> None:
         update_count_progress(
@@ -3145,6 +3160,7 @@ def render_land_output_tiles(
                         if now - last_progress_at >= LAND_PROGRESS_HEARTBEAT_SECONDS:
                             last_progress_at = now
                             emit_progress()
+                            flush_state()
                         continue
                     future = executor.submit(
                         render_final_output_tile,
@@ -3171,6 +3187,7 @@ def render_land_output_tiles(
                 )
                 if not done_futures:
                     emit_progress()
+                    flush_state()
                     continue
                 for future in done_futures:
                     contributor_ids = future_to_contributors.pop(future)
@@ -3188,7 +3205,9 @@ def render_land_output_tiles(
                         pass
                 last_progress_at = time.perf_counter()
                 emit_progress()
+                flush_state()
         progress_line.finish()
+        flush_state(force=True)
     finally:
         if handler_installed:
             signal.signal(signal.SIGINT, previous_sigint_handler)
