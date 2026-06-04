@@ -2733,6 +2733,46 @@ def test_build_land_run_token_changes_with_winter_flag() -> None:
 
     assert summer_token != winter_token
 
+def test_build_land_run_token_changes_with_full_render_first_flag() -> None:
+    common_args = dict(
+        output="render.pmtiles",
+        max_zoom=13,
+        resample_alg="lanczos",
+        stats_min=0.0,
+        stats_max=10000.0,
+        tonemap=True,
+        grade=True,
+        exposure=1.0,
+        sb=0.3,
+        hb=0.75,
+        ss=1.4,
+        ms=0.9,
+        hs=0.5,
+        gamma=1.0,
+        sat=0.9,
+        db=0.7,
+        ls=0.7,
+        ghb=None,
+        gms=1.0,
+        ghs=None,
+        winter=False,
+    )
+
+    default_token = satmaps.build_land_run_token(
+        argparse.Namespace(**common_args, full_render_first=False),
+        ["2025/07/01"],
+        None,
+        None,
+    )
+    raster_first_token = satmaps.build_land_run_token(
+        argparse.Namespace(**common_args, full_render_first=True),
+        ["2025/07/01"],
+        None,
+        None,
+    )
+
+    assert default_token != raster_first_token
+
 def configure_main_defaults(
     monkeypatch: object,
     tmp_path: Path,
@@ -2862,6 +2902,107 @@ def test_main_reports_land_progress(
     assert "Land tile progress: 4/4 (100%); Elapsed:" in out
     assert "Rendered 4 land tile(s); reused 0 cached tile(s)." in out
     assert "Building master VRT" not in out
+
+def test_main_full_render_first_builds_master_vrt_and_commits_to_tile_cache(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--parallel", "1", "--date", "2025/07/01", "--full-render-first"],
+        mgrs_bases=["31TDF"],
+        unique_id="fullrender",
+    )
+    raster_calls: list[dict[str, object]] = []
+    master_calls: list[tuple[tuple[str, ...], str]] = []
+    commit_calls: list[tuple[object, ...]] = []
+    package_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "satmaps.render_land_output_tiles",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("full-render-first should bypass output-tile rendering")
+        ),
+    )
+    monkeypatch.setattr(
+        "satmaps.fill_missing_ocean_to_final_tile_cache",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("full-render-first should not backfill ocean tiles")
+        ),
+    )
+
+    def fake_render_land_work_unit_rasters(
+        work_units, date_paths, args, unique_id, **kwargs
+    ) -> satmaps.LandRasterRenderStats:
+        raster_calls.append(
+            {
+                "work_units": tuple(work_unit.unit_id for work_unit in work_units),
+                "unique_id": unique_id,
+                "full_render_first": args.full_render_first,
+            }
+        )
+        for work_unit in work_units:
+            Path(
+                satmaps.build_work_unit_raster_path(args.output, unique_id, work_unit.unit_id)
+            ).write_text("raster")
+        return satmaps.LandRasterRenderStats(
+            total_work_units=len(work_units),
+            rendered_work_units=len(work_units),
+            cached_work_units=0,
+        )
+
+    monkeypatch.setattr("satmaps.render_land_work_unit_rasters", fake_render_land_work_unit_rasters)
+    monkeypatch.setattr(
+        "satmaps.build_master_vrt",
+        lambda source_rasters, output_vrt: master_calls.append((tuple(source_rasters), output_vrt))
+        or Path(output_vrt).write_text("vrt")
+        or output_vrt,
+    )
+    monkeypatch.setattr(
+        "satmaps.commit_raster_to_final_tile_cache",
+        lambda *args, **kwargs: commit_calls.append(args) or ["13/1/2.webp"],
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: package_calls.append(dict(kwargs))
+        or str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    assert raster_calls == [
+        {
+            "work_units": ("31TDF_0_0", "31TDF_0_1", "31TDF_1_0", "31TDF_1_1"),
+            "unique_id": "fullrender",
+            "full_render_first": True,
+        }
+    ]
+    assert len(master_calls) == 1
+    assert set(master_calls[0][0]) == {
+        ".temp/land_31TDF_0_0_fullrender_3857.tif",
+        ".temp/land_31TDF_0_1_fullrender_3857.tif",
+        ".temp/land_31TDF_1_0_fullrender_3857.tif",
+        ".temp/land_31TDF_1_1_fullrender_3857.tif",
+    }
+    assert master_calls[0][1] == ".temp/master_fullrender.vrt"
+    assert len(commit_calls) == 1
+    assert commit_calls[0][:4] == (
+        ".temp/master_fullrender.vrt",
+        "output.pmtiles",
+        "fullrender",
+        satmaps.FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID,
+    )
+    assert package_calls == [
+        {
+            "resample_alg": "lanczos",
+            "max_zoom": ocean.DEFAULT_MAX_ZOOM,
+            "name": "Sentinel-2 Mosaic",
+            "description": "Copernicus Sentinel data",
+            "requested_bbox": None,
+        }
+    ]
 
 def test_main_uses_default_tile_batch_width(monkeypatch: object, tmp_path: Path) -> None:
     configure_main_defaults(
@@ -3077,6 +3218,46 @@ def test_render_land_output_tiles_dispatches_strip_batches_when_requested(
         cached_tiles=0,
         empty_tiles=0,
     )
+
+def test_render_land_work_unit_rasters_fast_forwards_existing_outputs(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles", prefetch_cache=None)
+    work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
+    raster_path = Path(satmaps.build_work_unit_raster_path("output.pmtiles", "rasterrun", "31TDF_0_0"))
+    raster_path.write_text("raster")
+    completed: set[str] = set()
+    state_file = str(tmp_path / ".temp" / "state.json")
+
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "satmaps.render_land_work_unit_raster",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("existing raster should not re-render")
+        ),
+    )
+
+    stats = satmaps.render_land_work_unit_rasters(
+        work_units,
+        ["2025/07/01"],
+        args,
+        "rasterrun",
+        state_file=state_file,
+        completed_units=completed,
+    )
+
+    assert stats == satmaps.LandRasterRenderStats(
+        total_work_units=1,
+        rendered_work_units=0,
+        cached_work_units=1,
+        skipped_work_units=0,
+    )
+    assert completed == {"31TDF_0_0"}
+    with open(state_file) as state_handle:
+        persisted = json.load(state_handle)
+    assert persisted["completed_units"] == ["31TDF_0_0"]
 
 def test_main_low_zoom_uses_subtile_processing_strategy(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]

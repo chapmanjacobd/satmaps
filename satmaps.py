@@ -80,6 +80,7 @@ FINAL_TILE_CACHE_COMMIT_LOCK = threading.Lock()
 WORK_UNIT_PREFETCH_LOCKS_LOCK = threading.Lock()
 WORK_UNIT_PREFETCH_LOCKS: dict[str, threading.Lock] = {}
 OCEAN_TILE_CACHE_CONTRIBUTOR_ID = "__ocean__"
+FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID = "__full_render_first__"
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,14 @@ class LandOutputRenderStats:
     skipped_tiles: int
     cached_tiles: int = 0
     empty_tiles: int = 0
+
+
+@dataclass(frozen=True)
+class LandRasterRenderStats:
+    total_work_units: int
+    rendered_work_units: int
+    cached_work_units: int
+    skipped_work_units: int = 0
 
 
 @dataclass(frozen=True)
@@ -212,6 +221,16 @@ def build_candidate_tile_cache_path(unique_id: str) -> str:
 def build_temp_mbtiles_path(output_path: str) -> str:
     """Return the deterministic heavyweight MBTiles path."""
     return f"{TEMP_DIR}/{temp_basename_from_output(output_path)}.mbtiles"
+
+
+def build_work_unit_raster_path(output_path: str, unique_id: str, work_unit_id: str) -> str:
+    """Return the deterministic full-render-first GeoTIFF path for one work unit."""
+    return f"{TEMP_DIR}/land_{work_unit_id}_{unique_id}_3857.tif"
+
+
+def build_master_vrt_path(unique_id: str) -> str:
+    """Return the deterministic full-render-first master VRT path."""
+    return f"{TEMP_DIR}/master_{unique_id}.vrt"
 
 
 def build_tile_cache_root(output_path: str, unique_id: str) -> str:
@@ -655,6 +674,7 @@ def build_land_run_token(
             "gms": args.gms,
             "ghs": args.ghs,
             "winter": getattr(args, "winter", False),
+            "full_render_first": getattr(args, "full_render_first", False),
             "ocean_mask_source": os.path.abspath(gebco_vrt_source) if gebco_vrt_source else None,
         },
         sort_keys=True,
@@ -2779,6 +2799,24 @@ def iter_processing_windows(tile_grid: TileGrid) -> Iterator[Tuple[int, int, int
         yield 0, yoff, tile_grid.width, min(PROCESS_SLAB_HEIGHT, tile_grid.height - yoff)
 
 
+def iter_processing_windows_in_window(processing_window: ProcessingWindow) -> Iterator[ProcessingWindow]:
+    """Yield PROCESS_SLAB_HEIGHT windows constrained to a larger processing window."""
+    for yoff in range(
+        processing_window.yoff,
+        processing_window.yoff + processing_window.height,
+        PROCESS_SLAB_HEIGHT,
+    ):
+        yield ProcessingWindow(
+            xoff=processing_window.xoff,
+            yoff=yoff,
+            width=processing_window.width,
+            height=min(
+                PROCESS_SLAB_HEIGHT,
+                (processing_window.yoff + processing_window.height) - yoff,
+            ),
+        )
+
+
 def average_block(
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]],
     xoff: int,
@@ -2968,11 +3006,16 @@ def create_output_dataset(
     tile_grid: TileGrid,
     *,
     driver_name: str = "GTiff",
+    blocksize: Optional[int] = None,
 ) -> Tuple[gdal.Dataset, List[gdal.Band], gdal.Band]:
     """Create a temporary RGBA dataset used before Web Mercator warping."""
     driver = gdal.GetDriverByName(driver_name)
     destination = output_path if output_path is not None else ""
-    creation_options = ["COMPRESS=ZSTD", "TILED=YES"] if driver_name == "GTiff" else []
+    creation_options: list[str] = []
+    if driver_name == "GTiff":
+        creation_options = ["COMPRESS=ZSTD", "TILED=YES", "BIGTIFF=YES"]
+        if blocksize is not None:
+            creation_options.extend([f"BLOCKXSIZE={blocksize}", f"BLOCKYSIZE={blocksize}"])
     dataset = driver.Create(
         destination,
         tile_grid.width,
@@ -3261,6 +3304,323 @@ def render_land_contributor_output_batch(
         date_band_sets.clear()
         ocean_mask = None
         ds_out = None
+
+
+def build_work_unit_output_tile_grid(
+    folders: Sequence[Tuple[str, str]],
+    args: argparse.Namespace,
+) -> TileGrid:
+    """Derive the aligned full-render-first 3857 output grid for one work unit."""
+    if not folders:
+        raise ValueError("folders must contain at least one source")
+
+    prefetch_cache_dir = getattr(args, "prefetch_cache", None) or args.cache + ".temp"
+    folder_name, date_path = folders[0]
+    source_path = get_tile_band_path(
+        folder_name,
+        date_path,
+        DEFAULT_CANDIDATE_FOOTPRINT_BAND_ID,
+        args.cache,
+        download=False,
+        ephemeral_cache_dir=prefetch_cache_dir,
+        quiet=True,
+    )
+    warped_vrt = gdal.Warp(
+        "",
+        source_path,
+        options=build_web_mercator_warp_options(
+            None,
+            args.resample_alg,
+            args.max_zoom,
+            args.blocksize,
+            output_format="VRT",
+        ),
+    )
+    if warped_vrt is None:
+        raise RuntimeError(f"Could not derive output grid for {folder_name} ({date_path})")
+    try:
+        return TileGrid(
+            projection=warped_vrt.GetProjection(),
+            geotransform=warped_vrt.GetGeoTransform(),
+            width=warped_vrt.RasterXSize,
+            height=warped_vrt.RasterYSize,
+        )
+    finally:
+        warped_vrt = None
+
+
+def render_land_work_unit_raster(
+    work_unit: LandWorkUnit,
+    folders: List[Tuple[str, str]],
+    output_path: str,
+    args: argparse.Namespace,
+    *,
+    gebco_src: Optional[str] = None,
+) -> Optional[str]:
+    """Render one work unit into a full aligned EPSG:3857 RGBA GeoTIFF."""
+    if not folders:
+        return None
+    if file_has_content(output_path):
+        return output_path
+
+    tile_grid = build_work_unit_output_tile_grid(folders, args)
+    staged_output_path = build_staged_path(output_path)
+    remove_if_exists(staged_output_path)
+    ocean_mask: Optional[OceanMaskWarp] = None
+    date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
+    ds_out: Optional[gdal.Dataset] = None
+    wrote_any_alpha = False
+    try:
+        ocean_mask = open_gebco_mask(gebco_src, tile_grid, work_unit.unit_id)
+        full_processing_window = ProcessingWindow(0, 0, tile_grid.width, tile_grid.height)
+        mask_slabs: Optional[dict[int, OceanMaskSlab]] = None
+        if ocean_mask is not None:
+            collected = collect_ocean_mask_slabs(ocean_mask, tile_grid)
+            if collected is None:
+                return None
+            full_processing_window, mask_slabs = collected
+
+        prefetch_if_land = float(getattr(args, "prefetch_if_land", DEFAULT_PREFETCH_IF_LAND))
+        prefetch_cache_dir = getattr(args, "prefetch_cache", None) or args.cache + ".temp"
+        if should_prefetch_tile_bands(prefetch_if_land, mask_slabs, tile_grid):
+            with get_work_unit_prefetch_lock(work_unit.unit_id):
+                prefetch_tile_bands_locally(folders, args.cache, prefetch_cache_dir)
+
+        date_band_sets = open_warped_date_band_sets(
+            folders,
+            args.cache,
+            tile_grid,
+            args.resample_alg,
+            ephemeral_cache_dir=prefetch_cache_dir,
+        )
+        ds_out, color_bands, alpha_band = create_output_dataset(
+            staged_output_path,
+            tile_grid,
+            driver_name="GTiff",
+            blocksize=args.blocksize,
+        )
+        for processing_window in iter_processing_windows_in_window(full_processing_window):
+            averaged, source_valid_mask, alpha_mask, fill_allowed_mask = average_tile_blocks(
+                date_band_sets,
+                processing_window,
+                mask_slabs,
+                tile_grid=tile_grid,
+                winter=getattr(args, "winter", False),
+            )
+            averaged = fill_missing_pixels(averaged, source_valid_mask, fill_allowed_mask)
+            if np.any(alpha_mask):
+                wrote_any_alpha = True
+            write_processed_blocks(
+                averaged,
+                alpha_mask,
+                processing_window,
+                args,
+                color_bands,
+                alpha_band,
+            )
+        ds_out.FlushCache()
+        ds_out = None
+        if not wrote_any_alpha:
+            remove_if_exists(staged_output_path)
+            return None
+        publish_staged_path(staged_output_path, output_path)
+        return output_path
+    finally:
+        if ds_out is not None:
+            ds_out = None
+        for bands, datasets in date_band_sets:
+            bands.clear()
+            datasets.clear()
+        date_band_sets.clear()
+        ocean_mask = None
+
+
+def build_master_vrt(source_rasters: Sequence[str], output_vrt: str) -> str:
+    """Build a master VRT in the supplied source order."""
+    if not source_rasters:
+        raise ValueError("source_rasters must not be empty")
+    staged_output_vrt = build_staged_path(output_vrt)
+    remove_if_exists(staged_output_vrt)
+    merged = gdal.BuildVRT(staged_output_vrt, list(source_rasters))
+    if merged is None:
+        raise RuntimeError(f"Could not build master VRT: {output_vrt}")
+    merged = None
+    publish_staged_path(staged_output_vrt, output_vrt)
+    return output_vrt
+
+
+def render_land_work_unit_rasters(
+    work_units: Sequence[LandWorkUnit],
+    date_paths: List[str],
+    args: argparse.Namespace,
+    unique_id: str,
+    *,
+    gebco_src: Optional[str] = None,
+    state_file: Optional[str] = None,
+    completed_units: Optional[Set[str]] = None,
+) -> LandRasterRenderStats:
+    """Render work units into reusable full aligned EPSG:3857 GeoTIFFs."""
+    if not work_units:
+        return LandRasterRenderStats(total_work_units=0, rendered_work_units=0, cached_work_units=0)
+
+    prefetch_cache_dir = getattr(args, "prefetch_cache", None) or args.cache + ".temp"
+    folders_by_work_unit = WorkUnitFolderCache(
+        lambda unit_id: list_mosaic_folders_for_tile(
+            unit_id, date_paths, args.cache, ephemeral_cache_dir=prefetch_cache_dir
+        )
+    )
+    persisted_completed_units = completed_units if completed_units is not None else set()
+    rendered_work_units = 0
+    cached_work_units = 0
+    skipped_work_units = 0
+    processed_work_units = 0
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
+    last_progress_at = started_at
+    last_state_write_at = started_at
+    state_dirty = False
+    max_workers = max(1, min(args.parallel, len(work_units)))
+    future_to_work_unit: dict[Future[object], LandWorkUnit] = {}
+    shutdown_requested = threading.Event()
+    work_unit_iter = iter(work_units)
+
+    def flush_state(force: bool = False) -> None:
+        nonlocal state_dirty, last_state_write_at
+        if state_file is None or not state_dirty:
+            return
+        now = time.perf_counter()
+        if not force and now - last_state_write_at < LAND_PROGRESS_HEARTBEAT_SECONDS:
+            return
+        write_resume_state(state_file, unique_id, persisted_completed_units, args)
+        last_state_write_at = now
+        state_dirty = False
+
+    def emit_progress() -> None:
+        update_count_progress(
+            progress_line,
+            "Land raster progress:",
+            processed_work_units,
+            len(work_units),
+            started_at,
+            _join_progress_detail(
+                [
+                    f"{rendered_work_units} rendered",
+                    f"{cached_work_units} cached",
+                    *([f"{skipped_work_units} skipped"] if skipped_work_units > 0 else []),
+                    *(
+                        [f"{len(future_to_work_unit)} active"]
+                        if future_to_work_unit
+                        else []
+                    ),
+                ]
+            ),
+        )
+
+    previous_sigint_handler: Any = None
+    handler_installed = False
+
+    def handle_interrupt(_signum: int, _frame: object) -> None:
+        if not shutdown_requested.is_set():
+            shutdown_requested.set()
+            progress_line.finish()
+            print(
+                "Interrupt received; finishing in-flight rasters and saving resume state. "
+                "Re-run to continue."
+            )
+
+    if threading.current_thread() is threading.main_thread():
+        try:
+            previous_sigint_handler = signal.signal(signal.SIGINT, handle_interrupt)
+            handler_installed = True
+        except ValueError:
+            handler_installed = False
+
+    try:
+        with warp_thread_budget(per_worker_warp_threads(max_workers)), ThreadPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+
+            def submit_next_render() -> bool:
+                nonlocal processed_work_units, cached_work_units, last_progress_at, state_dirty
+                while True:
+                    if shutdown_requested.is_set():
+                        return False
+                    try:
+                        work_unit = next(work_unit_iter)
+                    except StopIteration:
+                        return False
+                    output_path = build_work_unit_raster_path(args.output, unique_id, work_unit.unit_id)
+                    if file_has_content(output_path):
+                        processed_work_units += 1
+                        cached_work_units += 1
+                        persisted_completed_units.add(work_unit.unit_id)
+                        state_dirty = True
+                        now = time.perf_counter()
+                        if now - last_progress_at >= LAND_PROGRESS_HEARTBEAT_SECONDS:
+                            last_progress_at = now
+                            emit_progress()
+                            flush_state()
+                        continue
+                    future = cast(
+                        Future[object],
+                        executor.submit(
+                            render_land_work_unit_raster,
+                            work_unit,
+                            folders_by_work_unit[work_unit.unit_id],
+                            output_path,
+                            args,
+                            gebco_src=gebco_src,
+                        ),
+                    )
+                    future_to_work_unit[future] = work_unit
+                    return True
+
+            while len(future_to_work_unit) < max_workers and submit_next_render():
+                pass
+
+            while future_to_work_unit:
+                done_futures, _ = wait(
+                    set(future_to_work_unit),
+                    timeout=LAND_PROGRESS_HEARTBEAT_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done_futures:
+                    emit_progress()
+                    flush_state()
+                    continue
+                for future in done_futures:
+                    work_unit = future_to_work_unit.pop(future)
+                    processed_work_units += 1
+                    result_path = future.result()
+                    folders = folders_by_work_unit.get(work_unit.unit_id)
+                    if folders:
+                        cleanup_work_unit_cache_files(folders, prefetch_cache_dir)
+                    if result_path is None:
+                        skipped_work_units += 1
+                    else:
+                        rendered_work_units += 1
+                    persisted_completed_units.add(work_unit.unit_id)
+                    state_dirty = True
+                if not shutdown_requested.is_set():
+                    while len(future_to_work_unit) < max_workers and submit_next_render():
+                        pass
+                last_progress_at = time.perf_counter()
+                emit_progress()
+                flush_state()
+        progress_line.finish()
+        flush_state(force=True)
+    finally:
+        if handler_installed:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+
+    if shutdown_requested.is_set():
+        sys.exit(130)
+    return LandRasterRenderStats(
+        total_work_units=len(work_units),
+        rendered_work_units=rendered_work_units,
+        cached_work_units=cached_work_units,
+        skipped_work_units=skipped_work_units,
+    )
 
 
 def render_final_output_tile_batch(
@@ -3909,6 +4269,12 @@ def main() -> None:
         default=True,
         help="Enable/disable land tile processing",
     )
+    parser.add_argument(
+        "--full-render-first",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Render full aligned land rasters first, then tile the merged master raster",
+    )
 
     parser.add_argument("--blocksize", type=int, default=512)
     parser.add_argument("--cache", default=".cache", help="Cache directory")
@@ -4035,6 +4401,7 @@ def main() -> None:
 
     prepared_ocean_background: Optional[str] = None
     ocean_cleanup_paths: List[str] = []
+    full_render_cleanup_paths: List[str] = []
     prepared_ocean_background = prepare_ocean_background_for_output(
         args.ocean_background,
         requested_bbox,
@@ -4047,17 +4414,93 @@ def main() -> None:
         print(f"Using ocean background: {prepared_ocean_background}")
         if os.path.abspath(prepared_ocean_background) != os.path.abspath(args.ocean_background):
             ocean_cleanup_paths.append(prepared_ocean_background)
-        if (not args.land or not plan.work_units) and commit_ocean_to_final_tile_cache(
-            prepared_ocean_background,
-            args.output,
-            unique_id,
-            args,
+        if (
+            not args.full_render_first
+            and (not args.land or not plan.work_units)
+            and commit_ocean_to_final_tile_cache(
+                prepared_ocean_background,
+                args.output,
+                unique_id,
+                args,
+            )
         ):
             print("Committed ocean background to final WebP tiles.")
     elif args.bbox:
         print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
 
-    if args.land:
+    if args.full_render_first:
+        source_rasters: List[str] = []
+        if args.land:
+            if plan.work_units:
+                print(
+                    f"Starting full-render-first raster generation for "
+                    f"{len(plan.work_units)} sub-tile(s) "
+                    f"with {args.parallel} worker(s)."
+                )
+                write_resume_state(
+                    state_file,
+                    unique_id,
+                    completed_units,
+                    args,
+                )
+                raster_stats = render_land_work_unit_rasters(
+                    plan.work_units,
+                    date_paths,
+                    args,
+                    unique_id,
+                    gebco_src=gebco_vrt_source,
+                    state_file=state_file,
+                    completed_units=completed_units,
+                )
+                land_raster_paths = [
+                    build_work_unit_raster_path(args.output, unique_id, work_unit.unit_id)
+                    for work_unit in plan.work_units
+                    if file_has_content(
+                        build_work_unit_raster_path(args.output, unique_id, work_unit.unit_id)
+                    )
+                ]
+                source_rasters.extend(land_raster_paths)
+                if raster_stats.rendered_work_units <= 0 and raster_stats.cached_work_units == raster_stats.total_work_units:
+                    print("All land rasters already rendered (reused from cache).")
+                else:
+                    land_summary = (
+                        f"Rendered {raster_stats.rendered_work_units} land raster(s); "
+                        f"reused {raster_stats.cached_work_units} cached raster(s)."
+                    )
+                    if raster_stats.skipped_work_units > 0:
+                        land_summary += f" Skipped {raster_stats.skipped_work_units} empty work unit(s)."
+                    print(land_summary)
+                full_render_cleanup_paths.extend(land_raster_paths)
+            else:
+                print("No land work units were found.")
+        else:
+            print("Skipping land tile processing (--no-land).")
+
+        if prepared_ocean_background:
+            source_rasters.insert(0, prepared_ocean_background)
+
+        if source_rasters:
+            master_vrt_path = build_master_vrt_path(unique_id)
+            print("Building master VRT...")
+            build_master_vrt(source_rasters, master_vrt_path)
+            full_render_cleanup_paths.append(master_vrt_path)
+            master_marker_path = build_tile_cache_marker_path(
+                args.output,
+                unique_id,
+                FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID,
+            )
+            if file_has_content(master_marker_path):
+                print("Raster-first master mosaic already committed to final WebP tiles.")
+            else:
+                commit_raster_to_final_tile_cache(
+                    master_vrt_path,
+                    args.output,
+                    unique_id,
+                    FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID,
+                    args,
+                )
+                print("Committed raster-first master mosaic to final WebP tiles.")
+    elif args.land:
         if pending_work_units:
             print(
                 f"Starting output-tile rendering for "
@@ -4113,7 +4556,7 @@ def main() -> None:
     else:
         print("Skipping land tile processing (--no-land).")
 
-    if args.land and prepared_ocean_background:
+    if args.land and prepared_ocean_background and not args.full_render_first:
         backfilled_ocean_tiles = fill_missing_ocean_to_final_tile_cache(
             prepared_ocean_background,
             args.output,
@@ -4138,7 +4581,7 @@ def main() -> None:
         description="Copernicus Sentinel data",
         requested_bbox=requested_bbox,
     )
-    cleanup_temporary_files([temp_mbtiles] + ocean_cleanup_paths)
+    cleanup_temporary_files([temp_mbtiles] + ocean_cleanup_paths + full_render_cleanup_paths)
 
     if os.path.exists(state_file):
         os.remove(state_file)
