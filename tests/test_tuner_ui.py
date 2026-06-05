@@ -161,7 +161,7 @@ def test_get_grade_presets_returns_mode_specific_values() -> None:
     land_presets = tuner_ui.get_grade_presets("land")
     ocean_presets = tuner_ui.get_grade_presets("ocean")
 
-    assert [preset["id"] for preset in land_presets] == ["balanced", "punchy", "minimal", "vivid"]
+    assert [preset["id"] for preset in land_presets] == ["balanced", "punchy", "minimal", "hdr"]
     assert [preset["id"] for preset in ocean_presets] == ["balanced", "punchy", "muted", "glow"]
     assert land_presets[0]["values"] == tuner_ui.build_grade_preset_values(tuner_ui.get_mode_defaults("land"))
     assert ocean_presets[0]["values"] == tuner_ui.build_grade_preset_values(tuner_ui.get_mode_defaults("ocean"))
@@ -178,6 +178,22 @@ def test_get_grade_presets_returns_mode_specific_values() -> None:
         ghb=1.0,
         ls=1.0,
         gms=1.05,
+        ghs=1.0,
+    )
+    assert land_presets[3]["blend_mode"] == "winter"
+    assert land_presets[3]["values"] == tuner_ui.build_grade_preset_values(
+        tuner_ui.get_mode_defaults("land"),
+        exp=0.94,
+        gamma=2.82,
+        shoulder=0.5,
+        sat=1.0,
+        vib=1.14,
+        bp=0.011,
+        wp=0.996,
+        db=0.0,
+        ghb=1.0,
+        ls=1.0,
+        gms=1.0,
         ghs=1.0,
     )
 
@@ -269,7 +285,7 @@ def test_index_exposes_shoulder_control() -> None:
     assert "Balanced" in html
     assert "Punchy" in html
     assert "Minimal" in html
-    assert "Vivid" in html
+    assert "HDR" in html
     assert "Summer" in html
     assert "Winter" in html
 

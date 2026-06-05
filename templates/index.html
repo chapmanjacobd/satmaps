@@ -684,6 +684,9 @@
                     document.getElementById(id).value = preset[id];
                 }
             });
+            if (currentMode === 'land' && hasLandBlend && preset.blend_mode !== undefined) {
+                document.getElementById('blend_mode').value = preset.blend_mode;
+            }
             document.getElementById('fg_on').checked = true;
             update();
         }
