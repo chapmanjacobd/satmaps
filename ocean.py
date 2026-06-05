@@ -33,6 +33,7 @@ from tiler import (
     apply_soft_knee_numpy,
     compute_in_memory_pixel_limit,
     colorize_depth_numpy,
+    is_identity_value,
     lonlat_bbox_to_mercator_bounds,
     parse_bbox_string,
     snap_bounds_to_pixel_grid,
@@ -653,7 +654,11 @@ def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
         )
         mako_colors = toned_mako.reshape(3, -1).T
     else:
-        mako_colors = np.clip(mako_colors * style.exposure, 0.0, 1.0)
+        mako_colors = (
+            mako_colors
+            if is_identity_value(style.exposure)
+            else np.clip(mako_colors * style.exposure, 0.0, 1.0)
+        )
 
     if style.grade:
         graded_mako = apply_preview_correction_numpy(

@@ -737,7 +737,11 @@ def get_preview_output(
                 params["exp"],
             )
         else:
-            toned = np.clip(source * params["exp"], 0.0, 1.0)
+            toned = (
+                source
+                if tiler.is_identity_value(params["exp"])
+                else np.clip(source * params["exp"], 0.0, 1.0)
+            )
         if not fg_on:
             return cast(FloatArray, toned)
         return cast(

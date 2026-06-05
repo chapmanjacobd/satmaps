@@ -3134,7 +3134,11 @@ def tone_mapped_byte_block(
             exposure=exposure,
         )
     else:
-        toned_block = np.clip(normalized * exposure, 0.0, 1.0)
+        toned_block = (
+            normalized
+            if tiler.is_identity_value(exposure)
+            else np.clip(normalized * exposure, 0.0, 1.0)
+        )
 
     if args.grade:
         toned_block = tiler.apply_preview_correction_numpy(

@@ -200,6 +200,23 @@ def test_apply_soft_knee_numpy_basics() -> None:
     np.testing.assert_allclose(toned, expected, atol=1e-5)
 
 
+def test_apply_soft_knee_numpy_unit_slopes_only_apply_exposure() -> None:
+    arr = np.array([0.2, 0.5, 1.0], dtype=np.float32)
+
+    toned = apply_soft_knee_numpy(
+        arr,
+        shadow_break=0.3,
+        highlight_break=0.75,
+        shadow_slope=1.0,
+        mid_slope=1.0,
+        highlight_slope=1.0,
+        exposure=0.5,
+    )
+
+    expected = np.array([0.1, 0.25, 0.5], dtype=np.float32)
+    np.testing.assert_allclose(toned, expected, atol=1e-5)
+
+
 def test_apply_preview_correction_numpy_basics() -> None:
     # (3, 1, 1) RGB stack
     rgb = np.array([[[0.5]], [[0.5]], [[0.5]]], dtype=np.float32)
@@ -212,6 +229,31 @@ def test_apply_preview_correction_numpy_basics() -> None:
     )
     expected = np.array([[[0.35]], [[0.35]], [[0.35]]], dtype=np.float32)
     np.testing.assert_allclose(corrected, expected, atol=1e-5)
+
+
+def test_apply_preview_correction_numpy_neutral_controls_return_identity() -> None:
+    rgb = np.array(
+        [
+            [[0.2, 0.8]],
+            [[0.6, 0.1]],
+            [[0.4, 0.9]],
+        ],
+        dtype=np.float32,
+    )
+
+    corrected = apply_preview_correction_numpy(
+        rgb,
+        saturation=1.0,
+        darken_break=0.0,
+        low_slope=1.0,
+        gamma=1.0,
+        shoulder=1.0,
+        highlight_break=1.0,
+        mid_slope=1.0,
+        high_slope=1.0,
+    )
+
+    np.testing.assert_allclose(corrected, rgb, atol=1e-5)
 
 
 def test_apply_preview_correction_numpy_supports_three_grade_regions() -> None:
@@ -230,6 +272,30 @@ def test_apply_preview_correction_numpy_supports_three_grade_regions() -> None:
 
     expected = np.array([[[0.1, 0.375, 0.7]]] * 3, dtype=np.float32)
     np.testing.assert_allclose(corrected, expected, atol=1e-5)
+
+
+def test_apply_preview_correction_numpy_unit_slopes_ignore_break_positions() -> None:
+    rgb = np.array(
+        [
+            [[0.2, 0.5, 0.8]],
+            [[0.1, 0.6, 0.7]],
+            [[0.3, 0.4, 0.9]],
+        ],
+        dtype=np.float32,
+    )
+
+    corrected = apply_preview_correction_numpy(
+        rgb,
+        saturation=1.0,
+        darken_break=0.25,
+        low_slope=1.0,
+        gamma=1.0,
+        shoulder=1.0,
+        highlight_break=0.75,
+        mid_slope=1.0,
+    )
+
+    np.testing.assert_allclose(corrected, rgb, atol=1e-5)
 
 
 def test_apply_preview_correction_numpy_supports_highlight_shoulder() -> None:

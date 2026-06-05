@@ -37,6 +37,7 @@ PREVIEW_DARKEN_MID_SLOPE = 1.0
 DEFAULT_EXPOSURE = 1.0
 DEFAULT_GAMMA = 1.0
 DEFAULT_SHOULDER = 1.0
+IDENTITY_VALUE_TOLERANCE = 1e-9
 TERRARIUM_OFFSET = 32768.0
 TERRARIUM_MAX_VALUE = 65535.99609375
 
@@ -161,7 +162,11 @@ def apply_soft_knee_numpy(
     exposure: float = DEFAULT_EXPOSURE,
 ) -> np.ndarray:
     """Apply soft-knee tone mapping using NumPy."""
-    arr = np.clip(arr * exposure, 0.0, 1.0)
+    arr = np.clip(arr, 0.0, 1.0)
+    if not is_identity_value(exposure):
+        arr = np.clip(arr * exposure, 0.0, 1.0)
+    if is_identity_piecewise_curve(shadow_slope, mid_slope, highlight_slope):
+        return arr
 
     return apply_piecewise_linear_curve_numpy(
         arr,
@@ -206,8 +211,23 @@ def apply_piecewise_linear_curve_numpy(
     out[mask_highlight] = (
         highlight_output + (arr[mask_highlight] - highlight_break) * highlight_slope
     )
-
     return cast(np.ndarray, np.clip(out, 0.0, 1.0))
+
+
+def is_identity_value(value: float) -> bool:
+    return math.isclose(value, 1.0, rel_tol=0.0, abs_tol=IDENTITY_VALUE_TOLERANCE)
+
+
+def is_identity_piecewise_curve(
+    shadow_slope: float,
+    mid_slope: float,
+    highlight_slope: float,
+) -> bool:
+    return (
+        is_identity_value(shadow_slope)
+        and is_identity_value(mid_slope)
+        and is_identity_value(highlight_slope)
+    )
 
 
 def derive_piecewise_high_slope(
@@ -269,26 +289,6 @@ def apply_preview_correction_numpy(
 ) -> np.ndarray:
     """Apply mild desaturation and preview darkening using NumPy. Expects (C, H, W) float32 [0,1]."""
     resolved_highlight_break = darken_break if highlight_break is None else highlight_break
-
-    # 1. Gamma
-    if gamma != 1.0:
-        rgb_arr = np.power(np.clip(rgb_arr, 0.0, 1.0), 1.0 / gamma)
-
-    # 2. Shoulder
-    if shoulder != 1.0:
-        rgb_arr = apply_highlight_shoulder_numpy(
-            rgb_arr,
-            shoulder=shoulder,
-            start=max(0.5, resolved_highlight_break),
-        )
-
-    # 3. Calculate luminance
-    luma = LUMA_RED * rgb_arr[0] + LUMA_GREEN * rgb_arr[1] + LUMA_BLUE * rgb_arr[2]
-
-    # 4. Desaturate
-    out = luma + (rgb_arr - luma) * saturation
-
-    # 5. Grading curve
     resolved_high_slope = (
         derive_piecewise_high_slope(
             darken_break,
@@ -299,6 +299,38 @@ def apply_preview_correction_numpy(
         if high_slope is None
         else high_slope
     )
+    rgb_arr = cast(np.ndarray, np.clip(rgb_arr, 0.0, 1.0))
+
+    if (
+        is_identity_value(gamma)
+        and is_identity_value(shoulder)
+        and is_identity_value(saturation)
+        and is_identity_piecewise_curve(low_slope, mid_slope, resolved_high_slope)
+    ):
+        return rgb_arr
+
+    # 1. Gamma
+    if not is_identity_value(gamma):
+        rgb_arr = np.power(rgb_arr, 1.0 / gamma)
+
+    # 2. Shoulder
+    if not is_identity_value(shoulder):
+        rgb_arr = apply_highlight_shoulder_numpy(
+            rgb_arr,
+            shoulder=shoulder,
+            start=max(0.5, resolved_highlight_break),
+        )
+
+    # 3. Calculate luminance
+    if is_identity_value(saturation):
+        out = rgb_arr
+    else:
+        luma = LUMA_RED * rgb_arr[0] + LUMA_GREEN * rgb_arr[1] + LUMA_BLUE * rgb_arr[2]
+        out = luma + (rgb_arr - luma) * saturation
+
+    # 5. Grading curve
+    if is_identity_piecewise_curve(low_slope, mid_slope, resolved_high_slope):
+        return cast(np.ndarray, np.clip(out, 0.0, 1.0))
 
     return apply_piecewise_linear_curve_numpy(
         out,
