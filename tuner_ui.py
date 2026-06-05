@@ -40,6 +40,7 @@ LAND_DEFAULT_GRADE_HIGHLIGHT_SLOPE = 1.7
 
 FloatArray = NDArray[np.float32]
 Hemisphere = Literal["north", "south"]
+GRADE_CONTROL_IDS = ("exp", "gamma", "shoulder", "sat", "db", "ghb", "ls", "gms", "ghs")
 
 
 @dataclass(frozen=True)
@@ -192,13 +193,15 @@ LAND_LOCATIONS = (
 DEFAULT_LAND_LOCATION_ID = "barcelona"
 LAND_LOCATIONS_BY_ID = {location.id: location for location in LAND_LOCATIONS}
 LAND_BLEND_MODES = (
+    LandBlendMode(id="summer", label="Summer"),
+    LandBlendMode(id="winter", label="Winter"),
     LandBlendMode(id="crossfade", label="Crossfade"),
     LandBlendMode(id="difference", label="Difference"),
     LandBlendMode(id="lighten", label="Lighten"),
     LandBlendMode(id="darken", label="Darken"),
     LandBlendMode(id="swipe", label="Swipe"),
 )
-DEFAULT_LAND_BLEND_MODE = "crossfade"
+DEFAULT_LAND_BLEND_MODE = "summer"
 LAND_BLEND_MODES_BY_ID = {blend_mode.id: blend_mode for blend_mode in LAND_BLEND_MODES}
 
 
@@ -264,19 +267,10 @@ def get_land_sample_tile_prefixes() -> tuple[str, ...]:
     return tuple(prefixes)
 
 
-def get_land_default_blend(location: LandLocation, winter: bool) -> float:
-    return 1.0 if ((location.hemisphere == "south") != winter) else 0.0
-
-
-def parse_checkbox_arg(name: str) -> bool:
-    raw_value = request.args.get(name)
-    if raw_value is None:
-        return False
-    return raw_value.lower() in {"1", "true", "on", "yes"}
-
-
-def get_land_winter_flag() -> bool:
-    return parse_checkbox_arg("winter")
+def get_land_season_blend(location: LandLocation, season_mode: str) -> float:
+    if season_mode not in {"summer", "winter"}:
+        raise ValueError(f"Unsupported season mode: {season_mode}")
+    return 1.0 if ((location.hemisphere == "south") == (season_mode == "summer")) else 0.0
 
 
 def download_configured_land_samples(
@@ -490,15 +484,141 @@ def get_mode_defaults(mode: str) -> dict[str, float]:
     return params
 
 
+def build_grade_preset_values(mode_defaults: dict[str, float], **overrides: float) -> dict[str, float]:
+    values = {key: float(mode_defaults[key]) for key in GRADE_CONTROL_IDS}
+    values.update(overrides)
+    return values
+
+
+def get_neutral_grade_values() -> dict[str, float]:
+    return {
+        "exp": 1.0,
+        "gamma": 1.0,
+        "shoulder": 1.0,
+        "sat": 1.0,
+        "db": 0.0,
+        "ghb": 1.0,
+        "ls": 1.0,
+        "gms": 1.0,
+        "ghs": 1.0,
+    }
+
+
+def get_grade_presets(mode: str) -> tuple[dict[str, object], ...]:
+    defaults = get_mode_defaults(mode)
+    if mode == "ocean":
+        return (
+            {"id": "balanced", "label": "Balanced", "values": build_grade_preset_values(defaults)},
+            {
+                "id": "punchy",
+                "label": "Punchy",
+                "values": build_grade_preset_values(
+                    defaults,
+                    exp=1.1,
+                    gamma=2.2,
+                    shoulder=1.0,
+                    sat=1.1,
+                    db=0.14,
+                    ghb=0.74,
+                    ls=0.15,
+                    gms=1.1,
+                    ghs=1.5,
+                ),
+            },
+            {
+                "id": "muted",
+                "label": "Muted",
+                "values": build_grade_preset_values(
+                    defaults,
+                    exp=0.9,
+                    gamma=2.5,
+                    shoulder=0.6,
+                    sat=0.75,
+                    db=0.06,
+                    ghb=0.82,
+                    ls=0.0,
+                    gms=0.9,
+                    ghs=1.2,
+                ),
+            },
+            {
+                "id": "glow",
+                "label": "Glow",
+                "values": build_grade_preset_values(
+                    defaults,
+                    exp=1.2,
+                    gamma=2.0,
+                    shoulder=1.3,
+                    sat=0.95,
+                    db=0.1,
+                    ghb=0.7,
+                    ls=0.05,
+                    gms=1.0,
+                    ghs=1.35,
+                ),
+            },
+        )
+    return (
+        {"id": "balanced", "label": "Balanced", "values": build_grade_preset_values(defaults)},
+        {
+            "id": "punchy",
+            "label": "Punchy",
+            "values": build_grade_preset_values(
+                defaults,
+                exp=2.8,
+                gamma=2.0,
+                shoulder=0.7,
+                sat=1.1,
+                db=0.12,
+                ghb=0.86,
+                ls=0.15,
+                gms=1.1,
+                ghs=1.9,
+            ),
+        },
+        {
+            "id": "matte",
+            "label": "Matte",
+            "values": build_grade_preset_values(
+                defaults,
+                exp=2.3,
+                gamma=2.5,
+                shoulder=0.35,
+                sat=0.8,
+                db=0.05,
+                ghb=0.94,
+                ls=0.0,
+                gms=0.9,
+                ghs=1.3,
+            ),
+        },
+        {
+            "id": "vivid",
+            "label": "Vivid",
+            "values": build_grade_preset_values(
+                defaults,
+                exp=3.0,
+                gamma=2.1,
+                shoulder=0.6,
+                sat=1.25,
+                db=0.1,
+                ghb=0.88,
+                ls=0.05,
+                gms=1.15,
+                ghs=1.8,
+            ),
+        },
+    )
+
+
 def parse_request_params(
     mode: str,
     land_location: LandLocation | None = None,
-    *,
-    winter: bool = False,
+    blend_mode_id: str | None = None,
 ) -> dict[str, float]:
     defaults = get_mode_defaults(mode)
-    if mode == "land" and land_location is not None:
-        defaults["blend"] = get_land_default_blend(land_location, winter)
+    if mode == "land" and land_location is not None and blend_mode_id in {"summer", "winter"}:
+        defaults["blend"] = get_land_season_blend(land_location, blend_mode_id)
     params = {key: float(request.args.get(key, default)) for key, default in defaults.items()}
     if "blend" in params:
         params["blend"] = float(np.clip(params["blend"], 0.0, 1.0))
@@ -528,6 +648,7 @@ def get_cropped_land_samples(location_id: str, land_view: LandView) -> tuple[Flo
 
 
 def blend_land_samples(
+    location: LandLocation,
     cropped_samples: tuple[FloatArray, ...],
     blend: float,
     blend_mode_id: str,
@@ -542,6 +663,8 @@ def blend_land_samples(
     blend_mode = get_land_blend_mode(blend_mode_id).id
     mix = float(np.clip(blend, 0.0, 1.0))
 
+    if blend_mode in {"summer", "winter"}:
+        return secondary if get_land_season_blend(location, blend_mode) >= 0.5 else primary
     if blend_mode == "difference":
         return cast(FloatArray, np.abs(primary - secondary))
     if blend_mode == "lighten":
@@ -570,15 +693,15 @@ def blend_land_samples(
 
 
 def get_land_source(
-    location_id: str,
+    location: LandLocation,
     blend: float,
     blend_mode_id: str,
     land_view: LandView,
 ) -> FloatArray | None:
-    cropped_samples = get_cropped_land_samples(location_id, land_view)
+    cropped_samples = get_cropped_land_samples(location.id, land_view)
     if len(cropped_samples) == 1:
         return cropped_samples[0]
-    return blend_land_samples(cropped_samples, blend, blend_mode_id)
+    return blend_land_samples(location, cropped_samples, blend, blend_mode_id)
 
 
 def get_histogram_data(
@@ -611,7 +734,6 @@ def index() -> ResponseReturnValue:
 
     fg_on = request.args.get("fg", "1") == "1"
     land_location = get_land_location(request.args.get("loc"))
-    winter = get_land_winter_flag()
     land_samples = get_land_samples(land_location.id)
     land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
@@ -619,9 +741,9 @@ def index() -> ResponseReturnValue:
         get_land_pan_arg("panx"),
         get_land_pan_arg("pany"),
     )
-    params = parse_request_params(mode, land_location, winter=winter)
+    params = parse_request_params(mode, land_location, land_blend_mode.id)
     source = (
-        get_land_source(land_location.id, params.get("blend", 0.0), land_blend_mode.id, land_view)
+        get_land_source(land_location, params.get("blend", 0.0), land_blend_mode.id, land_view)
         if mode == "land"
         else RAW_GEBCO
     )
@@ -631,6 +753,8 @@ def index() -> ResponseReturnValue:
         mode=mode,
         params=params,
         defaults=get_mode_defaults(mode),
+        grade_presets=get_grade_presets(mode),
+        neutral_grade_values=get_neutral_grade_values(),
         raw_hist=hist,
         land_locations=LAND_LOCATIONS,
         land_blend_modes=LAND_BLEND_MODES,
@@ -640,7 +764,6 @@ def index() -> ResponseReturnValue:
         land_view=land_view,
         land_dates=[sample.date_label for sample in land_samples],
         has_land_blend=len(land_samples) > 1,
-        winter=winter,
         fg_on=fg_on,
     )
 
@@ -652,16 +775,15 @@ def histogram() -> ResponseReturnValue:
         mode = "land"
 
     land_location = get_land_location(request.args.get("loc"))
-    winter = get_land_winter_flag()
     land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
         land_location.id,
         get_land_pan_arg("panx"),
         get_land_pan_arg("pany"),
     )
-    params = parse_request_params(mode, land_location, winter=winter)
+    params = parse_request_params(mode, land_location, land_blend_mode.id)
     source = (
-        get_land_source(land_location.id, params.get("blend", 0.0), land_blend_mode.id, land_view)
+        get_land_source(land_location, params.get("blend", 0.0), land_blend_mode.id, land_view)
         if mode == "land"
         else RAW_GEBCO
     )
@@ -684,19 +806,18 @@ def render() -> ResponseReturnValue:
         mode = "land"
 
     land_location = get_land_location(request.args.get("loc"))
-    winter = get_land_winter_flag()
     land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
         land_location.id,
         get_land_pan_arg("panx"),
         get_land_pan_arg("pany"),
     )
-    p = parse_request_params(mode, land_location, winter=winter)
+    p = parse_request_params(mode, land_location, land_blend_mode.id)
     tm_on = request.args.get("tm", "0") == "1"
     fg_on = request.args.get("fg", "1") == "1"
 
     if mode == "land":
-        source_rgb = get_land_source(land_location.id, p.get("blend", 0.0), land_blend_mode.id, land_view)
+        source_rgb = get_land_source(land_location, p.get("blend", 0.0), land_blend_mode.id, land_view)
         if source_rgb is None:
             return "No sample data", 404
         if tm_on:

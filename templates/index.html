@@ -30,6 +30,8 @@
         .button-row button { padding: 10px; cursor: pointer; border: none; border-radius: 4px; }
         .primary-btn { flex: 1; background: #fb0; font-weight: bold; }
         .secondary-btn { background: #444; color: white; }
+        .preset-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+        .preset-grid button { padding: 10px; cursor: pointer; border: none; border-radius: 4px; background: #3a3a3a; color: white; }
         .note { margin: 0; color: #999; font-size: 12px; line-height: 1.4; }
         .range-hint { display: flex; justify-content: space-between; color: #777; font-size: 11px; margin-top: 4px; }
         select { background: #1f1f1f; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 8px; }
@@ -57,10 +59,6 @@
                     </option>
                     {% endfor %}
                 </select>
-            </div>
-            <div class="slider-group">
-                <label for="winter">Winter Season Swap</label>
-                <input type="checkbox" id="winter" {{ 'checked' if winter else '' }} {{ '' if has_land_blend else 'disabled' }}>
             </div>
             {% if has_land_blend %}
             <div class="slider-group">
@@ -178,13 +176,18 @@
                 <button class="primary-btn" onclick="copyCLI(this)">Copy CLI Args</button>
                 <button class="secondary-btn" onclick="resetDefaults()">Reset</button>
             </div>
+            <div class="preset-grid">
+                {% for preset in grade_presets %}
+                <button type="button" onclick='applyGradePreset({{ preset.id | tojson }})'>{{ preset.label }}</button>
+                {% endfor %}
+            </div>
         </div>
 
         <div class="image-container">
             <img
                 id="preview"
                 class="{{ 'land-preview' if mode == 'land' else '' }}"
-                src="/render?mode={{ mode }}{% if mode == 'land' %}&loc={{ selected_land_location.id }}&winter={{ '1' if winter else '0' }}&panx={{ land_view.pan_x }}&pany={{ land_view.pan_y }}{% endif %}"
+                src="/render?mode={{ mode }}{% if mode == 'land' %}&loc={{ selected_land_location.id }}&panx={{ land_view.pan_x }}&pany={{ land_view.pan_y }}{% endif %}"
             >
             <p style="font-size: 12px; color: #666; margin-top: 10px;">
                 {% if mode == 'land' %}
@@ -205,10 +208,13 @@
         const canPanLandView = {{ (mode == 'land' and land_dates) | tojson }};
         const defaultLandBlendMode = {{ default_land_blend_mode | tojson }};
         const defaultParams = {{ defaults | tojson }};
+        const gradePresets = {{ grade_presets | tojson }};
+        const neutralGradeValues = {{ neutral_grade_values | tojson }};
         const landDates = {{ land_dates | tojson }};
         let rawHist = {{ raw_hist | tojson }};
         const img = document.getElementById('preview');
         const gradingControls = ['exp', 'gamma', 'shoulder', 'sat', 'db', 'ghb', 'ls', 'gms', 'ghs'];
+        const gradePresetMap = Object.fromEntries(gradePresets.map(preset => [preset.id, preset.values]));
         const sharedControls = [...gradingControls];
         const landViewControls = canPanLandView ? ['panx', 'pany'] : [];
         const renderControls = currentMode === 'land'
@@ -255,18 +261,18 @@
         let updateTimeout;
         let histogramToken = 0;
 
-        function isWinterEnabled() {
-            const winterToggle = document.getElementById('winter');
-            return winterToggle ? winterToggle.checked : false;
-        }
-
-        function getDefaultLandBlend() {
-            return (currentLandHemisphere === 'south') !== isWinterEnabled() ? 1.0 : 0.0;
+        function getSeasonalBlendForMode(blendModeId) {
+            if (blendModeId === 'summer') {
+                return currentLandHemisphere === 'south' ? 1.0 : 0.0;
+            }
+            if (blendModeId === 'winter') {
+                return currentLandHemisphere === 'south' ? 0.0 : 1.0;
+            }
+            return parseFloat(document.getElementById('blend').value);
         }
 
         function appendLandParams(params, locationId = currentLandLocation, includeBlend = true) {
             params.set('loc', locationId);
-            params.set('winter', isWinterEnabled() ? '1' : '0');
             landViewControls.forEach(id => params.set(id, document.getElementById(id).value));
             sharedControls.forEach(id => params.set(id, document.getElementById(id).value));
             if (hasLandBlend) {
@@ -320,8 +326,15 @@
             const blendNote = document.getElementById('blend_note');
             const showBlendSlider = blendMode === 'crossfade' || blendMode === 'swipe';
 
+            if (blendMode === 'summer' || blendMode === 'winter') {
+                document.getElementById('blend').value = getSeasonalBlendForMode(blendMode);
+            }
             blendGroup.style.display = showBlendSlider ? 'flex' : 'none';
-            if (blendMode === 'swipe') {
+            if (blendMode === 'summer') {
+                blendNote.innerText = 'Summer selects the local summer sample for this hemisphere.';
+            } else if (blendMode === 'winter') {
+                blendNote.innerText = 'Winter selects the local winter sample for this hemisphere.';
+            } else if (blendMode === 'swipe') {
                 blendLabel.innerText = `Swipe ${landDates[0]} | ${landDates[1]}`;
                 blendNote.innerText = 'This slider moves the swipe divider across the preview crop.';
             } else if (blendMode === 'crossfade') {
@@ -546,14 +559,34 @@
         }
 
         function resetDefaults() {
-            Object.entries(defaultParams).forEach(([key, value]) => {
+            Object.entries(neutralGradeValues).forEach(([key, value]) => {
                 const el = document.getElementById(key);
                 if (el) el.value = value;
             });
+            if (currentMode === 'ocean') {
+                ['dmin', 'dmax'].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el && defaultParams[id] !== undefined) {
+                        el.value = defaultParams[id];
+                    }
+                });
+            }
             if (hasLandBlend) {
                 document.getElementById('blend_mode').value = defaultLandBlendMode;
-                document.getElementById('blend').value = getDefaultLandBlend();
+                document.getElementById('blend').value = getSeasonalBlendForMode(defaultLandBlendMode);
             }
+            update();
+        }
+
+        function applyGradePreset(presetId) {
+            const preset = gradePresetMap[presetId];
+            if (!preset) return;
+            gradingControls.forEach(id => {
+                if (preset[id] !== undefined) {
+                    document.getElementById(id).value = preset[id];
+                }
+            });
+            document.getElementById('fg_on').checked = true;
             update();
         }
 
@@ -562,7 +595,7 @@
                 const flag = cliArgMap[currentMode][id];
                 return `${flag} ${document.getElementById(id).value}`;
             });
-            if (currentMode === 'land' && isWinterEnabled()) {
+            if (currentMode === 'land' && getBlendMode() === 'winter') {
                 args.push('--winter');
             }
 
@@ -576,9 +609,6 @@
         renderControls.forEach(id => document.getElementById(id).addEventListener('input', update));
         if (hasLandBlend) {
             document.getElementById('blend_mode').addEventListener('change', update);
-        }
-        if (currentMode === 'land') {
-            document.getElementById('winter').addEventListener('change', update);
         }
         document.getElementById('fg_on').addEventListener('change', update);
 

@@ -45,7 +45,7 @@ Before a large run, use the Tuner UI to find the best visual parameters:
 ```bash
 satmaps-tuner
 ```
-Visit `http://localhost:5001` to adjust exposure, soft-knee curves, saturation, and the north/south seasonal winter swap.
+Visit `http://localhost:5001` to adjust exposure, soft-knee curves, saturation, and the north/south seasonal Summer/Winter blend modes.
 
 If the tuner reports missing cached sample tiles, fetch the built-in sample set first:
 

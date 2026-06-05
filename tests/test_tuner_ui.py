@@ -151,32 +151,59 @@ def test_ocean_defaults_match_cli_defaults() -> None:
     assert defaults["dmax"] == 0.0
 
 
-def test_get_land_default_blend_tracks_hemisphere_and_winter() -> None:
-    assert tuner_ui.get_land_default_blend(tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"], winter=False) == 0.0
-    assert tuner_ui.get_land_default_blend(tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"], winter=True) == 1.0
-    assert tuner_ui.get_land_default_blend(tuner_ui.LAND_LOCATIONS_BY_ID["sydney"], winter=False) == 1.0
-    assert tuner_ui.get_land_default_blend(tuner_ui.LAND_LOCATIONS_BY_ID["sydney"], winter=True) == 0.0
+def test_get_grade_presets_returns_mode_specific_values() -> None:
+    land_presets = tuner_ui.get_grade_presets("land")
+    ocean_presets = tuner_ui.get_grade_presets("ocean")
+
+    assert [preset["id"] for preset in land_presets] == ["balanced", "punchy", "matte", "vivid"]
+    assert [preset["id"] for preset in ocean_presets] == ["balanced", "punchy", "muted", "glow"]
+    assert land_presets[0]["values"] == tuner_ui.build_grade_preset_values(tuner_ui.get_mode_defaults("land"))
+    assert ocean_presets[0]["values"] == tuner_ui.build_grade_preset_values(tuner_ui.get_mode_defaults("ocean"))
 
 
-def test_parse_request_params_uses_land_hemisphere_defaults_and_explicit_blend() -> None:
+def test_get_land_season_blend_tracks_hemisphere() -> None:
+    assert tuner_ui.get_land_season_blend(tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"], "summer") == 0.0
+    assert tuner_ui.get_land_season_blend(tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"], "winter") == 1.0
+    assert tuner_ui.get_land_season_blend(tuner_ui.LAND_LOCATIONS_BY_ID["sydney"], "summer") == 1.0
+    assert tuner_ui.get_land_season_blend(tuner_ui.LAND_LOCATIONS_BY_ID["sydney"], "winter") == 0.0
+
+
+def test_parse_request_params_uses_season_mode_defaults_and_explicit_blend() -> None:
     with tuner_ui.app.test_request_context("/"):
-        north_params = tuner_ui.parse_request_params("land", tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"], winter=False)
+        north_summer_params = tuner_ui.parse_request_params("land", tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"], "summer")
     with tuner_ui.app.test_request_context("/"):
-        south_winter_params = tuner_ui.parse_request_params(
+        south_summer_params = tuner_ui.parse_request_params(
             "land",
             tuner_ui.LAND_LOCATIONS_BY_ID["sydney"],
-            winter=True,
+            "summer",
         )
+    with tuner_ui.app.test_request_context("/"):
+        north_winter_params = tuner_ui.parse_request_params("land", tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"], "winter")
     with tuner_ui.app.test_request_context("/?blend=0.25"):
         explicit_params = tuner_ui.parse_request_params(
             "land",
             tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"],
-            winter=False,
+            "crossfade",
         )
 
-    assert north_params["blend"] == 0.0
-    assert south_winter_params["blend"] == 0.0
+    assert north_summer_params["blend"] == 0.0
+    assert south_summer_params["blend"] == 1.0
+    assert north_winter_params["blend"] == 1.0
     assert explicit_params["blend"] == 0.25
+
+
+def test_get_neutral_grade_values_are_identity_like() -> None:
+    assert tuner_ui.get_neutral_grade_values() == {
+        "exp": 1.0,
+        "gamma": 1.0,
+        "shoulder": 1.0,
+        "sat": 1.0,
+        "db": 0.0,
+        "ghb": 1.0,
+        "ls": 1.0,
+        "gms": 1.0,
+        "ghs": 1.0,
+    }
 
 
 def test_index_exposes_shoulder_control() -> None:
@@ -188,9 +215,18 @@ def test_index_exposes_shoulder_control() -> None:
     assert response.status_code == 200
     assert "Shoulder" in html
     assert "--shoulder" in html
+    assert "applyGradePreset" in html
+    assert 'onclick=\'applyGradePreset("balanced")\'' in html
+    assert '"exp": 1.0' in html
+    assert "Balanced" in html
+    assert "Punchy" in html
+    assert "Matte" in html
+    assert "Vivid" in html
+    assert "Summer" in html
+    assert "Winter" in html
 
 
-def test_index_uses_hemisphere_default_blend_and_winter_toggle(monkeypatch: object) -> None:
+def test_index_uses_season_blend_modes(monkeypatch: object) -> None:
     client = tuner_ui.app.test_client()
     samples = (
         tuner_ui.LandSample("2025-07-01", {"red": "r", "green": "g", "blue": "b"}),
@@ -206,16 +242,17 @@ def test_index_uses_hemisphere_default_blend_and_winter_toggle(monkeypatch: obje
 
     north_response = client.get("/?loc=barcelona")
     south_response = client.get("/?loc=sydney")
-    winter_response = client.get("/?loc=barcelona&winter=1")
+    winter_response = client.get("/?loc=barcelona&blend_mode=winter")
 
     north_html = north_response.get_data(as_text=True)
     south_html = south_response.get_data(as_text=True)
     winter_html = winter_response.get_data(as_text=True)
 
-    assert '<input type="checkbox" id="winter"  >' in north_html
+    assert 'Winter Season Swap' not in north_html
+    assert '<option value="summer" selected' in north_html
     assert '<input type="range" id="blend" min="0" max="1" step="0.01" value="0.0">' in north_html
     assert '<input type="range" id="blend" min="0" max="1" step="0.01" value="1.0">' in south_html
-    assert '<input type="checkbox" id="winter" checked >' in winter_html
+    assert '<option value="winter" selected' in winter_html
     assert '<input type="range" id="blend" min="0" max="1" step="0.01" value="1.0">' in winter_html
 
 
@@ -241,12 +278,13 @@ def test_index_preserves_land_controls_when_switching_locations() -> None:
 
     html = response.get_data(as_text=True)
     assert "function appendLandParams(params, locationId = currentLandLocation, includeBlend = true)" in html
-    assert "params.set('winter', isWinterEnabled() ? '1' : '0');" in html
+    assert "function getSeasonalBlendForMode(blendModeId)" in html
     assert "landViewControls.forEach(id => params.set(id, document.getElementById(id).value));" in html
     assert "sharedControls.forEach(id => params.set(id, document.getElementById(id).value));" in html
     assert "appendLandParams(params, locationId, false);" in html
+    assert "document.getElementById('blend').value = getSeasonalBlendForMode(defaultLandBlendMode);" in html
     assert "fg: document.getElementById('fg_on').checked ? '1' : '0'" in html
-    assert "args.push('--winter');" in html
+    assert "getBlendMode() === 'winter'" in html
 
 
 def test_index_respects_fg_query_param() -> None:
@@ -260,10 +298,10 @@ def test_index_respects_fg_query_param() -> None:
     assert '<input type="checkbox" id="fg_on" checked>' not in html
 
 
-def test_get_land_blend_mode_defaults_to_crossfade() -> None:
+def test_get_land_blend_mode_defaults_to_summer() -> None:
     blend_mode = tuner_ui.get_land_blend_mode(None)
 
-    assert blend_mode.id == "crossfade"
+    assert blend_mode.id == "summer"
 
 
 def test_download_configured_land_samples_uses_satmaps_helpers(monkeypatch: object) -> None:
@@ -345,18 +383,32 @@ def test_blend_land_samples_supports_all_requested_modes() -> None:
     primary = tuner_ui.np.zeros((3, 2, 4), dtype=tuner_ui.np.float32)
     secondary = tuner_ui.np.ones((3, 2, 4), dtype=tuner_ui.np.float32)
     samples = (primary, secondary)
+    north_location = tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"]
+    south_location = tuner_ui.LAND_LOCATIONS_BY_ID["sydney"]
 
-    crossfade = tuner_ui.blend_land_samples(samples, 0.25, "crossfade")
-    difference = tuner_ui.blend_land_samples(samples, 0.25, "difference")
-    lighten = tuner_ui.blend_land_samples(samples, 0.25, "lighten")
-    darken = tuner_ui.blend_land_samples(samples, 0.25, "darken")
-    swipe = tuner_ui.blend_land_samples(samples, 0.25, "swipe")
+    summer_north = tuner_ui.blend_land_samples(north_location, samples, 0.25, "summer")
+    winter_north = tuner_ui.blend_land_samples(north_location, samples, 0.25, "winter")
+    summer_south = tuner_ui.blend_land_samples(south_location, samples, 0.25, "summer")
+    winter_south = tuner_ui.blend_land_samples(south_location, samples, 0.25, "winter")
+    crossfade = tuner_ui.blend_land_samples(north_location, samples, 0.25, "crossfade")
+    difference = tuner_ui.blend_land_samples(north_location, samples, 0.25, "difference")
+    lighten = tuner_ui.blend_land_samples(north_location, samples, 0.25, "lighten")
+    darken = tuner_ui.blend_land_samples(north_location, samples, 0.25, "darken")
+    swipe = tuner_ui.blend_land_samples(north_location, samples, 0.25, "swipe")
 
+    assert summer_north is not None
+    assert winter_north is not None
+    assert summer_south is not None
+    assert winter_south is not None
     assert crossfade is not None
     assert difference is not None
     assert lighten is not None
     assert darken is not None
     assert swipe is not None
+    assert tuner_ui.np.allclose(summer_north, 0.0)
+    assert tuner_ui.np.allclose(winter_north, 1.0)
+    assert tuner_ui.np.allclose(summer_south, 1.0)
+    assert tuner_ui.np.allclose(winter_south, 0.0)
     assert tuner_ui.np.allclose(crossfade, 0.25)
     assert tuner_ui.np.allclose(difference, 1.0)
     assert tuner_ui.np.allclose(lighten, 1.0)
