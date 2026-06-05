@@ -116,6 +116,12 @@ LAND_LOCATIONS = (
         tile_prefix="36RUU_0_0",
     ),
     LandLocation(
+        id="banc-darguin",
+        name="Banc d'Arguin",
+        sample_label="Banc d'Arguin, Mauritania (28QCH)",
+        tile_prefix="28QCH_0_0",
+    ),
+    LandLocation(
         id="mexico-city",
         name="Mexico City",
         sample_label="Mexico City (14QMG)",
