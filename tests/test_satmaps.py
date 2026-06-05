@@ -2694,6 +2694,24 @@ def test_build_ocean_ramp_colors_respects_style_flags() -> None:
     assert np.all((default_colors >= 0.0) & (default_colors <= 1.0))
     assert np.all((ungraded_colors >= 0.0) & (ungraded_colors <= 1.0))
 
+
+def test_build_ocean_ramp_colors_applies_vibrance_and_black_white_points() -> None:
+    neutral_colors = ocean.build_ocean_ramp_colors(
+        ocean.OceanStyleOptions(tonemap=False, grade=True, exposure=1.0)
+    )
+    adjusted_colors = ocean.build_ocean_ramp_colors(
+        ocean.OceanStyleOptions(
+            tonemap=False,
+            grade=True,
+            exposure=1.0,
+            vibrance=1.4,
+            black_point=0.05,
+            white_point=0.95,
+        )
+    )
+
+    assert not np.allclose(neutral_colors, adjusted_colors)
+
 def test_build_land_run_token_changes_with_winter_flag() -> None:
     common_args = dict(
         output="render.pmtiles",

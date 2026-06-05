@@ -124,6 +124,9 @@ def test_land_defaults_match_tuned_land_preset() -> None:
     assert defaults["gamma"] == tuner_ui.LAND_DEFAULT_GAMMA
     assert defaults["shoulder"] == tuner_ui.LAND_DEFAULT_SHOULDER
     assert defaults["sat"] == tuner_ui.LAND_DEFAULT_SATURATION
+    assert defaults["vib"] == tuner_ui.tiler.DEFAULT_VIBRANCE
+    assert defaults["bp"] == tuner_ui.tiler.DEFAULT_BLACK_POINT
+    assert defaults["wp"] == tuner_ui.tiler.DEFAULT_WHITE_POINT
     assert defaults["db"] == tuner_ui.LAND_DEFAULT_GRADE_LOW_BREAK
     assert defaults["ghb"] == tuner_ui.LAND_DEFAULT_GRADE_HIGHLIGHT_BREAK
     assert defaults["ls"] == tuner_ui.LAND_DEFAULT_GRADE_LOW_SLOPE
@@ -143,6 +146,9 @@ def test_ocean_defaults_match_cli_defaults() -> None:
     assert defaults["gamma"] == tuner_ui.ocean.OCEAN_DEFAULT_GAMMA
     assert defaults["shoulder"] == tuner_ui.ocean.OCEAN_DEFAULT_SHOULDER
     assert defaults["sat"] == tuner_ui.ocean.OCEAN_DEFAULT_SATURATION
+    assert defaults["vib"] == tuner_ui.tiler.DEFAULT_VIBRANCE
+    assert defaults["bp"] == tuner_ui.tiler.DEFAULT_BLACK_POINT
+    assert defaults["wp"] == tuner_ui.tiler.DEFAULT_WHITE_POINT
     assert defaults["db"] == tuner_ui.ocean.OCEAN_DEFAULT_BLACK_BREAK
     assert defaults["ghb"] == tuner_ui.ocean.OCEAN_DEFAULT_BLACK_BREAK
     assert defaults["ls"] == tuner_ui.ocean.OCEAN_DEFAULT_BLACK_SLOPE
@@ -198,6 +204,9 @@ def test_get_neutral_grade_values_are_identity_like() -> None:
         "gamma": 1.0,
         "shoulder": 1.0,
         "sat": 1.0,
+        "vib": 1.0,
+        "bp": 0.0,
+        "wp": 1.0,
         "db": 0.0,
         "ghb": 1.0,
         "ls": 1.0,
@@ -232,9 +241,16 @@ def test_index_exposes_shoulder_control() -> None:
     assert response.status_code == 200
     assert "Shoulder" in html
     assert "--shoulder" in html
+    assert "Vibrance" in html
+    assert "Black Point" in html
+    assert "White Point" in html
+    assert "--vibrance" in html
+    assert "--black-point" in html
+    assert "--white-point" in html
     assert "applyGradePreset" in html
     assert 'onclick=\'applyGradePreset("balanced")\'' in html
     assert '"exp": 1.0' in html
+    assert '"vib": 1.0' in html
     assert "Balanced" in html
     assert "Punchy" in html
     assert "Matte" in html

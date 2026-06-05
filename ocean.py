@@ -39,6 +39,9 @@ from tiler import (
     snap_bounds_to_pixel_grid,
     web_mercator_pixel_size,
     web_mercator_pixel_size_for_tile_size,
+    DEFAULT_BLACK_POINT,
+    DEFAULT_VIBRANCE,
+    DEFAULT_WHITE_POINT,
 )
 
 gdal.UseExceptions()
@@ -170,6 +173,9 @@ class OceanStyleOptions:
     gamma: float = OCEAN_DEFAULT_GAMMA
     shoulder: float = OCEAN_DEFAULT_SHOULDER
     saturation: float = OCEAN_DEFAULT_SATURATION
+    vibrance: float = DEFAULT_VIBRANCE
+    black_point: float = DEFAULT_BLACK_POINT
+    white_point: float = DEFAULT_WHITE_POINT
     black_break: float = OCEAN_DEFAULT_BLACK_BREAK
     black_slope: float = OCEAN_DEFAULT_BLACK_SLOPE
     grade_high_break: float | None = None
@@ -664,6 +670,9 @@ def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
         graded_mako = apply_preview_correction_numpy(
             mako_colors.T.reshape(3, -1, 1),
             saturation=style.saturation,
+            vibrance=style.vibrance,
+            black_point=style.black_point,
+            white_point=style.white_point,
             darken_break=style.black_break,
             low_slope=style.black_slope,
             gamma=style.gamma,
@@ -1381,6 +1390,9 @@ def main() -> None:
     parser.add_argument(
         "--sat", "--saturation", type=float, default=OCEAN_DEFAULT_SATURATION
     )
+    parser.add_argument("--vibrance", type=float, default=DEFAULT_VIBRANCE)
+    parser.add_argument("--black-point", type=float, default=DEFAULT_BLACK_POINT)
+    parser.add_argument("--white-point", type=float, default=DEFAULT_WHITE_POINT)
     parser.add_argument(
         "--db", "--black-break", "--grade-low-break", type=float, default=OCEAN_DEFAULT_BLACK_BREAK
     )
@@ -1450,6 +1462,9 @@ def main() -> None:
             gamma=args.gamma,
             shoulder=args.shoulder,
             saturation=args.sat,
+            vibrance=args.vibrance,
+            black_point=args.black_point,
+            white_point=args.white_point,
             black_break=args.db,
             black_slope=args.ls,
             grade_high_break=args.ghb,

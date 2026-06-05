@@ -37,6 +37,9 @@ PREVIEW_DARKEN_MID_SLOPE = 1.0
 DEFAULT_EXPOSURE = 1.0
 DEFAULT_GAMMA = 1.0
 DEFAULT_SHOULDER = 1.0
+DEFAULT_VIBRANCE = 1.0
+DEFAULT_BLACK_POINT = 0.0
+DEFAULT_WHITE_POINT = 1.0
 IDENTITY_VALUE_TOLERANCE = 1e-9
 TERRARIUM_OFFSET = 32768.0
 TERRARIUM_MAX_VALUE = 65535.99609375
@@ -218,6 +221,10 @@ def is_identity_value(value: float) -> bool:
     return math.isclose(value, 1.0, rel_tol=0.0, abs_tol=IDENTITY_VALUE_TOLERANCE)
 
 
+def is_zero_value(value: float) -> bool:
+    return math.isclose(value, 0.0, rel_tol=0.0, abs_tol=IDENTITY_VALUE_TOLERANCE)
+
+
 def is_identity_piecewise_curve(
     shadow_slope: float,
     mid_slope: float,
@@ -228,6 +235,10 @@ def is_identity_piecewise_curve(
         and is_identity_value(mid_slope)
         and is_identity_value(highlight_slope)
     )
+
+
+def has_neutral_black_white_points(black_point: float, white_point: float) -> bool:
+    return is_zero_value(black_point) and is_identity_value(white_point)
 
 
 def derive_piecewise_high_slope(
@@ -276,9 +287,53 @@ def apply_highlight_shoulder_numpy(
     return cast(np.ndarray, np.clip(out, 0.0, 1.0))
 
 
+def apply_black_white_points_numpy(
+    arr: np.ndarray,
+    *,
+    black_point: float,
+    white_point: float,
+) -> np.ndarray:
+    clipped = np.clip(arr, 0.0, 1.0)
+    if black_point < 0.0 or black_point > 1.0:
+        raise ValueError("black_point must satisfy 0 <= black_point <= 1")
+    if white_point < 0.0 or white_point > 1.0:
+        raise ValueError("white_point must satisfy 0 <= white_point <= 1")
+    if white_point <= black_point:
+        raise ValueError("white_point must be greater than black_point")
+    if has_neutral_black_white_points(black_point, white_point):
+        return cast(np.ndarray, clipped)
+    return cast(
+        np.ndarray,
+        np.clip((clipped - black_point) / (white_point - black_point), 0.0, 1.0),
+    )
+
+
+def apply_vibrance_numpy(
+    rgb_arr: np.ndarray,
+    *,
+    vibrance: float,
+) -> np.ndarray:
+    clipped = np.clip(rgb_arr, 0.0, 1.0)
+    if vibrance < 0.0:
+        raise ValueError("vibrance must be non-negative")
+    if is_identity_value(vibrance):
+        return cast(np.ndarray, clipped)
+
+    luma = LUMA_RED * clipped[0] + LUMA_GREEN * clipped[1] + LUMA_BLUE * clipped[2]
+    chroma_spread = np.max(clipped, axis=0) - np.min(clipped, axis=0)
+    effective_saturation = 1.0 + (vibrance - 1.0) * (1.0 - chroma_spread)
+    return cast(
+        np.ndarray,
+        np.clip(luma + (clipped - luma) * np.expand_dims(effective_saturation, axis=0), 0.0, 1.0),
+    )
+
+
 def apply_preview_correction_numpy(
     rgb_arr: np.ndarray,
     saturation: float = PREVIEW_SATURATION,
+    vibrance: float = DEFAULT_VIBRANCE,
+    black_point: float = DEFAULT_BLACK_POINT,
+    white_point: float = DEFAULT_WHITE_POINT,
     darken_break: float = PREVIEW_DARKEN_BREAK,
     low_slope: float = PREVIEW_DARKEN_LOW_SLOPE,
     gamma: float = DEFAULT_GAMMA,
@@ -300,10 +355,18 @@ def apply_preview_correction_numpy(
         else high_slope
     )
     rgb_arr = cast(np.ndarray, np.clip(rgb_arr, 0.0, 1.0))
+    rgb_arr = apply_black_white_points_numpy(
+        rgb_arr,
+        black_point=black_point,
+        white_point=white_point,
+    )
 
     if (
+        has_neutral_black_white_points(black_point, white_point)
+        and
         is_identity_value(gamma)
         and is_identity_value(shoulder)
+        and is_identity_value(vibrance)
         and is_identity_value(saturation)
         and is_identity_piecewise_curve(low_slope, mid_slope, resolved_high_slope)
     ):
@@ -321,7 +384,11 @@ def apply_preview_correction_numpy(
             start=max(0.5, resolved_highlight_break),
         )
 
-    # 3. Calculate luminance
+    # 3. Vibrance
+    if not is_identity_value(vibrance):
+        rgb_arr = apply_vibrance_numpy(rgb_arr, vibrance=vibrance)
+
+    # 4. Saturation
     if is_identity_value(saturation):
         out = rgb_arr
     else:

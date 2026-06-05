@@ -669,6 +669,9 @@ def build_land_run_token(
             "gamma": args.gamma,
             "shoulder": getattr(args, "shoulder", tiler.DEFAULT_SHOULDER),
             "sat": args.sat,
+            "vibrance": getattr(args, "vibrance", tiler.DEFAULT_VIBRANCE),
+            "black_point": getattr(args, "black_point", tiler.DEFAULT_BLACK_POINT),
+            "white_point": getattr(args, "white_point", tiler.DEFAULT_WHITE_POINT),
             "db": args.db,
             "ls": args.ls,
             "ghb": args.ghb,
@@ -3144,6 +3147,9 @@ def tone_mapped_byte_block(
         toned_block = tiler.apply_preview_correction_numpy(
             toned_block,
             saturation=args.sat,
+            vibrance=getattr(args, "vibrance", tiler.DEFAULT_VIBRANCE),
+            black_point=getattr(args, "black_point", tiler.DEFAULT_BLACK_POINT),
+            white_point=getattr(args, "white_point", tiler.DEFAULT_WHITE_POINT),
             darken_break=args.db,
             low_slope=args.ls,
             gamma=args.gamma,
@@ -4236,6 +4242,9 @@ def main() -> None:
     parser.add_argument(
         "--sat", "--saturation", type=float, default=0.9
     )
+    parser.add_argument("--vibrance", type=float, default=tiler.DEFAULT_VIBRANCE)
+    parser.add_argument("--black-point", type=float, default=tiler.DEFAULT_BLACK_POINT)
+    parser.add_argument("--white-point", type=float, default=tiler.DEFAULT_WHITE_POINT)
     parser.add_argument(
         "--db", "--black-break", "--grade-low-break", type=float, default=0.08
     )

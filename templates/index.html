@@ -152,6 +152,18 @@
                 <input type="range" id="sat" min="0" max="2" step="0.1" value="{{ params.sat }}">
             </div>
             <div class="slider-group">
+                <label>Vibrance <span class="val" id="vib_val"></span></label>
+                <input type="range" id="vib" min="0" max="2" step="0.1" value="{{ params.vib }}">
+            </div>
+            <div class="slider-group">
+                <label>Black Point <span class="val" id="bp_val"></span></label>
+                <input type="range" id="bp" min="0" max="0.99" step="0.01" value="{{ params.bp }}">
+            </div>
+            <div class="slider-group">
+                <label>White Point <span class="val" id="wp_val"></span></label>
+                <input type="range" id="wp" min="0.01" max="1" step="0.01" value="{{ params.wp }}">
+            </div>
+            <div class="slider-group">
                 <label>Low/Mid Break <span class="val" id="db_val"></span></label>
                 <input type="range" id="db" min="0" max="1" step="0.01" value="{{ params.db }}">
             </div>
@@ -214,7 +226,7 @@
         let inputHist = {{ raw_hist | tojson }};
         let finalHist = {{ final_hist | tojson }};
         const img = document.getElementById('preview');
-        const gradingControls = ['exp', 'gamma', 'shoulder', 'sat', 'db', 'ghb', 'ls', 'gms', 'ghs'];
+        const gradingControls = ['exp', 'gamma', 'shoulder', 'sat', 'vib', 'bp', 'wp', 'db', 'ghb', 'ls', 'gms', 'ghs'];
         const gradePresetMap = Object.fromEntries(gradePresets.map(preset => [preset.id, preset.values]));
         const sharedControls = [...gradingControls];
         const landViewControls = canPanLandView ? ['panx', 'pany'] : [];
@@ -230,6 +242,9 @@
                 gamma: '--gamma',
                 shoulder: '--shoulder',
                 sat: '--saturation',
+                vib: '--vibrance',
+                bp: '--black-point',
+                wp: '--white-point',
                 db: '--grade-low-break',
                 ghb: '--grade-highlight-break',
                 ls: '--grade-low-slope',
@@ -241,6 +256,9 @@
                 gamma: '--gamma',
                 shoulder: '--shoulder',
                 sat: '--saturation',
+                vib: '--vibrance',
+                bp: '--black-point',
+                wp: '--white-point',
                 db: '--grade-low-break',
                 ghb: '--grade-highlight-break',
                 ls: '--grade-low-slope',
@@ -404,6 +422,9 @@
                 gamma: getValue('gamma'),
                 shoulder: getValue('shoulder'),
                 sat: getValue('sat'),
+                vib: getValue('vib'),
+                bp: getValue('bp'),
+                wp: Math.max(getValue('bp') + 0.01, getValue('wp')),
                 db: getValue('db'),
                 ghb: Math.max(getValue('db'), getValue('ghb')),
                 ls: getValue('ls'),
@@ -423,16 +444,43 @@
             return clippedStart + adjusted * (1.0 - clippedStart);
         }
 
-        function applyGrading(x, p) {
-            const gammaAdjusted = Math.pow(Math.max(0.0, x), 1.0 / p.gamma);
-            const shoulderAdjusted = applyShoulder(gammaAdjusted, p.shoulder, Math.max(0.5, p.ghb));
-            return Math.min(1.0, Math.max(0.0, applyPiecewiseCurve(shoulderAdjusted, {
+        function applyBlackWhitePoint(x, blackPoint, whitePoint) {
+            const clipped = Math.min(1.0, Math.max(0.0, x));
+            return Math.min(1.0, Math.max(0.0, (clipped - blackPoint) / (whitePoint - blackPoint)));
+        }
+
+        function applyGradePrep(x, p) {
+            const levelsAdjusted = applyBlackWhitePoint(x, p.bp, p.wp);
+            const gammaAdjusted = Math.pow(Math.max(0.0, levelsAdjusted), 1.0 / p.gamma);
+            return applyShoulder(gammaAdjusted, p.shoulder, Math.max(0.5, p.ghb));
+        }
+
+        function applyGradeCurve(x, p) {
+            return Math.min(1.0, Math.max(0.0, applyPiecewiseCurve(x, {
                 shadowBreak: p.db,
                 highlightBreak: p.ghb,
                 shadowSlope: p.ls,
                 midSlope: p.gms,
                 highlightSlope: p.ghs
             })));
+        }
+
+        function applyScalarGrading(x, p) {
+            return applyGradeCurve(applyGradePrep(x, p), p);
+        }
+
+        function applyRgbVibrance(rgb, p) {
+            if (p.vib === 1.0) return rgb;
+            const luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+            const chromaSpread = Math.max(...rgb) - Math.min(...rgb);
+            const effectiveSat = 1.0 + (p.vib - 1.0) * (1.0 - chromaSpread);
+            return rgb.map(channel => Math.min(1.0, Math.max(0.0, luma + (channel - luma) * effectiveSat)));
+        }
+
+        function applyRgbSaturation(rgb, p) {
+            if (p.sat === 1.0) return rgb;
+            const luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+            return rgb.map(channel => luma + (channel - luma) * p.sat);
         }
 
         function drawFinalGradeCurve() {
@@ -443,7 +491,7 @@
             for (let i = 0; i <= 256; i += 2) {
                 const x = i / 256;
                 const exposed = Math.min(1.0, x * p.exp);
-                const y = 1.0 - (fgOn ? applyGrading(exposed, p) : exposed);
+                const y = 1.0 - (fgOn ? applyScalarGrading(exposed, p) : exposed);
                 d += (i === 0 ? 'M' : 'L') + ` ${i} ${y * 128} `;
             }
             path.setAttribute('d', d);
@@ -457,20 +505,19 @@
 
             const stops = makoRamp.map(stop => {
                 const frac = stop[0];
-                let r = Math.min(1.0, (stop[1] / 255) * gradeParams.exp);
-                let g = Math.min(1.0, (stop[2] / 255) * gradeParams.exp);
-                let b = Math.min(1.0, (stop[3] / 255) * gradeParams.exp);
+                let rgb = [
+                    Math.min(1.0, (stop[1] / 255) * gradeParams.exp),
+                    Math.min(1.0, (stop[2] / 255) * gradeParams.exp),
+                    Math.min(1.0, (stop[3] / 255) * gradeParams.exp)
+                ];
                 if (fgOn) {
-                    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                    r = luma + (r - luma) * gradeParams.sat;
-                    g = luma + (g - luma) * gradeParams.sat;
-                    b = luma + (b - luma) * gradeParams.sat;
-                    r = applyGrading(r, gradeParams);
-                    g = applyGrading(g, gradeParams);
-                    b = applyGrading(b, gradeParams);
+                    rgb = rgb.map(channel => applyGradePrep(channel, gradeParams));
+                    rgb = applyRgbVibrance(rgb, gradeParams);
+                    rgb = applyRgbSaturation(rgb, gradeParams);
+                    rgb = rgb.map(channel => applyGradeCurve(channel, gradeParams));
                 }
 
-                return `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)}) ${frac * 100}%`;
+                return `rgb(${Math.round(rgb[0] * 255)}, ${Math.round(rgb[1] * 255)}, ${Math.round(rgb[2] * 255)}) ${frac * 100}%`;
             }).join(', ');
 
             rampEl.style.background = `linear-gradient(to right, ${stops})`;
@@ -596,6 +643,10 @@
             const gradeHighlightBreak = document.getElementById('ghb');
             if (gradeHighlightBreak) {
                 gradeHighlightBreak.value = Math.max(getValue('db'), getValue('ghb'));
+            }
+            const gradeWhitePoint = document.getElementById('wp');
+            if (gradeWhitePoint) {
+                gradeWhitePoint.value = Math.min(1.0, Math.max(getValue('bp') + 0.01, getValue('wp')));
             }
 
             updateLabels();

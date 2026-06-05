@@ -40,7 +40,7 @@ LAND_DEFAULT_GRADE_HIGHLIGHT_SLOPE = 1.7
 
 FloatArray = NDArray[np.float32]
 Hemisphere = Literal["north", "south"]
-GRADE_CONTROL_IDS = ("exp", "gamma", "shoulder", "sat", "db", "ghb", "ls", "gms", "ghs")
+GRADE_CONTROL_IDS = ("exp", "gamma", "shoulder", "sat", "vib", "bp", "wp", "db", "ghb", "ls", "gms", "ghs")
 
 
 @dataclass(frozen=True)
@@ -452,6 +452,9 @@ def get_mode_defaults(mode: str) -> dict[str, float]:
             "gamma": ocean.OCEAN_DEFAULT_GAMMA,
             "shoulder": ocean.OCEAN_DEFAULT_SHOULDER,
             "sat": ocean.OCEAN_DEFAULT_SATURATION,
+            "vib": tiler.DEFAULT_VIBRANCE,
+            "bp": tiler.DEFAULT_BLACK_POINT,
+            "wp": tiler.DEFAULT_WHITE_POINT,
             "dmin": -11000.0,
             "dmax": 0.0,
         }
@@ -470,6 +473,9 @@ def get_mode_defaults(mode: str) -> dict[str, float]:
         "gamma": LAND_DEFAULT_GAMMA,
         "shoulder": LAND_DEFAULT_SHOULDER,
         "sat": LAND_DEFAULT_SATURATION,
+        "vib": tiler.DEFAULT_VIBRANCE,
+        "bp": tiler.DEFAULT_BLACK_POINT,
+        "wp": tiler.DEFAULT_WHITE_POINT,
         "blend": 0.0,
     }
     params.update(
@@ -496,6 +502,9 @@ def get_neutral_grade_values() -> dict[str, float]:
         "gamma": 1.0,
         "shoulder": 1.0,
         "sat": 1.0,
+        "vib": 1.0,
+        "bp": 0.0,
+        "wp": 1.0,
         "db": 0.0,
         "ghb": 1.0,
         "ls": 1.0,
@@ -749,6 +758,9 @@ def get_preview_output(
             tiler.apply_preview_correction_numpy(
                 toned,
                 saturation=params["sat"],
+                vibrance=params["vib"],
+                black_point=params["bp"],
+                white_point=params["wp"],
                 darken_break=params["db"],
                 low_slope=params["ls"],
                 gamma=params["gamma"],
@@ -775,6 +787,9 @@ def get_preview_output(
                 gamma=params["gamma"],
                 shoulder=params["shoulder"],
                 saturation=params["sat"],
+                vibrance=params["vib"],
+                black_point=params["bp"],
+                white_point=params["wp"],
                 black_break=params["db"],
                 black_slope=params["ls"],
                 grade_high_break=params["ghb"],

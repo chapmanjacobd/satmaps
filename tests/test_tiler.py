@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tiler as tiler_module
 from tiler import (
+    DEFAULT_BLACK_POINT,
+    DEFAULT_WHITE_POINT,
     WEB_MERCATOR_LIMIT,
     apply_preview_correction_numpy,
     apply_soft_knee_numpy,
@@ -244,6 +246,9 @@ def test_apply_preview_correction_numpy_neutral_controls_return_identity() -> No
     corrected = apply_preview_correction_numpy(
         rgb,
         saturation=1.0,
+        vibrance=1.0,
+        black_point=0.0,
+        white_point=1.0,
         darken_break=0.0,
         low_slope=1.0,
         gamma=1.0,
@@ -262,6 +267,9 @@ def test_apply_preview_correction_numpy_supports_three_grade_regions() -> None:
     corrected = apply_preview_correction_numpy(
         rgb,
         saturation=1.0,
+        vibrance=1.0,
+        black_point=0.0,
+        white_point=1.0,
         darken_break=0.25,
         low_slope=0.5,
         gamma=1.0,
@@ -287,6 +295,9 @@ def test_apply_preview_correction_numpy_unit_slopes_ignore_break_positions() -> 
     corrected = apply_preview_correction_numpy(
         rgb,
         saturation=1.0,
+        vibrance=1.0,
+        black_point=0.0,
+        white_point=1.0,
         darken_break=0.25,
         low_slope=1.0,
         gamma=1.0,
@@ -304,6 +315,9 @@ def test_apply_preview_correction_numpy_supports_highlight_shoulder() -> None:
     corrected = apply_preview_correction_numpy(
         rgb,
         saturation=1.0,
+        vibrance=1.0,
+        black_point=0.0,
+        white_point=1.0,
         darken_break=0.25,
         low_slope=1.0,
         gamma=1.0,
@@ -323,6 +337,9 @@ def test_apply_preview_correction_numpy_derives_highlight_slope_from_breaks() ->
     corrected = apply_preview_correction_numpy(
         rgb,
         saturation=1.0,
+        vibrance=1.0,
+        black_point=0.0,
+        white_point=1.0,
         darken_break=0.2,
         low_slope=0.25,
         gamma=1.0,
@@ -332,6 +349,81 @@ def test_apply_preview_correction_numpy_derives_highlight_slope_from_breaks() ->
 
     expected = np.array([[[1.0]], [[1.0]], [[1.0]]], dtype=np.float32)
     np.testing.assert_allclose(corrected, expected, atol=1e-5)
+
+
+def test_apply_preview_correction_numpy_black_white_points_rescale_channels() -> None:
+    rgb = np.array([[[0.1, 0.25, 0.75]]] * 3, dtype=np.float32)
+
+    corrected = apply_preview_correction_numpy(
+        rgb,
+        saturation=1.0,
+        vibrance=1.0,
+        black_point=0.25,
+        white_point=0.75,
+        darken_break=0.0,
+        low_slope=1.0,
+        gamma=1.0,
+        shoulder=1.0,
+        highlight_break=1.0,
+        mid_slope=1.0,
+        high_slope=1.0,
+    )
+
+    expected = np.array([[[0.0, 0.0, 1.0]]] * 3, dtype=np.float32)
+    np.testing.assert_allclose(corrected, expected, atol=1e-5)
+
+
+def test_apply_preview_correction_numpy_rejects_invalid_black_white_points() -> None:
+    rgb = np.array([[[0.5]], [[0.5]], [[0.5]]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="white_point must be greater than black_point"):
+        apply_preview_correction_numpy(
+            rgb,
+            saturation=1.0,
+            vibrance=1.0,
+            black_point=0.5,
+            white_point=0.5,
+            darken_break=0.0,
+            low_slope=1.0,
+            gamma=1.0,
+            shoulder=1.0,
+            highlight_break=1.0,
+            mid_slope=1.0,
+            high_slope=1.0,
+        )
+
+
+def test_apply_preview_correction_numpy_vibrance_boosts_muted_colors_more_than_vivid() -> None:
+    rgb = np.array(
+        [
+            [[0.55, 0.7]],
+            [[0.45, 0.3]],
+            [[0.5, 0.1]],
+        ],
+        dtype=np.float32,
+    )
+
+    corrected = apply_preview_correction_numpy(
+        rgb,
+        saturation=1.0,
+        vibrance=1.5,
+        black_point=DEFAULT_BLACK_POINT,
+        white_point=DEFAULT_WHITE_POINT,
+        darken_break=0.0,
+        low_slope=1.0,
+        gamma=1.0,
+        shoulder=1.0,
+        highlight_break=1.0,
+        mid_slope=1.0,
+        high_slope=1.0,
+    )
+
+    muted_before = float(np.max(rgb[:, 0, 0]) - np.min(rgb[:, 0, 0]))
+    muted_after = float(np.max(corrected[:, 0, 0]) - np.min(corrected[:, 0, 0]))
+    vivid_before = float(np.max(rgb[:, 0, 1]) - np.min(rgb[:, 0, 1]))
+    vivid_after = float(np.max(corrected[:, 0, 1]) - np.min(corrected[:, 0, 1]))
+
+    assert (muted_after / muted_before) > (vivid_after / vivid_before)
 
 
 def test_encode_terrarium_numpy_round_trips_elevations() -> None:
