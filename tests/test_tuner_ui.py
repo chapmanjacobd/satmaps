@@ -3,6 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import satmaps
 import tuner_ui
 
 
@@ -31,6 +32,16 @@ def test_find_land_samples_uses_requested_location(tmp_path: Path) -> None:
     assert [sample.date_label for sample in samples] == ["2025-07-01", "2025-01-01"]
     assert samples[0].paths["red"].endswith("06VUN_0_0_B04.tif")
     assert all("31TDF_0_0" not in path for sample in samples for path in sample.paths.values())
+
+
+def test_get_land_samples_reads_cache_live(tmp_path: Path) -> None:
+    assert tuner_ui.get_land_samples("barcelona", tmp_path) == ()
+
+    _create_sample(tmp_path, "2025-07-01", "31TDF_0_0")
+
+    samples = tuner_ui.get_land_samples("barcelona", tmp_path)
+
+    assert [sample.date_label for sample in samples] == ["2025-07-01"]
 
 
 def test_land_locations_include_global_presets() -> None:
@@ -134,6 +145,21 @@ def test_index_exposes_shoulder_control() -> None:
     assert "--shoulder" in html
 
 
+def test_index_shows_sample_download_hint_when_cache_is_empty(monkeypatch: object) -> None:
+    client = tuner_ui.app.test_client()
+    monkeypatch.setattr(
+        tuner_ui,
+        "find_land_samples",
+        lambda location, cache_root=tuner_ui.LAND_CACHE_ROOT: (),
+    )
+
+    response = client.get("/")
+
+    html = response.get_data(as_text=True)
+    assert "satmaps-tuner --download-samples" in html
+    assert "then refresh" in html
+
+
 def test_index_preserves_land_controls_when_switching_locations() -> None:
     client = tuner_ui.app.test_client()
 
@@ -160,6 +186,81 @@ def test_get_land_blend_mode_defaults_to_crossfade() -> None:
     blend_mode = tuner_ui.get_land_blend_mode(None)
 
     assert blend_mode.id == "crossfade"
+
+
+def test_download_configured_land_samples_uses_satmaps_helpers(monkeypatch: object) -> None:
+    setup_calls: list[bool] = []
+    download_calls: list[tuple[tuple[satmaps.LandWorkUnit, ...], list[str], str, int]] = []
+
+    monkeypatch.setattr(satmaps, "DEFAULT_DATE_PATHS", "2025/07/01,2025/01/01")
+    monkeypatch.setattr(satmaps, "setup_gdal_cdse", lambda: setup_calls.append(True))
+    monkeypatch.setattr(
+        satmaps,
+        "download_source_tiles_to_cache",
+        lambda work_units, date_paths, cache_dir, parallel: (
+            download_calls.append((tuple(work_units), list(date_paths), cache_dir, parallel)) or 5
+        ),
+    )
+
+    downloaded = tuner_ui.download_configured_land_samples(cache_dir=".cache", parallel=7)
+
+    assert downloaded == 5
+    assert setup_calls == [True]
+    captured_units, captured_dates, cache_dir, parallel = download_calls[0]
+    assert [work_unit.unit_id for work_unit in captured_units] == list(tuner_ui.get_land_sample_tile_prefixes())
+    assert all(work_unit.source_subtiles == (work_unit.unit_id,) for work_unit in captured_units)
+    assert captured_dates == ["2025/07/01", "2025/01/01"]
+    assert cache_dir == ".cache"
+    assert parallel == 7
+
+
+def test_download_configured_land_samples_raises_when_nothing_is_downloaded(monkeypatch: object) -> None:
+    monkeypatch.setattr(satmaps, "DEFAULT_DATE_PATHS", "2025/07/01")
+    monkeypatch.setattr(satmaps, "setup_gdal_cdse", lambda: None)
+    monkeypatch.setattr(satmaps, "download_source_tiles_to_cache", lambda *args, **kwargs: 0)
+
+    try:
+        tuner_ui.download_configured_land_samples()
+    except RuntimeError as exc:
+        assert "No source tiles were downloaded into .cache" in str(exc)
+    else:
+        raise AssertionError("expected download_configured_land_samples to raise RuntimeError")
+
+
+def test_main_download_samples_downloads_and_exits(monkeypatch: object, capsys: object) -> None:
+    called: dict[str, object] = {}
+
+    def fake_download_configured_land_samples(
+        *,
+        date_arg: str | None = None,
+        cache_dir: str = ".cache",
+        parallel: int = tuner_ui.DEFAULT_SAMPLE_DOWNLOAD_PARALLEL,
+    ) -> int:
+        called.update(
+            {
+                "date_arg": date_arg,
+                "cache_dir": cache_dir,
+                "parallel": parallel,
+            }
+        )
+        return 5
+
+    monkeypatch.setattr(tuner_ui, "download_configured_land_samples", fake_download_configured_land_samples)
+    monkeypatch.setattr(tuner_ui.app, "run", lambda **kwargs: (_ for _ in ()).throw(AssertionError("unexpected app.run")))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tuner_ui.py", "--download-samples", "--date", "2025/10/01,2025/07/01", "--parallel", "3"],
+    )
+
+    tuner_ui.main()
+
+    assert called == {
+        "date_arg": "2025/10/01,2025/07/01",
+        "cache_dir": ".cache",
+        "parallel": 3,
+    }
+    assert "Download complete. Cached 5 folder(s) for the tuner." in capsys.readouterr().out
 
 
 def test_blend_land_samples_supports_all_requested_modes() -> None:

@@ -1,6 +1,7 @@
+import argparse
 import io
-from functools import lru_cache
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import cast
 
@@ -23,6 +24,7 @@ LAND_SAMPLE_LIMIT = 2
 LAND_SAMPLE_CROP_SIZE = 1024
 LAND_SAMPLE_DEFAULT_OFF_X = 2000
 LAND_SAMPLE_DEFAULT_OFF_Y = 2000
+DEFAULT_SAMPLE_DOWNLOAD_PARALLEL = 12
 LAND_SAMPLE_MIN = 0.0
 LAND_SAMPLE_MAX = 9000.0
 LAND_DEFAULT_EXPOSURE = 2.5
@@ -207,6 +209,50 @@ def find_land_samples(
     return tuple(samples)
 
 
+def get_land_samples(
+    location_id: str,
+    cache_root: Path = LAND_CACHE_ROOT,
+) -> tuple[LandSample, ...]:
+    return find_land_samples(get_land_location(location_id), cache_root)
+
+
+def get_land_sample_tile_prefixes() -> tuple[str, ...]:
+    prefixes: list[str] = []
+    seen: set[str] = set()
+    for location in LAND_LOCATIONS:
+        if location.tile_prefix in seen:
+            continue
+        seen.add(location.tile_prefix)
+        prefixes.append(location.tile_prefix)
+    return tuple(prefixes)
+
+
+def download_configured_land_samples(
+    *,
+    date_arg: str | None = None,
+    cache_dir: str = str(LAND_CACHE_ROOT),
+    parallel: int = DEFAULT_SAMPLE_DOWNLOAD_PARALLEL,
+) -> int:
+    import satmaps
+
+    date_value = satmaps.DEFAULT_DATE_PATHS if date_arg is None else date_arg
+    date_paths = [date_path.strip() for date_path in date_value.split(",") if date_path.strip()]
+    if not date_paths:
+        raise ValueError("Expected at least one date path for tuner sample downloads.")
+
+    satmaps.setup_gdal_cdse()
+    work_units = tuple(
+        satmaps.LandWorkUnit(unit_id=tile_prefix, source_subtiles=(tile_prefix,))
+        for tile_prefix in get_land_sample_tile_prefixes()
+    )
+    downloaded = satmaps.download_source_tiles_to_cache(work_units, date_paths, cache_dir, parallel)
+    if downloaded <= 0:
+        raise RuntimeError(
+            f"No source tiles were downloaded into {cache_dir}. Check the requested dates and CDSE access."
+        )
+    return downloaded
+
+
 def clamp_unit(value: float) -> float:
     return float(np.clip(value, 0.0, 1.0))
 
@@ -237,11 +283,6 @@ def build_land_view(
     )
 
 
-LAND_SAMPLE_SOURCES = {
-    location.id: find_land_samples(location) for location in LAND_LOCATIONS
-}
-
-
 @lru_cache(maxsize=64)
 def get_raster_size(path: str) -> tuple[int, int]:
     ds = gdal.Open(path)
@@ -253,7 +294,7 @@ def get_raster_size(path: str) -> tuple[int, int]:
 
 
 def get_land_view(location_id: str, pan_x: float | None = None, pan_y: float | None = None) -> LandView:
-    land_samples = LAND_SAMPLE_SOURCES[location_id]
+    land_samples = get_land_samples(location_id)
     if not land_samples:
         return build_land_view(LAND_SAMPLE_CROP_SIZE, LAND_SAMPLE_CROP_SIZE, pan_x, pan_y)
     widths: list[int] = []
@@ -423,7 +464,7 @@ def get_cropped_land_samples(location_id: str, land_view: LandView) -> tuple[Flo
             land_view.crop_width,
             land_view.crop_height,
         )
-        for sample in LAND_SAMPLE_SOURCES[location_id]
+        for sample in get_land_samples(location_id)
     )
 
 
@@ -511,7 +552,7 @@ def index() -> ResponseReturnValue:
 
     fg_on = request.args.get("fg", "1") == "1"
     land_location = get_land_location(request.args.get("loc"))
-    land_samples = LAND_SAMPLE_SOURCES[land_location.id]
+    land_samples = get_land_samples(land_location.id)
     land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
         land_location.id,
@@ -660,6 +701,41 @@ def render() -> ResponseReturnValue:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Start the satmaps style tuner or download its configured sample tiles."
+    )
+    parser.add_argument(
+        "--download-samples",
+        action="store_true",
+        help="Download the configured tuner land sample tiles into the cache and exit",
+    )
+    parser.add_argument(
+        "--date",
+        default=None,
+        help="Mosaic date(s), comma-separated. Only used with --download-samples.",
+    )
+    parser.add_argument(
+        "--cache",
+        default=str(LAND_CACHE_ROOT),
+        help="Cache directory for tuner sample downloads (default: .cache).",
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=DEFAULT_SAMPLE_DOWNLOAD_PARALLEL,
+        help="Parallel sample downloads to run with --download-samples.",
+    )
+    args = parser.parse_args()
+
+    if args.download_samples:
+        downloaded = download_configured_land_samples(
+            date_arg=args.date,
+            cache_dir=args.cache,
+            parallel=args.parallel,
+        )
+        print(f"Download complete. Cached {downloaded} folder(s) for the tuner.")
+        return
+
     app.run(debug=True, port=5001)
 
 

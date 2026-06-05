@@ -52,6 +52,7 @@ DATE_PATH_QUARTERS = (
     ("01/01", "Q1"),
 )
 RGB_BANDS = (("B04", "red"), ("B03", "green"), ("B02", "blue"))
+DEFAULT_DATE_PATHS = "2025/07/01,2025/01/01"
 DEFAULT_CANDIDATE_FOOTPRINT_BAND_ID = "B04"
 SUBTILE_OFFSETS = ((0, 0), (0, 1), (1, 0), (1, 1))
 SENTINEL_NODATA = -32768
@@ -4170,7 +4171,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--date",
-        default="2025/07/01,2025/01/01",
+        default=DEFAULT_DATE_PATHS,
         help=(
             "Mosaic date(s), comma-separated. With two dates, the first is blended north "
             "of the equator and the second south of it; --winter swaps the hemispheres."

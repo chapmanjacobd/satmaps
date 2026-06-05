@@ -81,7 +81,7 @@
             {% elif land_dates %}
             <p class="note">Loaded land sample date: <strong>{{ land_dates[0] }}</strong></p>
             {% else %}
-            <p class="note">No cached {{ selected_land_location.name }} sample tile was found under <code>.cache/</code>.</p>
+            <p class="note">No cached {{ selected_land_location.name }} sample tile was found under <code>.cache/</code>. Run <code>satmaps-tuner --download-samples</code> to fetch the configured sample tiles, then refresh.</p>
             {% endif %}
             {% if land_dates %}
             <div class="slider-group">

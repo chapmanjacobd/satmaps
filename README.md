@@ -45,7 +45,15 @@ Before a large run, use the Tuner UI to find the best visual parameters:
 ```bash
 satmaps-tuner
 ```
-Visit `http://localhost:5001` to adjust exposure, soft-knee curves, and saturation. Note: Requires some data in `.cache/2025-07-01` (e.g., from a small `satmaps` run).
+Visit `http://localhost:5001` to adjust exposure, soft-knee curves, and saturation.
+
+If the tuner reports missing cached sample tiles, fetch the built-in sample set first:
+
+```bash
+satmaps-tuner --download-samples
+```
+
+You can also target different mosaic dates, for example `satmaps-tuner --download-samples --date 2025/10/01,2025/07/01`.
 
 ### 2. Prepare `land_mgrs.list`
 
