@@ -4240,7 +4240,7 @@ def main() -> None:
         help="Highlight shaping curve; values above 1 lift the top end",
     )
     parser.add_argument(
-        "--sat", "--saturation", type=float, default=0.9
+        "--sat", "--saturation", type=float, default=1.0
     )
     parser.add_argument("--vibrance", type=float, default=tiler.DEFAULT_VIBRANCE)
     parser.add_argument("--black-point", type=float, default=tiler.DEFAULT_BLACK_POINT)
