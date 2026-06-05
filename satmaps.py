@@ -677,6 +677,7 @@ def build_land_run_token(
             "ghb": args.ghb,
             "gms": args.gms,
             "ghs": args.ghs,
+            "hdr_highlights": getattr(args, "hdr_highlights", False),
             "winter": getattr(args, "winter", False),
             "full_render_first": getattr(args, "full_render_first", False),
             "ocean_mask_source": os.path.abspath(gebco_vrt_source) if gebco_vrt_source else None,
@@ -3124,42 +3125,31 @@ def tone_mapped_byte_block(
     """Return an 8-bit RGB block after normalization, tonemapping, and grading."""
     normalized = np.clip((averaged_block - source_min) / scale, 0.0, 1.0)
     normalized[np.isnan(normalized)] = 0.0
-    exposure = getattr(args, "exposure", tiler.DEFAULT_EXPOSURE)
+    styled_block = tiler.apply_land_style_numpy(
+        normalized,
+        tonemap=getattr(args, "tonemap", False),
+        grade=args.grade,
+        exposure=getattr(args, "exposure", tiler.DEFAULT_EXPOSURE),
+        shadow_break=getattr(args, "sb", tiler.SOFT_KNEE_SHADOW_BREAK),
+        highlight_break=getattr(args, "hb", tiler.SOFT_KNEE_HIGHLIGHT_BREAK),
+        shadow_slope=getattr(args, "ss", tiler.SOFT_KNEE_SHADOW_SLOPE),
+        mid_slope=getattr(args, "ms", tiler.SOFT_KNEE_MID_SLOPE),
+        highlight_slope=getattr(args, "hs", tiler.SOFT_KNEE_HIGHLIGHT_SLOPE),
+        saturation=args.sat,
+        vibrance=getattr(args, "vibrance", tiler.DEFAULT_VIBRANCE),
+        black_point=getattr(args, "black_point", tiler.DEFAULT_BLACK_POINT),
+        white_point=getattr(args, "white_point", tiler.DEFAULT_WHITE_POINT),
+        darken_break=args.db,
+        low_slope=args.ls,
+        gamma=args.gamma,
+        shoulder=getattr(args, "shoulder", tiler.DEFAULT_SHOULDER),
+        grade_highlight_break=args.ghb,
+        grade_mid_slope=args.gms,
+        grade_high_slope=args.ghs,
+        hdr_highlights=getattr(args, "hdr_highlights", False),
+    )
 
-    if getattr(args, "tonemap", False):
-        toned_block = tiler.apply_soft_knee_numpy(
-            normalized,
-            shadow_break=getattr(args, "sb", tiler.SOFT_KNEE_SHADOW_BREAK),
-            highlight_break=getattr(args, "hb", tiler.SOFT_KNEE_HIGHLIGHT_BREAK),
-            shadow_slope=getattr(args, "ss", tiler.SOFT_KNEE_SHADOW_SLOPE),
-            mid_slope=getattr(args, "ms", tiler.SOFT_KNEE_MID_SLOPE),
-            highlight_slope=getattr(args, "hs", tiler.SOFT_KNEE_HIGHLIGHT_SLOPE),
-            exposure=exposure,
-        )
-    else:
-        toned_block = (
-            normalized
-            if tiler.is_identity_value(exposure)
-            else np.clip(normalized * exposure, 0.0, 1.0)
-        )
-
-    if args.grade:
-        toned_block = tiler.apply_preview_correction_numpy(
-            toned_block,
-            saturation=args.sat,
-            vibrance=getattr(args, "vibrance", tiler.DEFAULT_VIBRANCE),
-            black_point=getattr(args, "black_point", tiler.DEFAULT_BLACK_POINT),
-            white_point=getattr(args, "white_point", tiler.DEFAULT_WHITE_POINT),
-            darken_break=args.db,
-            low_slope=args.ls,
-            gamma=args.gamma,
-            shoulder=getattr(args, "shoulder", tiler.DEFAULT_SHOULDER),
-            highlight_break=args.ghb,
-            mid_slope=args.gms,
-            high_slope=args.ghs,
-        )
-
-    return np.nan_to_num(toned_block * 255.0, nan=0.0).astype(np.uint8)
+    return np.nan_to_num(styled_block * 255.0, nan=0.0).astype(np.uint8)
 
 
 def render_land_contributor_output_tile(
@@ -4276,6 +4266,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--hdr-highlights",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Blend HDR grading into bright near-neutral land highlights to preserve snow and ice detail",
     )
     parser.add_argument(
         "--land",

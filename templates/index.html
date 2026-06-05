@@ -188,6 +188,9 @@
                 <button class="primary-btn" onclick="copyCLI(this)">Copy CLI Args</button>
                 <button class="secondary-btn" onclick="resetDefaults()">Reset</button>
             </div>
+            {% if mode == 'land' %}
+            <input type="hidden" id="hdr_highlights" value="{{ 1 if params.hdr_highlights >= 0.5 else 0 }}">
+            {% endif %}
             <div class="preset-grid">
                 {% for preset in grade_presets %}
                 <button type="button" onclick='applyGradePreset({{ preset.id | tojson }})'>{{ preset.label }}</button>
@@ -222,12 +225,13 @@
         const defaultParams = {{ defaults | tojson }};
         const gradePresets = {{ grade_presets | tojson }};
         const neutralGradeValues = {{ neutral_grade_values | tojson }};
+        const hdrHighlightCurve = {{ hdr_highlight_curve | tojson }};
         const landDates = {{ land_dates | tojson }};
         let inputHist = {{ raw_hist | tojson }};
         let finalHist = {{ final_hist | tojson }};
         const img = document.getElementById('preview');
         const gradingControls = ['exp', 'gamma', 'shoulder', 'sat', 'vib', 'bp', 'wp', 'db', 'ghb', 'ls', 'gms', 'ghs'];
-        const gradePresetMap = Object.fromEntries(gradePresets.map(preset => [preset.id, preset.values]));
+        const gradePresetMap = Object.fromEntries(gradePresets.map(preset => [preset.id, preset]));
         const sharedControls = [...gradingControls];
         const landViewControls = canPanLandView ? ['panx', 'pany'] : [];
         const renderControls = currentMode === 'land'
@@ -296,6 +300,10 @@
             params.set('loc', locationId);
             landViewControls.forEach(id => params.set(id, document.getElementById(id).value));
             sharedControls.forEach(id => params.set(id, document.getElementById(id).value));
+            const hdrHighlightsInput = document.getElementById('hdr_highlights');
+            if (hdrHighlightsInput) {
+                params.set('hdr_highlights', hdrHighlightsInput.value);
+            }
             if (hasLandBlend) {
                 if (includeBlend) {
                     params.set('blend', document.getElementById('blend').value);
@@ -319,6 +327,18 @@
 
         function getBlendMode() {
             return hasLandBlend ? document.getElementById('blend_mode').value : defaultLandBlendMode;
+        }
+
+        function getHdrHighlightsEnabled() {
+            const hdrHighlightsInput = document.getElementById('hdr_highlights');
+            return hdrHighlightsInput ? hdrHighlightsInput.value === '1' : false;
+        }
+
+        function setHdrHighlightsEnabled(enabled) {
+            const hdrHighlightsInput = document.getElementById('hdr_highlights');
+            if (hdrHighlightsInput) {
+                hdrHighlightsInput.value = enabled ? '1' : '0';
+            }
         }
 
         function formatValue(id, value) {
@@ -469,6 +489,18 @@
             return applyGradeCurve(applyGradePrep(x, p), p);
         }
 
+        function getHdrReferenceGradeParams() {
+            const hdrPreset = gradePresetMap['hdr'];
+            return hdrPreset ? hdrPreset.values : null;
+        }
+
+        function getHdrHighlightBlendWeight(x) {
+            if (hdrHighlightCurve.luma_end <= hdrHighlightCurve.luma_start) return 0.0;
+            const normalized = (x - hdrHighlightCurve.luma_start) / (hdrHighlightCurve.luma_end - hdrHighlightCurve.luma_start);
+            const clipped = Math.min(1.0, Math.max(0.0, normalized));
+            return clipped * clipped * (3.0 - (2.0 * clipped));
+        }
+
         function applyRgbVibrance(rgb, p) {
             if (p.vib === 1.0) return rgb;
             const luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
@@ -491,7 +523,17 @@
             for (let i = 0; i <= 256; i += 2) {
                 const x = i / 256;
                 const exposed = Math.min(1.0, x * p.exp);
-                const y = 1.0 - (fgOn ? applyScalarGrading(exposed, p) : exposed);
+                let output = fgOn ? applyScalarGrading(exposed, p) : exposed;
+                if (fgOn && currentMode === 'land' && getHdrHighlightsEnabled()) {
+                    const hdrRef = getHdrReferenceGradeParams();
+                    if (hdrRef) {
+                        const hdrExposed = Math.min(1.0, x * hdrRef.exp);
+                        const blendWeight = getHdrHighlightBlendWeight(exposed);
+                        const hdrOutput = applyScalarGrading(hdrExposed, hdrRef);
+                        output = output + ((hdrOutput - output) * blendWeight);
+                    }
+                }
+                const y = 1.0 - output;
                 d += (i === 0 ? 'M' : 'L') + ` ${i} ${y * 128} `;
             }
             path.setAttribute('d', d);
@@ -673,6 +715,7 @@
                 document.getElementById('blend_mode').value = defaultLandBlendMode;
                 document.getElementById('blend').value = getSeasonalBlendForMode(defaultLandBlendMode);
             }
+            setHdrHighlightsEnabled(false);
             update();
         }
 
@@ -680,13 +723,12 @@
             const preset = gradePresetMap[presetId];
             if (!preset) return;
             gradingControls.forEach(id => {
-                if (preset[id] !== undefined) {
-                    document.getElementById(id).value = preset[id];
+                if (preset.values[id] !== undefined) {
+                    document.getElementById(id).value = preset.values[id];
                 }
             });
-            if (currentMode === 'land' && hasLandBlend && preset.blend_mode !== undefined) {
-                document.getElementById('blend_mode').value = preset.blend_mode;
-            }
+            setHdrHighlightsEnabled(Boolean(preset.hdr_highlights));
+
             document.getElementById('fg_on').checked = true;
             update();
         }
@@ -698,6 +740,9 @@
             });
             if (currentMode === 'land' && getBlendMode() === 'winter') {
                 args.push('--winter');
+            }
+            if (currentMode === 'land' && getHdrHighlightsEnabled()) {
+                args.push('--hdr-highlights');
             }
 
             navigator.clipboard.writeText(args.join(' ')).then(() => {

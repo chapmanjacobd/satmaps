@@ -161,11 +161,12 @@ def test_get_grade_presets_returns_mode_specific_values() -> None:
     land_presets = tuner_ui.get_grade_presets("land")
     ocean_presets = tuner_ui.get_grade_presets("ocean")
 
-    assert [preset["id"] for preset in land_presets] == ["balanced", "punchy", "minimal", "hdr"]
+    assert [preset["id"] for preset in land_presets] == ["balanced", "balanced-hdr", "punchy", "minimal", "hdr"]
     assert [preset["id"] for preset in ocean_presets] == ["balanced", "punchy", "muted", "glow"]
     assert land_presets[0]["values"] == tuner_ui.build_grade_preset_values(tuner_ui.get_mode_defaults("land"))
     assert ocean_presets[0]["values"] == tuner_ui.build_grade_preset_values(tuner_ui.get_mode_defaults("ocean"))
-    assert land_presets[2]["values"] == tuner_ui.build_grade_preset_values(
+    assert land_presets[1]["hdr_highlights"] is True
+    assert land_presets[3]["values"] == tuner_ui.build_grade_preset_values(
         tuner_ui.get_mode_defaults("land"),
         exp=1.0,
         gamma=2.8,
@@ -180,21 +181,20 @@ def test_get_grade_presets_returns_mode_specific_values() -> None:
         gms=1.05,
         ghs=1.0,
     )
-    assert land_presets[3]["blend_mode"] == "winter"
-    assert land_presets[3]["values"] == tuner_ui.build_grade_preset_values(
+    assert land_presets[4]["values"] == tuner_ui.build_grade_preset_values(
         tuner_ui.get_mode_defaults("land"),
-        exp=0.94,
-        gamma=2.82,
-        shoulder=0.5,
-        sat=1.0,
-        vib=1.14,
-        bp=0.011,
-        wp=0.996,
-        db=0.0,
-        ghb=1.0,
-        ls=1.0,
-        gms=1.0,
-        ghs=1.0,
+        exp=tuner_ui.tiler.LAND_HDR_REFERENCE_EXPOSURE,
+        gamma=tuner_ui.tiler.LAND_HDR_REFERENCE_GAMMA,
+        shoulder=tuner_ui.tiler.LAND_HDR_REFERENCE_SHOULDER,
+        sat=tuner_ui.tiler.LAND_HDR_REFERENCE_SATURATION,
+        vib=tuner_ui.tiler.LAND_HDR_REFERENCE_VIBRANCE,
+        bp=tuner_ui.tiler.LAND_HDR_REFERENCE_BLACK_POINT,
+        wp=tuner_ui.tiler.LAND_HDR_REFERENCE_WHITE_POINT,
+        db=tuner_ui.tiler.LAND_HDR_REFERENCE_GRADE_LOW_BREAK,
+        ghb=tuner_ui.tiler.LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_BREAK,
+        ls=tuner_ui.tiler.LAND_HDR_REFERENCE_GRADE_LOW_SLOPE,
+        gms=tuner_ui.tiler.LAND_HDR_REFERENCE_GRADE_MID_SLOPE,
+        ghs=tuner_ui.tiler.LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_SLOPE,
     )
 
 
@@ -285,9 +285,14 @@ def test_index_exposes_shoulder_control() -> None:
     assert "Balanced" in html
     assert "Punchy" in html
     assert "Minimal" in html
+    assert "Balanced + HDR" in html
     assert "HDR" in html
     assert "Summer" in html
     assert "Winter" in html
+    assert 'id="hdr_highlights"' in html
+    assert "const gradePresetMap = Object.fromEntries(gradePresets.map(preset => [preset.id, preset]));" in html
+    assert "setHdrHighlightsEnabled(Boolean(preset.hdr_highlights));" in html
+    assert "args.push('--hdr-highlights');" in html
 
 
 def test_index_sets_up_histogram_hold_preview() -> None:

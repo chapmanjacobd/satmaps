@@ -43,6 +43,22 @@ DEFAULT_WHITE_POINT = 1.0
 IDENTITY_VALUE_TOLERANCE = 1e-9
 TERRARIUM_OFFSET = 32768.0
 TERRARIUM_MAX_VALUE = 65535.99609375
+LAND_HDR_REFERENCE_EXPOSURE = 0.94
+LAND_HDR_REFERENCE_GAMMA = 2.82
+LAND_HDR_REFERENCE_SHOULDER = 0.5
+LAND_HDR_REFERENCE_SATURATION = 1.0
+LAND_HDR_REFERENCE_VIBRANCE = 1.14
+LAND_HDR_REFERENCE_BLACK_POINT = 0.011
+LAND_HDR_REFERENCE_WHITE_POINT = 0.996
+LAND_HDR_REFERENCE_GRADE_LOW_BREAK = 0.0
+LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_BREAK = 1.0
+LAND_HDR_REFERENCE_GRADE_LOW_SLOPE = 1.0
+LAND_HDR_REFERENCE_GRADE_MID_SLOPE = 1.0
+LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_SLOPE = 1.0
+LAND_HDR_HIGHLIGHT_LUMA_START = 0.72
+LAND_HDR_HIGHLIGHT_LUMA_END = 0.92
+LAND_HDR_HIGHLIGHT_NEUTRALITY_START = 0.55
+LAND_HDR_HIGHLIGHT_NEUTRALITY_END = 0.9
 
 MAKO_RAMP = [
     (0.00, 0, 8, 37),
@@ -153,6 +169,12 @@ def colorize_depth_numpy(
     b = np.interp(frac, ramp_fracs, ramp_colors[:, 2]).astype(np.float32, copy=False)
 
     return np.stack([r, g, b]).astype(np.float32, copy=False)
+
+
+def smoothstep_numpy(values: np.ndarray) -> np.ndarray:
+    """Clamp to [0, 1] and ease with a cubic smoothstep."""
+    clipped = np.clip(values, 0.0, 1.0)
+    return cast(np.ndarray, clipped * clipped * (3.0 - (2.0 * clipped)))
 
 
 def apply_soft_knee_numpy(
@@ -328,6 +350,62 @@ def apply_vibrance_numpy(
     )
 
 
+def apply_land_tonemap_numpy(
+    rgb_arr: np.ndarray,
+    *,
+    tonemap: bool,
+    shadow_break: float = SOFT_KNEE_SHADOW_BREAK,
+    highlight_break: float = SOFT_KNEE_HIGHLIGHT_BREAK,
+    shadow_slope: float = SOFT_KNEE_SHADOW_SLOPE,
+    mid_slope: float = SOFT_KNEE_MID_SLOPE,
+    highlight_slope: float = SOFT_KNEE_HIGHLIGHT_SLOPE,
+    exposure: float = DEFAULT_EXPOSURE,
+) -> np.ndarray:
+    """Apply the land exposure/tonemap stage to normalized RGB data."""
+    clipped = cast(np.ndarray, np.clip(rgb_arr, 0.0, 1.0))
+    if tonemap:
+        return apply_soft_knee_numpy(
+            clipped,
+            shadow_break=shadow_break,
+            highlight_break=highlight_break,
+            shadow_slope=shadow_slope,
+            mid_slope=mid_slope,
+            highlight_slope=highlight_slope,
+            exposure=exposure,
+        )
+    if is_identity_value(exposure):
+        return clipped
+    return np.clip(clipped * exposure, 0.0, 1.0)
+
+
+def build_hdr_highlight_blend_weight_numpy(
+    rgb_arr: np.ndarray,
+    *,
+    luma_start: float = LAND_HDR_HIGHLIGHT_LUMA_START,
+    luma_end: float = LAND_HDR_HIGHLIGHT_LUMA_END,
+    neutrality_start: float = LAND_HDR_HIGHLIGHT_NEUTRALITY_START,
+    neutrality_end: float = LAND_HDR_HIGHLIGHT_NEUTRALITY_END,
+) -> np.ndarray:
+    """Return per-pixel blend weights for bright near-neutral highlights such as snow and ice."""
+    if luma_end <= luma_start:
+        raise ValueError("luma_end must be greater than luma_start")
+    if neutrality_end <= neutrality_start:
+        raise ValueError("neutrality_end must be greater than neutrality_start")
+
+    clipped = cast(np.ndarray, np.clip(rgb_arr, 0.0, 1.0))
+    luma = LUMA_RED * clipped[0] + LUMA_GREEN * clipped[1] + LUMA_BLUE * clipped[2]
+    chroma_spread = np.max(clipped, axis=0) - np.min(clipped, axis=0)
+    neutrality = 1.0 - chroma_spread
+    luma_weight = smoothstep_numpy((luma - luma_start) / (luma_end - luma_start))
+    neutrality_weight = smoothstep_numpy(
+        (neutrality - neutrality_start) / (neutrality_end - neutrality_start)
+    )
+    return cast(
+        np.ndarray,
+        np.clip(luma_weight * neutrality_weight, 0.0, 1.0).astype(np.float32, copy=False),
+    )
+
+
 def apply_preview_correction_numpy(
     rgb_arr: np.ndarray,
     saturation: float = PREVIEW_SATURATION,
@@ -406,6 +484,99 @@ def apply_preview_correction_numpy(
         shadow_slope=low_slope,
         mid_slope=mid_slope,
         highlight_slope=resolved_high_slope,
+    )
+
+
+def apply_land_style_numpy(
+    rgb_arr: np.ndarray,
+    *,
+    tonemap: bool,
+    grade: bool,
+    exposure: float = DEFAULT_EXPOSURE,
+    shadow_break: float = SOFT_KNEE_SHADOW_BREAK,
+    highlight_break: float = SOFT_KNEE_HIGHLIGHT_BREAK,
+    shadow_slope: float = SOFT_KNEE_SHADOW_SLOPE,
+    mid_slope: float = SOFT_KNEE_MID_SLOPE,
+    highlight_slope: float = SOFT_KNEE_HIGHLIGHT_SLOPE,
+    saturation: float = PREVIEW_SATURATION,
+    vibrance: float = DEFAULT_VIBRANCE,
+    black_point: float = DEFAULT_BLACK_POINT,
+    white_point: float = DEFAULT_WHITE_POINT,
+    darken_break: float = PREVIEW_DARKEN_BREAK,
+    low_slope: float = PREVIEW_DARKEN_LOW_SLOPE,
+    gamma: float = DEFAULT_GAMMA,
+    shoulder: float = DEFAULT_SHOULDER,
+    grade_highlight_break: float | None = None,
+    grade_mid_slope: float = PREVIEW_DARKEN_MID_SLOPE,
+    grade_high_slope: float | None = None,
+    hdr_highlights: bool = False,
+) -> np.ndarray:
+    """Apply the full land styling pipeline, optionally blending HDR handling into bright white highlights."""
+    toned = apply_land_tonemap_numpy(
+        rgb_arr,
+        tonemap=tonemap,
+        shadow_break=shadow_break,
+        highlight_break=highlight_break,
+        shadow_slope=shadow_slope,
+        mid_slope=mid_slope,
+        highlight_slope=highlight_slope,
+        exposure=exposure,
+    )
+    if not grade:
+        return toned
+
+    base_graded = apply_preview_correction_numpy(
+        toned,
+        saturation=saturation,
+        vibrance=vibrance,
+        black_point=black_point,
+        white_point=white_point,
+        darken_break=darken_break,
+        low_slope=low_slope,
+        gamma=gamma,
+        shoulder=shoulder,
+        highlight_break=grade_highlight_break,
+        mid_slope=grade_mid_slope,
+        high_slope=grade_high_slope,
+    )
+    if not hdr_highlights:
+        return base_graded
+
+    hdr_weight = build_hdr_highlight_blend_weight_numpy(toned)
+    if not np.any(hdr_weight > 0.0):
+        return base_graded
+
+    hdr_toned = apply_land_tonemap_numpy(
+        rgb_arr,
+        tonemap=tonemap,
+        shadow_break=shadow_break,
+        highlight_break=highlight_break,
+        shadow_slope=shadow_slope,
+        mid_slope=mid_slope,
+        highlight_slope=highlight_slope,
+        exposure=LAND_HDR_REFERENCE_EXPOSURE,
+    )
+    hdr_graded = apply_preview_correction_numpy(
+        hdr_toned,
+        saturation=LAND_HDR_REFERENCE_SATURATION,
+        vibrance=LAND_HDR_REFERENCE_VIBRANCE,
+        black_point=LAND_HDR_REFERENCE_BLACK_POINT,
+        white_point=LAND_HDR_REFERENCE_WHITE_POINT,
+        darken_break=LAND_HDR_REFERENCE_GRADE_LOW_BREAK,
+        low_slope=LAND_HDR_REFERENCE_GRADE_LOW_SLOPE,
+        gamma=LAND_HDR_REFERENCE_GAMMA,
+        shoulder=LAND_HDR_REFERENCE_SHOULDER,
+        highlight_break=LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_BREAK,
+        mid_slope=LAND_HDR_REFERENCE_GRADE_MID_SLOPE,
+        high_slope=LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_SLOPE,
+    )
+    return cast(
+        np.ndarray,
+        np.clip(
+            base_graded + ((hdr_graded - base_graded) * np.expand_dims(hdr_weight, axis=0)),
+            0.0,
+            1.0,
+        ),
     )
 
 

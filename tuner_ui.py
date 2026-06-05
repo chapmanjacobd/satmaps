@@ -37,6 +37,7 @@ LAND_DEFAULT_GRADE_HIGHLIGHT_BREAK = 0.9
 LAND_DEFAULT_GRADE_LOW_SLOPE = 0.0
 LAND_DEFAULT_GRADE_MID_SLOPE = 1.0
 LAND_DEFAULT_GRADE_HIGHLIGHT_SLOPE = 1.7
+LAND_DEFAULT_HDR_HIGHLIGHTS = 0.0
 
 FloatArray = NDArray[np.float32]
 Hemisphere = Literal["north", "south"]
@@ -477,6 +478,7 @@ def get_mode_defaults(mode: str) -> dict[str, float]:
         "bp": tiler.DEFAULT_BLACK_POINT,
         "wp": tiler.DEFAULT_WHITE_POINT,
         "blend": 0.0,
+        "hdr_highlights": LAND_DEFAULT_HDR_HIGHLIGHTS,
     }
     params.update(
         build_grade_defaults(
@@ -570,6 +572,12 @@ def get_grade_presets(mode: str) -> tuple[dict[str, object], ...]:
     return (
         {"id": "balanced", "label": "Balanced", "values": build_grade_preset_values(defaults)},
         {
+            "id": "balanced-hdr",
+            "label": "Balanced + HDR",
+            "hdr_highlights": True,
+            "values": build_grade_preset_values(defaults),
+        },
+        {
             "id": "punchy",
             "label": "Punchy",
             "values": build_grade_preset_values(
@@ -607,21 +615,20 @@ def get_grade_presets(mode: str) -> tuple[dict[str, object], ...]:
         {
             "id": "hdr",
             "label": "HDR",
-            "blend_mode": "winter",
             "values": build_grade_preset_values(
                 defaults,
-                exp=0.94,
-                gamma=2.82,
-                shoulder=0.5,
-                sat=1.0,
-                vib=1.14,
-                bp=0.011,
-                wp=0.996,
-                db=0.0,
-                ghb=1.0,
-                ls=1.0,
-                gms=1.0,
-                ghs=1.0,
+                exp=tiler.LAND_HDR_REFERENCE_EXPOSURE,
+                gamma=tiler.LAND_HDR_REFERENCE_GAMMA,
+                shoulder=tiler.LAND_HDR_REFERENCE_SHOULDER,
+                sat=tiler.LAND_HDR_REFERENCE_SATURATION,
+                vib=tiler.LAND_HDR_REFERENCE_VIBRANCE,
+                bp=tiler.LAND_HDR_REFERENCE_BLACK_POINT,
+                wp=tiler.LAND_HDR_REFERENCE_WHITE_POINT,
+                db=tiler.LAND_HDR_REFERENCE_GRADE_LOW_BREAK,
+                ghb=tiler.LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_BREAK,
+                ls=tiler.LAND_HDR_REFERENCE_GRADE_LOW_SLOPE,
+                gms=tiler.LAND_HDR_REFERENCE_GRADE_MID_SLOPE,
+                ghs=tiler.LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_SLOPE,
             ),
         },
     )
@@ -742,28 +749,18 @@ def get_preview_output(
     if source is None:
         return None
     if mode == "land":
-        if tm_on:
-            toned = tiler.apply_soft_knee_numpy(
-                source,
-                params["sb"],
-                params["hb"],
-                params["ss"],
-                params["ms"],
-                params["hs"],
-                params["exp"],
-            )
-        else:
-            toned = (
-                source
-                if tiler.is_identity_value(params["exp"])
-                else np.clip(source * params["exp"], 0.0, 1.0)
-            )
-        if not fg_on:
-            return cast(FloatArray, toned)
         return cast(
             FloatArray,
-            tiler.apply_preview_correction_numpy(
-                toned,
+            tiler.apply_land_style_numpy(
+                source,
+                tonemap=tm_on,
+                grade=fg_on,
+                exposure=params["exp"],
+                shadow_break=params["sb"],
+                highlight_break=params["hb"],
+                shadow_slope=params["ss"],
+                mid_slope=params["ms"],
+                highlight_slope=params["hs"],
                 saturation=params["sat"],
                 vibrance=params["vib"],
                 black_point=params["bp"],
@@ -772,9 +769,10 @@ def get_preview_output(
                 low_slope=params["ls"],
                 gamma=params["gamma"],
                 shoulder=params["shoulder"],
-                highlight_break=params["ghb"],
-                mid_slope=params["gms"],
-                high_slope=params["ghs"],
+                grade_highlight_break=params["ghb"],
+                grade_mid_slope=params["gms"],
+                grade_high_slope=params["ghs"],
+                hdr_highlights=params.get("hdr_highlights", 0.0) >= 0.5,
             ),
         )
 
@@ -864,6 +862,10 @@ def index() -> ResponseReturnValue:
         neutral_grade_values=get_neutral_grade_values(),
         raw_hist=hist,
         final_hist=final_hist,
+        hdr_highlight_curve={
+            "luma_start": tiler.LAND_HDR_HIGHLIGHT_LUMA_START,
+            "luma_end": tiler.LAND_HDR_HIGHLIGHT_LUMA_END,
+        },
         land_locations=LAND_LOCATIONS,
         land_blend_modes=LAND_BLEND_MODES,
         selected_land_blend_mode=land_blend_mode,

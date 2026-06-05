@@ -13,10 +13,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tiler as tiler_module
 from tiler import (
     DEFAULT_BLACK_POINT,
+    DEFAULT_VIBRANCE,
     DEFAULT_WHITE_POINT,
+    LAND_HDR_REFERENCE_BLACK_POINT,
+    LAND_HDR_REFERENCE_EXPOSURE,
+    LAND_HDR_REFERENCE_GAMMA,
+    LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_BREAK,
+    LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_SLOPE,
+    LAND_HDR_REFERENCE_GRADE_LOW_BREAK,
+    LAND_HDR_REFERENCE_GRADE_LOW_SLOPE,
+    LAND_HDR_REFERENCE_GRADE_MID_SLOPE,
+    LAND_HDR_REFERENCE_SATURATION,
+    LAND_HDR_REFERENCE_SHOULDER,
+    LAND_HDR_REFERENCE_VIBRANCE,
+    LAND_HDR_REFERENCE_WHITE_POINT,
+    SOFT_KNEE_HIGHLIGHT_BREAK,
+    SOFT_KNEE_HIGHLIGHT_SLOPE,
+    SOFT_KNEE_MID_SLOPE,
+    SOFT_KNEE_SHADOW_BREAK,
+    SOFT_KNEE_SHADOW_SLOPE,
     WEB_MERCATOR_LIMIT,
+    apply_land_style_numpy,
     apply_preview_correction_numpy,
     apply_soft_knee_numpy,
+    build_hdr_highlight_blend_weight_numpy,
     encode_terrarium_numpy,
     get_chunk_tile_range,
     get_web_mercator_bounds,
@@ -424,6 +444,84 @@ def test_apply_preview_correction_numpy_vibrance_boosts_muted_colors_more_than_v
     vivid_after = float(np.max(corrected[:, 0, 1]) - np.min(corrected[:, 0, 1]))
 
     assert (muted_after / muted_before) > (vivid_after / vivid_before)
+
+
+def test_build_hdr_highlight_blend_weight_targets_bright_neutral_pixels() -> None:
+    rgb = np.array(
+        [
+            [[0.95, 0.3]],
+            [[0.95, 0.55]],
+            [[0.95, 0.95]],
+        ],
+        dtype=np.float32,
+    )
+
+    weights = build_hdr_highlight_blend_weight_numpy(rgb)
+
+    assert weights.shape == (1, 2)
+    assert weights[0, 0] > 0.9
+    assert weights[0, 1] < 0.1
+
+
+def test_apply_land_style_numpy_blends_hdr_only_into_snow_like_highlights() -> None:
+    source = np.array(
+        [
+            [[0.98, 0.2]],
+            [[0.98, 0.2]],
+            [[0.98, 0.2]],
+        ],
+        dtype=np.float32,
+    )
+    common_kwargs = {
+        "tonemap": False,
+        "grade": True,
+        "exposure": 2.5,
+        "shadow_break": SOFT_KNEE_SHADOW_BREAK,
+        "highlight_break": SOFT_KNEE_HIGHLIGHT_BREAK,
+        "shadow_slope": SOFT_KNEE_SHADOW_SLOPE,
+        "mid_slope": SOFT_KNEE_MID_SLOPE,
+        "highlight_slope": SOFT_KNEE_HIGHLIGHT_SLOPE,
+        "saturation": 0.9,
+        "vibrance": DEFAULT_VIBRANCE,
+        "black_point": DEFAULT_BLACK_POINT,
+        "white_point": DEFAULT_WHITE_POINT,
+        "darken_break": 0.08,
+        "low_slope": 0.0,
+        "gamma": 2.2,
+        "shoulder": 0.5,
+        "grade_highlight_break": 0.9,
+        "grade_mid_slope": 1.0,
+        "grade_high_slope": 1.7,
+    }
+
+    balanced = apply_land_style_numpy(source, **common_kwargs)
+    hybrid = apply_land_style_numpy(source, hdr_highlights=True, **common_kwargs)
+    hdr = apply_land_style_numpy(
+        source,
+        tonemap=False,
+        grade=True,
+        exposure=LAND_HDR_REFERENCE_EXPOSURE,
+        shadow_break=SOFT_KNEE_SHADOW_BREAK,
+        highlight_break=SOFT_KNEE_HIGHLIGHT_BREAK,
+        shadow_slope=SOFT_KNEE_SHADOW_SLOPE,
+        mid_slope=SOFT_KNEE_MID_SLOPE,
+        highlight_slope=SOFT_KNEE_HIGHLIGHT_SLOPE,
+        saturation=LAND_HDR_REFERENCE_SATURATION,
+        vibrance=LAND_HDR_REFERENCE_VIBRANCE,
+        black_point=LAND_HDR_REFERENCE_BLACK_POINT,
+        white_point=LAND_HDR_REFERENCE_WHITE_POINT,
+        darken_break=LAND_HDR_REFERENCE_GRADE_LOW_BREAK,
+        low_slope=LAND_HDR_REFERENCE_GRADE_LOW_SLOPE,
+        gamma=LAND_HDR_REFERENCE_GAMMA,
+        shoulder=LAND_HDR_REFERENCE_SHOULDER,
+        grade_highlight_break=LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_BREAK,
+        grade_mid_slope=LAND_HDR_REFERENCE_GRADE_MID_SLOPE,
+        grade_high_slope=LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_SLOPE,
+    )
+
+    assert hybrid[0, 0, 0] < balanced[0, 0, 0]
+    assert hybrid[0, 0, 0] <= hdr[0, 0, 0]
+    np.testing.assert_allclose(hybrid[:, 0, 1], balanced[:, 0, 1], atol=1e-5)
 
 
 def test_encode_terrarium_numpy_round_trips_elevations() -> None:

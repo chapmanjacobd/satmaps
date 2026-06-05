@@ -787,6 +787,47 @@ def test_write_processed_blocks_block_path_matches_in_memory_path(
     np.testing.assert_array_equal(rgba[:, 0, 0], np.array([255, 127, 63, 255], dtype=np.uint8))
     np.testing.assert_array_equal(rgba[:, 0, 1], np.array([255, 127, 63, 255], dtype=np.uint8))
 
+
+def test_tone_mapped_byte_block_supports_hdr_highlights_flag() -> None:
+    averaged_block = np.array([[[0.98]], [[0.98]], [[0.98]]], dtype=np.float32)
+    common_args = {
+        "grade": True,
+        "tonemap": False,
+        "exposure": 2.5,
+        "sb": 0.3,
+        "hb": 0.75,
+        "ss": 1.4,
+        "ms": 0.9,
+        "hs": 0.5,
+        "sat": 0.9,
+        "vibrance": 1.0,
+        "black_point": 0.0,
+        "white_point": 1.0,
+        "db": 0.08,
+        "ls": 0.0,
+        "ghb": 0.9,
+        "gms": 1.0,
+        "ghs": 1.7,
+        "gamma": 2.2,
+        "shoulder": 0.5,
+    }
+
+    balanced = satmaps.tone_mapped_byte_block(
+        averaged_block,
+        argparse.Namespace(**common_args, hdr_highlights=False),
+        0.0,
+        1.0,
+    )
+    hybrid = satmaps.tone_mapped_byte_block(
+        averaged_block,
+        argparse.Namespace(**common_args, hdr_highlights=True),
+        0.0,
+        1.0,
+    )
+
+    assert hybrid[0, 0, 0] < balanced[0, 0, 0]
+
+
 def test_open_gebco_mask_avoids_update_mode_warning(tmp_path: Path) -> None:
     gebco_path = tmp_path / "gebco.tif"
     gebco_ds = gdal.GetDriverByName("GTiff").Create(str(gebco_path), 4, 3, 4, gdal.GDT_Byte)
