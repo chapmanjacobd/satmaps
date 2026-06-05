@@ -3,7 +3,7 @@ import io
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import numpy as np
 from flask import Flask, jsonify, render_template, request, send_file
@@ -25,6 +25,7 @@ LAND_SAMPLE_CROP_SIZE = 1024
 LAND_SAMPLE_DEFAULT_OFF_X = 2000
 LAND_SAMPLE_DEFAULT_OFF_Y = 2000
 DEFAULT_SAMPLE_DOWNLOAD_PARALLEL = 12
+LAND_SAMPLE_PREFERRED_DATE_ORDER = ("2025-07-01", "2025-01-01")
 LAND_SAMPLE_MIN = 0.0
 LAND_SAMPLE_MAX = 9000.0
 LAND_DEFAULT_EXPOSURE = 2.5
@@ -38,6 +39,7 @@ LAND_DEFAULT_GRADE_MID_SLOPE = 1.0
 LAND_DEFAULT_GRADE_HIGHLIGHT_SLOPE = 1.7
 
 FloatArray = NDArray[np.float32]
+Hemisphere = Literal["north", "south"]
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,7 @@ class LandLocation:
     name: str
     sample_label: str
     tile_prefix: str
+    hemisphere: Hemisphere
 
 
 @dataclass(frozen=True)
@@ -78,96 +81,112 @@ LAND_LOCATIONS = (
         name="Barcelona",
         sample_label="Barcelona Downtown (31TDF)",
         tile_prefix="31TDF_0_0",
+        hemisphere="north",
     ),
     LandLocation(
         id="anchorage",
         name="Anchorage",
         sample_label="Anchorage (06VUN)",
         tile_prefix="06VUN_0_0",
+        hemisphere="north",
     ),
     LandLocation(
         id="shanghai",
         name="Shanghai",
         sample_label="Shanghai (51RUQ)",
         tile_prefix="51RUQ_0_0",
+        hemisphere="north",
     ),
     LandLocation(
         id="singapore",
         name="Singapore",
         sample_label="Singapore (48NUG)",
         tile_prefix="48NUG_0_0",
+        hemisphere="north",
     ),
     LandLocation(
         id="sao-paulo",
         name="Sao Paulo",
         sample_label="Sao Paulo (23KLP)",
         tile_prefix="23KLP_0_0",
+        hemisphere="south",
     ),
     LandLocation(
         id="cape-town",
         name="Cape Town",
         sample_label="Cape Town (34HBH)",
         tile_prefix="34HBH_0_0",
+        hemisphere="south",
     ),
     LandLocation(
         id="cairo",
         name="Cairo",
         sample_label="Cairo (36RUU)",
         tile_prefix="36RUU_0_0",
+        hemisphere="north",
     ),
     LandLocation(
         id="banc-darguin",
         name="Banc d'Arguin",
         sample_label="Banc d'Arguin, Mauritania (28QCH)",
         tile_prefix="28QCH_0_0",
+        hemisphere="north",
     ),
     LandLocation(
         id="mexico-city",
         name="Mexico City",
         sample_label="Mexico City (14QMG)",
         tile_prefix="14QMG_0_0",
+        hemisphere="north",
     ),
     LandLocation(
         id="sydney",
         name="Sydney",
         sample_label="Sydney (56HLH)",
         tile_prefix="56HLH_0_0",
+        hemisphere="south",
     ),
     LandLocation(
         id="santiago",
         name="Santiago, Chile",
         sample_label="Santiago / Valle Nevado (19HCD)",
         tile_prefix="19HCD_0_0",
+        hemisphere="south",
     ),
     LandLocation(
         id="bariloche",
         name="Bariloche, Argentina",
         sample_label="Bariloche / Cerro Catedral (19GBQ)",
         tile_prefix="19GBQ_0_0",
+        hemisphere="south",
     ),
     LandLocation(
         id="queenstown-wanaka",
         name="Queenstown & Wanaka, New Zealand",
         sample_label="Queenstown / Wanaka (59GLL)",
         tile_prefix="59GLL_0_0",
+        hemisphere="south",
     ),
     LandLocation(
         id="snowy-mountains",
         name="Snowy Mountains, Australia",
         sample_label="Snowy Mountains / Perisher (55HFV)",
         tile_prefix="55HFV_0_0",
+        hemisphere="south",
     ),
     LandLocation(
         id="lesotho",
         name="Lesotho",
         sample_label="Lesotho / Afriski (35JPJ)",
         tile_prefix="35JPJ_0_0",
+        hemisphere="south",
     ),
     LandLocation(
         id="nairobi",
         name="Nairobi",
         sample_label="Nairobi (37MBU)",
         tile_prefix="37MBU_0_0",
+        hemisphere="south",
     ),
 )
 DEFAULT_LAND_LOCATION_ID = "barcelona"
@@ -210,9 +229,21 @@ def find_land_samples(
         }
         if all(Path(path).exists() for path in paths.values()):
             samples.append(LandSample(date_label=date_dir.name, paths=paths))
-        if len(samples) >= LAND_SAMPLE_LIMIT:
-            break
-    return tuple(samples)
+    return sort_land_samples_for_tuner(tuple(samples))
+
+
+def sort_land_samples_for_tuner(samples: tuple[LandSample, ...]) -> tuple[LandSample, ...]:
+    preferred_dates = {date_label: index for index, date_label in enumerate(LAND_SAMPLE_PREFERRED_DATE_ORDER)}
+    prioritized = sorted(
+        (sample for sample in samples if sample.date_label in preferred_dates),
+        key=lambda sample: preferred_dates[sample.date_label],
+    )
+    extras = sorted(
+        (sample for sample in samples if sample.date_label not in preferred_dates),
+        key=lambda sample: sample.date_label,
+        reverse=True,
+    )
+    return tuple((prioritized + extras)[:LAND_SAMPLE_LIMIT])
 
 
 def get_land_samples(
@@ -231,6 +262,21 @@ def get_land_sample_tile_prefixes() -> tuple[str, ...]:
         seen.add(location.tile_prefix)
         prefixes.append(location.tile_prefix)
     return tuple(prefixes)
+
+
+def get_land_default_blend(location: LandLocation, winter: bool) -> float:
+    return 1.0 if ((location.hemisphere == "south") != winter) else 0.0
+
+
+def parse_checkbox_arg(name: str) -> bool:
+    raw_value = request.args.get(name)
+    if raw_value is None:
+        return False
+    return raw_value.lower() in {"1", "true", "on", "yes"}
+
+
+def get_land_winter_flag() -> bool:
+    return parse_checkbox_arg("winter")
 
 
 def download_configured_land_samples(
@@ -444,8 +490,15 @@ def get_mode_defaults(mode: str) -> dict[str, float]:
     return params
 
 
-def parse_request_params(mode: str) -> dict[str, float]:
+def parse_request_params(
+    mode: str,
+    land_location: LandLocation | None = None,
+    *,
+    winter: bool = False,
+) -> dict[str, float]:
     defaults = get_mode_defaults(mode)
+    if mode == "land" and land_location is not None:
+        defaults["blend"] = get_land_default_blend(land_location, winter)
     params = {key: float(request.args.get(key, default)) for key, default in defaults.items()}
     if "blend" in params:
         params["blend"] = float(np.clip(params["blend"], 0.0, 1.0))
@@ -558,6 +611,7 @@ def index() -> ResponseReturnValue:
 
     fg_on = request.args.get("fg", "1") == "1"
     land_location = get_land_location(request.args.get("loc"))
+    winter = get_land_winter_flag()
     land_samples = get_land_samples(land_location.id)
     land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
@@ -565,7 +619,7 @@ def index() -> ResponseReturnValue:
         get_land_pan_arg("panx"),
         get_land_pan_arg("pany"),
     )
-    params = parse_request_params(mode)
+    params = parse_request_params(mode, land_location, winter=winter)
     source = (
         get_land_source(land_location.id, params.get("blend", 0.0), land_blend_mode.id, land_view)
         if mode == "land"
@@ -586,6 +640,7 @@ def index() -> ResponseReturnValue:
         land_view=land_view,
         land_dates=[sample.date_label for sample in land_samples],
         has_land_blend=len(land_samples) > 1,
+        winter=winter,
         fg_on=fg_on,
     )
 
@@ -597,13 +652,14 @@ def histogram() -> ResponseReturnValue:
         mode = "land"
 
     land_location = get_land_location(request.args.get("loc"))
+    winter = get_land_winter_flag()
     land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
         land_location.id,
         get_land_pan_arg("panx"),
         get_land_pan_arg("pany"),
     )
-    params = parse_request_params(mode)
+    params = parse_request_params(mode, land_location, winter=winter)
     source = (
         get_land_source(land_location.id, params.get("blend", 0.0), land_blend_mode.id, land_view)
         if mode == "land"
@@ -628,13 +684,14 @@ def render() -> ResponseReturnValue:
         mode = "land"
 
     land_location = get_land_location(request.args.get("loc"))
+    winter = get_land_winter_flag()
     land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
         land_location.id,
         get_land_pan_arg("panx"),
         get_land_pan_arg("pany"),
     )
-    p = parse_request_params(mode)
+    p = parse_request_params(mode, land_location, winter=winter)
     tm_on = request.args.get("tm", "0") == "1"
     fg_on = request.args.get("fg", "1") == "1"
 

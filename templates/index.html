@@ -58,6 +58,10 @@
                     {% endfor %}
                 </select>
             </div>
+            <div class="slider-group">
+                <label for="winter">Winter Season Swap</label>
+                <input type="checkbox" id="winter" {{ 'checked' if winter else '' }} {{ '' if has_land_blend else 'disabled' }}>
+            </div>
             {% if has_land_blend %}
             <div class="slider-group">
                 <label for="blend_mode">Blend Mode</label>
@@ -180,7 +184,7 @@
             <img
                 id="preview"
                 class="{{ 'land-preview' if mode == 'land' else '' }}"
-                src="/render?mode={{ mode }}{% if mode == 'land' %}&loc={{ selected_land_location.id }}&panx={{ land_view.pan_x }}&pany={{ land_view.pan_y }}{% endif %}"
+                src="/render?mode={{ mode }}{% if mode == 'land' %}&loc={{ selected_land_location.id }}&winter={{ '1' if winter else '0' }}&panx={{ land_view.pan_x }}&pany={{ land_view.pan_y }}{% endif %}"
             >
             <p style="font-size: 12px; color: #666; margin-top: 10px;">
                 {% if mode == 'land' %}
@@ -196,6 +200,7 @@
     <script>
         const currentMode = "{{ mode }}";
         const currentLandLocation = {{ selected_land_location.id | tojson }};
+        const currentLandHemisphere = {{ selected_land_location.hemisphere | tojson }};
         const hasLandBlend = {{ has_land_blend | tojson }};
         const canPanLandView = {{ (mode == 'land' and land_dates) | tojson }};
         const defaultLandBlendMode = {{ default_land_blend_mode | tojson }};
@@ -250,10 +255,24 @@
         let updateTimeout;
         let histogramToken = 0;
 
-        function appendLandParams(params, locationId = currentLandLocation) {
+        function isWinterEnabled() {
+            const winterToggle = document.getElementById('winter');
+            return winterToggle ? winterToggle.checked : false;
+        }
+
+        function getDefaultLandBlend() {
+            return (currentLandHemisphere === 'south') !== isWinterEnabled() ? 1.0 : 0.0;
+        }
+
+        function appendLandParams(params, locationId = currentLandLocation, includeBlend = true) {
             params.set('loc', locationId);
-            renderControls.forEach(id => params.set(id, document.getElementById(id).value));
+            params.set('winter', isWinterEnabled() ? '1' : '0');
+            landViewControls.forEach(id => params.set(id, document.getElementById(id).value));
+            sharedControls.forEach(id => params.set(id, document.getElementById(id).value));
             if (hasLandBlend) {
+                if (includeBlend) {
+                    params.set('blend', document.getElementById('blend').value);
+                }
                 params.set('blend_mode', getBlendMode());
             }
         }
@@ -263,7 +282,7 @@
                 mode: 'land',
                 fg: document.getElementById('fg_on').checked ? '1' : '0'
             });
-            appendLandParams(params, locationId);
+            appendLandParams(params, locationId, false);
             window.location.href = `/?${params.toString()}`;
         }
 
@@ -533,6 +552,7 @@
             });
             if (hasLandBlend) {
                 document.getElementById('blend_mode').value = defaultLandBlendMode;
+                document.getElementById('blend').value = getDefaultLandBlend();
             }
             update();
         }
@@ -541,9 +561,12 @@
             const args = cliControls.map(id => {
                 const flag = cliArgMap[currentMode][id];
                 return `${flag} ${document.getElementById(id).value}`;
-            }).join(' ');
+            });
+            if (currentMode === 'land' && isWinterEnabled()) {
+                args.push('--winter');
+            }
 
-            navigator.clipboard.writeText(args).then(() => {
+            navigator.clipboard.writeText(args.join(' ')).then(() => {
                 const oldText = button.innerText;
                 button.innerText = 'Copied!';
                 setTimeout(() => button.innerText = oldText, 2000);
@@ -553,6 +576,9 @@
         renderControls.forEach(id => document.getElementById(id).addEventListener('input', update));
         if (hasLandBlend) {
             document.getElementById('blend_mode').addEventListener('change', update);
+        }
+        if (currentMode === 'land') {
+            document.getElementById('winter').addEventListener('change', update);
         }
         document.getElementById('fg_on').addEventListener('change', update);
 

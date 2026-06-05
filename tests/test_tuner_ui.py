@@ -44,6 +44,16 @@ def test_get_land_samples_reads_cache_live(tmp_path: Path) -> None:
     assert [sample.date_label for sample in samples] == ["2025-07-01"]
 
 
+def test_get_land_samples_prioritizes_july_and_january(tmp_path: Path) -> None:
+    _create_sample(tmp_path, "2025-10-01", "31TDF_0_0")
+    _create_sample(tmp_path, "2025-07-01", "31TDF_0_0")
+    _create_sample(tmp_path, "2025-01-01", "31TDF_0_0")
+
+    samples = tuner_ui.get_land_samples("barcelona", tmp_path)
+
+    assert [sample.date_label for sample in samples] == ["2025-07-01", "2025-01-01"]
+
+
 def test_land_locations_include_global_presets() -> None:
     assert set(tuner_ui.LAND_LOCATIONS_BY_ID) == {
         "barcelona",
@@ -77,6 +87,11 @@ def test_land_locations_include_global_presets() -> None:
     assert tuner_ui.LAND_LOCATIONS_BY_ID["snowy-mountains"].tile_prefix == "55HFV_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["sydney"].tile_prefix == "56HLH_0_0"
     assert tuner_ui.LAND_LOCATIONS_BY_ID["nairobi"].tile_prefix == "37MBU_0_0"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"].hemisphere == "north"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["banc-darguin"].hemisphere == "north"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["singapore"].hemisphere == "north"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["sydney"].hemisphere == "south"
+    assert tuner_ui.LAND_LOCATIONS_BY_ID["nairobi"].hemisphere == "south"
 
 
 def test_build_land_view_defaults_to_previous_fixed_crop() -> None:
@@ -136,6 +151,34 @@ def test_ocean_defaults_match_cli_defaults() -> None:
     assert defaults["dmax"] == 0.0
 
 
+def test_get_land_default_blend_tracks_hemisphere_and_winter() -> None:
+    assert tuner_ui.get_land_default_blend(tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"], winter=False) == 0.0
+    assert tuner_ui.get_land_default_blend(tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"], winter=True) == 1.0
+    assert tuner_ui.get_land_default_blend(tuner_ui.LAND_LOCATIONS_BY_ID["sydney"], winter=False) == 1.0
+    assert tuner_ui.get_land_default_blend(tuner_ui.LAND_LOCATIONS_BY_ID["sydney"], winter=True) == 0.0
+
+
+def test_parse_request_params_uses_land_hemisphere_defaults_and_explicit_blend() -> None:
+    with tuner_ui.app.test_request_context("/"):
+        north_params = tuner_ui.parse_request_params("land", tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"], winter=False)
+    with tuner_ui.app.test_request_context("/"):
+        south_winter_params = tuner_ui.parse_request_params(
+            "land",
+            tuner_ui.LAND_LOCATIONS_BY_ID["sydney"],
+            winter=True,
+        )
+    with tuner_ui.app.test_request_context("/?blend=0.25"):
+        explicit_params = tuner_ui.parse_request_params(
+            "land",
+            tuner_ui.LAND_LOCATIONS_BY_ID["barcelona"],
+            winter=False,
+        )
+
+    assert north_params["blend"] == 0.0
+    assert south_winter_params["blend"] == 0.0
+    assert explicit_params["blend"] == 0.25
+
+
 def test_index_exposes_shoulder_control() -> None:
     client = tuner_ui.app.test_client()
 
@@ -145,6 +188,35 @@ def test_index_exposes_shoulder_control() -> None:
     assert response.status_code == 200
     assert "Shoulder" in html
     assert "--shoulder" in html
+
+
+def test_index_uses_hemisphere_default_blend_and_winter_toggle(monkeypatch: object) -> None:
+    client = tuner_ui.app.test_client()
+    samples = (
+        tuner_ui.LandSample("2025-07-01", {"red": "r", "green": "g", "blue": "b"}),
+        tuner_ui.LandSample("2025-01-01", {"red": "r2", "green": "g2", "blue": "b2"}),
+    )
+    monkeypatch.setattr(tuner_ui, "find_land_samples", lambda location, cache_root=tuner_ui.LAND_CACHE_ROOT: samples)
+    monkeypatch.setattr(
+        tuner_ui,
+        "get_land_view",
+        lambda location_id, pan_x=None, pan_y=None: tuner_ui.build_land_view(10980, 10980, pan_x, pan_y),
+    )
+    monkeypatch.setattr(tuner_ui, "get_land_source", lambda *args, **kwargs: None)
+
+    north_response = client.get("/?loc=barcelona")
+    south_response = client.get("/?loc=sydney")
+    winter_response = client.get("/?loc=barcelona&winter=1")
+
+    north_html = north_response.get_data(as_text=True)
+    south_html = south_response.get_data(as_text=True)
+    winter_html = winter_response.get_data(as_text=True)
+
+    assert '<input type="checkbox" id="winter"  >' in north_html
+    assert '<input type="range" id="blend" min="0" max="1" step="0.01" value="0.0">' in north_html
+    assert '<input type="range" id="blend" min="0" max="1" step="0.01" value="1.0">' in south_html
+    assert '<input type="checkbox" id="winter" checked >' in winter_html
+    assert '<input type="range" id="blend" min="0" max="1" step="0.01" value="1.0">' in winter_html
 
 
 def test_index_shows_sample_download_hint_when_cache_is_empty(monkeypatch: object) -> None:
@@ -168,9 +240,13 @@ def test_index_preserves_land_controls_when_switching_locations() -> None:
     response = client.get("/")
 
     html = response.get_data(as_text=True)
-    assert "function appendLandParams(params, locationId = currentLandLocation)" in html
-    assert "renderControls.forEach(id => params.set(id, document.getElementById(id).value));" in html
+    assert "function appendLandParams(params, locationId = currentLandLocation, includeBlend = true)" in html
+    assert "params.set('winter', isWinterEnabled() ? '1' : '0');" in html
+    assert "landViewControls.forEach(id => params.set(id, document.getElementById(id).value));" in html
+    assert "sharedControls.forEach(id => params.set(id, document.getElementById(id).value));" in html
+    assert "appendLandParams(params, locationId, false);" in html
     assert "fg: document.getElementById('fg_on').checked ? '1' : '0'" in html
+    assert "args.push('--winter');" in html
 
 
 def test_index_respects_fg_query_param() -> None:
