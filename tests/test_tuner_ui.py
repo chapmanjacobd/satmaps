@@ -206,6 +206,23 @@ def test_get_neutral_grade_values_are_identity_like() -> None:
     }
 
 
+def test_get_output_histogram_data_uses_rgb_luma_for_rendered_output() -> None:
+    rendered = tuner_ui.np.array(
+        [
+            [[0.0, 1.0]],
+            [[0.0, 1.0]],
+            [[0.0, 1.0]],
+        ],
+        dtype=tuner_ui.np.float32,
+    )
+
+    hist = tuner_ui.get_output_histogram_data(rendered)
+
+    assert hist[0] == 1.0
+    assert hist[-1] == 1.0
+    assert sum(value > 0 for value in hist) == 2
+
+
 def test_index_exposes_shoulder_control() -> None:
     client = tuner_ui.app.test_client()
 
@@ -224,6 +241,22 @@ def test_index_exposes_shoulder_control() -> None:
     assert "Vivid" in html
     assert "Summer" in html
     assert "Winter" in html
+
+
+def test_index_sets_up_histogram_hold_preview() -> None:
+    client = tuner_ui.app.test_client()
+
+    response = client.get("/")
+
+    html = response.get_data(as_text=True)
+    assert 'id="fg_hist_label"' in html
+    assert "FINAL OUTPUT (hold for input)" in html
+    assert "function setupHistogramHoldPreview()" in html
+    assert "setHistogramPreview(true);" in html
+    assert "finalGradeViz.setPointerCapture(event.pointerId);" in html
+    assert "finalGradeViz.addEventListener('pointercancel', endPreview);" in html
+    assert "inputHist = payload.raw_hist || [];" in html
+    assert "finalHist = payload.final_hist || [];" in html
 
 
 def test_index_uses_season_blend_modes(monkeypatch: object) -> None:
@@ -296,6 +329,52 @@ def test_index_respects_fg_query_param() -> None:
     assert response.status_code == 200
     assert '<input type="checkbox" id="fg_on" >' in html
     assert '<input type="checkbox" id="fg_on" checked>' not in html
+
+
+def test_histogram_route_returns_input_and_final_histograms(monkeypatch: object) -> None:
+    client = tuner_ui.app.test_client()
+    sample = tuner_ui.np.array(
+        [
+            [[0.02, 0.15, 0.45, 0.9]],
+            [[0.02, 0.15, 0.45, 0.9]],
+            [[0.02, 0.15, 0.45, 0.9]],
+        ],
+        dtype=tuner_ui.np.float32,
+    )
+    monkeypatch.setattr(tuner_ui, "get_land_source", lambda *args, **kwargs: sample)
+
+    response = client.get("/histogram?mode=land")
+
+    payload = response.get_json()
+    assert response.status_code == 200
+    assert payload is not None
+    assert set(payload) == {"raw_hist", "final_hist"}
+    assert payload["raw_hist"] != payload["final_hist"]
+
+
+def test_histogram_route_respects_fg_query_param(monkeypatch: object) -> None:
+    client = tuner_ui.app.test_client()
+    sample = tuner_ui.np.array(
+        [
+            [[0.02, 0.15, 0.45, 0.9]],
+            [[0.02, 0.15, 0.45, 0.9]],
+            [[0.02, 0.15, 0.45, 0.9]],
+        ],
+        dtype=tuner_ui.np.float32,
+    )
+    monkeypatch.setattr(tuner_ui, "get_land_source", lambda *args, **kwargs: sample)
+
+    ungraded_response = client.get("/histogram?mode=land&fg=0")
+    graded_response = client.get("/histogram?mode=land&fg=1")
+
+    ungraded_payload = ungraded_response.get_json()
+    graded_payload = graded_response.get_json()
+    assert ungraded_response.status_code == 200
+    assert graded_response.status_code == 200
+    assert ungraded_payload is not None
+    assert graded_payload is not None
+    assert ungraded_payload["raw_hist"] == graded_payload["raw_hist"]
+    assert ungraded_payload["final_hist"] != graded_payload["final_hist"]
 
 
 def test_get_land_blend_mode_defaults_to_summer() -> None:

@@ -127,7 +127,7 @@
             </div>
 
             <div class="viz-container" id="final_grade_viz">
-                <div class="viz-label">INPUT → FINAL</div>
+                <div class="viz-label" id="fg_hist_label">FINAL OUTPUT (hold for input)</div>
                 <svg id="fg_svg" viewBox="0 0 256 128" preserveAspectRatio="none">
                     <path id="fg_hist" fill="#333" d=""></path>
                     <path id="fg_curve" stroke="#0af" stroke-width="2" fill="none" d=""></path>
@@ -211,7 +211,8 @@
         const gradePresets = {{ grade_presets | tojson }};
         const neutralGradeValues = {{ neutral_grade_values | tojson }};
         const landDates = {{ land_dates | tojson }};
-        let rawHist = {{ raw_hist | tojson }};
+        let inputHist = {{ raw_hist | tojson }};
+        let finalHist = {{ final_hist | tojson }};
         const img = document.getElementById('preview');
         const gradingControls = ['exp', 'gamma', 'shoulder', 'sat', 'db', 'ghb', 'ls', 'gms', 'ghs'];
         const gradePresetMap = Object.fromEntries(gradePresets.map(preset => [preset.id, preset.values]));
@@ -260,6 +261,8 @@
 
         let updateTimeout;
         let histogramToken = 0;
+        let showingInputHistogram = false;
+        let histogramHoldPointerId = null;
 
         function getSeasonalBlendForMode(blendModeId) {
             if (blendModeId === 'summer') {
@@ -349,17 +352,34 @@
             }
         }
 
+        function getDisplayedHistogram() {
+            return showingInputHistogram ? inputHist : finalHist;
+        }
+
+        function updateHistogramLabel() {
+            const label = document.getElementById('fg_hist_label');
+            if (!label) return;
+            label.innerText = showingInputHistogram ? 'INPUT PREVIEW' : 'FINAL OUTPUT (hold for input)';
+        }
+
+        function setHistogramPreview(showInput) {
+            showingInputHistogram = showInput;
+            updateHistogramLabel();
+            drawHist();
+        }
+
         function drawHist() {
             const path = document.getElementById('fg_hist');
-            if (!rawHist || rawHist.length === 0) {
+            const hist = getDisplayedHistogram();
+            if (!hist || hist.length === 0) {
                 path.setAttribute('d', '');
                 return;
             }
 
             let d = 'M 0 128 ';
-            for (let i = 0; i < rawHist.length; i++) {
-                const x = (i / (rawHist.length - 1)) * 256;
-                const y = 128 - (rawHist[i] * 120);
+            for (let i = 0; i < hist.length; i++) {
+                const x = (i / (hist.length - 1)) * 256;
+                const y = 128 - (hist[i] * 120);
                 d += `L ${x} ${y} `;
             }
             d += 'L 256 128 Z';
@@ -466,13 +486,14 @@
         }
 
         async function refreshHistogram(token) {
-            const params = new URLSearchParams({ mode: currentMode });
+            const params = new URLSearchParams({
+                mode: currentMode,
+                fg: document.getElementById('fg_on').checked ? '1' : '0'
+            });
             if (currentMode === 'land') {
                 appendLandParams(params);
-            }
-            if (currentMode === 'ocean') {
-                params.set('dmin', document.getElementById('dmin').value);
-                params.set('dmax', document.getElementById('dmax').value);
+            } else {
+                renderControls.forEach(id => params.set(id, document.getElementById(id).value));
             }
 
             const response = await fetch(`/histogram?${params.toString()}`);
@@ -480,7 +501,8 @@
 
             const payload = await response.json();
             if (token !== histogramToken) return;
-            rawHist = payload.hist || [];
+            inputHist = payload.raw_hist || [];
+            finalHist = payload.final_hist || [];
             drawHist();
         }
 
@@ -543,6 +565,31 @@
             };
             img.addEventListener('pointerup', endDrag);
             img.addEventListener('pointercancel', endDrag);
+        }
+
+        function setupHistogramHoldPreview() {
+            const finalGradeViz = document.getElementById('final_grade_viz');
+            if (!finalGradeViz) return;
+
+            finalGradeViz.addEventListener('pointerdown', event => {
+                if (histogramHoldPointerId !== null) return;
+                histogramHoldPointerId = event.pointerId;
+                finalGradeViz.setPointerCapture(event.pointerId);
+                setHistogramPreview(true);
+                event.preventDefault();
+            });
+
+            const endPreview = event => {
+                if (histogramHoldPointerId === null || event.pointerId !== histogramHoldPointerId) return;
+                if (finalGradeViz.hasPointerCapture(event.pointerId)) {
+                    finalGradeViz.releasePointerCapture(event.pointerId);
+                }
+                histogramHoldPointerId = null;
+                setHistogramPreview(false);
+            };
+
+            finalGradeViz.addEventListener('pointerup', endPreview);
+            finalGradeViz.addEventListener('pointercancel', endPreview);
         }
 
         function update() {
@@ -612,8 +659,9 @@
         }
         document.getElementById('fg_on').addEventListener('change', update);
 
-        drawHist();
+        setHistogramPreview(false);
         update();
+        setupHistogramHoldPreview();
         setupLandDragging();
     </script>
 </body>

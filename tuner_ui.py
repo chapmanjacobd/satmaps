@@ -704,6 +704,85 @@ def get_land_source(
     return blend_land_samples(location, cropped_samples, blend, blend_mode_id)
 
 
+def get_preview_source(
+    mode: str,
+    land_location: LandLocation,
+    params: dict[str, float],
+    land_blend_mode: LandBlendMode,
+    land_view: LandView,
+) -> FloatArray | None:
+    if mode == "land":
+        return get_land_source(land_location, params.get("blend", 0.0), land_blend_mode.id, land_view)
+    return RAW_GEBCO
+
+
+def get_preview_output(
+    source: FloatArray | None,
+    mode: str,
+    params: dict[str, float],
+    tm_on: bool,
+    fg_on: bool,
+) -> FloatArray | None:
+    if source is None:
+        return None
+    if mode == "land":
+        if tm_on:
+            toned = tiler.apply_soft_knee_numpy(
+                source,
+                params["sb"],
+                params["hb"],
+                params["ss"],
+                params["ms"],
+                params["hs"],
+                params["exp"],
+            )
+        else:
+            toned = np.clip(source * params["exp"], 0.0, 1.0)
+        if not fg_on:
+            return cast(FloatArray, toned)
+        return cast(
+            FloatArray,
+            tiler.apply_preview_correction_numpy(
+                toned,
+                saturation=params["sat"],
+                darken_break=params["db"],
+                low_slope=params["ls"],
+                gamma=params["gamma"],
+                shoulder=params["shoulder"],
+                highlight_break=params["ghb"],
+                mid_slope=params["gms"],
+                high_slope=params["ghs"],
+            ),
+        )
+
+    return cast(
+        FloatArray,
+        ocean.colorize_ocean_depths(
+            source,
+            ocean.OceanStyleOptions(
+                tonemap=tm_on,
+                grade=fg_on,
+                exposure=params["exp"],
+                shadow_break=params["sb"],
+                highlight_break=params["hb"],
+                shadow_slope=params["ss"],
+                mid_slope=params["ms"],
+                highlight_slope=params["hs"],
+                gamma=params["gamma"],
+                shoulder=params["shoulder"],
+                saturation=params["sat"],
+                black_break=params["db"],
+                black_slope=params["ls"],
+                grade_high_break=params["ghb"],
+                grade_mid_slope=params["gms"],
+                grade_high_slope=params["ghs"],
+                depth_min=params["dmin"],
+                depth_max=params["dmax"],
+            ),
+        ),
+    )
+
+
 def get_histogram_data(
     arr: FloatArray | None,
     mode: str,
@@ -726,6 +805,10 @@ def get_histogram_data(
     return [float(value) for value in hist.tolist()]
 
 
+def get_output_histogram_data(arr: FloatArray | None) -> list[float]:
+    return get_histogram_data(arr, "land")
+
+
 @app.route("/")
 def index() -> ResponseReturnValue:
     mode = request.args.get("mode", "land")
@@ -733,6 +816,7 @@ def index() -> ResponseReturnValue:
         mode = "land"
 
     fg_on = request.args.get("fg", "1") == "1"
+    tm_on = request.args.get("tm", "0") == "1"
     land_location = get_land_location(request.args.get("loc"))
     land_samples = get_land_samples(land_location.id)
     land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
@@ -742,12 +826,9 @@ def index() -> ResponseReturnValue:
         get_land_pan_arg("pany"),
     )
     params = parse_request_params(mode, land_location, land_blend_mode.id)
-    source = (
-        get_land_source(land_location, params.get("blend", 0.0), land_blend_mode.id, land_view)
-        if mode == "land"
-        else RAW_GEBCO
-    )
+    source = get_preview_source(mode, land_location, params, land_blend_mode, land_view)
     hist = get_histogram_data(source, mode, params.get("dmin", -11000.0), params.get("dmax", 0.0))
+    final_hist = get_output_histogram_data(get_preview_output(source, mode, params, tm_on, fg_on))
     return render_template(
         "index.html",
         mode=mode,
@@ -756,6 +837,7 @@ def index() -> ResponseReturnValue:
         grade_presets=get_grade_presets(mode),
         neutral_grade_values=get_neutral_grade_values(),
         raw_hist=hist,
+        final_hist=final_hist,
         land_locations=LAND_LOCATIONS,
         land_blend_modes=LAND_BLEND_MODES,
         selected_land_blend_mode=land_blend_mode,
@@ -774,6 +856,8 @@ def histogram() -> ResponseReturnValue:
     if mode not in {"land", "ocean"}:
         mode = "land"
 
+    fg_on = request.args.get("fg", "1") == "1"
+    tm_on = request.args.get("tm", "0") == "1"
     land_location = get_land_location(request.args.get("loc"))
     land_blend_mode = get_land_blend_mode(request.args.get("blend_mode"))
     land_view = get_land_view(
@@ -782,19 +866,16 @@ def histogram() -> ResponseReturnValue:
         get_land_pan_arg("pany"),
     )
     params = parse_request_params(mode, land_location, land_blend_mode.id)
-    source = (
-        get_land_source(land_location, params.get("blend", 0.0), land_blend_mode.id, land_view)
-        if mode == "land"
-        else RAW_GEBCO
-    )
+    source = get_preview_source(mode, land_location, params, land_blend_mode, land_view)
     return jsonify(
         {
-            "hist": get_histogram_data(
+            "raw_hist": get_histogram_data(
                 source,
                 mode,
                 params.get("dmin", -11000.0),
                 params.get("dmax", 0.0),
-            )
+            ),
+            "final_hist": get_output_histogram_data(get_preview_output(source, mode, params, tm_on, fg_on)),
         }
     )
 
@@ -815,65 +896,12 @@ def render() -> ResponseReturnValue:
     p = parse_request_params(mode, land_location, land_blend_mode.id)
     tm_on = request.args.get("tm", "0") == "1"
     fg_on = request.args.get("fg", "1") == "1"
-
-    if mode == "land":
-        source_rgb = get_land_source(land_location, p.get("blend", 0.0), land_blend_mode.id, land_view)
-        if source_rgb is None:
+    source = get_preview_source(mode, land_location, p, land_blend_mode, land_view)
+    corrected = get_preview_output(source, mode, p, tm_on, fg_on)
+    if corrected is None:
+        if mode == "land":
             return "No sample data", 404
-        if tm_on:
-            toned = tiler.apply_soft_knee_numpy(
-                source_rgb,
-                p["sb"],
-                p["hb"],
-                p["ss"],
-                p["ms"],
-                p["hs"],
-                p["exp"],
-            )
-        else:
-            toned = np.clip(source_rgb * p["exp"], 0.0, 1.0)
-
-        if fg_on:
-            corrected = tiler.apply_preview_correction_numpy(
-                toned,
-                saturation=p["sat"],
-                darken_break=p["db"],
-                low_slope=p["ls"],
-                gamma=p["gamma"],
-                shoulder=p["shoulder"],
-                highlight_break=p["ghb"],
-                mid_slope=p["gms"],
-                high_slope=p["ghs"],
-            )
-        else:
-            corrected = toned
-    else:
-        if RAW_GEBCO is None:
-            return "No GEBCO zip found", 404
-
-        corrected = ocean.colorize_ocean_depths(
-            RAW_GEBCO,
-            ocean.OceanStyleOptions(
-                tonemap=tm_on,
-                grade=fg_on,
-                exposure=p["exp"],
-                shadow_break=p["sb"],
-                highlight_break=p["hb"],
-                shadow_slope=p["ss"],
-                mid_slope=p["ms"],
-                highlight_slope=p["hs"],
-                gamma=p["gamma"],
-                shoulder=p["shoulder"],
-                saturation=p["sat"],
-                black_break=p["db"],
-                black_slope=p["ls"],
-                grade_high_break=p["ghb"],
-                grade_mid_slope=p["gms"],
-                grade_high_slope=p["ghs"],
-                depth_min=p["dmin"],
-                depth_max=p["dmax"],
-            ),
-        )
+        return "No GEBCO zip found", 404
 
     byte_arr = (np.clip(corrected, 0, 1) * 255).astype(np.uint8)
     img = Image.fromarray(np.transpose(byte_arr, (1, 2, 0)))
