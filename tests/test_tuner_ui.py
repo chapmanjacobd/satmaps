@@ -161,10 +161,25 @@ def test_get_grade_presets_returns_mode_specific_values() -> None:
     land_presets = tuner_ui.get_grade_presets("land")
     ocean_presets = tuner_ui.get_grade_presets("ocean")
 
-    assert [preset["id"] for preset in land_presets] == ["balanced", "punchy", "matte", "vivid"]
+    assert [preset["id"] for preset in land_presets] == ["balanced", "punchy", "minimal", "vivid"]
     assert [preset["id"] for preset in ocean_presets] == ["balanced", "punchy", "muted", "glow"]
     assert land_presets[0]["values"] == tuner_ui.build_grade_preset_values(tuner_ui.get_mode_defaults("land"))
     assert ocean_presets[0]["values"] == tuner_ui.build_grade_preset_values(tuner_ui.get_mode_defaults("ocean"))
+    assert land_presets[2]["values"] == tuner_ui.build_grade_preset_values(
+        tuner_ui.get_mode_defaults("land"),
+        exp=1.0,
+        gamma=2.8,
+        shoulder=1.0,
+        sat=1.0,
+        vib=1.2,
+        bp=0.01,
+        wp=0.99,
+        db=0.0,
+        ghb=1.0,
+        ls=1.0,
+        gms=1.05,
+        ghs=1.0,
+    )
 
 
 def test_get_land_season_blend_tracks_hemisphere() -> None:
@@ -253,7 +268,7 @@ def test_index_exposes_shoulder_control() -> None:
     assert '"vib": 1.0' in html
     assert "Balanced" in html
     assert "Punchy" in html
-    assert "Matte" in html
+    assert "Minimal" in html
     assert "Vivid" in html
     assert "Summer" in html
     assert "Winter" in html
