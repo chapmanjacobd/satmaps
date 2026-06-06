@@ -13,9 +13,10 @@ from osgeo import gdal
 from PIL import Image
 
 import ocean
+import satmaps_assets
 import tiler
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder=str(Path(satmaps_assets.__file__).resolve().parent / "templates"))
 
 # GEBCO discovery for Ocean Mode
 GEBCO_ZIP = "gebco_2025_sub_ice_topo_geotiff.zip"

@@ -14,10 +14,11 @@ dependencies = [
 ]
 
 [tool.setuptools]
+packages = ["satmaps_assets"]
 py-modules = ["common", "land_mgrs", "ocean", "satmaps", "terrain", "tiler", "tuner_ui"]
 
-[tool.setuptools.data-files]
-templates = ["templates/*.html"]
+[tool.setuptools.package-data]
+satmaps_assets = ["templates/*.html"]
 
 [project.scripts]
 land-mgrs = "land_mgrs:main"
