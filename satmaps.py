@@ -64,6 +64,7 @@ DEFAULT_PREFETCH_IF_LAND = 100.0
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
 DEFAULT_TILE_BATCH_WIDTH = 32
 DEFAULT_TEMP_DIR = ".temp"
+FULL_RENDER_CACHE_DIR = ".cache.render"
 TEMP_DIR = DEFAULT_TEMP_DIR
 
 
@@ -226,12 +227,12 @@ def build_temp_mbtiles_path(output_path: str) -> str:
 
 def build_work_unit_raster_path(output_path: str, unique_id: str, work_unit_id: str) -> str:
     """Return the deterministic full-render-first GeoTIFF path for one work unit."""
-    return f"{TEMP_DIR}/land_{work_unit_id}_{unique_id}_3857.tif"
+    return f"{FULL_RENDER_CACHE_DIR}/land_{work_unit_id}_{unique_id}_3857.tif"
 
 
 def build_master_vrt_path(unique_id: str) -> str:
     """Return the deterministic full-render-first master VRT path."""
-    return f"{TEMP_DIR}/master_{unique_id}.vrt"
+    return f"{FULL_RENDER_CACHE_DIR}/master_{unique_id}.vrt"
 
 
 def build_tile_cache_root(output_path: str, unique_id: str) -> str:
@@ -3365,6 +3366,7 @@ def render_land_work_unit_raster(
         return output_path
 
     tile_grid = build_work_unit_output_tile_grid(folders, args)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     staged_output_path = build_staged_path(output_path)
     remove_if_exists(staged_output_path)
     ocean_mask: Optional[OceanMaskWarp] = None
@@ -3440,6 +3442,7 @@ def build_master_vrt(source_rasters: Sequence[str], output_vrt: str) -> str:
     """Build a master VRT in the supplied source order."""
     if not source_rasters:
         raise ValueError("source_rasters must not be empty")
+    os.makedirs(os.path.dirname(output_vrt), exist_ok=True)
     staged_output_vrt = build_staged_path(output_vrt)
     remove_if_exists(staged_output_vrt)
     merged = gdal.BuildVRT(staged_output_vrt, list(source_rasters))
@@ -4352,6 +4355,7 @@ def main() -> None:
         args.prefetch_cache = args.cache + ".temp"
 
     os.makedirs(TEMP_DIR, exist_ok=True)
+    os.makedirs(FULL_RENDER_CACHE_DIR, exist_ok=True)
 
     requested_bbox = parse_bbox(args.bbox) if args.bbox else None
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
@@ -4411,7 +4415,6 @@ def main() -> None:
 
     prepared_ocean_background: Optional[str] = None
     ocean_cleanup_paths: List[str] = []
-    full_render_cleanup_paths: List[str] = []
     prepared_ocean_background = prepare_ocean_background_for_output(
         args.ocean_background,
         requested_bbox,
@@ -4480,7 +4483,6 @@ def main() -> None:
                     if raster_stats.skipped_work_units > 0:
                         land_summary += f" Skipped {raster_stats.skipped_work_units} empty work unit(s)."
                     print(land_summary)
-                full_render_cleanup_paths.extend(land_raster_paths)
             else:
                 print("No land work units were found.")
         else:
@@ -4493,7 +4495,6 @@ def main() -> None:
             master_vrt_path = build_master_vrt_path(unique_id)
             print("Building master VRT...")
             build_master_vrt(source_rasters, master_vrt_path)
-            full_render_cleanup_paths.append(master_vrt_path)
             master_marker_path = build_tile_cache_marker_path(
                 args.output,
                 unique_id,
@@ -4591,7 +4592,7 @@ def main() -> None:
         description="Copernicus Sentinel data",
         requested_bbox=requested_bbox,
     )
-    cleanup_temporary_files([temp_mbtiles] + ocean_cleanup_paths + full_render_cleanup_paths)
+    cleanup_temporary_files([temp_mbtiles] + ocean_cleanup_paths)
 
     if os.path.exists(state_file):
         os.remove(state_file)

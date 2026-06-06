@@ -146,7 +146,7 @@ satmaps --estimate
 - `--chunk-zoom`: Chunking zoom used during MBTiles generation (default: `4`).
 - `--parallel`: Number of worker processes/threads used for tile processing and chunk generation (default: `2`).
 - `--tile-batch-width` / `--ty`: Target number of contiguous output tiles rendered together within one row during the final land pass (default: `32`).
-- `--full-render-first`: Render each land work unit into a full aligned EPSG:3857 GeoTIFF first, build a master VRT, then tile that merged raster once. This usually trades higher temporary disk/RAM for less repeated final-tile work.
+- `--full-render-first`: Render each land work unit into a full aligned EPSG:3857 GeoTIFF first, cache those rasters under `.cache.render`, build a master VRT, then tile that merged raster once. This usually trades higher disk/RAM for less repeated final-tile work.
 - `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
 - `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before max-zoom tile caching. Coarser ocean masks (for example z4-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass.
 - Final Web Mercator land outputs target `--max-zoom` (supported: 4-14; default zoom 13, ~19.11 m/px at the equator). Ocean backgrounds may be reused from the same or a coarser zoom level and are resampled onto that final output grid during composition. Low-resolution runs at `--max-zoom 7` and below use a coarse-grid-first land renderer to avoid the full per-subtile pipeline.
@@ -156,10 +156,10 @@ satmaps --estimate
 - `--hdr-highlights` / `--no-hdr-highlights`: Blend the HDR land look into bright near-neutral highlights so snow and ice keep more detail without flattening the rest of the map.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
 - `--prefetch-cache`: Ephemeral cache directory for prefetched RGB bands (default: `<cache>.temp`).
-- `--temp-dir`: Directory for heavyweight intermediary files, resume state, and the staged MBTiles (default: `.temp`).
+- `--temp-dir`: Directory for heavyweight intermediary files, resume state, and the staged MBTiles (default: `.temp`). Full-render-first rasters are cached separately under `.cache.render`.
 - `--output` / `-o`: Final output PMTiles path (default: `output.pmtiles`).
 - `--download`: Download source tiles into the cache and exit without building output tiles.
-- Runs always resume automatically: `satmaps` reuses any matching `<temp-dir>/state_*.json` and on-disk tiles from a previous run with the same parameters, so interrupted runs continue where they left off.
+- Runs always resume automatically: `satmaps` reuses any matching `<temp-dir>/state_*.json`, on-disk final tiles, and any matching `.cache.render` full-render-first rasters from a previous run with the same parameters, so interrupted runs continue where they left off.
 - `--refresh-land-mgrs-list`: Rebuild `land_mgrs.list` in the repository root from `gebco_2025_sub_ice_topo_geotiff.zip` using the same generator as `land-mgrs --refresh`, then exit.
 - `--estimate`: Print estimated time, RAM, disk, and network usage, then exit.
 
@@ -214,7 +214,7 @@ You can override the defaults (tuned via `satmaps-tuner`):
 5.  Processing (NumPy):
     - Soft-Knee Tone Mapping: A 3-segment linear curve to compress high dynamic range while preserving local contrast.
     - Color Grading: Exposure, gamma/shoulder shaping, and contrast controls for a "natural" look.
-6.  Packaging: By default, `satmaps` renders each land work unit and the prepared ocean background into a resumable max-zoom `z/x/y.webp` cache, batching neighboring final land tiles together row-by-row when possible, then copies those WebP bytes into MBTiles, builds lower zooms with `gdaladdo`, and converts the archive to PMTiles. With `--full-render-first`, it instead writes full aligned 3857 land rasters first, builds a master VRT, and tiles that merged raster tree once before packaging.
+6.  Packaging: By default, `satmaps` renders each land work unit and the prepared ocean background into a resumable max-zoom `z/x/y.webp` cache, batching neighboring final land tiles together row-by-row when possible, then copies those WebP bytes into MBTiles, builds lower zooms with `gdaladdo`, and converts the archive to PMTiles. With `--full-render-first`, it instead writes full aligned 3857 land rasters into `.cache.render`, builds a master VRT, and tiles that merged raster tree once before packaging.
 
 ## Datasets
 

@@ -45,5 +45,5 @@ clean:
 	@echo "Cleaned up temporary files."
 
 clean-cache:
-	rm -rf .cache/*
+	rm -rf .cache/* .cache.render/*
 	@echo "Cache cleared."

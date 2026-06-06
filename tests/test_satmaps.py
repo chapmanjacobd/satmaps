@@ -3040,15 +3040,15 @@ def test_main_full_render_first_builds_master_vrt_and_commits_to_tile_cache(
     ]
     assert len(master_calls) == 1
     assert set(master_calls[0][0]) == {
-        ".temp/land_31TDF_0_0_fullrender_3857.tif",
-        ".temp/land_31TDF_0_1_fullrender_3857.tif",
-        ".temp/land_31TDF_1_0_fullrender_3857.tif",
-        ".temp/land_31TDF_1_1_fullrender_3857.tif",
+        ".cache.render/land_31TDF_0_0_fullrender_3857.tif",
+        ".cache.render/land_31TDF_0_1_fullrender_3857.tif",
+        ".cache.render/land_31TDF_1_0_fullrender_3857.tif",
+        ".cache.render/land_31TDF_1_1_fullrender_3857.tif",
     }
-    assert master_calls[0][1] == ".temp/master_fullrender.vrt"
+    assert master_calls[0][1] == ".cache.render/master_fullrender.vrt"
     assert len(commit_calls) == 1
     assert commit_calls[0][:4] == (
-        ".temp/master_fullrender.vrt",
+        ".cache.render/master_fullrender.vrt",
         "output.pmtiles",
         "fullrender",
         satmaps.FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID,
@@ -3283,6 +3283,7 @@ def test_render_land_work_unit_rasters_fast_forwards_existing_outputs(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
+    (tmp_path / ".cache.render").mkdir()
     args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles", prefetch_cache=None)
     work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
     raster_path = Path(satmaps.build_work_unit_raster_path("output.pmtiles", "rasterrun", "31TDF_0_0"))
