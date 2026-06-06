@@ -37,6 +37,7 @@ from tiler import (
     apply_preview_correction_numpy,
     apply_soft_knee_numpy,
     build_hdr_highlight_blend_weight_numpy,
+    build_hdr_shadow_blend_weight_numpy,
     encode_terrarium_numpy,
     get_chunk_tile_range,
     get_web_mercator_bounds,
@@ -463,12 +464,46 @@ def test_build_hdr_highlight_blend_weight_targets_bright_neutral_pixels() -> Non
     assert weights[0, 1] < 0.1
 
 
+def test_build_hdr_shadow_blend_weight_targets_darker_pixels_with_large_hdr_gap() -> None:
+    source = np.array(
+        [
+            [[0.2, 0.95, 0.35]],
+            [[0.2, 0.95, 0.35]],
+            [[0.2, 0.95, 0.35]],
+        ],
+        dtype=np.float32,
+    )
+    base = np.array(
+        [
+            [[0.65, 0.98, 0.55]],
+            [[0.65, 0.98, 0.55]],
+            [[0.65, 0.98, 0.55]],
+        ],
+        dtype=np.float32,
+    )
+    hdr = np.array(
+        [
+            [[0.54, 0.94, 0.43]],
+            [[0.54, 0.94, 0.43]],
+            [[0.54, 0.94, 0.43]],
+        ],
+        dtype=np.float32,
+    )
+
+    weights = build_hdr_shadow_blend_weight_numpy(source, base, hdr)
+
+    assert weights.shape == (1, 3)
+    assert weights[0, 0] > 0.7
+    assert weights[0, 1] < 0.1
+    assert 0.1 < weights[0, 2] < 0.5
+
+
 def test_apply_land_style_numpy_blends_hdr_only_into_snow_like_highlights() -> None:
     source = np.array(
         [
-            [[0.98, 0.2]],
-            [[0.98, 0.2]],
-            [[0.98, 0.2]],
+            [[0.98, 0.2, 0.05]],
+            [[0.98, 0.2, 0.6]],
+            [[0.98, 0.2, 0.05]],
         ],
         dtype=np.float32,
     )
@@ -521,7 +556,8 @@ def test_apply_land_style_numpy_blends_hdr_only_into_snow_like_highlights() -> N
 
     assert hybrid[0, 0, 0] < balanced[0, 0, 0]
     assert hybrid[0, 0, 0] <= hdr[0, 0, 0]
-    np.testing.assert_allclose(hybrid[:, 0, 1], balanced[:, 0, 1], atol=1e-5)
+    assert hdr[0, 0, 1] < hybrid[0, 0, 1] < balanced[0, 0, 1]
+    np.testing.assert_allclose(hybrid[:, 0, 2], balanced[:, 0, 2], atol=2e-4)
 
 
 def test_encode_terrarium_numpy_round_trips_elevations() -> None:

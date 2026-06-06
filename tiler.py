@@ -59,6 +59,10 @@ LAND_HDR_HIGHLIGHT_LUMA_START = 0.72
 LAND_HDR_HIGHLIGHT_LUMA_END = 0.92
 LAND_HDR_HIGHLIGHT_NEUTRALITY_START = 0.55
 LAND_HDR_HIGHLIGHT_NEUTRALITY_END = 0.9
+LAND_HDR_SHADOW_LUMA_START = 0.12
+LAND_HDR_SHADOW_LUMA_END = 0.45
+LAND_HDR_SHADOW_DELTA_START = 0.02
+LAND_HDR_SHADOW_DELTA_END = 0.1
 
 MAKO_RAMP = [
     (0.00, 0, 8, 37),
@@ -406,6 +410,40 @@ def build_hdr_highlight_blend_weight_numpy(
     )
 
 
+def build_hdr_shadow_blend_weight_numpy(
+    source_rgb_arr: np.ndarray,
+    base_rgb_arr: np.ndarray,
+    hdr_rgb_arr: np.ndarray,
+    *,
+    luma_start: float = LAND_HDR_SHADOW_LUMA_START,
+    luma_end: float = LAND_HDR_SHADOW_LUMA_END,
+    delta_start: float = LAND_HDR_SHADOW_DELTA_START,
+    delta_end: float = LAND_HDR_SHADOW_DELTA_END,
+) -> np.ndarray:
+    """Return per-pixel blend weights for darker land where Balanced stays noticeably brighter than HDR."""
+    if luma_end <= luma_start:
+        raise ValueError("luma_end must be greater than luma_start")
+    if delta_end <= delta_start:
+        raise ValueError("delta_end must be greater than delta_start")
+
+    source_clipped = cast(np.ndarray, np.clip(source_rgb_arr, 0.0, 1.0))
+    base_clipped = cast(np.ndarray, np.clip(base_rgb_arr, 0.0, 1.0))
+    hdr_clipped = cast(np.ndarray, np.clip(hdr_rgb_arr, 0.0, 1.0))
+    source_luma = (
+        LUMA_RED * source_clipped[0] + LUMA_GREEN * source_clipped[1] + LUMA_BLUE * source_clipped[2]
+    )
+    base_luma = LUMA_RED * base_clipped[0] + LUMA_GREEN * base_clipped[1] + LUMA_BLUE * base_clipped[2]
+    hdr_luma = LUMA_RED * hdr_clipped[0] + LUMA_GREEN * hdr_clipped[1] + LUMA_BLUE * hdr_clipped[2]
+    shadow_luma_weight = 1.0 - smoothstep_numpy((source_luma - luma_start) / (luma_end - luma_start))
+    delta_weight = smoothstep_numpy(
+        (np.maximum(base_luma - hdr_luma, 0.0) - delta_start) / (delta_end - delta_start)
+    )
+    return cast(
+        np.ndarray,
+        np.clip(shadow_luma_weight * delta_weight, 0.0, 1.0).astype(np.float32, copy=False),
+    )
+
+
 def apply_preview_correction_numpy(
     rgb_arr: np.ndarray,
     saturation: float = PREVIEW_SATURATION,
@@ -542,10 +580,6 @@ def apply_land_style_numpy(
     if not hdr_highlights:
         return base_graded
 
-    hdr_weight = build_hdr_highlight_blend_weight_numpy(toned)
-    if not np.any(hdr_weight > 0.0):
-        return base_graded
-
     hdr_toned = apply_land_tonemap_numpy(
         rgb_arr,
         tonemap=tonemap,
@@ -570,6 +604,12 @@ def apply_land_style_numpy(
         mid_slope=LAND_HDR_REFERENCE_GRADE_MID_SLOPE,
         high_slope=LAND_HDR_REFERENCE_GRADE_HIGHLIGHT_SLOPE,
     )
+    hdr_weight = np.maximum(
+        build_hdr_highlight_blend_weight_numpy(toned),
+        build_hdr_shadow_blend_weight_numpy(rgb_arr, base_graded, hdr_graded),
+    )
+    if not np.any(hdr_weight > 0.0):
+        return base_graded
     return cast(
         np.ndarray,
         np.clip(

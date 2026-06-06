@@ -4271,7 +4271,7 @@ def main() -> None:
         "--hdr-highlights",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Blend HDR grading into bright near-neutral land highlights to preserve snow and ice detail",
+        help="Blend HDR grading into bright land highlights and selected darker terrain shadows to preserve snow/ice detail and deepen mountain relief",
     )
     parser.add_argument(
         "--land",

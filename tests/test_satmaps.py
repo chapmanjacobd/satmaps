@@ -789,7 +789,7 @@ def test_write_processed_blocks_block_path_matches_in_memory_path(
 
 
 def test_tone_mapped_byte_block_supports_hdr_highlights_flag() -> None:
-    averaged_block = np.array([[[0.98]], [[0.98]], [[0.98]]], dtype=np.float32)
+    averaged_block = np.array([[[0.98, 0.2, 0.05]], [[0.98, 0.2, 0.6]], [[0.98, 0.2, 0.05]]], dtype=np.float32)
     common_args = {
         "grade": True,
         "tonemap": False,
@@ -826,6 +826,8 @@ def test_tone_mapped_byte_block_supports_hdr_highlights_flag() -> None:
     )
 
     assert hybrid[0, 0, 0] < balanced[0, 0, 0]
+    assert hybrid[0, 0, 1] < balanced[0, 0, 1]
+    assert hybrid[0, 0, 2] == balanced[0, 0, 2]
 
 
 def test_open_gebco_mask_avoids_update_mode_warning(tmp_path: Path) -> None:

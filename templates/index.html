@@ -489,6 +489,11 @@
             return applyGradeCurve(applyGradePrep(x, p), p);
         }
 
+        function smoothstep(x) {
+            const clipped = Math.min(1.0, Math.max(0.0, x));
+            return clipped * clipped * (3.0 - (2.0 * clipped));
+        }
+
         function getHdrReferenceGradeParams() {
             const hdrPreset = gradePresetMap['hdr'];
             return hdrPreset ? hdrPreset.values : null;
@@ -496,9 +501,21 @@
 
         function getHdrHighlightBlendWeight(x) {
             if (hdrHighlightCurve.luma_end <= hdrHighlightCurve.luma_start) return 0.0;
-            const normalized = (x - hdrHighlightCurve.luma_start) / (hdrHighlightCurve.luma_end - hdrHighlightCurve.luma_start);
-            const clipped = Math.min(1.0, Math.max(0.0, normalized));
-            return clipped * clipped * (3.0 - (2.0 * clipped));
+            return smoothstep((x - hdrHighlightCurve.luma_start) / (hdrHighlightCurve.luma_end - hdrHighlightCurve.luma_start));
+        }
+
+        function getHdrShadowBlendWeight(sourceLuma, baseOutput, hdrOutput) {
+            if (hdrHighlightCurve.shadow_luma_end <= hdrHighlightCurve.shadow_luma_start) return 0.0;
+            if (hdrHighlightCurve.shadow_delta_end <= hdrHighlightCurve.shadow_delta_start) return 0.0;
+            const shadowLumaWeight = 1.0 - smoothstep(
+                (sourceLuma - hdrHighlightCurve.shadow_luma_start)
+                / (hdrHighlightCurve.shadow_luma_end - hdrHighlightCurve.shadow_luma_start)
+            );
+            const deltaWeight = smoothstep(
+                (Math.max(0.0, baseOutput - hdrOutput) - hdrHighlightCurve.shadow_delta_start)
+                / (hdrHighlightCurve.shadow_delta_end - hdrHighlightCurve.shadow_delta_start)
+            );
+            return shadowLumaWeight * deltaWeight;
         }
 
         function applyRgbVibrance(rgb, p) {
@@ -528,8 +545,11 @@
                     const hdrRef = getHdrReferenceGradeParams();
                     if (hdrRef) {
                         const hdrExposed = Math.min(1.0, x * hdrRef.exp);
-                        const blendWeight = getHdrHighlightBlendWeight(exposed);
                         const hdrOutput = applyScalarGrading(hdrExposed, hdrRef);
+                        const blendWeight = Math.max(
+                            getHdrHighlightBlendWeight(exposed),
+                            getHdrShadowBlendWeight(x, output, hdrOutput)
+                        );
                         output = output + ((hdrOutput - output) * blendWeight);
                     }
                 }

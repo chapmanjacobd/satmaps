@@ -153,7 +153,7 @@ satmaps --estimate
 - `--land` / `--no-land`: Enable or skip Sentinel-2 land tile processing entirely.
 - `--grade` / `--no-grade`: Enable or disable final land grading.
 - `--exposure`: Global brightness multiplier.
-- `--hdr-highlights` / `--no-hdr-highlights`: Blend the HDR land look into bright near-neutral highlights so snow and ice keep more detail without flattening the rest of the map.
+- `--hdr-highlights` / `--no-hdr-highlights`: Blend the HDR land look into bright land highlights and selected darker terrain shadows so snow/ice detail holds up without making mountain relief look washed out.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
 - `--prefetch-cache`: Ephemeral cache directory for prefetched RGB bands (default: `<cache>.temp`).
 - `--temp-dir`: Directory for heavyweight intermediary files, resume state, and the staged MBTiles (default: `.temp`).
@@ -203,7 +203,7 @@ You can override the defaults (tuned via `satmaps-tuner`):
 - `--shoulder`: Highlight shaping curve for moving the top end.
 - `--db`, `--ls`: Low-tone grading breakpoint and slope.
 - `--ghb`, `--gms`, `--ghs`: Mid/high grading breakpoint and contrast slopes.
-- `--hdr-highlights`: Use the selective Balanced+HDR snow/ice highlight recovery pass from the tuner preset.
+- `--hdr-highlights`: Use the selective Balanced+HDR highlight and shadow recovery pass from the tuner preset.
 
 ## Technical Details
 

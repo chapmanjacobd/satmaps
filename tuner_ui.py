@@ -865,6 +865,10 @@ def index() -> ResponseReturnValue:
         hdr_highlight_curve={
             "luma_start": tiler.LAND_HDR_HIGHLIGHT_LUMA_START,
             "luma_end": tiler.LAND_HDR_HIGHLIGHT_LUMA_END,
+            "shadow_luma_start": tiler.LAND_HDR_SHADOW_LUMA_START,
+            "shadow_luma_end": tiler.LAND_HDR_SHADOW_LUMA_END,
+            "shadow_delta_start": tiler.LAND_HDR_SHADOW_DELTA_START,
+            "shadow_delta_end": tiler.LAND_HDR_SHADOW_DELTA_END,
         },
         land_locations=LAND_LOCATIONS,
         land_blend_modes=LAND_BLEND_MODES,
