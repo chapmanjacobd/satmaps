@@ -70,7 +70,6 @@ SUBTILE_OFFSETS = ((0, 0), (0, 1), (1, 0), (1, 1))
 SENTINEL_NODATA = -32768
 PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
-OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
 OCEAN_MASK_SOURCE_CROP_HALO_PIXELS = 2
 DEFAULT_PREFETCH_IF_LAND = 100.0
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
@@ -281,53 +280,6 @@ class SatmapsRunPaths:
 
 
 # Compatibility wrappers for callers that still use the legacy path-helper API.
-def build_output_temp_dir(unique_id: str) -> str:
-   return build_output_namespace_dir(TEMP_DIR, unique_id)
-
-
-def build_full_render_cache_dir(unique_id: str) -> str:
-   return build_output_namespace_dir(FULL_RENDER_CACHE_DIR, unique_id)
-
-
-def build_state_file_path(unique_id: str) -> str:
-   return os.path.join(build_output_temp_dir(unique_id), "state.json")
-
-
-def build_land_run_metadata_path(unique_id: str) -> str:
-   return os.path.join(build_output_temp_dir(unique_id), "run.json")
-
-
-def build_candidate_tile_cache_path(unique_id: str) -> str:
-   return os.path.join(build_output_temp_dir(unique_id), "candidate_tiles.json")
-
-
-def build_temp_mbtiles_path(output_path: str, unique_id: str) -> str:
-   return SatmapsRunPaths(output_path, unique_id).temp_mbtiles
-
-
-def build_work_unit_raster_path(output_path: str, unique_id: str, work_unit_id: str) -> str:
-   return SatmapsRunPaths(output_path, unique_id).work_unit_raster(work_unit_id)
-
-
-def build_master_vrt_path(unique_id: str) -> str:
-   return os.path.join(build_full_render_cache_dir(unique_id), "master.vrt")
-
-
-def build_tile_cache_root(output_path: str, unique_id: str) -> str:
-   return SatmapsRunPaths(output_path, unique_id).tile_cache_root
-
-
-def build_tile_cache_marker_path(output_path: str, unique_id: str, contributor_id: str) -> str:
-   return SatmapsRunPaths(output_path, unique_id).tile_cache_marker(contributor_id)
-
-
-def build_final_tile_cache_dir(output_path: str, unique_id: str) -> str:
-   return SatmapsRunPaths(output_path, unique_id).final_tile_cache_dir
-
-
-def build_prepared_ocean_path(output_path: str, unique_id: str) -> str:
-   return SatmapsRunPaths(output_path, unique_id).prepared_ocean_path
-
 
 def build_empty_tile_marker_path(destination_path: str) -> str:
    """Return the sentinel path recording that a final tile rendered empty (no data)."""
@@ -553,13 +505,6 @@ def write_tile_cache_marker(
     )
 
 
-def read_tile_cache_marker(marker_path: str) -> Tuple[str, List[str]]:
-    """Load one contributor completion marker."""
-    with open(marker_path) as marker_file:
-        payload = json.load(marker_file)
-    contributor_id = cast(str, payload["contributor_id"])
-    tile_relpaths = [cast(str, tile_path) for tile_path in payload.get("tiles", [])]
-    return contributor_id, tile_relpaths
 
 
 def write_candidate_tile_cache(
@@ -633,14 +578,6 @@ def read_candidate_tile_cache_record(cache_path: str) -> Optional["CandidateTile
         return None
 
 
-def read_candidate_tile_cache(
-    cache_path: str,
-) -> Optional[dict[str, tuple[tuple[int, int, int], ...]]]:
-    """Load previously precomputed final-tile candidates from disk."""
-    record = read_candidate_tile_cache_record(cache_path)
-    if record is None:
-        return None
-    return record.contributor_row_slabs
 
 
 def parse_prefetch_if_land(value: str) -> float:
@@ -979,36 +916,6 @@ def discover_mgrs_tiles_in_bbox(
                 continue
 
     return list(discovered_mgrs)
-
-
-def build_bbox_geometry(
-    bbox: Tuple[float, float, float, float],
-    target_srs: Optional[osr.SpatialReference] = None,
-) -> ogr.Geometry:
-    """Build a bbox polygon, reprojecting it from WGS84 when a target SRS is supplied."""
-    min_lon, min_lat, max_lon, max_lat = bbox
-    ring = ogr.Geometry(ogr.wkbLinearRing)
-    ring.AddPoint(min_lon, min_lat)
-    ring.AddPoint(max_lon, min_lat)
-    ring.AddPoint(max_lon, max_lat)
-    ring.AddPoint(min_lon, max_lat)
-    ring.AddPoint(min_lon, min_lat)
-    polygon = ogr.Geometry(ogr.wkbPolygon)
-    polygon.AddGeometry(ring)
-
-    if target_srs is None:
-        return polygon
-
-    dataset_srs = target_srs.Clone()
-    wgs84_srs = osr.SpatialReference()
-    wgs84_srs.ImportFromEPSG(4326)
-    if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
-        wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        dataset_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    if not (dataset_srs.IsSameGeogCS(wgs84_srs) and dataset_srs.IsGeographic()):
-        polygon.Transform(osr.CoordinateTransformation(wgs84_srs, dataset_srs))
-
-    return polygon
 
 
 def build_tile_grid_geometry(
@@ -1886,24 +1793,6 @@ def get_ocean_mask_band_index(dataset: gdal.Dataset) -> Optional[int]:
     return None
 
 
-def get_bbox_scan_window(
-    dataset: gdal.Dataset,
-    bbox: Optional[Tuple[float, float, float, float]],
-) -> Optional[Tuple[int, int, int, int]]:
-    """Return the source window covering the requested bbox before block iteration starts."""
-    if bbox is None:
-        return 0, 0, dataset.RasterXSize, dataset.RasterYSize
-
-    dataset_srs = dataset.GetSpatialRef()
-    bbox_geometry = build_bbox_geometry(bbox, dataset_srs)
-    min_x, max_x, min_y, max_y = bbox_geometry.GetEnvelope()
-    bbox_bounds = (min_x, min_y, max_x, max_y)
-    src_win = tiler.te_to_src_win(dataset, bbox_bounds)
-    if src_win[2] <= 0 or src_win[3] <= 0:
-        return None
-
-    return src_win
-
 
 def get_aligned_web_mercator_src_win(
     dataset: gdal.Dataset,
@@ -2126,18 +2015,6 @@ def fill_nan_nearest(
 
     return filled
 
-
-def load_tile_grid(red_path: str) -> TileGrid:
-    """Read the common raster grid metadata from the red band."""
-    dataset = gdal.Open(red_path)
-    tile_grid = TileGrid(
-        projection=dataset.GetProjection(),
-        geotransform=dataset.GetGeoTransform(),
-        width=dataset.RasterXSize,
-        height=dataset.RasterYSize,
-    )
-    dataset = None
-    return tile_grid
 
 
 def build_projection_to_wgs84_transform(projection: str) -> osr.CoordinateTransformation:
@@ -2684,28 +2561,6 @@ def build_output_tile_contributor_rows(
         total_tiles += len(ordered_row)
     return total_tiles, rows
 
-
-def build_output_tile_contributor_iterator(
-    work_units: Sequence[LandWorkUnit],
-    contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]],
-    zoom: int,
-    *,
-    consume_candidates: bool = False,
-) -> tuple[int, Iterator[tuple[str, tuple[str, ...]]]]:
-    """Yield inverted contributor final-tile footprint relationships row by row."""
-    total_tiles, rows = build_output_tile_contributor_rows(
-        work_units,
-        contributor_row_slabs,
-        consume_candidates=consume_candidates,
-    )
-
-    def iterator() -> Iterator[tuple[str, tuple[str, ...]]]:
-        for ty in sorted(rows.keys()):
-            for tx, contributor_ids in rows[ty]:
-                relpath = os.path.join(str(zoom), str(tx), f"{ty}.webp")
-                yield relpath, contributor_ids
-
-    return total_tiles, iterator()
 
 
 def build_output_tile_batch_iterator(

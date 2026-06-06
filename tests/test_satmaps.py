@@ -24,6 +24,42 @@ from satmaps import (
     main,
 )
 
+from typing import cast, Tuple, List, Sequence, Iterator
+def read_tile_cache_marker_helper(marker_path: str) -> Tuple[str, List[str]]:
+    """Load one contributor completion marker."""
+    with open(marker_path) as marker_file:
+        payload = json.load(marker_file)
+    contributor_id = cast(str, payload["contributor_id"])
+    tile_relpaths = [cast(str, tile_path) for tile_path in payload.get("tiles", [])]
+    return contributor_id, tile_relpaths
+
+
+
+def build_output_tile_contributor_iterator_helper(
+    work_units: Sequence[satmaps.LandWorkUnit],
+    contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]],
+    zoom: int,
+    *,
+    consume_candidates: bool = False,
+) -> tuple[int, Iterator[tuple[str, tuple[str, ...]]]]:
+    """Yield inverted contributor final-tile footprint relationships row by row."""
+    total_tiles, rows = satmaps.build_output_tile_contributor_rows(
+        work_units,
+        contributor_row_slabs,
+        consume_candidates=consume_candidates,
+    )
+
+    def iterator() -> Iterator[tuple[str, tuple[str, ...]]]:
+        for ty in sorted(rows.keys()):
+            for tx, contributor_ids in rows[ty]:
+                relpath = os.path.join(str(zoom), str(tx), f"{ty}.webp")
+                yield relpath, contributor_ids
+
+    return total_tiles, iterator()
+
+
+
+
 class StubBand:
     def __init__(self, data: np.ndarray) -> None:
         self.data = data
@@ -1071,7 +1107,7 @@ def test_build_output_tile_contributor_iterator_preserves_work_unit_order() -> N
         satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
     )
 
-    _, iterator = satmaps.build_output_tile_contributor_iterator(
+    _, iterator = build_output_tile_contributor_iterator_helper(
         work_units,
         {
             "31TDF_1_0": ((2, 1, 1),),
@@ -1096,7 +1132,7 @@ def test_build_output_tile_contributor_iterator_can_consume_candidates() -> None
         "31TDF_0_0": ((2, 1, 1), (3, 1, 1)),
     }
 
-    _, iterator = satmaps.build_output_tile_contributor_iterator(
+    _, iterator = build_output_tile_contributor_iterator_helper(
         work_units,
         contributor_row_slabs,
         zoom=13,
@@ -1588,7 +1624,7 @@ def test_get_bbox_scan_window_crops_before_scanning(tmp_path: Path) -> None:
     srs.ImportFromEPSG(4326)
     dataset.SetProjection(srs.ExportToWkt())
 
-    src_win = satmaps.get_bbox_scan_window(dataset, (1.0, 1.0, 2.0, 2.0))
+    src_win = land_mgrs.get_bbox_scan_window(dataset, (1.0, 1.0, 2.0, 2.0))
 
     assert src_win == (10, 80, 10, 10)
 
@@ -1601,7 +1637,7 @@ def test_get_bbox_scan_window_returns_none_outside_dataset(tmp_path: Path) -> No
     srs.ImportFromEPSG(4326)
     dataset.SetProjection(srs.ExportToWkt())
 
-    assert satmaps.get_bbox_scan_window(dataset, (20.0, 20.0, 21.0, 21.0)) is None
+    assert land_mgrs.get_bbox_scan_window(dataset, (20.0, 20.0, 21.0, 21.0)) is None
 
 def test_convert_raster_to_pmtiles_stages_final_output(
     tmp_path: Path, monkeypatch: object
@@ -2538,7 +2574,7 @@ def test_resolve_work_unit_candidate_row_slabs_reuses_cached_subset_and_persists
         satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),
         satmaps.LandWorkUnit("31TDF_0_1", ("31TDF_0_1",)),
     )
-    cache_path = satmaps.build_candidate_tile_cache_path("candidatecache")
+    cache_path = satmaps.SatmapsRunPaths("", "candidatecache").candidate_tile_cache_path
     satmaps.write_candidate_tile_cache(
         cache_path,
         {"31TDF_0_0": ((1, 1, 1),)},
@@ -2577,7 +2613,7 @@ def test_resolve_work_unit_candidate_row_slabs_reuses_cached_subset_and_persists
         "31TDF_0_0": ((1, 1, 1),),
         "31TDF_0_1": ((2, 2, 2),),
     }
-    assert satmaps.read_candidate_tile_cache(cache_path) == actual
+    assert satmaps.read_candidate_tile_cache_record(cache_path).contributor_row_slabs == actual
     out = capsys.readouterr().out
     assert f"Loaded candidate tile cache from {cache_path} with 1 sub-tile(s)." in out
     assert "Reusing cached candidate tile footprints for 1 sub-tile(s); computing 1 missing." in out
@@ -2591,7 +2627,7 @@ def test_resolve_work_unit_candidate_row_slabs_warns_for_changed_cache_settings(
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
     work_units = (satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),)
-    cache_path = satmaps.build_candidate_tile_cache_path("candidatecache")
+    cache_path = satmaps.SatmapsRunPaths("", "candidatecache").candidate_tile_cache_path
     previous_settings = satmaps.build_candidate_tile_cache_settings(
         argparse.Namespace(output="render.pmtiles", max_zoom=13, blocksize=512, resample_alg="lanczos")
     )
@@ -3059,7 +3095,7 @@ def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
     ]
     assert packaged == [
         (
-            satmaps.build_final_tile_cache_dir("output.pmtiles", "mainwebp"),
+            satmaps.SatmapsRunPaths("output.pmtiles", "mainwebp").final_tile_cache_dir,
             "output.pmtiles",
             {
                 "resample_alg": "lanczos",
@@ -3153,7 +3189,7 @@ def test_main_full_render_first_builds_master_vrt_and_commits_to_tile_cache(
         )
         for work_unit in work_units:
             Path(
-                satmaps.build_work_unit_raster_path(args.output, unique_id, work_unit.unit_id)
+                satmaps.SatmapsRunPaths(args.output, unique_id).work_unit_raster(work_unit.unit_id)
             ).write_text("raster")
         return satmaps.LandRasterRenderStats(
             total_work_units=len(work_units),
@@ -3436,7 +3472,7 @@ def test_render_land_work_unit_rasters_fast_forwards_existing_outputs(
     (tmp_path / ".cache.render").mkdir()
     args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles", prefetch_cache=None)
     work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
-    raster_path = Path(satmaps.build_work_unit_raster_path("output.pmtiles", "rasterrun", "31TDF_0_0"))
+    raster_path = Path(satmaps.SatmapsRunPaths("output.pmtiles", "rasterrun").work_unit_raster("31TDF_0_0"))
     raster_path.parent.mkdir(parents=True, exist_ok=True)
     raster_path.write_text("raster")
     completed: set[str] = set()
@@ -3610,7 +3646,7 @@ def test_main_bbox_prepares_and_commits_ocean_background(
 
     def fake_prepare(*args):
         prepare_calls.append(args)
-        return satmaps.build_prepared_ocean_path("output.pmtiles", "bboxrun")
+        return satmaps.SatmapsRunPaths("output.pmtiles", "bboxrun").prepared_ocean_path
 
     def fake_commit(*args):
         commit_calls.append(args)
@@ -3640,7 +3676,7 @@ def test_main_bbox_prepares_and_commits_ocean_background(
     ]
     assert len(commit_calls) == 1
     assert commit_calls[0][:3] == (
-        satmaps.build_prepared_ocean_path("output.pmtiles", "bboxrun"),
+        satmaps.SatmapsRunPaths("output.pmtiles", "bboxrun").prepared_ocean_path,
         "output.pmtiles",
         "bboxrun",
     )
@@ -3671,7 +3707,7 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
 
     monkeypatch.setattr(
         "satmaps.prepare_ocean_background_for_output",
-        lambda *args, **kwargs: satmaps.build_prepared_ocean_path("output.pmtiles", "lazyocean"),
+        lambda *args, **kwargs: satmaps.SatmapsRunPaths("output.pmtiles", "lazyocean").prepared_ocean_path,
     )
     monkeypatch.setattr(
         "satmaps.commit_ocean_to_final_tile_cache",
@@ -3724,9 +3760,9 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
     assert render_calls[0]["work_unit_count"] == 4
     assert render_calls[0]["quality"] == 74
     assert render_calls[0]["zoom"] == ocean.DEFAULT_MAX_ZOOM
-    assert render_calls[0]["prepared_ocean_background"] == satmaps.build_prepared_ocean_path(
+    assert render_calls[0]["prepared_ocean_background"] == satmaps.SatmapsRunPaths(
         "output.pmtiles", "lazyocean"
-    )
+    ).prepared_ocean_path
     contributor_row_slabs = render_calls[0]["contributor_row_slabs"]
     assert isinstance(contributor_row_slabs, dict)
     assert set(contributor_row_slabs) == {
@@ -3737,7 +3773,7 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
     }
     assert all(candidate_relpaths for candidate_relpaths in contributor_row_slabs.values())
     assert backfill_calls == [
-        (satmaps.build_prepared_ocean_path("output.pmtiles", "lazyocean"), "output.pmtiles", "lazyocean")
+        (satmaps.SatmapsRunPaths("output.pmtiles", "lazyocean").prepared_ocean_path, "output.pmtiles", "lazyocean")
     ]
     assert package_calls == [
         {
@@ -3768,7 +3804,7 @@ def test_main_reuses_cached_candidate_tile_footprints(
         "31TDF_1_1": ((4, 1, 1),),
     }
     satmaps.write_candidate_tile_cache(
-        satmaps.build_candidate_tile_cache_path("cachedcandidates"),
+        satmaps.SatmapsRunPaths("", "cachedcandidates").candidate_tile_cache_path,
         cached_candidates,
         settings=satmaps.build_candidate_tile_cache_settings(
             argparse.Namespace(output="output.pmtiles", max_zoom=13, blocksize=512, resample_alg="lanczos")
@@ -3807,13 +3843,13 @@ def test_main_reuses_cached_candidate_tile_footprints(
     out = capsys.readouterr().out
     assert (
         "Loaded candidate tile cache from "
-        f"{satmaps.build_candidate_tile_cache_path('cachedcandidates')} with 4 sub-tile(s)."
+        f"{satmaps.SatmapsRunPaths('', 'cachedcandidates').candidate_tile_cache_path} with 4 sub-tile(s)."
         in out
     )
     assert "Reusing cached candidate tile footprints for 4 sub-tile(s)." in out
-    assert satmaps.read_candidate_tile_cache(
-        satmaps.build_candidate_tile_cache_path("cachedcandidates")
-    ) == cached_candidates
+    assert satmaps.read_candidate_tile_cache_record(
+        satmaps.SatmapsRunPaths("", "cachedcandidates").candidate_tile_cache_path
+    ).contributor_row_slabs == cached_candidates
 
 @pytest.mark.parametrize("max_zoom", [ocean.DEFAULT_MAX_ZOOM, 14, 11, 12, 4])
 def test_main_passes_requested_zoom_to_webp_pipeline(
@@ -3856,7 +3892,7 @@ def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    final_tile_tree = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "oceanfill"))
+    final_tile_tree = Path(satmaps.SatmapsRunPaths("output.pmtiles", "oceanfill").final_tile_cache_dir)
     existing_tile = final_tile_tree / "13/1/2.webp"
     tiler.save_webp_image(Image.new("RGB", (8, 8), (1, 2, 3)), str(existing_tile), quality=100)
     original_bytes = existing_tile.read_bytes()
@@ -3984,13 +4020,13 @@ def test_commit_raster_to_final_tile_cache_streams_tile_images(
 
     assert relpaths == ["13/1/2.webp", "13/1/3.webp"]
     marker_path = Path(
-        satmaps.build_tile_cache_marker_path("output.pmtiles", "streamraster", "31TDF_0_0")
+        satmaps.SatmapsRunPaths("output.pmtiles", "streamraster").tile_cache_marker("31TDF_0_0")
     )
     assert marker_path.exists()
-    assert satmaps.read_tile_cache_marker(str(marker_path)) == ("31TDF_0_0", relpaths)
+    assert read_tile_cache_marker_helper(str(marker_path)) == ("31TDF_0_0", relpaths)
     for relative_path in relpaths:
         assert (
-            Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "streamraster")) / relative_path
+            Path(satmaps.SatmapsRunPaths("output.pmtiles", "streamraster").final_tile_cache_dir) / relative_path
         ).exists()
 
 def test_render_final_output_tile_composites_ocean_and_ordered_contributors(
@@ -4046,7 +4082,7 @@ def test_render_final_output_tile_composites_ocean_and_ordered_contributors(
     )
 
     assert wrote_tile
-    final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "tilecompose")) / "13/1/2.webp"
+    final_tile_path = Path(satmaps.SatmapsRunPaths("output.pmtiles", "tilecompose").final_tile_cache_dir) / "13/1/2.webp"
     assert final_tile_path.exists()
 
     expected = Image.alpha_composite(ocean_image, first_contributor)
@@ -4066,7 +4102,7 @@ def test_render_final_output_tile_skips_existing_tile(monkeypatch: object, tmp_p
         resample_alg="lanczos",
         quality=74,
     )
-    final_tile_path = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "tileskip")) / "13/1/2.webp"
+    final_tile_path = Path(satmaps.SatmapsRunPaths("output.pmtiles", "tileskip").final_tile_cache_dir) / "13/1/2.webp"
     tiler.save_webp_image(Image.new("RGB", (8, 8), (10, 20, 30)), str(final_tile_path), quality=100)
 
     monkeypatch.setattr(
@@ -4124,7 +4160,7 @@ def test_render_final_output_tile_marks_and_resumes_empty_tile(
     assert status == satmaps.LandTileRenderStatus.EMPTY
     assert render_calls == 1
 
-    final_dir = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "tileempty"))
+    final_dir = Path(satmaps.SatmapsRunPaths("output.pmtiles", "tileempty").final_tile_cache_dir)
     destination_path = str(final_dir / "13/1/2.webp")
     assert not Path(destination_path).exists()
     assert Path(satmaps.build_empty_tile_marker_path(destination_path)).exists()
@@ -4146,7 +4182,7 @@ def test_render_final_output_tile_clears_stale_empty_marker_on_render(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    final_tile_tree = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "oceanstale"))
+    final_tile_tree = Path(satmaps.SatmapsRunPaths("output.pmtiles", "oceanstale").final_tile_cache_dir)
     destination_path = str(final_tile_tree / "13/1/3.webp")
     satmaps.mark_tile_empty(destination_path)
     assert Path(satmaps.build_empty_tile_marker_path(destination_path)).exists()
@@ -4188,7 +4224,7 @@ def test_render_land_output_tiles_fast_forwards_empty_marked_tiles(
     # ty=5, tx 1..3 -> three output tiles; mark the first two empty on disk.
     contributor_row_slabs = {"31TDF_0_0": ((5, 1, 3),)}
 
-    final_dir = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "ffempty"))
+    final_dir = Path(satmaps.SatmapsRunPaths("output.pmtiles", "ffempty").final_tile_cache_dir)
     for tx in (1, 2):
         satmaps.mark_tile_empty(str(final_dir / f"14/{tx}/5.webp"))
 
@@ -4270,12 +4306,12 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
     for tile_slabs in contributor_row_slabs.values():
         ty, tx_min, tx_max = tile_slabs[0]
         final_tile = (
-            Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "webpresume"))
+            Path(satmaps.SatmapsRunPaths("output.pmtiles", "webpresume").final_tile_cache_dir)
             / f"13/{tx_min}/{ty}.webp"
         )
         tiler.save_webp_image(Image.new("RGB", (8, 8), (0, 0, 255)), str(final_tile), quality=100)
 
-    stale_state = Path(satmaps.build_state_file_path("stale"))
+    stale_state = Path(satmaps.SatmapsRunPaths("", "stale").state_file)
     stale_state.parent.mkdir(parents=True, exist_ok=True)
     stale_state.write_text(
         '{"unique_id": "stale", "completed_units": ["stale"], "processed_tifs": [], "args": {}}'
@@ -4301,7 +4337,7 @@ def test_main_warns_when_prior_land_run_settings_change(
     )
     previous_settings = {"output": "output.pmtiles", "winter": True}
     current_settings = {"output": "output.pmtiles", "winter": False}
-    state_file = Path(satmaps.build_state_file_path("landwarn"))
+    state_file = Path(satmaps.SatmapsRunPaths("", "landwarn").state_file)
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(
         json.dumps(
@@ -4562,7 +4598,7 @@ def test_main_resume_skips_completed_work_units(
         ),
     )
 
-    state_file = Path(satmaps.build_state_file_path("resumefilter"))
+    state_file = Path(satmaps.SatmapsRunPaths("", "resumefilter").state_file)
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(
         json.dumps(
@@ -4590,7 +4626,7 @@ def test_render_land_output_tiles_fast_forwards_existing_tiles_without_dispatch(
     # ty=5, tx 1..3 -> three output tiles; pre-render the first two on disk.
     contributor_row_slabs = {"31TDF_0_0": ((5, 1, 3),)}
 
-    final_dir = Path(satmaps.build_final_tile_cache_dir("output.pmtiles", "ffrun"))
+    final_dir = Path(satmaps.SatmapsRunPaths("output.pmtiles", "ffrun").final_tile_cache_dir)
     for tx in (1, 2):
         tiler.save_webp_image(
             Image.new("RGB", (8, 8), (1, 2, 3)),

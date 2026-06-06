@@ -16,7 +16,6 @@ import tiler
 from satmaps import (
     build_alpha_block,
     build_fill_allowed_mask,
-    build_bbox_geometry,
     build_candidate_tile_cache_settings,
     build_land_run_settings,
     expand_subtiles,
@@ -611,7 +610,7 @@ def test_build_discovery_fill_allowed_mask_depth_mode_uses_shallow_cutoff() -> N
 def test_build_bbox_geometry_reprojects_bbox_to_dataset_srs() -> None:
     web_mercator = osr.SpatialReference()
     web_mercator.ImportFromEPSG(3857)
-    bbox_geom = build_bbox_geometry(QFJ_TILE_BOUNDS, web_mercator)
+    bbox_geom = land_mgrs.build_bbox_geometry(QFJ_TILE_BOUNDS, web_mercator)
 
     min_lon, min_lat, max_lon, max_lat = QFJ_TILE_BOUNDS
     expected_bounds = satmaps.tiler.lonlat_bbox_to_mercator_bounds(
