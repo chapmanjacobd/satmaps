@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import hashlib
 import json
 import os
 import signal
@@ -18,19 +17,23 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, cast
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, cast
 
 import mgrs
 from mgrs import core as mgrs_core
 import numpy as np
 from common import (
     LiveProgressLine,
+    build_output_namespace,
     build_staged_path,
+    print_settings_diff_warning,
+    read_settings_file,
     file_has_content,
     format_eta,
     per_worker_warp_threads,
     publish_staged_path,
     remove_if_exists,
+    write_settings_file,
     warp_thread_budget,
     warp_thread_options,
 )
@@ -213,6 +216,11 @@ def temp_basename_from_output(output_path: str) -> str:
 def build_state_file_path(unique_id: str) -> str:
     """Return the lightweight JSON resume state path."""
     return f"{TEMP_DIR}/state_{unique_id}.json"
+
+
+def build_land_run_metadata_path(unique_id: str) -> str:
+    """Return the persistent JSON sidecar describing the last land run for one output."""
+    return f"{TEMP_DIR}/run_{unique_id}.json"
 
 
 def build_candidate_tile_cache_path(unique_id: str) -> str:
@@ -501,32 +509,28 @@ def read_tile_cache_marker(marker_path: str) -> Tuple[str, List[str]]:
 def write_candidate_tile_cache(
     cache_path: str,
     contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]],
+    *,
+    settings: Mapping[str, Any] | None = None,
 ) -> None:
     """Persist precomputed final-tile candidates atomically for future runs."""
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     temp_cache_path = f"{cache_path}.tmp"
+    payload: dict[str, Any] = {
+        "work_units": sorted(contributor_row_slabs),
+        "contributor_row_slabs": {
+            contributor_id: [list(slab) for slab in row_slabs]
+            for contributor_id, row_slabs in sorted(contributor_row_slabs.items())
+        },
+    }
+    if settings is not None:
+        payload["settings"] = dict(settings)
     with open(temp_cache_path, "w") as cache_file:
-        json.dump(
-            {
-                "work_units": sorted(contributor_row_slabs),
-                "contributor_row_slabs": {
-                    contributor_id: [list(slab) for slab in row_slabs]
-                    for contributor_id, row_slabs in sorted(
-                        contributor_row_slabs.items()
-                    )
-                },
-            },
-            cache_file,
-            indent=2,
-            sort_keys=True,
-        )
+        json.dump(payload, cache_file, indent=2, sort_keys=True)
     os.replace(temp_cache_path, cache_path)
 
 
-def read_candidate_tile_cache(
-    cache_path: str,
-) -> Optional[dict[str, tuple[tuple[int, int, int], ...]]]:
-    """Load previously precomputed final-tile candidates from disk."""
+def read_candidate_tile_cache_record(cache_path: str) -> Optional["CandidateTileCacheRecord"]:
+    """Load previously precomputed final-tile candidates and their settings from disk."""
     if not os.path.exists(cache_path):
         return None
 
@@ -537,6 +541,7 @@ def read_candidate_tile_cache(
             raise ValueError("candidate tile cache must contain a JSON object")
         cached_work_units = payload.get("work_units")
         raw_candidates = payload.get("contributor_row_slabs")
+        raw_settings = payload.get("settings")
         if not isinstance(cached_work_units, list) or not all(
             isinstance(work_unit_id, str) for work_unit_id in cached_work_units
         ):
@@ -565,10 +570,25 @@ def read_candidate_tile_cache(
             raise ValueError(
                 "candidate tile cache work_units must match contributor_row_slabs keys"
             )
-        return normalized_candidates
+        if raw_settings is not None and not isinstance(raw_settings, dict):
+            raise ValueError("candidate tile cache settings must be an object")
+        return CandidateTileCacheRecord(
+            contributor_row_slabs=normalized_candidates,
+            settings=cast(Optional[dict[str, Any]], raw_settings),
+        )
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(f"Warning: Could not load candidate tile cache {cache_path}: {exc}")
         return None
+
+
+def read_candidate_tile_cache(
+    cache_path: str,
+) -> Optional[dict[str, tuple[tuple[int, int, int], ...]]]:
+    """Load previously precomputed final-tile candidates from disk."""
+    record = read_candidate_tile_cache_record(cache_path)
+    if record is None:
+        return None
+    return record.contributor_row_slabs
 
 
 def parse_prefetch_if_land(value: str) -> float:
@@ -642,64 +662,62 @@ def plan_subtile_work_units(
         for subtile in planned_subtiles
     )
 
-def build_land_run_token(
+def build_land_run_settings(
     args: argparse.Namespace,
     date_paths: List[str],
     requested_bbox: Optional[Tuple[float, float, float, float]],
     gebco_vrt_source: Optional[str],
-) -> str:
-    """Return a stable token so identical land-processing runs reuse temp outputs."""
+) -> dict[str, Any]:
+    """Return the resumable land-processing settings for one output."""
     tonemap_enabled = getattr(args, "tonemap", False)
-    payload = json.dumps(
-        {
-            "output": os.path.abspath(args.output),
-            "date_paths": date_paths,
-            "bbox": requested_bbox,
-            "max_zoom": args.max_zoom,
-            "resample_alg": args.resample_alg,
-            "stats_min": args.stats_min,
-            "stats_max": args.stats_max,
-            "tonemap": tonemap_enabled,
-            "grade": args.grade,
-            "exposure": args.exposure,
-            "sb": getattr(args, "sb", tiler.SOFT_KNEE_SHADOW_BREAK) if tonemap_enabled else None,
-            "hb": getattr(args, "hb", tiler.SOFT_KNEE_HIGHLIGHT_BREAK) if tonemap_enabled else None,
-            "ss": getattr(args, "ss", tiler.SOFT_KNEE_SHADOW_SLOPE) if tonemap_enabled else None,
-            "ms": getattr(args, "ms", tiler.SOFT_KNEE_MID_SLOPE) if tonemap_enabled else None,
-            "hs": getattr(args, "hs", tiler.SOFT_KNEE_HIGHLIGHT_SLOPE) if tonemap_enabled else None,
-            "gamma": args.gamma,
-            "shoulder": getattr(args, "shoulder", tiler.DEFAULT_SHOULDER),
-            "sat": args.sat,
-            "vibrance": getattr(args, "vibrance", tiler.DEFAULT_VIBRANCE),
-            "black_point": getattr(args, "black_point", tiler.DEFAULT_BLACK_POINT),
-            "white_point": getattr(args, "white_point", tiler.DEFAULT_WHITE_POINT),
-            "db": args.db,
-            "ls": args.ls,
-            "ghb": args.ghb,
-            "gms": args.gms,
-            "ghs": args.ghs,
-            "hdr_highlights": getattr(args, "hdr_highlights", False),
-            "winter": getattr(args, "winter", False),
-            "full_render_first": getattr(args, "full_render_first", False),
-            "ocean_mask_source": os.path.abspath(gebco_vrt_source) if gebco_vrt_source else None,
-        },
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+    return {
+        "output": os.path.abspath(args.output),
+        "date_paths": date_paths,
+        "bbox": requested_bbox,
+        "max_zoom": args.max_zoom,
+        "resample_alg": args.resample_alg,
+        "stats_min": args.stats_min,
+        "stats_max": args.stats_max,
+        "tonemap": tonemap_enabled,
+        "grade": args.grade,
+        "exposure": args.exposure,
+        "sb": getattr(args, "sb", tiler.SOFT_KNEE_SHADOW_BREAK) if tonemap_enabled else None,
+        "hb": getattr(args, "hb", tiler.SOFT_KNEE_HIGHLIGHT_BREAK) if tonemap_enabled else None,
+        "ss": getattr(args, "ss", tiler.SOFT_KNEE_SHADOW_SLOPE) if tonemap_enabled else None,
+        "ms": getattr(args, "ms", tiler.SOFT_KNEE_MID_SLOPE) if tonemap_enabled else None,
+        "hs": getattr(args, "hs", tiler.SOFT_KNEE_HIGHLIGHT_SLOPE) if tonemap_enabled else None,
+        "gamma": args.gamma,
+        "shoulder": getattr(args, "shoulder", tiler.DEFAULT_SHOULDER),
+        "sat": args.sat,
+        "vibrance": getattr(args, "vibrance", tiler.DEFAULT_VIBRANCE),
+        "black_point": getattr(args, "black_point", tiler.DEFAULT_BLACK_POINT),
+        "white_point": getattr(args, "white_point", tiler.DEFAULT_WHITE_POINT),
+        "db": args.db,
+        "ls": args.ls,
+        "ghb": args.ghb,
+        "gms": args.gms,
+        "ghs": args.ghs,
+        "hdr_highlights": getattr(args, "hdr_highlights", False),
+        "winter": getattr(args, "winter", False),
+        "full_render_first": getattr(args, "full_render_first", False),
+        "ocean_mask_source": os.path.abspath(gebco_vrt_source) if gebco_vrt_source else None,
+    }
 
 
-def build_candidate_tile_cache_token(args: argparse.Namespace) -> str:
-    """Return a stable token for the reusable candidate-footprint cache."""
-    payload = json.dumps(
-        {
-            "max_zoom": args.max_zoom,
-            "resample_alg": args.resample_alg,
-            "blocksize": args.blocksize,
-            "footprint_band": DEFAULT_CANDIDATE_FOOTPRINT_BAND_ID,
-        },
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+def build_candidate_tile_cache_settings(args: argparse.Namespace) -> dict[str, Any]:
+    """Return the reusable candidate-footprint cache settings."""
+    return {
+        "max_zoom": args.max_zoom,
+        "resample_alg": args.resample_alg,
+        "blocksize": args.blocksize,
+        "footprint_band": DEFAULT_CANDIDATE_FOOTPRINT_BAND_ID,
+    }
+
+
+@dataclass(frozen=True)
+class CandidateTileCacheRecord:
+    contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]]
+    settings: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -1625,6 +1643,7 @@ def resolve_work_unit_candidate_row_slabs(
     *,
     cache_path: str,
     fallback_cache_path: Optional[str] = None,
+    cache_settings: Mapping[str, Any] | None = None,
     tile_size: int = 512,
     resample_alg: str = "lanczos",
     parallel: int = 1,
@@ -1633,16 +1652,29 @@ def resolve_work_unit_candidate_row_slabs(
     if not work_units:
         return {}
 
-    loaded_candidates = read_candidate_tile_cache(cache_path)
-    loaded_cache_path = cache_path if loaded_candidates is not None else None
+    loaded_record = read_candidate_tile_cache_record(cache_path)
+    loaded_cache_path = cache_path if loaded_record is not None else None
     if (
-        loaded_candidates is None
+        loaded_record is None
         and fallback_cache_path is not None
         and fallback_cache_path != cache_path
     ):
-        loaded_candidates = read_candidate_tile_cache(fallback_cache_path)
-        if loaded_candidates is not None:
+        loaded_record = read_candidate_tile_cache_record(fallback_cache_path)
+        if loaded_record is not None:
             loaded_cache_path = fallback_cache_path
+    if (
+        loaded_record is not None
+        and cache_settings is not None
+        and loaded_record.settings is not None
+    ):
+        print_settings_diff_warning(
+            "Candidate tile cache",
+            loaded_record.settings,
+            cache_settings,
+        )
+    loaded_candidates = (
+        loaded_record.contributor_row_slabs if loaded_record is not None else None
+    )
     if loaded_candidates is None:
         print(f"No usable candidate tile cache found at {cache_path}; computing source footprints.")
     else:
@@ -1665,7 +1697,7 @@ def resolve_work_unit_candidate_row_slabs(
 
     if reused_candidates and not missing_work_units:
         if loaded_cache_path and loaded_cache_path != cache_path:
-            write_candidate_tile_cache(cache_path, cached_candidates)
+            write_candidate_tile_cache(cache_path, cached_candidates, settings=cache_settings)
         print(
             f"Reusing cached candidate tile footprints for "
             f"{len(reused_candidates)} sub-tile(s)."
@@ -1690,7 +1722,7 @@ def resolve_work_unit_candidate_row_slabs(
     )
     merged_candidates = dict(cached_candidates)
     merged_candidates.update(computed_candidates)
-    write_candidate_tile_cache(cache_path, merged_candidates)
+    write_candidate_tile_cache(cache_path, merged_candidates, settings=cache_settings)
     return {
         work_unit.unit_id: merged_candidates[work_unit.unit_id]
         for work_unit in work_units
@@ -4373,11 +4405,28 @@ def main() -> None:
     if requested_bbox is None:
         populate_s3_cache(date_paths)
 
-    unique_id = build_land_run_token(args, date_paths, requested_bbox, gebco_vrt_source)
+    unique_id = build_output_namespace(args.output, default_stem="satmaps")
+    land_run_settings = build_land_run_settings(
+        args,
+        date_paths,
+        requested_bbox,
+        gebco_vrt_source,
+    )
     state_file = build_state_file_path(unique_id)
-    candidate_tile_cache_token = build_candidate_tile_cache_token(args)
-    candidate_tile_cache_path = build_candidate_tile_cache_path(candidate_tile_cache_token)
-    legacy_candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
+    land_run_metadata_path = build_land_run_metadata_path(unique_id)
+    previous_land_run_settings = read_settings_file(
+        land_run_metadata_path,
+        description="land run metadata",
+    )
+    if previous_land_run_settings is not None:
+        print_settings_diff_warning(
+            "Land run",
+            previous_land_run_settings,
+            land_run_settings,
+        )
+    write_settings_file(land_run_metadata_path, land_run_settings)
+    candidate_tile_cache_settings = build_candidate_tile_cache_settings(args)
+    candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
     completed_units: Set[str] = set()
     if os.path.exists(state_file):
         resume_state = restore_resume_state(state_file)
@@ -4524,7 +4573,7 @@ def main() -> None:
                 args.cache,
                 args.max_zoom,
                 cache_path=candidate_tile_cache_path,
-                fallback_cache_path=legacy_candidate_tile_cache_path,
+                cache_settings=candidate_tile_cache_settings,
                 tile_size=args.blocksize,
                 resample_alg=args.resample_alg,
                 parallel=args.parallel,

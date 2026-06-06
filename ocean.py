@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 import argparse
-import hashlib
-import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from shutil import copyfile
-from typing import Callable, Sequence, TypeVar
+from typing import Any, Callable, Sequence, TypeVar
 from xml.sax.saxutils import escape
 
 import numpy as np
 from common import (
     LiveProgressLine,
+    build_output_namespace,
     build_staged_path,
     file_has_content,
     format_eta,
     per_worker_warp_threads,
+    print_settings_diff_warning,
     publish_staged_path,
+    read_settings_file,
     remove_if_exists,
+    write_settings_file,
     warp_thread_budget,
     warp_thread_options,
 )
@@ -980,7 +982,7 @@ def build_ocean_chunk_artifacts(
     )
 
 
-def build_ocean_run_token(
+def build_ocean_run_settings(
     destination: str,
     bbox: tuple[float, float, float, float] | None,
     *,
@@ -989,21 +991,22 @@ def build_ocean_run_token(
     resample_alg: str,
     hillshade_z: float,
     style: OceanStyleOptions,
-) -> str:
-    """Return a stable token so repeated runs can reuse chunk outputs safely."""
-    payload = json.dumps(
-        {
-            "destination": os.path.abspath(destination),
-            "bbox": bbox,
-            "max_zoom": max_zoom,
-            "chunk_size": chunk_size,
-            "resample_alg": resample_alg,
-            "hillshade_z": hillshade_z,
-            "style": asdict(style),
-        },
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+) -> dict[str, Any]:
+    """Return the resumable ocean-processing settings for one destination."""
+    return {
+        "destination": os.path.abspath(destination),
+        "bbox": bbox,
+        "max_zoom": max_zoom,
+        "chunk_size": chunk_size,
+        "resample_alg": resample_alg,
+        "hillshade_z": hillshade_z,
+        "style": asdict(style),
+    }
+
+
+def build_ocean_run_metadata_path(temp_dir: str, unique_id: str) -> str:
+    """Return the persistent settings sidecar for one ocean output namespace."""
+    return os.path.join(temp_dir, f"run_{unique_id}.json")
 
 
 def recover_ocean_chunk_outputs(
@@ -1180,7 +1183,8 @@ def generate_ocean_background(
     if style is None:
         style = OceanStyleOptions()
 
-    unique_id = build_ocean_run_token(
+    unique_id = build_output_namespace(destination, default_stem="ocean")
+    ocean_run_settings = build_ocean_run_settings(
         destination,
         bbox,
         max_zoom=max_zoom,
@@ -1189,6 +1193,18 @@ def generate_ocean_background(
         hillshade_z=hillshade_z,
         style=style,
     )
+    metadata_path = build_ocean_run_metadata_path(temp_dir, unique_id)
+    previous_ocean_run_settings = read_settings_file(
+        metadata_path,
+        description="ocean run metadata",
+    )
+    if previous_ocean_run_settings is not None:
+        print_settings_diff_warning(
+            "Ocean run",
+            previous_ocean_run_settings,
+            ocean_run_settings,
+        )
+    write_settings_file(metadata_path, ocean_run_settings)
     source_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_source.vrt")
     masked_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_masked.vrt")
     warped_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_depth_chunks.vrt")

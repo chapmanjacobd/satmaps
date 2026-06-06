@@ -17,8 +17,8 @@ from satmaps import (
     build_alpha_block,
     build_fill_allowed_mask,
     build_bbox_geometry,
-    build_candidate_tile_cache_token,
-    build_land_run_token,
+    build_candidate_tile_cache_settings,
+    build_land_run_settings,
     expand_subtiles,
     format_progress,
     get_ocean_mask_band_index,
@@ -327,7 +327,7 @@ def test_expand_subtiles() -> None:
     ]
 
 
-def test_build_land_run_token_is_stable_for_matching_inputs() -> None:
+def test_build_land_run_settings_capture_winter_changes() -> None:
     args = satmaps.argparse.Namespace(
         output="render.pmtiles",
         max_zoom=13,
@@ -351,32 +351,31 @@ def test_build_land_run_token_is_stable_for_matching_inputs() -> None:
         ghb=None,
         gms=1.0,
         ghs=None,
+        hdr_highlights=False,
+        winter=False,
+        full_render_first=False,
     )
 
-    token_a = build_land_run_token(
+    summer_settings = build_land_run_settings(
         args,
         ["2025/07/01", "2025/10/01"],
         (0.0, 0.0, 1.0, 1.0),
         "ocean.tif",
     )
-    token_b = build_land_run_token(
+    args.winter = True
+    winter_settings = build_land_run_settings(
         args,
         ["2025/07/01", "2025/10/01"],
         (0.0, 0.0, 1.0, 1.0),
         "ocean.tif",
     )
-    token_c = build_land_run_token(
-        args,
-        ["2025/07/01"],
-        (0.0, 0.0, 1.0, 1.0),
-        "ocean.tif",
-    )
 
-    assert token_a == token_b
-    assert token_a != token_c
+    assert summer_settings["winter"] is False
+    assert winter_settings["winter"] is True
+    assert summer_settings != winter_settings
 
 
-def test_build_candidate_tile_cache_token_ignores_output_path() -> None:
+def test_build_candidate_tile_cache_settings_ignore_output_path() -> None:
     args_a = satmaps.argparse.Namespace(
         output="render-a.pmtiles",
         max_zoom=13,
@@ -396,19 +395,21 @@ def test_build_candidate_tile_cache_token_ignores_output_path() -> None:
         resample_alg="lanczos",
     )
 
-    token_a = build_candidate_tile_cache_token(args_a)
-    token_b = build_candidate_tile_cache_token(args_b)
-    token_c = build_candidate_tile_cache_token(args_c)
-    assert token_a == token_b
-    assert token_a != token_c
+    settings_a = build_candidate_tile_cache_settings(args_a)
+    settings_b = build_candidate_tile_cache_settings(args_b)
+    settings_c = build_candidate_tile_cache_settings(args_c)
+    assert settings_a == settings_b
+    assert settings_a != settings_c
 
 
 def test_helper_modules_reexport_common_helpers() -> None:
     assert satmaps.build_staged_path is common.build_staged_path
+    assert satmaps.build_output_namespace is common.build_output_namespace
     assert satmaps.publish_staged_path is common.publish_staged_path
     assert satmaps.remove_if_exists is common.remove_if_exists
     assert satmaps.format_eta is common.format_eta
     assert satmaps.LiveProgressLine is common.LiveProgressLine
+    assert ocean.build_output_namespace is common.build_output_namespace
     assert ocean.build_staged_path is common.build_staged_path
     assert ocean.publish_staged_path is common.publish_staged_path
     assert ocean.remove_if_exists is common.remove_if_exists

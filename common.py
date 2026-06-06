@@ -1,7 +1,10 @@
 import contextlib
+import hashlib
+import json
 import math
 import os
-from typing import Iterator
+from collections.abc import Mapping
+from typing import Any, Iterator
 
 from osgeo import gdal
 
@@ -126,3 +129,91 @@ def remove_if_exists(path: str) -> None:
             gdal.Unlink(path)
         except RuntimeError:
             os.remove(path)
+
+
+def build_output_namespace(output_path: str, *, default_stem: str = "output") -> str:
+    """Return a deterministic cache namespace scoped to one output path."""
+    stem = os.path.splitext(os.path.basename(output_path))[0] or default_stem
+    path_digest = hashlib.sha256(os.path.abspath(output_path).encode("utf-8")).hexdigest()[:8]
+    return f"{stem}_{path_digest}"
+
+
+def describe_settings_differences(
+    previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> list[str]:
+    """Return dotted-key setting diffs between two JSON-like mappings."""
+
+    def flatten_settings(
+        value: Mapping[str, Any],
+        *,
+        prefix: str = "",
+    ) -> dict[str, Any]:
+        flattened: dict[str, Any] = {}
+        for key, item in value.items():
+            key_path = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(item, Mapping):
+                flattened.update(flatten_settings(item, prefix=key_path))
+            else:
+                flattened[key_path] = item
+        return flattened
+
+    def format_value(value: Any) -> str:
+        if value is _MISSING_SETTING:
+            return "<missing>"
+        return json.dumps(value, sort_keys=True)
+
+    previous_flat = flatten_settings(previous)
+    current_flat = flatten_settings(current)
+    differences: list[str] = []
+    for key in sorted(set(previous_flat) | set(current_flat)):
+        previous_value = previous_flat.get(key, _MISSING_SETTING)
+        current_value = current_flat.get(key, _MISSING_SETTING)
+        if previous_value != current_value:
+            differences.append(f"{key}: {format_value(previous_value)} -> {format_value(current_value)}")
+    return differences
+
+
+def print_settings_diff_warning(
+    label: str,
+    previous: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> bool:
+    """Print a warning when prior settings differ from the current run."""
+    differences = describe_settings_differences(previous, current)
+    if not differences:
+        return False
+
+    for difference in differences:
+        print(f"Warning: {label} setting mismatch: {difference}")
+    return True
+
+
+def read_settings_file(path: str, *, description: str) -> dict[str, Any] | None:
+    """Load a JSON settings sidecar written by ``write_settings_file``."""
+    if not os.path.exists(path):
+        return None
+
+    try:
+        with open(path) as file_handle:
+            payload = json.load(file_handle)
+        if not isinstance(payload, dict):
+            raise ValueError("settings file must contain a JSON object")
+        settings = payload.get("settings", payload)
+        if not isinstance(settings, dict):
+            raise ValueError("settings file payload must be an object")
+        return settings
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Warning: Could not load {description} {path}: {exc}")
+        return None
+
+
+def write_settings_file(path: str, settings: Mapping[str, Any]) -> None:
+    """Persist a JSON settings sidecar atomically."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w") as file_handle:
+        json.dump({"settings": dict(settings)}, file_handle, indent=2, sort_keys=True)
+    os.replace(temp_path, path)
+
+
+_MISSING_SETTING = object()

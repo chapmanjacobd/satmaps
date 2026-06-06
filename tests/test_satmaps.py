@@ -1977,6 +1977,8 @@ def test_generate_ocean_without_bbox_processes_chunk_outputs(monkeypatch: object
     )
 
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.read_settings_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.write_settings_file", lambda *args, **kwargs: None)
     monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
     monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
     monkeypatch.setattr(
@@ -2054,15 +2056,7 @@ def test_generate_ocean_reuses_existing_chunk_outputs(
             ),
         ),
     )
-    unique_id = ocean.build_ocean_run_token(
-        str(tmp_path / "ocean.tif"),
-        None,
-        max_zoom=ocean.DEFAULT_MAX_ZOOM,
-        chunk_size=ocean.DEFAULT_OCEAN_CHUNK_SIZE,
-        resample_alg="cubicspline",
-        hillshade_z=5.0,
-        style=ocean.OceanStyleOptions(),
-    )
+    unique_id = ocean.build_output_namespace(str(tmp_path / "ocean.tif"), default_stem="ocean")
     existing_chunk = Path(
         ocean.build_ocean_chunk_artifacts(str(temp_dir), "ocean", unique_id, plan.chunks[0]).rgba_tif
     )
@@ -2108,6 +2102,97 @@ def test_generate_ocean_reuses_existing_chunk_outputs(
 
     assert translated == [(artifacts.rgba_vrt, str(tmp_path / "ocean.tif"))]
 
+
+def test_generate_ocean_warns_for_changed_run_settings(
+    tmp_path: Path,
+    monkeypatch: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    temp_dir = tmp_path / ".temp"
+    temp_dir.mkdir()
+    plan = ocean.OceanBuildPlan(
+        bounds=ocean.WEB_MERCATOR_WORLD_BOUNDS,
+        pixel_size=satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM),
+        zoom=ocean.DEFAULT_MAX_ZOOM,
+        width=8,
+        height=8,
+        total_pixels=64,
+        chunk_size=8,
+        halo_pixels=2,
+        chunks=(
+            ocean.OceanChunkPlan(
+                row=0,
+                col=0,
+                xoff=0,
+                yoff=0,
+                width=8,
+                height=8,
+                bounds=(0.0, 0.0, 8.0, 8.0),
+                expanded_bounds=(0.0, 0.0, 8.0, 8.0),
+                core_src_win=(0, 0, 8, 8),
+            ),
+        ),
+    )
+    unique_id = ocean.build_output_namespace(str(tmp_path / "ocean.tif"), default_stem="ocean")
+    existing_chunk = Path(
+        ocean.build_ocean_chunk_artifacts(str(temp_dir), "ocean", unique_id, plan.chunks[0]).rgba_tif
+    )
+    existing_chunk.write_text("chunk")
+
+    previous_settings = {"destination": str(tmp_path / "ocean.tif"), "hillshade_z": 4.0}
+    current_settings = {"destination": str(tmp_path / "ocean.tif"), "hillshade_z": 5.0}
+    processed_chunks: list[tuple[int, int]] = []
+
+    monkeypatch.setattr("ocean.read_settings_file", lambda *args, **kwargs: previous_settings)
+    monkeypatch.setattr("ocean.write_settings_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.build_ocean_run_settings", lambda *args, **kwargs: current_settings)
+    monkeypatch.setattr(
+        "ocean.build_gebco_source_vrt",
+        lambda gebco_zip, output_vrt: (Path(output_vrt).write_text("source"), output_vrt)[1],
+    )
+    monkeypatch.setattr(
+        "ocean.create_gebco_ocean_vrt",
+        lambda source_vrt, output_vrt: (Path(output_vrt).write_text("masked"), output_vrt)[1],
+    )
+    monkeypatch.setattr("ocean.build_ocean_output_plan", lambda bbox, *, max_zoom, chunk_size: plan)
+    monkeypatch.setattr(
+        "ocean.process_ocean_chunk",
+        lambda **kwargs: (
+            processed_chunks.append((kwargs["chunk"].row, kwargs["chunk"].col)),
+            Path(temp_dir / "generated_chunk.tif").write_text("generated"),
+            str(temp_dir / "generated_chunk.tif"),
+        )[-1],
+    )
+    monkeypatch.setattr(
+        "ocean.build_merged_vrt",
+        lambda output_vrt, source_rasters, progress=None: (
+            progress and progress(1.0),
+            Path(output_vrt).write_text("rgba"),
+            output_vrt,
+        )[-1],
+    )
+    monkeypatch.setattr(
+        "ocean.translate_rgba_vrt",
+        lambda rgba_vrt, destination, progress=None: (
+            progress and progress(1.0),
+            Path(destination).write_text("final"),
+            destination,
+        )[-1],
+    )
+
+    ocean.generate_ocean_background(
+        gebco_zip="gebco.zip",
+        destination=str(tmp_path / "ocean.tif"),
+        temp_dir=str(temp_dir),
+    )
+
+    assert processed_chunks == []
+    out = capsys.readouterr().out
+    assert "Warning: Ocean run setting mismatch: hillshade_z: 4.0 -> 5.0" in out
+    assert "Reusing 1 existing ocean chunk(s)." in out
+
+
 def test_generate_ocean_without_bbox_reports_chunk_progress(
     monkeypatch: object, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2147,6 +2232,8 @@ def test_generate_ocean_without_bbox_reports_chunk_progress(
     )
 
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.read_settings_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.write_settings_file", lambda *args, **kwargs: None)
     monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
     monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
     monkeypatch.setattr("ocean.build_ocean_output_plan", lambda bbox, *, max_zoom, chunk_size: plan)
@@ -2214,6 +2301,8 @@ def test_generate_ocean_with_bbox_builds_requested_plan(monkeypatch: object) -> 
     )
 
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.read_settings_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.write_settings_file", lambda *args, **kwargs: None)
     monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
     monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
     monkeypatch.setattr(
@@ -2275,6 +2364,8 @@ def test_generate_ocean_uses_requested_zoom_in_plan(monkeypatch: object) -> None
     )
 
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.read_settings_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.write_settings_file", lambda *args, **kwargs: None)
     monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
     monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
     monkeypatch.setattr(
@@ -2476,6 +2567,47 @@ def test_resolve_work_unit_candidate_row_slabs_reuses_cached_subset_and_persists
     assert "Reusing cached candidate tile footprints for 1 sub-tile(s); computing 1 missing." in out
 
 
+def test_resolve_work_unit_candidate_row_slabs_warns_for_changed_cache_settings(
+    monkeypatch: object,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    work_units = (satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),)
+    cache_path = satmaps.build_candidate_tile_cache_path("candidatecache")
+    previous_settings = satmaps.build_candidate_tile_cache_settings(
+        argparse.Namespace(output="render.pmtiles", max_zoom=13, blocksize=512, resample_alg="lanczos")
+    )
+    current_settings = dict(previous_settings)
+    current_settings["max_zoom"] = 14
+    satmaps.write_candidate_tile_cache(
+        cache_path,
+        {"31TDF_0_0": ((1, 1, 1),)},
+        settings=previous_settings,
+    )
+    monkeypatch.setattr(
+        "satmaps.precompute_work_unit_candidate_row_slabs_from_sources",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("expected mismatched cache settings to still reuse cached candidates")
+        ),
+    )
+
+    actual = satmaps.resolve_work_unit_candidate_row_slabs(
+        work_units,
+        ["2025/07/01"],
+        ".cache",
+        14,
+        cache_path=cache_path,
+        cache_settings=current_settings,
+    )
+
+    assert actual == {"31TDF_0_0": ((1, 1, 1),)}
+    out = capsys.readouterr().out
+    assert "Warning: Candidate tile cache setting mismatch: max_zoom: 13 -> 14" in out
+    assert "Reusing cached candidate tile footprints for 1 sub-tile(s)." in out
+
+
 def test_precompute_work_unit_candidate_tile_relpaths_reports_progress(
     monkeypatch: object, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2516,6 +2648,8 @@ def test_generate_ocean_vrt_mode_skips_translate(monkeypatch: object) -> None:
     vrt_outputs: list[tuple[str, str]] = []
 
     monkeypatch.setattr("ocean.os.makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.read_settings_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ocean.write_settings_file", lambda *args, **kwargs: None)
     monkeypatch.setattr("ocean.build_gebco_source_vrt", lambda gebco_zip, output_vrt: output_vrt)
     monkeypatch.setattr("ocean.create_gebco_ocean_vrt", lambda source_vrt, output_vrt: output_vrt)
     monkeypatch.setattr(
@@ -2753,7 +2887,7 @@ def test_build_ocean_ramp_colors_applies_vibrance_and_black_white_points() -> No
 
     assert not np.allclose(neutral_colors, adjusted_colors)
 
-def test_build_land_run_token_changes_with_winter_flag() -> None:
+def test_build_land_run_settings_changes_with_winter_flag() -> None:
     common_args = dict(
         output="render.pmtiles",
         max_zoom=13,
@@ -2777,22 +2911,24 @@ def test_build_land_run_token_changes_with_winter_flag() -> None:
         ghs=None,
     )
 
-    summer_token = satmaps.build_land_run_token(
+    summer_settings = satmaps.build_land_run_settings(
         argparse.Namespace(**common_args, winter=False),
         ["2025/07/01", "2025/01/01"],
         None,
         None,
     )
-    winter_token = satmaps.build_land_run_token(
+    winter_settings = satmaps.build_land_run_settings(
         argparse.Namespace(**common_args, winter=True),
         ["2025/07/01", "2025/01/01"],
         None,
         None,
     )
 
-    assert summer_token != winter_token
+    assert summer_settings["winter"] is False
+    assert winter_settings["winter"] is True
+    assert summer_settings != winter_settings
 
-def test_build_land_run_token_changes_with_full_render_first_flag() -> None:
+def test_build_land_run_settings_changes_with_full_render_first_flag() -> None:
     common_args = dict(
         output="render.pmtiles",
         max_zoom=13,
@@ -2817,20 +2953,22 @@ def test_build_land_run_token_changes_with_full_render_first_flag() -> None:
         winter=False,
     )
 
-    default_token = satmaps.build_land_run_token(
+    default_settings = satmaps.build_land_run_settings(
         argparse.Namespace(**common_args, full_render_first=False),
         ["2025/07/01"],
         None,
         None,
     )
-    raster_first_token = satmaps.build_land_run_token(
+    raster_first_settings = satmaps.build_land_run_settings(
         argparse.Namespace(**common_args, full_render_first=True),
         ["2025/07/01"],
         None,
         None,
     )
 
-    assert default_token != raster_first_token
+    assert default_settings["full_render_first"] is False
+    assert raster_first_settings["full_render_first"] is True
+    assert default_settings != raster_first_settings
 
 def configure_main_defaults(
     monkeypatch: object,
@@ -2846,11 +2984,7 @@ def configure_main_defaults(
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
     monkeypatch.setattr(satmaps, "S3_FOLDER_CACHE", {})
-    monkeypatch.setattr("satmaps.build_land_run_token", lambda *args, **kwargs: unique_id)
-    monkeypatch.setattr(
-        "satmaps.build_candidate_tile_cache_token",
-        lambda *args, **kwargs: unique_id,
-    )
+    monkeypatch.setattr("satmaps.build_output_namespace", lambda *args, **kwargs: unique_id)
     monkeypatch.setattr(
         "satmaps.discover_mgrs_bases",
         lambda bbox, gebco_src, land_mgrs_list_path=None: mgrs_bases,
@@ -3596,10 +3730,6 @@ def test_main_reuses_cached_candidate_tile_footprints(
         mgrs_bases=["31TDF"],
         unique_id="cachedcandidates",
     )
-    monkeypatch.setattr(
-        "satmaps.build_candidate_tile_cache_token",
-        lambda *args, **kwargs: "sharedcandidates",
-    )
     cached_candidates = {
         "31TDF_0_0": ((1, 1, 1),),
         "31TDF_0_1": ((2, 1, 1),),
@@ -3609,6 +3739,9 @@ def test_main_reuses_cached_candidate_tile_footprints(
     satmaps.write_candidate_tile_cache(
         satmaps.build_candidate_tile_cache_path("cachedcandidates"),
         cached_candidates,
+        settings=satmaps.build_candidate_tile_cache_settings(
+            argparse.Namespace(output="output.pmtiles", max_zoom=13, blocksize=512, resample_alg="lanczos")
+        ),
     )
     render_calls: list[dict[str, object]] = []
 
@@ -3644,7 +3777,7 @@ def test_main_reuses_cached_candidate_tile_footprints(
     assert "Loaded candidate tile cache from .temp/candidate_tiles_cachedcandidates.json with 4 sub-tile(s)." in out
     assert "Reusing cached candidate tile footprints for 4 sub-tile(s)." in out
     assert satmaps.read_candidate_tile_cache(
-        satmaps.build_candidate_tile_cache_path("sharedcandidates")
+        satmaps.build_candidate_tile_cache_path("cachedcandidates")
     ) == cached_candidates
 
 @pytest.mark.parametrize("max_zoom", [ocean.DEFAULT_MAX_ZOOM, 14, 11, 12, 4])
@@ -4082,7 +4215,7 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
         "satmaps.prepare_ocean_background_for_output",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr("satmaps.build_land_run_token", lambda *args, **kwargs: "webpresume")
+    monkeypatch.setattr("satmaps.build_output_namespace", lambda *args, **kwargs: "webpresume")
     monkeypatch.setattr(
         "satmaps.convert_tile_tree_to_pmtiles",
         lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
@@ -4115,6 +4248,70 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
 
     out = capsys.readouterr().out
     assert "All land output tiles already rendered (reused from cache)." in out
+
+
+def test_main_warns_when_prior_land_run_settings_change(
+    monkeypatch: object,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
+        unique_id="landwarn",
+    )
+    previous_settings = {"output": "output.pmtiles", "winter": True}
+    current_settings = {"output": "output.pmtiles", "winter": False}
+    state_file = tmp_path / ".temp" / "state_landwarn.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "unique_id": "landwarn",
+                "completed_units": ["31TDF_0_0"],
+                "args": {},
+            }
+        )
+    )
+    captured: dict[str, tuple[str, ...]] = {}
+
+    monkeypatch.setattr("satmaps.read_settings_file", lambda *args, **kwargs: previous_settings)
+    monkeypatch.setattr("satmaps.write_settings_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr("satmaps.build_land_run_settings", lambda *args, **kwargs: current_settings)
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "satmaps.resolve_work_unit_candidate_row_slabs",
+        lambda work_units, *args, **kwargs: (
+            captured.__setitem__("resolved", tuple(work_unit.unit_id for work_unit in work_units))
+            or {work_unit.unit_id: ((2, 1, 1),) for work_unit in work_units}
+        ),
+    )
+    monkeypatch.setattr(
+        "satmaps.render_land_output_tiles",
+        lambda work_units, *args, **kwargs: (
+            captured.__setitem__("rendered", tuple(work_unit.unit_id for work_unit in work_units))
+            or satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0)
+        ),
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    expected_work_units = tuple(
+        work_unit.unit_id
+        for work_unit in satmaps.plan_subtile_work_units(["31TDF"])
+        if work_unit.unit_id != "31TDF_0_0"
+    )
+    assert captured["resolved"] == expected_work_units
+    assert captured["rendered"] == expected_work_units
+    out = capsys.readouterr().out
+    assert "Warning: Land run setting mismatch: winter: true -> false" in out
+
 
 def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
     monkeypatch: object, tmp_path: Path
