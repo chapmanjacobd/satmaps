@@ -209,84 +209,121 @@ def max_in_memory_write_pixels() -> int:
 
 
 def temp_basename_from_output(output_path: str) -> str:
-    """Return a stable temp-file stem derived from the requested output path."""
-    stem = os.path.splitext(os.path.basename(output_path))[0]
-    return stem or "satmaps"
+   """Return a stable temp-file stem derived from the requested output path."""
+   stem = os.path.splitext(os.path.basename(output_path))[0]
+   return stem or "satmaps"
 
 
+@dataclass(frozen=True)
+class SatmapsRunPaths:
+   """Run-scoped paths derived from one output path and namespace."""
+
+   output_path: str
+   unique_id: str
+
+   @property
+   def output_stem(self) -> str:
+       return temp_basename_from_output(self.output_path)
+
+   @property
+   def output_temp_dir(self) -> str:
+       return build_output_namespace_dir(TEMP_DIR, self.unique_id)
+
+   @property
+   def full_render_cache_dir(self) -> str:
+       return build_output_namespace_dir(FULL_RENDER_CACHE_DIR, self.unique_id)
+
+   @property
+   def state_file(self) -> str:
+       return os.path.join(self.output_temp_dir, "state.json")
+
+   @property
+   def land_run_metadata_path(self) -> str:
+       return os.path.join(self.output_temp_dir, "run.json")
+
+   @property
+   def candidate_tile_cache_path(self) -> str:
+       return os.path.join(self.output_temp_dir, "candidate_tiles.json")
+
+   @property
+   def temp_mbtiles(self) -> str:
+       return os.path.join(self.output_temp_dir, f"{self.output_stem}.mbtiles")
+
+   def work_unit_raster(self, work_unit_id: str) -> str:
+       return os.path.join(self.full_render_cache_dir, f"land_{work_unit_id}_3857.tif")
+
+   @property
+   def master_vrt(self) -> str:
+       return os.path.join(self.full_render_cache_dir, "master.vrt")
+
+   @property
+   def tile_cache_root(self) -> str:
+       return os.path.join(self.output_temp_dir, f"{self.output_stem}_tilecache")
+
+   def tile_cache_marker(self, contributor_id: str) -> str:
+       return os.path.join(self.tile_cache_root, "markers", f"{contributor_id}.json")
+
+   @property
+   def final_tile_cache_dir(self) -> str:
+       return os.path.join(self.tile_cache_root, "final")
+
+   @property
+   def prepared_ocean_path(self) -> str:
+       return os.path.join(self.output_temp_dir, f"{self.output_stem}_ocean_bbox.tif")
+
+
+# Compatibility wrappers for callers that still use the legacy path-helper API.
 def build_output_temp_dir(unique_id: str) -> str:
-    """Return the temp directory holding artifacts for one output namespace."""
-    return build_output_namespace_dir(TEMP_DIR, unique_id)
+   return build_output_namespace_dir(TEMP_DIR, unique_id)
 
 
 def build_full_render_cache_dir(unique_id: str) -> str:
-    """Return the full-render cache directory for one output namespace."""
-    return build_output_namespace_dir(FULL_RENDER_CACHE_DIR, unique_id)
+   return build_output_namespace_dir(FULL_RENDER_CACHE_DIR, unique_id)
 
 
 def build_state_file_path(unique_id: str) -> str:
-    """Return the lightweight JSON resume state path."""
-    return os.path.join(build_output_temp_dir(unique_id), "state.json")
+   return os.path.join(build_output_temp_dir(unique_id), "state.json")
 
 
 def build_land_run_metadata_path(unique_id: str) -> str:
-    """Return the persistent JSON sidecar describing the last land run for one output."""
-    return os.path.join(build_output_temp_dir(unique_id), "run.json")
+   return os.path.join(build_output_temp_dir(unique_id), "run.json")
 
 
 def build_candidate_tile_cache_path(unique_id: str) -> str:
-    """Return the persistent JSON cache path for candidate final-tile footprints."""
-    return os.path.join(build_output_temp_dir(unique_id), "candidate_tiles.json")
+   return os.path.join(build_output_temp_dir(unique_id), "candidate_tiles.json")
 
 
 def build_temp_mbtiles_path(output_path: str, unique_id: str) -> str:
-    """Return the deterministic heavyweight MBTiles path."""
-    return os.path.join(
-        build_output_temp_dir(unique_id),
-        f"{temp_basename_from_output(output_path)}.mbtiles",
-    )
+   return SatmapsRunPaths(output_path, unique_id).temp_mbtiles
 
 
 def build_work_unit_raster_path(output_path: str, unique_id: str, work_unit_id: str) -> str:
-    """Return the deterministic full-render-first GeoTIFF path for one work unit."""
-    return os.path.join(
-        build_full_render_cache_dir(unique_id),
-        f"land_{work_unit_id}_3857.tif",
-    )
+   return SatmapsRunPaths(output_path, unique_id).work_unit_raster(work_unit_id)
 
 
 def build_master_vrt_path(unique_id: str) -> str:
-    """Return the deterministic full-render-first master VRT path."""
-    return os.path.join(build_full_render_cache_dir(unique_id), "master.vrt")
+   return os.path.join(build_full_render_cache_dir(unique_id), "master.vrt")
 
 
 def build_tile_cache_root(output_path: str, unique_id: str) -> str:
-    """Return the run-scoped root directory for cached max-zoom WebP tiles."""
-    return os.path.join(
-        build_output_temp_dir(unique_id),
-        f"{temp_basename_from_output(output_path)}_tilecache",
-    )
+   return SatmapsRunPaths(output_path, unique_id).tile_cache_root
 
 
-def build_tile_cache_marker_path(
-    output_path: str, unique_id: str, contributor_id: str
-) -> str:
-    """Return the completion marker path for one cached tile contributor."""
-    return os.path.join(
-        build_tile_cache_root(output_path, unique_id),
-        "markers",
-        f"{contributor_id}.json",
-    )
+def build_tile_cache_marker_path(output_path: str, unique_id: str, contributor_id: str) -> str:
+   return SatmapsRunPaths(output_path, unique_id).tile_cache_marker(contributor_id)
 
 
 def build_final_tile_cache_dir(output_path: str, unique_id: str) -> str:
-    """Return the final merged max-zoom WebP tree path."""
-    return os.path.join(build_tile_cache_root(output_path, unique_id), "final")
+   return SatmapsRunPaths(output_path, unique_id).final_tile_cache_dir
+
+
+def build_prepared_ocean_path(output_path: str, unique_id: str) -> str:
+   return SatmapsRunPaths(output_path, unique_id).prepared_ocean_path
 
 
 def build_empty_tile_marker_path(destination_path: str) -> str:
-    """Return the sentinel path recording that a final tile rendered empty (no data)."""
-    return f"{destination_path}.empty"
+   """Return the sentinel path recording that a final tile rendered empty (no data)."""
+   return f"{destination_path}.empty"
 
 
 def mark_tile_empty(destination_path: str) -> None:
@@ -416,7 +453,8 @@ def convert_raster_to_pmtiles(
     cleanup_input_paths: Optional[Sequence[str]] = None,
 ) -> PackagedPMTiles:
     """Tile a Web Mercator raster into MBTiles and convert the result to PMTiles."""
-    temp_mbtiles = build_temp_mbtiles_path(output_path, unique_id)
+    run_paths = SatmapsRunPaths(output_path, unique_id)
+    temp_mbtiles = run_paths.temp_mbtiles
     os.makedirs(os.path.dirname(temp_mbtiles), exist_ok=True)
     run_options: Dict[str, object] = {
         "format": tile_format,
@@ -462,7 +500,8 @@ def convert_tile_tree_to_pmtiles(
     requested_bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> str:
     """Build MBTiles from a final max-zoom WebP tree, then convert it to PMTiles."""
-    temp_mbtiles = build_temp_mbtiles_path(output_path, unique_id)
+    run_paths = SatmapsRunPaths(output_path, unique_id)
+    temp_mbtiles = run_paths.temp_mbtiles
     os.makedirs(os.path.dirname(temp_mbtiles), exist_ok=True)
     print("Generating MBTiles...")
     tiler.build_mbtiles_from_webp_tree(
@@ -493,14 +532,6 @@ def cleanup_temporary_files(paths: Sequence[str]) -> None:
                 os.remove(path)
             except OSError as exc:
                 print(f"Warning: Could not remove temporary file {path}: {exc}")
-
-
-def build_prepared_ocean_path(output_path: str, unique_id: str) -> str:
-    """Return the deterministic heavyweight bbox-clipped ocean TIFF path."""
-    return os.path.join(
-        build_output_temp_dir(unique_id),
-        f"{temp_basename_from_output(output_path)}_ocean_bbox.tif",
-    )
 
 
 def write_tile_cache_marker(
@@ -1172,8 +1203,9 @@ def commit_raster_to_final_tile_cache(
     source_under_existing: bool = False,
 ) -> List[str]:
     """Render and write one contributor directly into the shared final WebP tree."""
-    final_tile_tree = build_final_tile_cache_dir(output_path, unique_id)
-    marker_path = build_tile_cache_marker_path(output_path, unique_id, contributor_id)
+    run_paths = SatmapsRunPaths(output_path, unique_id)
+    final_tile_tree = run_paths.final_tile_cache_dir
+    marker_path = run_paths.tile_cache_marker(contributor_id)
     close_dataset = False
     if isinstance(input_raster, str):
         dataset = gdal.Open(input_raster)
@@ -1234,11 +1266,8 @@ def commit_ocean_to_final_tile_cache(
     args: argparse.Namespace,
 ) -> bool:
     """Seed or repair the final WebP tree with the ocean background beneath land tiles."""
-    marker_path = build_tile_cache_marker_path(
-        output_path,
-        unique_id,
-        OCEAN_TILE_CACHE_CONTRIBUTOR_ID,
-    )
+    run_paths = SatmapsRunPaths(output_path, unique_id)
+    marker_path = run_paths.tile_cache_marker(OCEAN_TILE_CACHE_CONTRIBUTOR_ID)
     if file_has_content(marker_path):
         return False
 
@@ -1261,7 +1290,8 @@ def fill_missing_ocean_to_final_tile_cache(
     args: argparse.Namespace,
 ) -> int:
     """Backfill any missing final max-zoom tiles from the ocean background."""
-    final_tile_tree = build_final_tile_cache_dir(output_path, unique_id)
+    run_paths = SatmapsRunPaths(output_path, unique_id)
+    final_tile_tree = run_paths.final_tile_cache_dir
     dataset = gdal.Open(input_raster)
     if dataset is None:
         raise RuntimeError(f"Could not open raster for tile rendering: {input_raster}")
@@ -1804,7 +1834,8 @@ def prepare_ocean_background_for_output(
         max_zoom,
         tile_size=blocksize,
     )
-    prepared_ocean_path = build_prepared_ocean_path(output_path, unique_id)
+    run_paths = SatmapsRunPaths(output_path, unique_id)
+    prepared_ocean_path = run_paths.prepared_ocean_path
     os.makedirs(os.path.dirname(prepared_ocean_path), exist_ok=True)
     staged_ocean_path = build_staged_path(prepared_ocean_path)
     remove_if_exists(staged_ocean_path)
@@ -3528,6 +3559,7 @@ def render_land_work_unit_rasters(
     if not work_units:
         return LandRasterRenderStats(total_work_units=0, rendered_work_units=0, cached_work_units=0)
 
+    run_paths = SatmapsRunPaths(args.output, unique_id)
     prefetch_cache_dir = getattr(args, "prefetch_cache", None) or args.cache + ".temp"
     folders_by_work_unit = WorkUnitFolderCache(
         lambda unit_id: list_mosaic_folders_for_tile(
@@ -3614,7 +3646,7 @@ def render_land_work_unit_rasters(
                         work_unit = next(work_unit_iter)
                     except StopIteration:
                         return False
-                    output_path = build_work_unit_raster_path(args.output, unique_id, work_unit.unit_id)
+                    output_path = run_paths.work_unit_raster(work_unit.unit_id)
                     if file_has_content(output_path):
                         processed_work_units += 1
                         cached_work_units += 1
@@ -3699,7 +3731,8 @@ def render_final_output_tile_batch(
     prepared_ocean_background: Optional[str] = None,
 ) -> LandOutputBatchRenderResult:
     """Render one contiguous final-tile batch directly from its ordered contributors."""
-    final_tile_dir = build_final_tile_cache_dir(args.output, unique_id)
+    run_paths = SatmapsRunPaths(args.output, unique_id)
+    final_tile_dir = run_paths.final_tile_cache_dir
     destination_paths = {
         relative_path: os.path.join(final_tile_dir, relative_path)
         for relative_path in batch.relative_paths
@@ -3828,8 +3861,9 @@ def render_final_output_tile(
     prepared_ocean_background: Optional[str] = None,
 ) -> LandTileRenderStatus:
     """Render one final output tile directly from its ordered contributors."""
+    run_paths = SatmapsRunPaths(args.output, unique_id)
     destination_path = os.path.join(
-        build_final_tile_cache_dir(args.output, unique_id),
+        run_paths.final_tile_cache_dir,
         relative_path,
     )
     if file_has_content(destination_path):
@@ -3957,7 +3991,8 @@ def render_land_output_tiles(
     last_state_write_at = started_at
     state_dirty = False
     processed_tiles = 0
-    final_tile_dir = build_final_tile_cache_dir(args.output, unique_id)
+    run_paths = SatmapsRunPaths(args.output, unique_id)
+    final_tile_dir = run_paths.final_tile_cache_dir
     max_workers = max(1, min(args.parallel, total_tiles))
     future_to_batches: dict[Future[object], LandOutputTileBatch] = {}
     shutdown_requested = threading.Event()
@@ -4449,16 +4484,17 @@ def main() -> None:
         populate_s3_cache(date_paths)
 
     unique_id = build_output_namespace(args.output, default_stem="satmaps")
-    os.makedirs(build_output_temp_dir(unique_id), exist_ok=True)
-    os.makedirs(build_full_render_cache_dir(unique_id), exist_ok=True)
+    run_paths = SatmapsRunPaths(args.output, unique_id)
+    os.makedirs(run_paths.output_temp_dir, exist_ok=True)
+    os.makedirs(run_paths.full_render_cache_dir, exist_ok=True)
     land_run_settings = build_land_run_settings(
         args,
         date_paths,
         requested_bbox,
         gebco_vrt_source,
     )
-    state_file = build_state_file_path(unique_id)
-    land_run_metadata_path = build_land_run_metadata_path(unique_id)
+    state_file = run_paths.state_file
+    land_run_metadata_path = run_paths.land_run_metadata_path
     previous_land_run_settings = read_settings_file(
         land_run_metadata_path,
         description="land run metadata",
@@ -4471,7 +4507,7 @@ def main() -> None:
         )
     write_settings_file(land_run_metadata_path, land_run_settings)
     candidate_tile_cache_settings = build_candidate_tile_cache_settings(args)
-    candidate_tile_cache_path = build_candidate_tile_cache_path(unique_id)
+    candidate_tile_cache_path = run_paths.candidate_tile_cache_path
     completed_units: Set[str] = set()
     if os.path.exists(state_file):
         resume_state = restore_resume_state(state_file)
@@ -4479,6 +4515,8 @@ def main() -> None:
             state_file = cast(str, resume_state["state_file"])
             unique_id = cast(str, resume_state["unique_id"])
             completed_units = cast(Set[str], resume_state["completed_units"])
+            run_paths = SatmapsRunPaths(args.output, unique_id)
+            candidate_tile_cache_path = run_paths.candidate_tile_cache_path
 
     mgrs_bases = discover_mgrs_bases(
         requested_bbox,
@@ -4561,11 +4599,9 @@ def main() -> None:
                     completed_units=completed_units,
                 )
                 land_raster_paths = [
-                    build_work_unit_raster_path(args.output, unique_id, work_unit.unit_id)
+                    run_paths.work_unit_raster(work_unit.unit_id)
                     for work_unit in plan.work_units
-                    if file_has_content(
-                        build_work_unit_raster_path(args.output, unique_id, work_unit.unit_id)
-                    )
+                    if file_has_content(run_paths.work_unit_raster(work_unit.unit_id))
                 ]
                 source_rasters.extend(land_raster_paths)
                 if raster_stats.rendered_work_units <= 0 and raster_stats.cached_work_units == raster_stats.total_work_units:
@@ -4587,14 +4623,10 @@ def main() -> None:
             source_rasters.insert(0, prepared_ocean_background)
 
         if source_rasters:
-            master_vrt_path = build_master_vrt_path(unique_id)
+            master_vrt_path = run_paths.master_vrt
             print("Building master VRT...")
             build_master_vrt(source_rasters, master_vrt_path)
-            master_marker_path = build_tile_cache_marker_path(
-                args.output,
-                unique_id,
-                FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID,
-            )
+            master_marker_path = run_paths.tile_cache_marker(FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID)
             if file_has_content(master_marker_path):
                 print("Raster-first master mosaic already committed to final WebP tiles.")
             else:
@@ -4672,7 +4704,7 @@ def main() -> None:
         if backfilled_ocean_tiles > 0:
             print(f"Backfilled {backfilled_ocean_tiles} ocean-only tile(s).")
 
-    final_tile_tree = build_final_tile_cache_dir(args.output, unique_id)
+    final_tile_tree = run_paths.final_tile_cache_dir
     has_final_tiles = next(iter(tiler.iter_tile_tree_paths(final_tile_tree)), None) is not None
     if not has_final_tiles:
         print("Error: No max-zoom tiles were generated.")
