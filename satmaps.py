@@ -226,17 +226,17 @@ def build_full_render_cache_dir(unique_id: str) -> str:
 
 def build_state_file_path(unique_id: str) -> str:
     """Return the lightweight JSON resume state path."""
-    return os.path.join(build_output_temp_dir(unique_id), f"state_{unique_id}.json")
+    return os.path.join(build_output_temp_dir(unique_id), "state.json")
 
 
 def build_land_run_metadata_path(unique_id: str) -> str:
     """Return the persistent JSON sidecar describing the last land run for one output."""
-    return os.path.join(build_output_temp_dir(unique_id), f"run_{unique_id}.json")
+    return os.path.join(build_output_temp_dir(unique_id), "run.json")
 
 
 def build_candidate_tile_cache_path(unique_id: str) -> str:
     """Return the persistent JSON cache path for candidate final-tile footprints."""
-    return os.path.join(build_output_temp_dir(unique_id), f"candidate_tiles_{unique_id}.json")
+    return os.path.join(build_output_temp_dir(unique_id), "candidate_tiles.json")
 
 
 def build_temp_mbtiles_path(output_path: str, unique_id: str) -> str:
@@ -251,20 +251,20 @@ def build_work_unit_raster_path(output_path: str, unique_id: str, work_unit_id: 
     """Return the deterministic full-render-first GeoTIFF path for one work unit."""
     return os.path.join(
         build_full_render_cache_dir(unique_id),
-        f"land_{work_unit_id}_{unique_id}_3857.tif",
+        f"land_{work_unit_id}_3857.tif",
     )
 
 
 def build_master_vrt_path(unique_id: str) -> str:
     """Return the deterministic full-render-first master VRT path."""
-    return os.path.join(build_full_render_cache_dir(unique_id), f"master_{unique_id}.vrt")
+    return os.path.join(build_full_render_cache_dir(unique_id), "master.vrt")
 
 
 def build_tile_cache_root(output_path: str, unique_id: str) -> str:
     """Return the run-scoped root directory for cached max-zoom WebP tiles."""
     return os.path.join(
         build_output_temp_dir(unique_id),
-        f"{temp_basename_from_output(output_path)}_{unique_id}_tilecache",
+        f"{temp_basename_from_output(output_path)}_tilecache",
     )
 
 

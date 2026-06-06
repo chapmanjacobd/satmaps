@@ -29,12 +29,13 @@ def generate_terrain_pmtiles(
 ) -> str:
     """Generate Terrarium-encoded PMTiles from the full GEBCO elevation raster."""
     os.makedirs(temp_dir, exist_ok=True)
+    stem = satmaps.temp_basename_from_output(destination)
     unique_id = build_output_namespace(destination, default_stem="terrain")
     output_temp_dir = build_output_namespace_dir(temp_dir, unique_id)
     os.makedirs(output_temp_dir, exist_ok=True)
 
-    source_vrt = os.path.join(output_temp_dir, f"terrain_{unique_id}_source.vrt")
-    warped_vrt = os.path.join(output_temp_dir, f"terrain_{unique_id}_3857.vrt")
+    source_vrt = os.path.join(output_temp_dir, f"{stem}_source.vrt")
+    warped_vrt = os.path.join(output_temp_dir, f"{stem}_3857.vrt")
 
     ocean.build_gebco_source_vrt(gebco_zip, source_vrt)
 

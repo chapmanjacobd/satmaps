@@ -156,10 +156,10 @@ satmaps --estimate
 - `--hdr-highlights` / `--no-hdr-highlights`: Blend the HDR land look into bright near-neutral highlights so snow and ice keep more detail without flattening the rest of the map.
 - `--cache`: Local directory for downloaded tiles (default: `.cache`).
 - `--prefetch-cache`: Ephemeral cache directory for prefetched RGB bands (default: `<cache>.temp`).
-- `--temp-dir`: Directory for heavyweight intermediary files, resume state, and the staged MBTiles (default: `.temp`). Full-render-first rasters are cached separately under `.cache.render`.
+- `--temp-dir`: Directory for heavyweight intermediary files, resume state, and the staged MBTiles (default: `.temp`). Output-scoped artifacts live under `<temp-dir>/<unique_id>/...`; full-render-first rasters are cached separately under `.cache.render/<unique_id>/...`.
 - `--output` / `-o`: Final output PMTiles path (default: `output.pmtiles`).
 - `--download`: Download source tiles into the cache and exit without building output tiles.
-- Runs always resume automatically: `satmaps` reuses any matching `<temp-dir>/state_*.json`, on-disk final tiles, and any matching `.cache.render` full-render-first rasters from a previous run with the same parameters, so interrupted runs continue where they left off.
+- Runs always resume automatically: `satmaps` reuses any matching `<temp-dir>/<unique_id>/state.json`, on-disk final tiles, and any matching `.cache.render/<unique_id>/...` full-render-first rasters from a previous run with the same parameters, so interrupted runs continue where they left off.
 - `--refresh-land-mgrs-list`: Rebuild `land_mgrs.list` in the repository root from `gebco_2025_sub_ice_topo_geotiff.zip` using the same generator as `land-mgrs --refresh`, then exit.
 - `--estimate`: Print estimated time, RAM, disk, and network usage, then exit.
 

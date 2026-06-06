@@ -3070,7 +3070,7 @@ def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
             },
         )
     ]
-    assert list(tmp_path.glob(".cache.render/*/master_*.vrt")) == []
+    assert list(tmp_path.glob(".cache.render/*/master.vrt")) == []
 
 def test_main_reports_land_progress(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -3190,15 +3190,15 @@ def test_main_full_render_first_builds_master_vrt_and_commits_to_tile_cache(
     ]
     assert len(master_calls) == 1
     assert set(master_calls[0][0]) == {
-        ".cache.render/fullrender/land_31TDF_0_0_fullrender_3857.tif",
-        ".cache.render/fullrender/land_31TDF_0_1_fullrender_3857.tif",
-        ".cache.render/fullrender/land_31TDF_1_0_fullrender_3857.tif",
-        ".cache.render/fullrender/land_31TDF_1_1_fullrender_3857.tif",
+        ".cache.render/fullrender/land_31TDF_0_0_3857.tif",
+        ".cache.render/fullrender/land_31TDF_0_1_3857.tif",
+        ".cache.render/fullrender/land_31TDF_1_0_3857.tif",
+        ".cache.render/fullrender/land_31TDF_1_1_3857.tif",
     }
-    assert master_calls[0][1] == ".cache.render/fullrender/master_fullrender.vrt"
+    assert master_calls[0][1] == ".cache.render/fullrender/master.vrt"
     assert len(commit_calls) == 1
     assert commit_calls[0][:4] == (
-        ".cache.render/fullrender/master_fullrender.vrt",
+        ".cache.render/fullrender/master.vrt",
         "output.pmtiles",
         "fullrender",
         satmaps.FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID,
@@ -4393,7 +4393,7 @@ def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
         bbox=(-158.0, 20.8, -157.0, 21.7),
         ocean_mask_source=ocean.DEFAULT_GEBCO_ZIP,
     ) == {"05QFJ"}
-    assert list(tmp_path.glob(".cache.render/*/master_*.vrt")) == []
+    assert list(tmp_path.glob(".cache.render/*/master.vrt")) == []
 
 def test_main_refresh_land_mgrs_list_requires_mask_source(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]

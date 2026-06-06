@@ -969,7 +969,7 @@ def build_ocean_chunk_artifacts(
     chunk: OceanChunkPlan,
 ) -> OceanChunkArtifacts:
     """Return deterministic intermediate paths for one chunked ocean output."""
-    chunk_stem = f"{stem}_{unique_id}_chunk_{chunk.row:04d}_{chunk.col:04d}"
+    chunk_stem = f"{stem}_chunk_{chunk.row:04d}_{chunk.col:04d}"
     return OceanChunkArtifacts(
         depth_tif=os.path.join(temp_dir, f"{chunk_stem}_depth.tif"),
         alpha_vrt=os.path.join(temp_dir, f"{chunk_stem}_alpha.vrt"),
@@ -1007,7 +1007,7 @@ def build_ocean_run_settings(
 
 def build_ocean_run_metadata_path(temp_dir: str, unique_id: str) -> str:
     """Return the persistent settings sidecar for one ocean output namespace."""
-    return os.path.join(temp_dir, f"run_{unique_id}.json")
+    return os.path.join(temp_dir, "run.json")
 
 
 def recover_ocean_chunk_outputs(
@@ -1208,14 +1208,14 @@ def generate_ocean_background(
             ocean_run_settings,
         )
     write_settings_file(metadata_path, ocean_run_settings)
-    source_vrt = os.path.join(output_temp_dir, f"{stem}_{unique_id}_source.vrt")
-    masked_vrt = os.path.join(output_temp_dir, f"{stem}_{unique_id}_masked.vrt")
-    warped_vrt = os.path.join(output_temp_dir, f"{stem}_{unique_id}_depth_chunks.vrt")
-    alpha_vrt = os.path.join(output_temp_dir, f"{stem}_{unique_id}_alpha.vrt")
-    alpha_tif = os.path.join(output_temp_dir, f"{stem}_{unique_id}_alpha_chunks.vrt")
-    hillshade_tif = os.path.join(output_temp_dir, f"{stem}_{unique_id}_hillshade_chunks.vrt")
-    color_tif = os.path.join(output_temp_dir, f"{stem}_{unique_id}_color_chunks.vrt")
-    rgba_vrt = os.path.join(output_temp_dir, f"{stem}_{unique_id}_rgba.vrt")
+    source_vrt = os.path.join(output_temp_dir, f"{stem}_source.vrt")
+    masked_vrt = os.path.join(output_temp_dir, f"{stem}_masked.vrt")
+    warped_vrt = os.path.join(output_temp_dir, f"{stem}_depth_chunks.vrt")
+    alpha_vrt = os.path.join(output_temp_dir, f"{stem}_alpha.vrt")
+    alpha_tif = os.path.join(output_temp_dir, f"{stem}_alpha_chunks.vrt")
+    hillshade_tif = os.path.join(output_temp_dir, f"{stem}_hillshade_chunks.vrt")
+    color_tif = os.path.join(output_temp_dir, f"{stem}_color_chunks.vrt")
+    rgba_vrt = os.path.join(output_temp_dir, f"{stem}_rgba.vrt")
 
     print("[1/6] Building GEBCO source VRT...")
     build_gebco_source_vrt(gebco_zip, source_vrt)
