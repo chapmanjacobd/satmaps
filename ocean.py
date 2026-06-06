@@ -1339,7 +1339,30 @@ def parse_bbox(bbox: str) -> tuple[float, float, float, float]:
     return parse_bbox_string(bbox)
 
 
-def main() -> None:
+def build_ocean_style_from_args(args: argparse.Namespace) -> OceanStyleOptions:
+    """Build style options from parsed CLI arguments."""
+    return OceanStyleOptions(
+        tonemap=args.tonemap,
+        grade=args.grade,
+        exposure=args.exposure,
+        gamma=args.gamma,
+        shoulder=args.shoulder,
+        saturation=args.sat,
+        vibrance=args.vibrance,
+        black_point=args.black_point,
+        white_point=args.white_point,
+        black_break=args.db,
+        black_slope=args.ls,
+        grade_high_break=args.ghb,
+        grade_mid_slope=args.gms,
+        grade_high_slope=args.ghs,
+        depth_min=args.depth_min,
+        depth_max=args.depth_max,
+    )
+
+
+def build_ocean_argument_parser() -> argparse.ArgumentParser:
+    """Build the ocean CLI parser."""
     parser = argparse.ArgumentParser(
         description=(
             "Generate a standalone GEBCO ocean hillshade GeoTIFF. "
@@ -1347,13 +1370,10 @@ def main() -> None:
             f"(~{web_mercator_pixel_size(DEFAULT_MAX_ZOOM):.2f} m/px at the equator)."
         )
     )
-    parser.add_argument(
-        "gebco_zip", nargs="?", default=DEFAULT_GEBCO_ZIP, help="GEBCO zip archive"
-    )
-    parser.add_argument(
-        "destination", nargs="?", default=DEFAULT_OUTPUT, help="Output GeoTIFF path"
-    )
-    parser.add_argument(
+    add = parser.add_argument
+    add("gebco_zip", nargs="?", default=DEFAULT_GEBCO_ZIP, help="GEBCO zip archive")
+    add("destination", nargs="?", default=DEFAULT_OUTPUT, help="Output GeoTIFF path")
+    add(
         "--bbox",
         help=(
             "Optional WGS84 bbox as min_lon,min_lat,max_lon,max_lat. "
@@ -1361,111 +1381,109 @@ def main() -> None:
             f"Web Mercator zoom {DEFAULT_MAX_ZOOM}."
         ),
     )
-    parser.add_argument(
+    add(
         "--max-zoom",
         type=int,
         choices=list(SUPPORTED_MAX_ZOOMS),
         default=DEFAULT_MAX_ZOOM,
         help="Target Web Mercator zoom used for output resolution",
     )
-    parser.add_argument("--temp-dir", default=".temp", help="Directory for intermediary files")
-    parser.add_argument(
+    add("--temp-dir", default=".temp", help="Directory for intermediary files")
+    add(
         "--resample-alg",
         choices=["cubicspline", "lanczos"],
         default="cubicspline",
         help="Resampling algorithm for the GEBCO upscale into EPSG:3857",
     )
-    parser.add_argument(
+    add(
         "--hillshade-z",
         type=float,
         default=5.0,
         help="Vertical exaggeration passed to gdaldem hillshade",
     )
-    parser.add_argument(
+    add(
         "--grade",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable/disable ocean final grading before colorization",
     )
-    parser.add_argument(
+    add(
         "--exposure",
         type=float,
         default=OCEAN_DEFAULT_EXPOSURE,
         help="Global brightness multiplier",
     )
-    parser.add_argument(
+    add(
         "--tonemap",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--gamma", type=float, default=OCEAN_DEFAULT_GAMMA)
-    parser.add_argument(
+    add("--gamma", type=float, default=OCEAN_DEFAULT_GAMMA)
+    add(
         "--shoulder",
         type=float,
         default=OCEAN_DEFAULT_SHOULDER,
         help="Highlight shaping curve; values above 1 lift the top end",
     )
-    parser.add_argument(
-        "--sat", "--saturation", type=float, default=OCEAN_DEFAULT_SATURATION
-    )
-    parser.add_argument("--vibrance", type=float, default=DEFAULT_VIBRANCE)
-    parser.add_argument("--black-point", type=float, default=DEFAULT_BLACK_POINT)
-    parser.add_argument("--white-point", type=float, default=DEFAULT_WHITE_POINT)
-    parser.add_argument(
-        "--db", "--black-break", "--grade-low-break", type=float, default=OCEAN_DEFAULT_BLACK_BREAK
-    )
-    parser.add_argument(
-        "--ls", "--black-slope", "--grade-low-slope", type=float, default=OCEAN_DEFAULT_BLACK_SLOPE
-    )
-    parser.add_argument(
+    add("--sat", "--saturation", type=float, default=OCEAN_DEFAULT_SATURATION)
+    add("--vibrance", type=float, default=DEFAULT_VIBRANCE)
+    add("--black-point", type=float, default=DEFAULT_BLACK_POINT)
+    add("--white-point", type=float, default=DEFAULT_WHITE_POINT)
+    add("--db", "--black-break", "--grade-low-break", type=float, default=OCEAN_DEFAULT_BLACK_BREAK)
+    add("--ls", "--black-slope", "--grade-low-slope", type=float, default=OCEAN_DEFAULT_BLACK_SLOPE)
+    add(
         "--ghb",
         "--grade-highlight-break",
         type=float,
         help="Upper breakpoint for the final grading curve; defaults to the low break",
     )
-    parser.add_argument(
+    add(
         "--gms",
         "--grade-mid-slope",
         type=float,
         default=PREVIEW_DARKEN_MID_SLOPE,
     )
-    parser.add_argument(
+    add(
         "--ghs",
         "--grade-highlight-slope",
         type=float,
         help="Highlight slope for the final grading curve; defaults to an anchored derived slope",
     )
-    parser.add_argument(
+    add(
         "--depth-min",
         type=float,
         default=-11000.0,
         help="Depth value mapped to the start of the ocean color ramp",
     )
-    parser.add_argument(
+    add(
         "--depth-max",
         type=float,
         default=0.0,
         help="Depth value mapped to the end of the ocean color ramp",
     )
-    parser.add_argument(
+    add(
         "--vrt",
         action="store_true",
         help="Write the final styled RGBA VRT instead of translating it to a GeoTIFF",
     )
-    parser.add_argument(
+    add(
         "--parallel",
         type=int,
         help="Number of parallel chunk workers for ocean processing",
         default=40,
     )
-    parser.add_argument(
+    add(
         "--chunk-size",
         type=int,
         default=DEFAULT_OCEAN_CHUNK_SIZE,
         help="Chunk edge length in output pixels for chunked ocean processing",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_ocean_argument_parser().parse_args()
 
     artifacts = generate_ocean_background(
         gebco_zip=args.gebco_zip,
@@ -1474,24 +1492,7 @@ def main() -> None:
         temp_dir=args.temp_dir,
         resample_alg=args.resample_alg,
         hillshade_z=args.hillshade_z,
-        style=OceanStyleOptions(
-            tonemap=args.tonemap,
-            grade=args.grade,
-            exposure=args.exposure,
-            gamma=args.gamma,
-            shoulder=args.shoulder,
-            saturation=args.sat,
-            vibrance=args.vibrance,
-            black_point=args.black_point,
-            white_point=args.white_point,
-            black_break=args.db,
-            black_slope=args.ls,
-            grade_high_break=args.ghb,
-            grade_mid_slope=args.gms,
-            grade_high_slope=args.ghs,
-            depth_min=args.depth_min,
-            depth_max=args.depth_max,
-        ),
+        style=build_ocean_style_from_args(args),
         vrt=args.vrt,
         max_zoom=args.max_zoom,
         parallel=args.parallel,

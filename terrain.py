@@ -99,69 +99,75 @@ def generate_terrain_pmtiles(
     return destination
 
 
-def main() -> None:
+def build_terrain_argument_parser() -> argparse.ArgumentParser:
+    """Build the terrain CLI parser."""
     parser = argparse.ArgumentParser(
         description=(
             "Generate Terrarium-encoded PMTiles from GEBCO elevation data. "
             f"Defaults to Web Mercator zoom {ocean.DEFAULT_MAX_ZOOM}."
         )
     )
-    parser.add_argument(
+    add = parser.add_argument
+    add(
         "gebco_zip",
         nargs="?",
         default=ocean.DEFAULT_GEBCO_ZIP,
         help="GEBCO zip archive",
     )
-    parser.add_argument(
+    add(
         "destination",
         nargs="?",
         default=DEFAULT_OUTPUT,
         help="Output PMTiles path",
     )
-    parser.add_argument(
+    add(
         "--bbox",
         help=(
             "Optional WGS84 bbox as min_lon,min_lat,max_lon,max_lat. "
             "When omitted, exports the full GEBCO DEM in EPSG:3857."
         ),
     )
-    parser.add_argument(
+    add(
         "--max-zoom",
         type=int,
         choices=list(ocean.SUPPORTED_MAX_ZOOMS),
         default=ocean.DEFAULT_MAX_ZOOM,
         help="Target Web Mercator zoom used for output resolution",
     )
-    parser.add_argument(
+    add(
         "--chunk-zoom",
         type=int,
         default=DEFAULT_CHUNK_ZOOM,
         help="Zoom level to chunk the Terrarium PMTiles generation at",
     )
-    parser.add_argument(
+    add(
         "--parallel",
         type=int,
         default=2,
         help="Number of parallel chunk processes",
     )
-    parser.add_argument(
+    add(
         "--blocksize",
         type=int,
         default=512,
         help="Output tile size passed to the MBTiles driver",
     )
-    parser.add_argument(
+    add(
         "--temp-dir",
         default=".temp",
         help="Directory for intermediary files",
     )
-    parser.add_argument(
+    add(
         "--resample-alg",
         choices=["bilinear", "cubicspline", "lanczos"],
         default="cubicspline",
         help="Resampling algorithm for the GEBCO warp into EPSG:3857",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_terrain_argument_parser().parse_args()
 
     output = generate_terrain_pmtiles(
         args.gebco_zip,

@@ -828,7 +828,8 @@ def discover_mgrs_bases(
 
 def add_land_mgrs_cli_args(parser: argparse.ArgumentParser) -> None:
     """Register land-MGRS cache management CLI flags."""
-    parser.add_argument(
+    add = parser.add_argument
+    add(
         "--refresh-land-mgrs-list",
         action="store_true",
         help=f"Force regenerate {build_land_mgrs_list_path()} from {ocean.DEFAULT_GEBCO_ZIP} and exit",
@@ -861,38 +862,44 @@ def handle_land_mgrs_refresh(
     return True
 
 
-def main() -> None:
+def build_land_mgrs_argument_parser() -> argparse.ArgumentParser:
+    """Build the land-mgrs CLI parser."""
     parser = argparse.ArgumentParser(
         description=(
             "Generate the reusable land_mgrs.list cache from GEBCO so satmaps can skip "
             "repeat land-tile discovery scans."
         )
     )
-    parser.add_argument(
+    add = parser.add_argument
+    add(
         "--bbox",
         help=(
             "Optional WGS84 bbox as min_lon,min_lat,max_lon,max_lat. "
             "When omitted, writes the global land/shallow-water cache."
         ),
     )
-    parser.add_argument(
+    add(
         "--refresh",
         action="store_true",
         help="Force regeneration even when an existing matching land_mgrs.list is present",
     )
-    parser.add_argument(
+    add(
         "gebco_zip",
         nargs="?",
         default=ocean.DEFAULT_GEBCO_ZIP,
         help="GEBCO zip archive",
     )
-    parser.add_argument(
+    add(
         "destination",
         nargs="?",
         default=build_land_mgrs_list_path(),
         help="Output land_mgrs.list path",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_land_mgrs_argument_parser().parse_args()
 
     try:
         output_path = generate_land_mgrs_list(

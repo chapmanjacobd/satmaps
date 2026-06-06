@@ -4229,11 +4229,10 @@ def calculate_estimates(args: argparse.Namespace) -> None:
     print("---------------------------")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE (NumPy Refactor)."
-    )
-    parser.add_argument(
+def add_satmaps_core_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Register the primary render controls."""
+    add = parser.add_argument
+    add(
         "--date",
         default=DEFAULT_DATE_PATHS,
         help=(
@@ -4241,25 +4240,21 @@ def main() -> None:
             "of the equator and the second south of it; --winter swaps the hemispheres."
         ),
     )
-    parser.add_argument(
-        "--output", "-o", default="output.pmtiles", help="Output PMTiles filename"
-    )
-    parser.add_argument("--quality", type=int, default=74, help="WebP quality (0-100)")
-    parser.add_argument(
+    add("--output", "-o", default="output.pmtiles", help="Output PMTiles filename")
+    add("--quality", type=int, default=74, help="WebP quality (0-100)")
+    add(
         "--resample-alg",
         default="lanczos",
         choices=["bilinear", "average", "gauss", "lanczos"],
     )
-    parser.add_argument(
+    add(
         "--chunk-zoom",
         type=int,
         default=6,
         help="Zoom level to chunk the processing at",
     )
-    parser.add_argument(
-        "--parallel", type=int, default=12, help="Number of parallel processes"
-    )
-    parser.add_argument(
+    add("--parallel", type=int, default=12, help="Number of parallel processes")
+    add(
         "--tile-batch-width",
         "--ty",
         dest="tile_batch_width",
@@ -4270,99 +4265,100 @@ def main() -> None:
             "(default: 32)"
         ),
     )
-    parser.add_argument("--stats-min", type=float, help="Hardcoded source min")
-    parser.add_argument("--stats-max", type=float, help="Hardcoded source max")
+    add("--stats-min", type=float, help="Hardcoded source min")
+    add("--stats-max", type=float, help="Hardcoded source max")
 
-    # Grading
-    parser.add_argument(
+
+def add_satmaps_grading_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Register the land grading controls."""
+    add = parser.add_argument
+    add(
         "--grade",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable/disable land final grading",
     )
-    parser.add_argument(
+    add(
         "--exposure",
         type=float,
         default=2.5,
         help="Global brightness multiplier",
     )
-    parser.add_argument("--gamma", type=float, default=2.2)
-    parser.add_argument(
+    add("--gamma", type=float, default=2.2)
+    add(
         "--shoulder",
         type=float,
         default=0.5,
         help="Highlight shaping curve; values above 1 lift the top end",
     )
-    parser.add_argument(
-        "--sat", "--saturation", type=float, default=1.0
-    )
-    parser.add_argument("--vibrance", type=float, default=tiler.DEFAULT_VIBRANCE)
-    parser.add_argument("--black-point", type=float, default=tiler.DEFAULT_BLACK_POINT)
-    parser.add_argument("--white-point", type=float, default=tiler.DEFAULT_WHITE_POINT)
-    parser.add_argument(
-        "--db", "--black-break", "--grade-low-break", type=float, default=0.08
-    )
-    parser.add_argument(
-        "--ls", "--black-slope", "--grade-low-slope", type=float, default=0.0
-    )
-    parser.add_argument(
+    add("--sat", "--saturation", type=float, default=1.0)
+    add("--vibrance", type=float, default=tiler.DEFAULT_VIBRANCE)
+    add("--black-point", type=float, default=tiler.DEFAULT_BLACK_POINT)
+    add("--white-point", type=float, default=tiler.DEFAULT_WHITE_POINT)
+    add("--db", "--black-break", "--grade-low-break", type=float, default=0.08)
+    add("--ls", "--black-slope", "--grade-low-slope", type=float, default=0.0)
+    add(
         "--ghb",
         "--grade-highlight-break",
         type=float,
         default=0.9,
         help="Upper breakpoint for the final grading curve",
     )
-    parser.add_argument(
+    add(
         "--gms",
         "--grade-mid-slope",
         type=float,
         default=1.0,
     )
-    parser.add_argument(
+    add(
         "--ghs",
         "--grade-highlight-slope",
         type=float,
         default=1.7,
         help="Highlight slope for the final grading curve",
     )
-    parser.add_argument(
+    add(
         "--tonemap",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument(
+    add(
         "--hdr-highlights",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Blend HDR grading into bright near-neutral land highlights to preserve snow and ice detail",
     )
-    parser.add_argument(
+
+
+def add_satmaps_output_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Register output and cache controls."""
+    add = parser.add_argument
+    add(
         "--land",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable/disable land tile processing",
     )
-    parser.add_argument(
+    add(
         "--full-render-first",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Render full aligned land rasters first, then tile the merged master raster",
     )
-
-    parser.add_argument("--blocksize", type=int, default=512)
-    parser.add_argument("--cache", default=".cache", help="Cache directory")
-    parser.add_argument(
+    add("--blocksize", type=int, default=512)
+    add("--cache", default=".cache", help="Cache directory")
+    add(
         "--prefetch-cache",
         default=None,
         help="Ephemeral cache directory for prefetched RGB bands (default: <cache>.temp)",
     )
-    parser.add_argument(
+    add(
         "--temp-dir",
         default=DEFAULT_TEMP_DIR,
         help="Directory for heavyweight intermediary files",
     )
-    parser.add_argument(
+    add(
         "--prefetch-if-land",
         type=parse_prefetch_if_land,
         default=DEFAULT_PREFETCH_IF_LAND,
@@ -4372,38 +4368,56 @@ def main() -> None:
             "0 never prefetches and also skips land-percentage calculation."
         ),
     )
-    parser.add_argument(
+    add(
         "--ocean-background",
         default="ocean.tif",
         help="Standalone ocean background GeoTIFF to use under bbox renders",
     )
-    parser.add_argument(
+
+
+def add_satmaps_discovery_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Register discovery and utility controls."""
+    add = parser.add_argument
+    add(
         "--download",
         action="store_true",
         help="Download S3 tiles to local cache and exit",
     )
-    parser.add_argument(
-        "--bbox", help="WGS84 bounding box as min_lon,min_lat,max_lon,max_lat"
-    )
-    parser.add_argument(
+    add("--bbox", help="WGS84 bounding box as min_lon,min_lat,max_lon,max_lat")
+    add(
         "--max-zoom",
         type=int,
         choices=list(ocean.SUPPORTED_MAX_ZOOMS),
         default=ocean.DEFAULT_MAX_ZOOM,
         help="Target Web Mercator zoom used for output resolution",
     )
-    parser.add_argument(
+    add(
         "--estimate",
         action="store_true",
         help="Print estimated time, RAM, disk space, and network size then exit",
     )
-    parser.add_argument(
+    add(
         "--winter",
         action="store_true",
         help="Swap the two-date equator blend so the first date favors the south and the second the north",
     )
+
+
+def build_satmaps_argument_parser() -> argparse.ArgumentParser:
+    """Build the satmaps CLI parser."""
+    parser = argparse.ArgumentParser(
+        description="Generate PMTiles from Sentinel-2 Global Mosaics on CDSE (NumPy Refactor)."
+    )
+    add_satmaps_core_cli_args(parser)
+    add_satmaps_grading_cli_args(parser)
+    add_satmaps_output_cli_args(parser)
+    add_satmaps_discovery_cli_args(parser)
     land_mgrs_module.add_land_mgrs_cli_args(parser)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_satmaps_argument_parser().parse_args()
 
     setup_gdal_cdse()
 
