@@ -27,6 +27,7 @@ from common import (
     build_output_namespace_dir,
     build_output_namespace,
     build_staged_path,
+    ensure_directory,
     print_settings_diff_warning,
     read_settings_file,
     file_has_content,
@@ -34,7 +35,9 @@ from common import (
     per_worker_warp_threads,
     publish_staged_path,
     remove_if_exists,
+    write_json_file,
     write_settings_file,
+    write_text_file,
     warp_thread_budget,
     warp_thread_options,
 )
@@ -334,12 +337,7 @@ def mark_tile_empty(destination_path: str) -> None:
     lets the resume fast-forward skip the (still non-trivial) contributor/ocean reads
     instead of re-rendering the tile only to discover it is empty again.
     """
-    marker_path = build_empty_tile_marker_path(destination_path)
-    os.makedirs(os.path.dirname(marker_path), exist_ok=True)
-    staged_path = build_staged_path(marker_path)
-    with open(staged_path, "w") as marker_file:
-        marker_file.write("empty\n")
-    os.replace(staged_path, marker_path)
+    write_text_file(build_empty_tile_marker_path(destination_path), "empty\n")
 
 
 def clear_tile_empty_marker(destination_path: str) -> None:
@@ -540,19 +538,15 @@ def write_tile_cache_marker(
     tile_relpaths: Sequence[str],
 ) -> None:
     """Persist a contributor completion marker for resume and introspection."""
-    os.makedirs(os.path.dirname(marker_path), exist_ok=True)
-    temp_marker_path = f"{marker_path}.tmp"
-    with open(temp_marker_path, "w") as marker_file:
-        json.dump(
-            {
-                "contributor_id": contributor_id,
-                "tile_count": len(tile_relpaths),
-                "tiles": list(tile_relpaths),
-            },
-            marker_file,
-            indent=2,
-        )
-    os.replace(temp_marker_path, marker_path)
+    write_json_file(
+        marker_path,
+        {
+            "contributor_id": contributor_id,
+            "tile_count": len(tile_relpaths),
+            "tiles": list(tile_relpaths),
+        },
+        indent=2,
+    )
 
 
 def read_tile_cache_marker(marker_path: str) -> Tuple[str, List[str]]:
@@ -571,8 +565,6 @@ def write_candidate_tile_cache(
     settings: Mapping[str, Any] | None = None,
 ) -> None:
     """Persist precomputed final-tile candidates atomically for future runs."""
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    temp_cache_path = f"{cache_path}.tmp"
     payload: dict[str, Any] = {
         "work_units": sorted(contributor_row_slabs),
         "contributor_row_slabs": {
@@ -582,9 +574,7 @@ def write_candidate_tile_cache(
     }
     if settings is not None:
         payload["settings"] = dict(settings)
-    with open(temp_cache_path, "w") as cache_file:
-        json.dump(payload, cache_file, indent=2, sort_keys=True)
-    os.replace(temp_cache_path, cache_path)
+    write_json_file(cache_path, payload, indent=2, sort_keys=True)
 
 
 def read_candidate_tile_cache_record(cache_path: str) -> Optional["CandidateTileCacheRecord"]:
@@ -2484,18 +2474,15 @@ def write_resume_state(
     args: argparse.Namespace,
 ) -> None:
     """Persist resume state atomically so interrupted writes do not corrupt the JSON file."""
-    temp_state_file = f"{state_file}.tmp"
-    with open(temp_state_file, "w") as f:
-        json.dump(
-            {
-                "unique_id": unique_id,
-                "completed_units": list(completed_units),
-                "args": vars(args),
-            },
-            f,
-            indent=2,
-        )
-    os.replace(temp_state_file, state_file)
+    write_json_file(
+        state_file,
+        {
+            "unique_id": unique_id,
+            "completed_units": list(completed_units),
+            "args": vars(args),
+        },
+        indent=2,
+    )
 
 
 def parse_tile_tree_relpath(relative_path: str) -> Tuple[int, int, int]:
@@ -4464,8 +4451,8 @@ def main() -> None:
     if not args.prefetch_cache:
         args.prefetch_cache = args.cache + ".temp"
 
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    os.makedirs(FULL_RENDER_CACHE_DIR, exist_ok=True)
+    ensure_directory(TEMP_DIR)
+    ensure_directory(FULL_RENDER_CACHE_DIR)
 
     requested_bbox = parse_bbox(args.bbox) if args.bbox else None
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
@@ -4485,8 +4472,8 @@ def main() -> None:
 
     unique_id = build_output_namespace(args.output, default_stem="satmaps")
     run_paths = SatmapsRunPaths(args.output, unique_id)
-    os.makedirs(run_paths.output_temp_dir, exist_ok=True)
-    os.makedirs(run_paths.full_render_cache_dir, exist_ok=True)
+    ensure_directory(run_paths.output_temp_dir)
+    ensure_directory(run_paths.full_render_cache_dir)
     land_run_settings = build_land_run_settings(
         args,
         date_paths,

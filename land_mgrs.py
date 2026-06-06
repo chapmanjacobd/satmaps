@@ -13,7 +13,7 @@ import mgrs
 from mgrs import core as mgrs_core
 import numpy as np
 import ocean
-from common import file_has_content
+from common import file_has_content, write_text_file
 from osgeo import gdal, ogr, osr
 
 import tiler
@@ -666,16 +666,10 @@ def save_land_mgrs_list(
     if land_mgrs_list_path is None:
         return
 
-    parent_dir = os.path.dirname(land_mgrs_list_path)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
-    temp_path = f"{land_mgrs_list_path}.tmp"
     metadata = build_land_mgrs_cache_metadata(bbox, ocean_mask_source)
-    with open(temp_path, "w") as file_obj:
-        file_obj.write(f"{LAND_MGRS_HEADER_PREFIX}{json.dumps(metadata, sort_keys=True)}\n")
-        for mgrs_tile in sorted(land_mgrs):
-            file_obj.write(f"{mgrs_tile}\n")
-    os.replace(temp_path, land_mgrs_list_path)
+    payload_lines = [f"{LAND_MGRS_HEADER_PREFIX}{json.dumps(metadata, sort_keys=True)}"]
+    payload_lines.extend(sorted(land_mgrs))
+    write_text_file(land_mgrs_list_path, "\n".join(payload_lines) + "\n")
     print(f"Saved land MGRS list to {land_mgrs_list_path}.")
 
 

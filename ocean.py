@@ -15,6 +15,7 @@ from common import (
     build_output_namespace_dir,
     build_output_namespace,
     build_staged_path,
+    ensure_directory,
     file_has_content,
     format_eta,
     per_worker_warp_threads,
@@ -1176,7 +1177,7 @@ def generate_ocean_background(
     if not hasattr(gdal, "DEMProcessing"):
         raise RuntimeError("GDAL DEMProcessing is required to generate the ocean background")
 
-    os.makedirs(temp_dir, exist_ok=True)
+    ensure_directory(temp_dir)
     stem = Path(destination).stem or "ocean"
     run_mode = "bbox" if bbox is not None else "global"
     print(f"Ocean build: {run_mode} run at z{max_zoom} -> {destination}")
@@ -1185,8 +1186,7 @@ def generate_ocean_background(
         style = OceanStyleOptions()
 
     unique_id = build_output_namespace(destination, default_stem="ocean")
-    output_temp_dir = build_output_namespace_dir(temp_dir, unique_id)
-    os.makedirs(output_temp_dir, exist_ok=True)
+    output_temp_dir = ensure_directory(build_output_namespace_dir(temp_dir, unique_id))
     ocean_run_settings = build_ocean_run_settings(
         destination,
         bbox,

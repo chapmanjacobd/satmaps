@@ -106,6 +106,19 @@ def build_staged_path(path: str) -> str:
     return os.path.join(directory, f".temp_{basename}")
 
 
+def ensure_directory(path: str) -> str:
+    """Create a directory when needed and return the same path."""
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def ensure_parent_dir(path: str) -> None:
+    """Create a file's parent directory when the path has one."""
+    parent_dir = os.path.dirname(path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+
 def file_has_content(path: str) -> bool:
     """Return True when a path exists and has non-zero size."""
     try:
@@ -212,13 +225,33 @@ def read_settings_file(path: str, *, description: str) -> dict[str, Any] | None:
         return None
 
 
-def write_settings_file(path: str, settings: Mapping[str, Any]) -> None:
-    """Persist a JSON settings sidecar atomically."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def write_text_file(path: str, content: str) -> None:
+    """Persist UTF-8 text atomically via a sibling temporary file."""
+    ensure_parent_dir(path)
     temp_path = f"{path}.tmp"
     with open(temp_path, "w") as file_handle:
-        json.dump({"settings": dict(settings)}, file_handle, indent=2, sort_keys=True)
+        file_handle.write(content)
     os.replace(temp_path, path)
+
+
+def write_json_file(
+    path: str,
+    payload: Any,
+    *,
+    indent: int = 2,
+    sort_keys: bool = False,
+) -> None:
+    """Persist JSON atomically via a sibling temporary file."""
+    ensure_parent_dir(path)
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w") as file_handle:
+        json.dump(payload, file_handle, indent=indent, sort_keys=sort_keys)
+    os.replace(temp_path, path)
+
+
+def write_settings_file(path: str, settings: Mapping[str, Any]) -> None:
+    """Persist a JSON settings sidecar atomically."""
+    write_json_file(path, {"settings": dict(settings)}, indent=2, sort_keys=True)
 
 
 _MISSING_SETTING = object()

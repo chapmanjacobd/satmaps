@@ -2,7 +2,14 @@
 import argparse
 import os
 
-from common import build_output_namespace, build_output_namespace_dir, build_staged_path, publish_staged_path, remove_if_exists
+from common import (
+    build_output_namespace,
+    build_output_namespace_dir,
+    build_staged_path,
+    ensure_directory,
+    publish_staged_path,
+    remove_if_exists,
+)
 from osgeo import gdal
 
 import ocean
@@ -28,11 +35,10 @@ def generate_terrain_pmtiles(
     blocksize: int = 512,
 ) -> str:
     """Generate Terrarium-encoded PMTiles from the full GEBCO elevation raster."""
-    os.makedirs(temp_dir, exist_ok=True)
+    ensure_directory(temp_dir)
     stem = satmaps.temp_basename_from_output(destination)
     unique_id = build_output_namespace(destination, default_stem="terrain")
-    output_temp_dir = build_output_namespace_dir(temp_dir, unique_id)
-    os.makedirs(output_temp_dir, exist_ok=True)
+    output_temp_dir = ensure_directory(build_output_namespace_dir(temp_dir, unique_id))
 
     source_vrt = os.path.join(output_temp_dir, f"{stem}_source.vrt")
     warped_vrt = os.path.join(output_temp_dir, f"{stem}_3857.vrt")
