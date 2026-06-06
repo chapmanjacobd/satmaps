@@ -28,7 +28,9 @@ from common import (
     build_output_namespace,
     build_staged_path,
     ensure_directory,
+    ensure_parent_dir,
     print_settings_diff_warning,
+    prepare_staged_path,
     read_settings_file,
     file_has_content,
     format_eta,
@@ -48,6 +50,9 @@ from osgeo import gdal, ogr, osr
 from PIL import Image
 
 import tiler
+
+# Re-exported for existing callers/tests.
+_ = build_staged_path
 
 # Setup GDAL exceptions
 gdal.UseExceptions()
@@ -433,6 +438,15 @@ class PackagedPMTiles:
     tiling_artifacts: tiler.TilingArtifacts
 
 
+def convert_mbtiles_to_pmtiles(temp_mbtiles: str, output_path: str) -> None:
+    """Convert MBTiles into the caller-visible PMTiles output via a staged publish."""
+    print("Converting to PMTiles...")
+    staged_output_path = prepare_staged_path(output_path)
+    subprocess.run(["pmtiles", "convert", temp_mbtiles, staged_output_path], check=True)
+    publish_staged_path(staged_output_path, output_path)
+    print(f"Success! {output_path}")
+
+
 def convert_raster_to_pmtiles(
     input_raster: str,
     output_path: str,
@@ -453,7 +467,7 @@ def convert_raster_to_pmtiles(
     """Tile a Web Mercator raster into MBTiles and convert the result to PMTiles."""
     run_paths = SatmapsRunPaths(output_path, unique_id)
     temp_mbtiles = run_paths.temp_mbtiles
-    os.makedirs(os.path.dirname(temp_mbtiles), exist_ok=True)
+    ensure_parent_dir(temp_mbtiles)
     run_options: Dict[str, object] = {
         "format": tile_format,
         "quality": quality,
@@ -474,12 +488,7 @@ def convert_raster_to_pmtiles(
     if cleanup_input_paths:
         cleanup_temporary_files(cleanup_input_paths)
 
-    print("Converting to PMTiles...")
-    staged_output_path = build_staged_path(output_path)
-    remove_if_exists(staged_output_path)
-    subprocess.run(["pmtiles", "convert", temp_mbtiles, staged_output_path], check=True)
-    publish_staged_path(staged_output_path, output_path)
-    print(f"Success! {output_path}")
+    convert_mbtiles_to_pmtiles(temp_mbtiles, output_path)
     return PackagedPMTiles(
         temp_mbtiles=temp_mbtiles,
         tiling_artifacts=tiling_artifacts,
@@ -500,7 +509,7 @@ def convert_tile_tree_to_pmtiles(
     """Build MBTiles from a final max-zoom WebP tree, then convert it to PMTiles."""
     run_paths = SatmapsRunPaths(output_path, unique_id)
     temp_mbtiles = run_paths.temp_mbtiles
-    os.makedirs(os.path.dirname(temp_mbtiles), exist_ok=True)
+    ensure_parent_dir(temp_mbtiles)
     print("Generating MBTiles...")
     tiler.build_mbtiles_from_webp_tree(
         input_tile_tree,
@@ -513,12 +522,7 @@ def convert_tile_tree_to_pmtiles(
     tiler.build_mbtiles_overviews(temp_mbtiles, resample_alg)
     tiler.finalize_mbtiles_metadata(temp_mbtiles)
 
-    print("Converting to PMTiles...")
-    staged_output_path = build_staged_path(output_path)
-    remove_if_exists(staged_output_path)
-    subprocess.run(["pmtiles", "convert", temp_mbtiles, staged_output_path], check=True)
-    publish_staged_path(staged_output_path, output_path)
-    print(f"Success! {output_path}")
+    convert_mbtiles_to_pmtiles(temp_mbtiles, output_path)
     return temp_mbtiles
 
 
@@ -931,7 +935,7 @@ def get_tile_band_path(
     s3_path = f"{base_s3}/{band_id}.tif"
     download_path = ephemeral_path or persistent_path
     if download and download_path:
-        os.makedirs(os.path.dirname(download_path), exist_ok=True)
+        ensure_parent_dir(download_path)
         if not quiet:
             print(f"Downloading {s3_path} to {download_path}...")
         src_ds = gdal.Open(s3_path)
@@ -1826,9 +1830,7 @@ def prepare_ocean_background_for_output(
     )
     run_paths = SatmapsRunPaths(output_path, unique_id)
     prepared_ocean_path = run_paths.prepared_ocean_path
-    os.makedirs(os.path.dirname(prepared_ocean_path), exist_ok=True)
-    staged_ocean_path = build_staged_path(prepared_ocean_path)
-    remove_if_exists(staged_ocean_path)
+    staged_ocean_path = prepare_staged_path(prepared_ocean_path)
     dataset: Optional[gdal.Dataset] = None
     try:
         try:
@@ -3445,9 +3447,7 @@ def render_land_work_unit_raster(
         return output_path
 
     tile_grid = build_work_unit_output_tile_grid(folders, args)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    staged_output_path = build_staged_path(output_path)
-    remove_if_exists(staged_output_path)
+    staged_output_path = prepare_staged_path(output_path)
     ocean_mask: Optional[OceanMaskWarp] = None
     date_band_sets: List[Tuple[List[gdal.Band], List[gdal.Dataset]]] = []
     ds_out: Optional[gdal.Dataset] = None
@@ -3521,9 +3521,7 @@ def build_master_vrt(source_rasters: Sequence[str], output_vrt: str) -> str:
     """Build a master VRT in the supplied source order."""
     if not source_rasters:
         raise ValueError("source_rasters must not be empty")
-    os.makedirs(os.path.dirname(output_vrt), exist_ok=True)
-    staged_output_vrt = build_staged_path(output_vrt)
-    remove_if_exists(staged_output_vrt)
+    staged_output_vrt = prepare_staged_path(output_vrt)
     merged = gdal.BuildVRT(staged_output_vrt, list(source_rasters))
     if merged is None:
         raise RuntimeError(f"Could not build master VRT: {output_vrt}")

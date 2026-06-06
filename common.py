@@ -106,6 +106,14 @@ def build_staged_path(path: str) -> str:
     return os.path.join(directory, f".temp_{basename}")
 
 
+def prepare_staged_path(path: str) -> str:
+    """Return a clean staged sibling path for a final output path."""
+    ensure_parent_dir(path)
+    staged_path = build_staged_path(path)
+    remove_if_exists(staged_path)
+    return staged_path
+
+
 def ensure_directory(path: str) -> str:
     """Create a directory when needed and return the same path."""
     os.makedirs(path, exist_ok=True)

@@ -9,9 +9,19 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
-from common import build_staged_path, file_has_content, publish_staged_path, remove_if_exists
+from common import (
+    build_staged_path,
+    ensure_parent_dir,
+    file_has_content,
+    prepare_staged_path,
+    publish_staged_path,
+    remove_if_exists,
+)
 from osgeo import gdal
 from PIL import Image
+
+# Re-exported for existing callers/tests.
+_ = build_staged_path
 
 gdal.UseExceptions()
 
@@ -811,9 +821,7 @@ def save_webp_image(
     lossless: bool = False,
 ) -> str:
     """Atomically write a PIL image as WebP."""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    staged_output_path = build_staged_path(output_path)
-    remove_if_exists(staged_output_path)
+    staged_output_path = prepare_staged_path(output_path)
     save_kwargs: Dict[str, Any] = {"format": "WEBP"}
     if lossless:
         save_kwargs["lossless"] = True
@@ -1156,7 +1164,7 @@ def publish_staged_webp_tree_commit(
     for relative_path in tile_relpaths:
         staged_path = os.path.join(staging_dir, relative_path)
         destination_path = os.path.join(output_dir, relative_path)
-        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+        ensure_parent_dir(destination_path)
         if file_has_content(staged_path):
             publish_staged_path(staged_path, destination_path)
         elif not file_has_content(destination_path):
@@ -1240,9 +1248,7 @@ def build_mbtiles_from_webp_tree(
     bounds_wgs84: Optional[Tuple[float, float, float, float]] = None,
 ) -> int:
     """Build a flat MBTiles database by copying cached WebP tile bytes as-is."""
-    os.makedirs(os.path.dirname(output_mbtiles), exist_ok=True)
-    staged_output_path = build_staged_path(output_mbtiles)
-    remove_if_exists(staged_output_path)
+    staged_output_path = prepare_staged_path(output_mbtiles)
     conn = sqlite3.connect(staged_output_path)
     cursor = conn.cursor()
     try:
@@ -1341,10 +1347,9 @@ def process_chunk(args: ChunkTask) -> str:
     """Worker function for parallel gdal.Translate."""
     input_vrt, chunk_file, format, options, te_bounds = args
     ds = None
-    os.makedirs(os.path.dirname(chunk_file), exist_ok=True)
     temp_chunk_raster = chunk_file.replace(".mbtiles", ".tif")
     temp_chunk_rgb = chunk_file.replace(".mbtiles", "_rgb.tif")
-    staged_chunk_file = build_staged_path(chunk_file)
+    staged_chunk_file = prepare_staged_path(chunk_file)
     try:
         gdal.UseExceptions()
 
@@ -1620,8 +1625,7 @@ def run_tiling_simplified(
                 process_chunk(task)
 
     # Merge chunks.
-    staged_output_mbtiles = build_staged_path(output_mbtiles)
-    remove_if_exists(staged_output_mbtiles)
+    staged_output_mbtiles = prepare_staged_path(output_mbtiles)
     merge_mbtiles(staged_output_mbtiles, chunk_files)
 
     # Refresh metadata before building overviews so GDAL sees the merged extent,

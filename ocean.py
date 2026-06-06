@@ -16,6 +16,7 @@ from common import (
     build_output_namespace,
     build_staged_path,
     ensure_directory,
+    prepare_staged_path,
     file_has_content,
     format_eta,
     per_worker_warp_threads,
@@ -382,8 +383,7 @@ def build_gebco_source_vrt(gebco_zip: str, output_vrt: str) -> str:
     if not tif_paths:
         raise RuntimeError(f"No GeoTIFF files found in GEBCO zip: {gebco_zip}")
 
-    staged_output_vrt = build_staged_path(output_vrt)
-    remove_if_exists(staged_output_vrt)
+    staged_output_vrt = prepare_staged_path(output_vrt)
     gdal.BuildVRT(staged_output_vrt, tif_paths)
     publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
@@ -407,8 +407,7 @@ def create_gebco_ocean_vrt(source_vrt: str, output_vrt: str) -> str:
     ysize = ds.RasterYSize
     ds = None
 
-    staged_output_vrt = build_staged_path(output_vrt)
-    remove_if_exists(staged_output_vrt)
+    staged_output_vrt = prepare_staged_path(output_vrt)
     with open(staged_output_vrt, "w") as f:
         f.write(
             f"""<VRTDataset rasterXSize="{xsize}" rasterYSize="{ysize}">
@@ -450,8 +449,7 @@ def create_alpha_vrt(
     xsize = ds.RasterXSize
     ysize = ds.RasterYSize
     alpha_tif = alpha_tif or str(Path(output_vrt).with_suffix(".tif"))
-    staged_alpha_tif = build_staged_path(alpha_tif)
-    remove_if_exists(staged_alpha_tif)
+    staged_alpha_tif = prepare_staged_path(alpha_tif)
     driver = gdal.GetDriverByName("GTiff")
     alpha_ds = driver.Create(staged_alpha_tif, xsize, ysize, 1, gdal.GDT_Byte, options=list(GTIFF_CREATION_OPTIONS))
     if alpha_ds is None:
@@ -504,12 +502,10 @@ def create_alpha_vrt(
                 SMALL_OCEAN_MAX_AREA_SQ_M,
                 cleanup_mask_path,
             )
-
     alpha_ds = None
     ds = None
     publish_staged_path(staged_alpha_tif, alpha_tif)
-    staged_output_vrt = build_staged_path(output_vrt)
-    remove_if_exists(staged_output_vrt)
+    staged_output_vrt = prepare_staged_path(output_vrt)
     gdal.BuildVRT(staged_output_vrt, [alpha_tif])
     publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
@@ -720,8 +716,7 @@ def create_hillshade_tif(
     z_factor: float,
 ) -> str:
     """Create the ocean hillshade GeoTIFF with GDAL's in-process DEM pipeline."""
-    staged_output_tif = build_staged_path(output_tif)
-    remove_if_exists(staged_output_tif)
+    staged_output_tif = prepare_staged_path(output_tif)
     options = gdal.DEMProcessingOptions(
         format="GTiff",
         creationOptions=list(GTIFF_CREATION_OPTIONS),
@@ -761,8 +756,7 @@ def create_ocean_rgb_tif(
     ramp_colors = build_ocean_ramp_colors(style)
 
     driver = gdal.GetDriverByName("GTiff")
-    staged_output_tif = build_staged_path(output_tif)
-    remove_if_exists(staged_output_tif)
+    staged_output_tif = prepare_staged_path(output_tif)
     color_ds = driver.Create(
         staged_output_tif,
         hillshade_ds.RasterXSize,
@@ -850,8 +844,7 @@ def create_rgb_with_alpha_vrt(
     rgb_ds = None
     alpha_ds = None
 
-    staged_output_vrt = build_staged_path(output_vrt)
-    remove_if_exists(staged_output_vrt)
+    staged_output_vrt = prepare_staged_path(output_vrt)
     with open(staged_output_vrt, "w") as f:
         f.write(
             f"""<VRTDataset rasterXSize="{xsize}" rasterYSize="{ysize}">
@@ -899,16 +892,11 @@ def translate_rgba_vrt(
     progress: Callable[[float], None] | None = None,
 ) -> str:
     """Materialize the RGBA VRT as a tiled GeoTIFF."""
-    destination_dir = os.path.dirname(destination)
-    if destination_dir:
-        os.makedirs(destination_dir, exist_ok=True)
-
     options = gdal.TranslateOptions(
         format="GTiff",
         creationOptions=list(GTIFF_CREATION_OPTIONS),
     )
-    staged_destination = build_staged_path(destination)
-    remove_if_exists(staged_destination)
+    staged_destination = prepare_staged_path(destination)
     translated = gdal.Translate(
         staged_destination,
         rgba_vrt,
@@ -928,12 +916,7 @@ def crop_raster_to_src_win(
     src_win: tuple[int, int, int, int],
 ) -> str:
     """Crop a raster window into a tiled GeoTIFF while preserving grid alignment."""
-    destination_dir = os.path.dirname(destination)
-    if destination_dir:
-        os.makedirs(destination_dir, exist_ok=True)
-
-    staged_destination = build_staged_path(destination)
-    remove_if_exists(staged_destination)
+    staged_destination = prepare_staged_path(destination)
     translated = gdal.Translate(
         staged_destination,
         source_raster,
@@ -952,12 +935,7 @@ def crop_raster_to_src_win(
 
 def write_rgba_vrt(rgba_vrt: str, destination: str) -> str:
     """Persist the final RGBA VRT to a caller-visible output path."""
-    destination_dir = os.path.dirname(destination)
-    if destination_dir:
-        os.makedirs(destination_dir, exist_ok=True)
-
-    staged_destination = build_staged_path(destination)
-    remove_if_exists(staged_destination)
+    staged_destination = prepare_staged_path(destination)
     copyfile(rgba_vrt, staged_destination)
     publish_staged_path(staged_destination, destination)
     return destination
@@ -1039,8 +1017,7 @@ def materialize_warped_ocean_chunk(
     resample_alg: str,
 ) -> str:
     """Warp one aligned 3857 ocean chunk directly into a reusable GeoTIFF."""
-    staged_destination = build_staged_path(destination)
-    remove_if_exists(staged_destination)
+    staged_destination = prepare_staged_path(destination)
     warped = gdal.Warp(
         staged_destination,
         source_vrt,
@@ -1073,8 +1050,7 @@ def build_merged_vrt(
     """Build a VRT that merges aligned raster chunks in deterministic order."""
     if not source_rasters:
         raise ValueError("source_rasters must not be empty")
-    staged_output_vrt = build_staged_path(output_vrt)
-    remove_if_exists(staged_output_vrt)
+    staged_output_vrt = prepare_staged_path(output_vrt)
     merged = gdal.BuildVRT(
         staged_output_vrt,
         sorted(source_rasters),
