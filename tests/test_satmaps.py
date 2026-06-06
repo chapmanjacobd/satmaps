@@ -1523,15 +1523,16 @@ def test_prepare_ocean_background_publishes_staged_tif_when_warping(
         str(source_path),
         (0.0, 0.0, 1.0, 1.0),
         "output.pmtiles",
+        "testrun",
         "lanczos",
         13,
         256,
     )
 
-    assert prepared == ".temp/output_ocean_bbox.tif"
-    assert destinations == [".temp/.temp_output_ocean_bbox.tif"]
+    assert prepared == ".temp/testrun/output_ocean_bbox.tif"
+    assert destinations == [".temp/testrun/.temp_output_ocean_bbox.tif"]
     assert Path(prepared).exists()
-    assert not Path(".temp/.temp_output_ocean_bbox.tif").exists()
+    assert not Path(".temp/testrun/.temp_output_ocean_bbox.tif").exists()
     assert warp_options_calls[0]["multithread"] is True
     assert warp_options_calls[0]["warpOptions"] == ["NUM_THREADS=ALL_CPUS"]
 
@@ -1564,12 +1565,13 @@ def test_prepare_ocean_background_crops_aligned_mercator_source_without_warp(
         str(source_path),
         bbox,
         "output.pmtiles",
+        "testrun",
         "lanczos",
         13,
         256,
     )
 
-    assert prepared == ".temp/output_ocean_bbox.tif"
+    assert prepared == ".temp/testrun/output_ocean_bbox.tif"
     prepared_ds = gdal.Open(prepared)
     assert prepared_ds is not None
     assert prepared_ds.GetGeoTransform() == pytest.approx(
@@ -1607,7 +1609,10 @@ def test_convert_raster_to_pmtiles_stages_final_output(
     monkeypatch.chdir(tmp_path)
     temp_dir = tmp_path / ".temp"
     temp_dir.mkdir()
-    (temp_dir / "output.mbtiles").write_text("mbtiles")
+    unique_id = "testrun"
+    namespaced_temp_dir = temp_dir / unique_id
+    namespaced_temp_dir.mkdir()
+    (namespaced_temp_dir / "output.mbtiles").write_text("mbtiles")
     converted: list[list[str]] = []
 
     monkeypatch.setattr(
@@ -1628,6 +1633,7 @@ def test_convert_raster_to_pmtiles_stages_final_output(
     packaged = satmaps.convert_raster_to_pmtiles(
         "input.vrt",
         "output.pmtiles",
+        unique_id,
         tile_format="webp",
         quality=80,
         resample_alg="lanczos",
@@ -1638,10 +1644,10 @@ def test_convert_raster_to_pmtiles_stages_final_output(
         description="Test",
     )
 
-    assert converted == [["pmtiles", "convert", ".temp/output.mbtiles", ".temp_output.pmtiles"]]
+    assert converted == [["pmtiles", "convert", ".temp/testrun/output.mbtiles", ".temp_output.pmtiles"]]
     assert Path("output.pmtiles").read_text() == "pmtiles"
     assert not Path(".temp_output.pmtiles").exists()
-    assert packaged.temp_mbtiles == ".temp/output.mbtiles"
+    assert packaged.temp_mbtiles == ".temp/testrun/output.mbtiles"
 
 def test_convert_raster_to_pmtiles_cleans_inputs_after_mbtiles_before_pmtiles(
     tmp_path: Path, monkeypatch: object
@@ -1649,11 +1655,13 @@ def test_convert_raster_to_pmtiles_cleans_inputs_after_mbtiles_before_pmtiles(
     monkeypatch.chdir(tmp_path)
     temp_dir = tmp_path / ".temp"
     temp_dir.mkdir()
+    unique_id = "testrun"
     cleanup_target = temp_dir / "land_31TDF_0_0_3857.tif"
     cleanup_target.write_text("tif")
     converted: list[list[str]] = []
 
     def fake_run_tiling_simplified(input_raster, output_mbtiles, options):
+        Path(output_mbtiles).parent.mkdir(parents=True, exist_ok=True)
         Path(output_mbtiles).write_text("mbtiles")
         assert cleanup_target.exists()
         return tiler.TilingArtifacts(final_vrt=input_raster, cleanup_paths=[])
@@ -1670,6 +1678,7 @@ def test_convert_raster_to_pmtiles_cleans_inputs_after_mbtiles_before_pmtiles(
     satmaps.convert_raster_to_pmtiles(
         "input.vrt",
         "output.pmtiles",
+        unique_id,
         tile_format="webp",
         quality=80,
         resample_alg="lanczos",
@@ -1681,7 +1690,7 @@ def test_convert_raster_to_pmtiles_cleans_inputs_after_mbtiles_before_pmtiles(
         cleanup_input_paths=[str(cleanup_target)],
     )
 
-    assert converted == [["pmtiles", "convert", ".temp/output.mbtiles", ".temp_output.pmtiles"]]
+    assert converted == [["pmtiles", "convert", ".temp/testrun/output.mbtiles", ".temp_output.pmtiles"]]
 
 def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
     tmp_path: Path, monkeypatch: object
@@ -1689,6 +1698,7 @@ def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
     (tmp_path / "tiles").mkdir()
+    unique_id = "testrun"
     build_calls: list[dict[str, object]] = []
     overview_calls: list[tuple[str, str]] = []
     converted: list[list[str]] = []
@@ -1701,6 +1711,7 @@ def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
                 **kwargs,
             }
         )
+        Path(output_mbtiles).parent.mkdir(parents=True, exist_ok=True)
         Path(output_mbtiles).write_text("mbtiles")
         return 1
 
@@ -1720,6 +1731,7 @@ def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
     temp_mbtiles = satmaps.convert_tile_tree_to_pmtiles(
         "tiles",
         "output.pmtiles",
+        unique_id,
         resample_alg="lanczos",
         max_zoom=13,
         name="Test",
@@ -1730,16 +1742,16 @@ def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
     assert build_calls == [
         {
             "input_dir": "tiles",
-            "output_mbtiles": ".temp/output.mbtiles",
+            "output_mbtiles": ".temp/testrun/output.mbtiles",
             "name": "Test",
             "description": "Test",
             "maxzoom": 13,
             "bounds_wgs84": (0.0, 1.0, 2.0, 3.0),
         }
     ]
-    assert overview_calls == [(".temp/output.mbtiles", "lanczos")]
-    assert converted == [["pmtiles", "convert", ".temp/output.mbtiles", ".temp_output.pmtiles"]]
-    assert temp_mbtiles == ".temp/output.mbtiles"
+    assert overview_calls == [(".temp/testrun/output.mbtiles", "lanczos")]
+    assert converted == [["pmtiles", "convert", ".temp/testrun/output.mbtiles", ".temp_output.pmtiles"]]
+    assert temp_mbtiles == ".temp/testrun/output.mbtiles"
 
 def test_create_hillshade_tif_uses_gdal_demprocessing(monkeypatch: object, tmp_path: Path) -> None:
     dem_processing_calls: list[tuple[str, str, str, object]] = []
@@ -2057,8 +2069,10 @@ def test_generate_ocean_reuses_existing_chunk_outputs(
         ),
     )
     unique_id = ocean.build_output_namespace(str(tmp_path / "ocean.tif"), default_stem="ocean")
+    output_temp_dir = temp_dir / unique_id
+    output_temp_dir.mkdir()
     existing_chunk = Path(
-        ocean.build_ocean_chunk_artifacts(str(temp_dir), "ocean", unique_id, plan.chunks[0]).rgba_tif
+        ocean.build_ocean_chunk_artifacts(str(output_temp_dir), "ocean", unique_id, plan.chunks[0]).rgba_tif
     )
     existing_chunk.write_text("chunk")
 
@@ -2135,8 +2149,10 @@ def test_generate_ocean_warns_for_changed_run_settings(
         ),
     )
     unique_id = ocean.build_output_namespace(str(tmp_path / "ocean.tif"), default_stem="ocean")
+    output_temp_dir = temp_dir / unique_id
+    output_temp_dir.mkdir()
     existing_chunk = Path(
-        ocean.build_ocean_chunk_artifacts(str(temp_dir), "ocean", unique_id, plan.chunks[0]).rgba_tif
+        ocean.build_ocean_chunk_artifacts(str(output_temp_dir), "ocean", unique_id, plan.chunks[0]).rgba_tif
     )
     existing_chunk.write_text("chunk")
 
@@ -2160,8 +2176,8 @@ def test_generate_ocean_warns_for_changed_run_settings(
         "ocean.process_ocean_chunk",
         lambda **kwargs: (
             processed_chunks.append((kwargs["chunk"].row, kwargs["chunk"].col)),
-            Path(temp_dir / "generated_chunk.tif").write_text("generated"),
-            str(temp_dir / "generated_chunk.tif"),
+            Path(output_temp_dir / "generated_chunk.tif").write_text("generated"),
+            str(output_temp_dir / "generated_chunk.tif"),
         )[-1],
     )
     monkeypatch.setattr(
@@ -3002,7 +3018,7 @@ def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
     render_calls: list[dict[str, object]] = []
     packaged: list[tuple[str, str, dict[str, object]]] = []
 
-    def fake_convert(input_tile_tree: str, output_path: str, **kwargs: object) -> str:
+    def fake_convert(input_tile_tree: str, output_path: str, unique_id: str, **kwargs: object) -> str:
         packaged.append((input_tile_tree, output_path, dict(kwargs)))
         return str(tmp_path / ".temp" / "output.mbtiles")
 
@@ -3054,7 +3070,7 @@ def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
             },
         )
     ]
-    assert list(tmp_path.glob(".temp/master_*.vrt")) == []
+    assert list(tmp_path.glob(".cache.render/*/master_*.vrt")) == []
 
 def test_main_reports_land_progress(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -3174,15 +3190,15 @@ def test_main_full_render_first_builds_master_vrt_and_commits_to_tile_cache(
     ]
     assert len(master_calls) == 1
     assert set(master_calls[0][0]) == {
-        ".cache.render/land_31TDF_0_0_fullrender_3857.tif",
-        ".cache.render/land_31TDF_0_1_fullrender_3857.tif",
-        ".cache.render/land_31TDF_1_0_fullrender_3857.tif",
-        ".cache.render/land_31TDF_1_1_fullrender_3857.tif",
+        ".cache.render/fullrender/land_31TDF_0_0_fullrender_3857.tif",
+        ".cache.render/fullrender/land_31TDF_0_1_fullrender_3857.tif",
+        ".cache.render/fullrender/land_31TDF_1_0_fullrender_3857.tif",
+        ".cache.render/fullrender/land_31TDF_1_1_fullrender_3857.tif",
     }
-    assert master_calls[0][1] == ".cache.render/master_fullrender.vrt"
+    assert master_calls[0][1] == ".cache.render/fullrender/master_fullrender.vrt"
     assert len(commit_calls) == 1
     assert commit_calls[0][:4] == (
-        ".cache.render/master_fullrender.vrt",
+        ".cache.render/fullrender/master_fullrender.vrt",
         "output.pmtiles",
         "fullrender",
         satmaps.FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID,
@@ -3421,6 +3437,7 @@ def test_render_land_work_unit_rasters_fast_forwards_existing_outputs(
     args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles", prefetch_cache=None)
     work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
     raster_path = Path(satmaps.build_work_unit_raster_path("output.pmtiles", "rasterrun", "31TDF_0_0"))
+    raster_path.parent.mkdir(parents=True, exist_ok=True)
     raster_path.write_text("raster")
     completed: set[str] = set()
     state_file = str(tmp_path / ".temp" / "state.json")
@@ -3593,7 +3610,7 @@ def test_main_bbox_prepares_and_commits_ocean_background(
 
     def fake_prepare(*args):
         prepare_calls.append(args)
-        return ".temp/output_ocean_bbox.tif"
+        return satmaps.build_prepared_ocean_path("output.pmtiles", "bboxrun")
 
     def fake_commit(*args):
         commit_calls.append(args)
@@ -3611,10 +3628,22 @@ def test_main_bbox_prepares_and_commits_ocean_background(
     main()
 
     assert prepare_calls == [
-        ("ocean.tif", (0.0, 0.0, 1.0, 1.0), "output.pmtiles", "lanczos", ocean.DEFAULT_MAX_ZOOM, 512)
+        (
+            "ocean.tif",
+            (0.0, 0.0, 1.0, 1.0),
+            "output.pmtiles",
+            "bboxrun",
+            "lanczos",
+            ocean.DEFAULT_MAX_ZOOM,
+            512,
+        )
     ]
     assert len(commit_calls) == 1
-    assert commit_calls[0][:3] == (".temp/output_ocean_bbox.tif", "output.pmtiles", "bboxrun")
+    assert commit_calls[0][:3] == (
+        satmaps.build_prepared_ocean_path("output.pmtiles", "bboxrun"),
+        "output.pmtiles",
+        "bboxrun",
+    )
     assert isinstance(commit_calls[0][3], argparse.Namespace)
     assert package_calls == [
         {
@@ -3642,7 +3671,7 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
 
     monkeypatch.setattr(
         "satmaps.prepare_ocean_background_for_output",
-        lambda *args, **kwargs: ".temp/output_ocean_bbox.tif",
+        lambda *args, **kwargs: satmaps.build_prepared_ocean_path("output.pmtiles", "lazyocean"),
     )
     monkeypatch.setattr(
         "satmaps.commit_ocean_to_final_tile_cache",
@@ -3695,7 +3724,9 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
     assert render_calls[0]["work_unit_count"] == 4
     assert render_calls[0]["quality"] == 74
     assert render_calls[0]["zoom"] == ocean.DEFAULT_MAX_ZOOM
-    assert render_calls[0]["prepared_ocean_background"] == ".temp/output_ocean_bbox.tif"
+    assert render_calls[0]["prepared_ocean_background"] == satmaps.build_prepared_ocean_path(
+        "output.pmtiles", "lazyocean"
+    )
     contributor_row_slabs = render_calls[0]["contributor_row_slabs"]
     assert isinstance(contributor_row_slabs, dict)
     assert set(contributor_row_slabs) == {
@@ -3706,7 +3737,7 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
     }
     assert all(candidate_relpaths for candidate_relpaths in contributor_row_slabs.values())
     assert backfill_calls == [
-        (".temp/output_ocean_bbox.tif", "output.pmtiles", "lazyocean")
+        (satmaps.build_prepared_ocean_path("output.pmtiles", "lazyocean"), "output.pmtiles", "lazyocean")
     ]
     assert package_calls == [
         {
@@ -3774,7 +3805,11 @@ def test_main_reuses_cached_candidate_tile_footprints(
     assert len(render_calls) == 1
     assert render_calls[0]["contributor_row_slabs"] == cached_candidates
     out = capsys.readouterr().out
-    assert "Loaded candidate tile cache from .temp/candidate_tiles_cachedcandidates.json with 4 sub-tile(s)." in out
+    assert (
+        "Loaded candidate tile cache from "
+        f"{satmaps.build_candidate_tile_cache_path('cachedcandidates')} with 4 sub-tile(s)."
+        in out
+    )
     assert "Reusing cached candidate tile footprints for 4 sub-tile(s)." in out
     assert satmaps.read_candidate_tile_cache(
         satmaps.build_candidate_tile_cache_path("cachedcandidates")
@@ -3795,6 +3830,7 @@ def test_main_passes_requested_zoom_to_webp_pipeline(
         ocean_background: str,
         requested_bbox: tuple[float, float, float, float] | None,
         output_path: str,
+        unique_id: str,
         resample_alg: str,
         requested_zoom: int,
         blocksize: int,
@@ -4239,7 +4275,8 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
         )
         tiler.save_webp_image(Image.new("RGB", (8, 8), (0, 0, 255)), str(final_tile), quality=100)
 
-    stale_state = tmp_path / ".temp" / "state_stale.json"
+    stale_state = Path(satmaps.build_state_file_path("stale"))
+    stale_state.parent.mkdir(parents=True, exist_ok=True)
     stale_state.write_text(
         '{"unique_id": "stale", "completed_units": ["stale"], "processed_tifs": [], "args": {}}'
     )
@@ -4264,7 +4301,8 @@ def test_main_warns_when_prior_land_run_settings_change(
     )
     previous_settings = {"output": "output.pmtiles", "winter": True}
     current_settings = {"output": "output.pmtiles", "winter": False}
-    state_file = tmp_path / ".temp" / "state_landwarn.json"
+    state_file = Path(satmaps.build_state_file_path("landwarn"))
+    state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(
         json.dumps(
             {
@@ -4355,7 +4393,7 @@ def test_main_refresh_land_mgrs_list_force_regenerates_and_exits(
         bbox=(-158.0, 20.8, -157.0, 21.7),
         ocean_mask_source=ocean.DEFAULT_GEBCO_ZIP,
     ) == {"05QFJ"}
-    assert list(tmp_path.glob(".temp/master_*.vrt")) == []
+    assert list(tmp_path.glob(".cache.render/*/master_*.vrt")) == []
 
 def test_main_refresh_land_mgrs_list_requires_mask_source(
     monkeypatch: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -4524,7 +4562,8 @@ def test_main_resume_skips_completed_work_units(
         ),
     )
 
-    state_file = tmp_path / ".temp" / "state_resumefilter.json"
+    state_file = Path(satmaps.build_state_file_path("resumefilter"))
+    state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(
         json.dumps(
             {

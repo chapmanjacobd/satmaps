@@ -24,6 +24,7 @@ from mgrs import core as mgrs_core
 import numpy as np
 from common import (
     LiveProgressLine,
+    build_output_namespace_dir,
     build_output_namespace,
     build_staged_path,
     print_settings_diff_warning,
@@ -213,39 +214,58 @@ def temp_basename_from_output(output_path: str) -> str:
     return stem or "satmaps"
 
 
+def build_output_temp_dir(unique_id: str) -> str:
+    """Return the temp directory holding artifacts for one output namespace."""
+    return build_output_namespace_dir(TEMP_DIR, unique_id)
+
+
+def build_full_render_cache_dir(unique_id: str) -> str:
+    """Return the full-render cache directory for one output namespace."""
+    return build_output_namespace_dir(FULL_RENDER_CACHE_DIR, unique_id)
+
+
 def build_state_file_path(unique_id: str) -> str:
     """Return the lightweight JSON resume state path."""
-    return f"{TEMP_DIR}/state_{unique_id}.json"
+    return os.path.join(build_output_temp_dir(unique_id), f"state_{unique_id}.json")
 
 
 def build_land_run_metadata_path(unique_id: str) -> str:
     """Return the persistent JSON sidecar describing the last land run for one output."""
-    return f"{TEMP_DIR}/run_{unique_id}.json"
+    return os.path.join(build_output_temp_dir(unique_id), f"run_{unique_id}.json")
 
 
 def build_candidate_tile_cache_path(unique_id: str) -> str:
     """Return the persistent JSON cache path for candidate final-tile footprints."""
-    return f"{TEMP_DIR}/candidate_tiles_{unique_id}.json"
+    return os.path.join(build_output_temp_dir(unique_id), f"candidate_tiles_{unique_id}.json")
 
 
-def build_temp_mbtiles_path(output_path: str) -> str:
+def build_temp_mbtiles_path(output_path: str, unique_id: str) -> str:
     """Return the deterministic heavyweight MBTiles path."""
-    return f"{TEMP_DIR}/{temp_basename_from_output(output_path)}.mbtiles"
+    return os.path.join(
+        build_output_temp_dir(unique_id),
+        f"{temp_basename_from_output(output_path)}.mbtiles",
+    )
 
 
 def build_work_unit_raster_path(output_path: str, unique_id: str, work_unit_id: str) -> str:
     """Return the deterministic full-render-first GeoTIFF path for one work unit."""
-    return f"{FULL_RENDER_CACHE_DIR}/land_{work_unit_id}_{unique_id}_3857.tif"
+    return os.path.join(
+        build_full_render_cache_dir(unique_id),
+        f"land_{work_unit_id}_{unique_id}_3857.tif",
+    )
 
 
 def build_master_vrt_path(unique_id: str) -> str:
     """Return the deterministic full-render-first master VRT path."""
-    return f"{FULL_RENDER_CACHE_DIR}/master_{unique_id}.vrt"
+    return os.path.join(build_full_render_cache_dir(unique_id), f"master_{unique_id}.vrt")
 
 
 def build_tile_cache_root(output_path: str, unique_id: str) -> str:
     """Return the run-scoped root directory for cached max-zoom WebP tiles."""
-    return f"{TEMP_DIR}/{temp_basename_from_output(output_path)}_{unique_id}_tilecache"
+    return os.path.join(
+        build_output_temp_dir(unique_id),
+        f"{temp_basename_from_output(output_path)}_{unique_id}_tilecache",
+    )
 
 
 def build_tile_cache_marker_path(
@@ -381,6 +401,7 @@ class PackagedPMTiles:
 def convert_raster_to_pmtiles(
     input_raster: str,
     output_path: str,
+    unique_id: str,
     *,
     tile_format: str,
     quality: int,
@@ -395,7 +416,8 @@ def convert_raster_to_pmtiles(
     cleanup_input_paths: Optional[Sequence[str]] = None,
 ) -> PackagedPMTiles:
     """Tile a Web Mercator raster into MBTiles and convert the result to PMTiles."""
-    temp_mbtiles = build_temp_mbtiles_path(output_path)
+    temp_mbtiles = build_temp_mbtiles_path(output_path, unique_id)
+    os.makedirs(os.path.dirname(temp_mbtiles), exist_ok=True)
     run_options: Dict[str, object] = {
         "format": tile_format,
         "quality": quality,
@@ -431,6 +453,7 @@ def convert_raster_to_pmtiles(
 def convert_tile_tree_to_pmtiles(
     input_tile_tree: str,
     output_path: str,
+    unique_id: str,
     *,
     resample_alg: str,
     max_zoom: int,
@@ -439,7 +462,8 @@ def convert_tile_tree_to_pmtiles(
     requested_bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> str:
     """Build MBTiles from a final max-zoom WebP tree, then convert it to PMTiles."""
-    temp_mbtiles = build_temp_mbtiles_path(output_path)
+    temp_mbtiles = build_temp_mbtiles_path(output_path, unique_id)
+    os.makedirs(os.path.dirname(temp_mbtiles), exist_ok=True)
     print("Generating MBTiles...")
     tiler.build_mbtiles_from_webp_tree(
         input_tile_tree,
@@ -471,9 +495,12 @@ def cleanup_temporary_files(paths: Sequence[str]) -> None:
                 print(f"Warning: Could not remove temporary file {path}: {exc}")
 
 
-def build_prepared_ocean_path(output_path: str) -> str:
+def build_prepared_ocean_path(output_path: str, unique_id: str) -> str:
     """Return the deterministic heavyweight bbox-clipped ocean TIFF path."""
-    return f"{TEMP_DIR}/{temp_basename_from_output(output_path)}_ocean_bbox.tif"
+    return os.path.join(
+        build_output_temp_dir(unique_id),
+        f"{temp_basename_from_output(output_path)}_ocean_bbox.tif",
+    )
 
 
 def write_tile_cache_marker(
@@ -1761,6 +1788,7 @@ def prepare_ocean_background_for_output(
     ocean_background_path: str,
     requested_bbox: Optional[Tuple[float, float, float, float]],
     output_path: str,
+    unique_id: str,
     resample_alg: str,
     max_zoom: int,
     blocksize: int,
@@ -1776,7 +1804,8 @@ def prepare_ocean_background_for_output(
         max_zoom,
         tile_size=blocksize,
     )
-    prepared_ocean_path = build_prepared_ocean_path(output_path)
+    prepared_ocean_path = build_prepared_ocean_path(output_path, unique_id)
+    os.makedirs(os.path.dirname(prepared_ocean_path), exist_ok=True)
     staged_ocean_path = build_staged_path(prepared_ocean_path)
     remove_if_exists(staged_ocean_path)
     dataset: Optional[gdal.Dataset] = None
@@ -4406,6 +4435,8 @@ def main() -> None:
         populate_s3_cache(date_paths)
 
     unique_id = build_output_namespace(args.output, default_stem="satmaps")
+    os.makedirs(build_output_temp_dir(unique_id), exist_ok=True)
+    os.makedirs(build_full_render_cache_dir(unique_id), exist_ok=True)
     land_run_settings = build_land_run_settings(
         args,
         date_paths,
@@ -4468,6 +4499,7 @@ def main() -> None:
         args.ocean_background,
         requested_bbox,
         args.output,
+        unique_id,
         args.resample_alg,
         args.max_zoom,
         args.blocksize,
@@ -4635,6 +4667,7 @@ def main() -> None:
     temp_mbtiles = convert_tile_tree_to_pmtiles(
         final_tile_tree,
         args.output,
+        unique_id,
         resample_alg=args.resample_alg,
         max_zoom=args.max_zoom,
         name="Sentinel-2 Mosaic",

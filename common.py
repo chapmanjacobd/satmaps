@@ -138,6 +138,11 @@ def build_output_namespace(output_path: str, *, default_stem: str = "output") ->
     return f"{stem}_{path_digest}"
 
 
+def build_output_namespace_dir(root_dir: str, unique_id: str) -> str:
+    """Return the directory holding artifacts for one output namespace."""
+    return os.path.join(root_dir, unique_id)
+
+
 def describe_settings_differences(
     previous: Mapping[str, Any], current: Mapping[str, Any]
 ) -> list[str]:

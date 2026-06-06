@@ -1240,6 +1240,7 @@ def build_mbtiles_from_webp_tree(
     bounds_wgs84: Optional[Tuple[float, float, float, float]] = None,
 ) -> int:
     """Build a flat MBTiles database by copying cached WebP tile bytes as-is."""
+    os.makedirs(os.path.dirname(output_mbtiles), exist_ok=True)
     staged_output_path = build_staged_path(output_mbtiles)
     remove_if_exists(staged_output_path)
     conn = sqlite3.connect(staged_output_path)
@@ -1340,6 +1341,7 @@ def process_chunk(args: ChunkTask) -> str:
     """Worker function for parallel gdal.Translate."""
     input_vrt, chunk_file, format, options, te_bounds = args
     ds = None
+    os.makedirs(os.path.dirname(chunk_file), exist_ok=True)
     temp_chunk_raster = chunk_file.replace(".mbtiles", ".tif")
     temp_chunk_rgb = chunk_file.replace(".mbtiles", "_rgb.tif")
     staged_chunk_file = build_staged_path(chunk_file)
@@ -1573,6 +1575,7 @@ def run_tiling_simplified(
 ) -> TilingArtifacts:
     """Simplified tiling from a pre-processed Byte VRT."""
     chunk_prefix = os.path.splitext(os.path.basename(output_mbtiles))[0] or "tiles"
+    chunk_dir = os.path.dirname(output_mbtiles) or "."
     chunk_zoom = options.get("chunk_zoom", 4)
     tile_format = options.get("format", "webp")
 
@@ -1592,7 +1595,7 @@ def run_tiling_simplified(
     chunk_files: List[str] = []
     for ty in range(ty_min, ty_max + 1):
         for tx in range(tx_min, tx_max + 1):
-            chunk_file = f".temp/{chunk_prefix}_chunk_{chunk_zoom}_{tx}_{ty}.mbtiles"
+            chunk_file = os.path.join(chunk_dir, f"{chunk_prefix}_chunk_{chunk_zoom}_{tx}_{ty}.mbtiles")
             chunk_files.append(chunk_file)
 
             if os.path.exists(chunk_file):

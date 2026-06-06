@@ -12,6 +12,7 @@ from xml.sax.saxutils import escape
 import numpy as np
 from common import (
     LiveProgressLine,
+    build_output_namespace_dir,
     build_output_namespace,
     build_staged_path,
     file_has_content,
@@ -1184,6 +1185,8 @@ def generate_ocean_background(
         style = OceanStyleOptions()
 
     unique_id = build_output_namespace(destination, default_stem="ocean")
+    output_temp_dir = build_output_namespace_dir(temp_dir, unique_id)
+    os.makedirs(output_temp_dir, exist_ok=True)
     ocean_run_settings = build_ocean_run_settings(
         destination,
         bbox,
@@ -1193,7 +1196,7 @@ def generate_ocean_background(
         hillshade_z=hillshade_z,
         style=style,
     )
-    metadata_path = build_ocean_run_metadata_path(temp_dir, unique_id)
+    metadata_path = build_ocean_run_metadata_path(output_temp_dir, unique_id)
     previous_ocean_run_settings = read_settings_file(
         metadata_path,
         description="ocean run metadata",
@@ -1205,14 +1208,14 @@ def generate_ocean_background(
             ocean_run_settings,
         )
     write_settings_file(metadata_path, ocean_run_settings)
-    source_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_source.vrt")
-    masked_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_masked.vrt")
-    warped_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_depth_chunks.vrt")
-    alpha_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_alpha.vrt")
-    alpha_tif = os.path.join(temp_dir, f"{stem}_{unique_id}_alpha_chunks.vrt")
-    hillshade_tif = os.path.join(temp_dir, f"{stem}_{unique_id}_hillshade_chunks.vrt")
-    color_tif = os.path.join(temp_dir, f"{stem}_{unique_id}_color_chunks.vrt")
-    rgba_vrt = os.path.join(temp_dir, f"{stem}_{unique_id}_rgba.vrt")
+    source_vrt = os.path.join(output_temp_dir, f"{stem}_{unique_id}_source.vrt")
+    masked_vrt = os.path.join(output_temp_dir, f"{stem}_{unique_id}_masked.vrt")
+    warped_vrt = os.path.join(output_temp_dir, f"{stem}_{unique_id}_depth_chunks.vrt")
+    alpha_vrt = os.path.join(output_temp_dir, f"{stem}_{unique_id}_alpha.vrt")
+    alpha_tif = os.path.join(output_temp_dir, f"{stem}_{unique_id}_alpha_chunks.vrt")
+    hillshade_tif = os.path.join(output_temp_dir, f"{stem}_{unique_id}_hillshade_chunks.vrt")
+    color_tif = os.path.join(output_temp_dir, f"{stem}_{unique_id}_color_chunks.vrt")
+    rgba_vrt = os.path.join(output_temp_dir, f"{stem}_{unique_id}_rgba.vrt")
 
     print("[1/6] Building GEBCO source VRT...")
     build_gebco_source_vrt(gebco_zip, source_vrt)
@@ -1228,7 +1231,7 @@ def generate_ocean_background(
     print(f"Processing {len(plan.chunks):,} chunk(s) with {chunk_workers} worker(s)...")
 
     recovered_chunk_keys, recovered_chunk_paths = recover_ocean_chunk_outputs(
-        temp_dir, stem, unique_id, plan.chunks
+        output_temp_dir, stem, unique_id, plan.chunks
     )
     if recovered_chunk_paths:
         print(f"Reusing {len(recovered_chunk_paths):,} existing ocean chunk(s).")
@@ -1259,7 +1262,7 @@ def generate_ocean_background(
                 chunk_rgba_paths.append(
                     process_ocean_chunk(
                         masked_vrt=masked_vrt,
-                        temp_dir=temp_dir,
+                        temp_dir=output_temp_dir,
                         stem=stem,
                         unique_id=unique_id,
                         chunk=chunk,
@@ -1279,7 +1282,7 @@ def generate_ocean_background(
                     executor.submit(
                         process_ocean_chunk,
                         masked_vrt=masked_vrt,
-                        temp_dir=temp_dir,
+                        temp_dir=output_temp_dir,
                         stem=stem,
                         unique_id=unique_id,
                         chunk=chunk,

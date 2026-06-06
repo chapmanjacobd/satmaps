@@ -39,6 +39,7 @@ def test_generate_terrain_pmtiles_uses_terrarium_tiling(
     def fake_convert_raster_to_pmtiles(
         input_raster: str,
         output_path: str,
+        unique_id: str,
         *,
         tile_format: str,
         quality: int,
@@ -55,6 +56,7 @@ def test_generate_terrain_pmtiles_uses_terrarium_tiling(
             {
                 "input_raster": input_raster,
                 "output_path": output_path,
+                "unique_id": unique_id,
                 "tile_format": tile_format,
                 "quality": quality,
                 "resample_alg": resample_alg,
@@ -98,6 +100,7 @@ def test_generate_terrain_pmtiles_uses_terrarium_tiling(
     assert captured == {
         **captured,
         "output_path": "terrain.pmtiles",
+        "unique_id": satmaps.build_output_namespace("terrain.pmtiles", default_stem="terrain"),
         "tile_format": "png",
         "quality": 100,
         "resample_alg": "bilinear",

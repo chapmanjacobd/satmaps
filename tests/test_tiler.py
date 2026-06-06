@@ -841,7 +841,7 @@ def test_run_tiling_simplified_uses_explicit_chunk_bounds(
     )
 
     assert seen_proj_wins == [requested_bounds]
-    assert seen_chunk_files == [".temp/output_chunk_4_8_7.mbtiles"]
+    assert seen_chunk_files == [str(tmp_path / "output_chunk_4_8_7.mbtiles")]
 
 
 def test_run_tiling_simplified_publishes_staged_output_mbtiles(
