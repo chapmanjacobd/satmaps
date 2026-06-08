@@ -2145,7 +2145,7 @@ def open_gebco_mask(
                     "",
                     gebco_ds,
                     options=gdal.TranslateOptions(
-                        format="MEM",
+                        format="VRT",
                         srcWin=aligned_src_win,
                         bandList=[band_index],
                         outputType=gdal.GDT_Float32,
@@ -2171,7 +2171,7 @@ def open_gebco_mask(
                     "",
                     gebco_ds,
                     options=gdal.TranslateOptions(
-                        format="MEM",
+                        format="VRT",
                         srcWin=cropped_src_win,
                         bandList=[band_index],
                         outputType=gdal.GDT_Float32,
@@ -2191,7 +2191,7 @@ def open_gebco_mask(
                 "",
                 warp_source,
                 options=gdal.WarpOptions(
-                    format="MEM",
+                    format="VRT",
                     dstSRS=tile_grid.projection,
                     outputBounds=(min_x, min_y, max_x, max_y),
                     width=tile_grid.width,
@@ -2662,7 +2662,7 @@ def warp_band_dataset_to_tile_grid(
                 "",
                 source_dataset,
                 options=gdal.TranslateOptions(
-                    format="MEM",
+                    format="VRT",
                     srcWin=aligned_src_win,
                     outputType=gdal.GDT_Float32,
                 ),
@@ -2687,7 +2687,7 @@ def warp_band_dataset_to_tile_grid(
                 "",
                 source_dataset,
                 options=gdal.TranslateOptions(
-                    format="MEM",
+                    format="VRT",
                     srcWin=cropped_src_win,
                     outputType=gdal.GDT_Float32,
                 ),
@@ -2706,7 +2706,7 @@ def warp_band_dataset_to_tile_grid(
             "",
             warp_source,
             options=gdal.WarpOptions(
-                format="MEM",
+                format="VRT",
                 dstSRS=tile_grid.projection,
                 outputBounds=(min_x, min_y, max_x, max_y),
                 width=tile_grid.width,
