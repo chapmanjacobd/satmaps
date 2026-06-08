@@ -2766,25 +2766,34 @@ def open_warped_date_band_sets(
         raise
 
 
+def get_process_slab_height() -> int:
+    """Return the process slab height matching the source block size."""
+    if CURRENT_DATASET_NAME == "S2MSI_L3__MCQ_LR":
+        return 256
+    return PROCESS_SLAB_HEIGHT
+
+
 def iter_processing_windows(tile_grid: TileGrid) -> Iterator[Tuple[int, int, int, int]]:
     """Yield full-width row slabs that match the striped source TIFF layout."""
-    for yoff in range(0, tile_grid.height, PROCESS_SLAB_HEIGHT):
-        yield 0, yoff, tile_grid.width, min(PROCESS_SLAB_HEIGHT, tile_grid.height - yoff)
+    slab_height = get_process_slab_height()
+    for yoff in range(0, tile_grid.height, slab_height):
+        yield 0, yoff, tile_grid.width, min(slab_height, tile_grid.height - yoff)
 
 
 def iter_processing_windows_in_window(processing_window: ProcessingWindow) -> Iterator[ProcessingWindow]:
-    """Yield PROCESS_SLAB_HEIGHT windows constrained to a larger processing window."""
+    """Yield process-slab windows constrained to a larger processing window."""
+    slab_height = get_process_slab_height()
     for yoff in range(
         processing_window.yoff,
         processing_window.yoff + processing_window.height,
-        PROCESS_SLAB_HEIGHT,
+        slab_height,
     ):
         yield ProcessingWindow(
             xoff=processing_window.xoff,
             yoff=yoff,
             width=processing_window.width,
             height=min(
-                PROCESS_SLAB_HEIGHT,
+                slab_height,
                 (processing_window.yoff + processing_window.height) - yoff,
             ),
         )
@@ -2877,9 +2886,10 @@ def average_tile_blocks(
     )
     use_local_season_blend = tile_grid is not None and len(date_band_sets) == 2
 
-    for relative_yoff in range(0, processing_window.height, PROCESS_SLAB_HEIGHT):
+    slab_height = get_process_slab_height()
+    for relative_yoff in range(0, processing_window.height, slab_height):
         yoff = processing_window.yoff + relative_yoff
-        block_height = min(PROCESS_SLAB_HEIGHT, processing_window.height - relative_yoff)
+        block_height = min(slab_height, processing_window.height - relative_yoff)
 
         if mask_slabs is None:
             actual_xoff = processing_window.xoff
@@ -3068,9 +3078,10 @@ def write_processed_blocks(
         )
         return
 
-    for relative_yoff in range(0, processing_window.height, PROCESS_SLAB_HEIGHT):
+    slab_height = get_process_slab_height()
+    for relative_yoff in range(0, processing_window.height, slab_height):
         yoff = processing_window.yoff + relative_yoff
-        block_height = min(PROCESS_SLAB_HEIGHT, processing_window.height - relative_yoff)
+        block_height = min(slab_height, processing_window.height - relative_yoff)
         averaged_block = averaged[
             :, relative_yoff : relative_yoff + block_height, :
         ]
