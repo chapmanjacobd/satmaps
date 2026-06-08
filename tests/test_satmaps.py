@@ -3540,10 +3540,10 @@ def test_main_low_zoom_uses_subtile_processing_strategy(
     main()
 
     out = capsys.readouterr().out
-    assert "Expanded 1 MGRS tiles into 4 sub-tiles across 1 date(s)." in out
-    assert "Starting output-tile rendering for 4 sub-tile(s) with 1 worker(s)." in out
-    assert "Land tile progress: 4/4 (100%); Elapsed:" in out
-    assert "Rendered 4 land tile(s); reused 0 cached tile(s)." in out
+    assert "Expanded 1 MGRS tiles into 1 sub-tiles across 1 date(s)." in out
+    assert "Starting output-tile rendering for 1 sub-tile(s) with 1 worker(s)." in out
+    assert "Land tile progress: 1/1 (100%); Elapsed:" in out
+    assert "Rendered 1 land tile(s); reused 0 cached tile(s)." in out
 
 def test_main_passes_ocean_path_to_tile_processing(
     monkeypatch: object, tmp_path: Path

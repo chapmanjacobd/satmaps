@@ -627,9 +627,11 @@ def discover_available_subtiles_from_s3_cache(
     for folders in S3_FOLDER_CACHE.values():
         for folder in folders:
             parts = folder.split("_")
-            if len(parts) < 7 or parts[4] not in requested_mgrs:
-                continue
-            available_subtiles.add(f"{parts[4]}_{parts[5]}_{parts[6]}")
+            if len(parts) >= 5 and parts[4] in requested_mgrs:
+                if CURRENT_DATASET_NAME == "S2MSI_L3__MCQ_LR":
+                    available_subtiles.add(parts[4])
+                elif len(parts) >= 7:
+                    available_subtiles.add(f"{parts[4]}_{parts[5]}_{parts[6]}")
     return available_subtiles
 
 
@@ -772,7 +774,10 @@ def list_mosaic_folders_for_tile(
     first_match_only: bool = False,
 ) -> List[Tuple[str, str]]:
     """Find all S3 folders for a specific MGRS sub-tile across multiple dates using the pre-populated cache."""
-    mgrs_id, x, y = mgrs_tile.split("_")
+    if CURRENT_DATASET_NAME == "S2MSI_L3__MCQ_LR":
+        mgrs_id = mgrs_tile
+    else:
+        mgrs_id, x, y = mgrs_tile.split("_")
     found = []
 
     for date_path in date_paths:
@@ -782,11 +787,16 @@ def list_mosaic_folders_for_tile(
                 quarter = candidate_quarter
                 break
         year = date_path.split("/")[0]
-        folder = f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs_id}_{x}_{y}"
+        
+        if CURRENT_DATASET_NAME == "S2MSI_L3__MCQ_LR":
+            folder = f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs_id}_low_resolution"
+            b04_filename = f"{mgrs_id}_low_resolution_B04.tif"
+        else:
+            folder = f"Sentinel-2_mosaic_{year}_{quarter}_{mgrs_id}_{x}_{y}"
+            b04_filename = f"{mgrs_id}_{x}_{y}_B04.tif"
 
         # 1. Check local cache first (persistent, then ephemeral)
         date_subdir = date_path.replace("/", "-")
-        b04_filename = f"{mgrs_id}_{x}_{y}_B04.tif"
         local_b04 = os.path.join(cache_dir, date_subdir, b04_filename)
         ephemeral_b04 = (
             os.path.join(ephemeral_cache_dir, date_subdir, b04_filename)
@@ -1016,6 +1026,19 @@ def discover_mgrs_bases(
     force_refresh: bool = False,
 ) -> List[str]:
     """Resolve the requested MGRS tile list from bbox or the default all-tiles flow."""
+    if CURRENT_DATASET_NAME == "S2MSI_L3__MCQ_LR":
+        # The LR dataset uses 36-degree chunks (e.g. N18E000) instead of MGRS tiles.
+        # There's no land_mgrs.list for these chunks, and there are only ~52 of them globally,
+        # so we can just return all populated S3 folders and bypass the intersection.
+        # Even for bbox requests, just returning all 52 chunks is fast enough.
+        s3_mgrs_set = land_mgrs_module._extract_s3_mgrs_tiles(S3_FOLDER_CACHE)
+        if not s3_mgrs_set:
+            print("Error: LR mode found no tiles in the S3 cache.")
+            sys.exit(1)
+        bases = sorted(list(s3_mgrs_set))
+        print(f"All-tiles mode: {len(bases)} LR chunks found from S3 cache.")
+        return bases
+
     return land_mgrs_module.discover_mgrs_bases(
         bbox,
         land_mgrs_source,
@@ -1029,6 +1052,10 @@ def discover_mgrs_bases(
 
 def expand_subtiles(mgrs_bases: List[str]) -> List[str]:
     """Expand each 100 km MGRS tile into its four processing subtiles."""
+    if CURRENT_DATASET_NAME == "S2MSI_L3__MCQ_LR":
+        # LR chunks are not subdivided.
+        return mgrs_bases
+
     return [
         f"{mgrs_tile}_{x}_{y}"
         for mgrs_tile in mgrs_bases
@@ -1392,6 +1419,9 @@ def build_work_unit_candidate_row_slabs(
     zoom: int,
 ) -> tuple[tuple[int, int, int], ...]:
     """Return a conservative set of final row slabs a work unit may affect."""
+    if CURRENT_DATASET_NAME == "S2MSI_L3__MCQ_LR":
+        raise RuntimeError(f"Cannot analytically compute bounds for LR chunk {work_unit.unit_id}; must inspect S3 source footprint.")
+
     web_mercator_srs = build_web_mercator_srs()
     candidate_slabs: list[tuple[int, int, int]] = []
     for source_subtile in work_unit.source_subtiles:
