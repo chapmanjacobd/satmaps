@@ -77,6 +77,7 @@ DEFAULT_TILE_BATCH_WIDTH = 32
 DEFAULT_TEMP_DIR = ".temp"
 FULL_RENDER_CACHE_DIR = ".cache.render"
 TEMP_DIR = DEFAULT_TEMP_DIR
+CURRENT_DATASET_NAME = "S2MSI_L3__MCQ"
 
 
 def set_temp_dir(temp_dir: str) -> None:
@@ -806,7 +807,7 @@ def list_mosaic_folders_for_tile(
                     return found
         else:
             # Fallback when the shared S3 cache was not pre-populated: check this folder directly.
-            s3_path = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder}"
+            s3_path = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/{CURRENT_DATASET_NAME}/{date_path}/{folder}"
             try:
                 if gdal.ReadDir(s3_path):
                     found.append((folder, date_path))
@@ -860,7 +861,7 @@ def get_tile_band_path(
     quiet: bool = False,
 ) -> str:
     """Construct a local or S3 path for one Sentinel band."""
-    base_s3 = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}/{folder_name}"
+    base_s3 = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/{CURRENT_DATASET_NAME}/{date_path}/{folder_name}"
     persistent_path = build_band_cache_path(folder_name, date_path, band_id, cache_dir) if cache_dir else None
     ephemeral_path = build_band_cache_path(folder_name, date_path, band_id, ephemeral_cache_dir) if ephemeral_cache_dir else None
 
@@ -1911,7 +1912,7 @@ def populate_s3_cache(date_paths: List[str]) -> None:
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
     for index, date_path in enumerate(date_paths, start=1):
-        s3_base = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/S2MSI_L3__MCQ/{date_path}"
+        s3_base = f"/vsis3/eodata/Global-Mosaics/Sentinel-2/{CURRENT_DATASET_NAME}/{date_path}"
         update_count_progress(
             progress_line,
             "S3 cache progress:",
@@ -4292,7 +4293,14 @@ def build_satmaps_argument_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    global CURRENT_DATASET_NAME
+
     args = build_satmaps_argument_parser().parse_args()
+
+    if args.max_zoom <= 8:
+        CURRENT_DATASET_NAME = "S2MSI_L3__MCQ_LR"
+    else:
+        CURRENT_DATASET_NAME = "S2MSI_L3__MCQ"
 
     setup_gdal_cdse()
 
