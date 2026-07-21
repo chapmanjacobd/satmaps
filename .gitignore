@@ -11,3 +11,4 @@ __pycache__
 /.temp
 /*.egg-info
 /build
+/.cache

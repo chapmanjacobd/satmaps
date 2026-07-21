@@ -84,7 +84,8 @@ def discover_naip_tiles_ee(bbox: Optional[BBox], api_key: str) -> List[Any]:
             "filterType": "mbr",
             "lowerLeft": {"latitude": min_lat, "longitude": min_lon},
             "upperRight": {"latitude": max_lat, "longitude": max_lon}
-        }
+        },
+        "maxResults": 50000
     }
     
     print(f"Querying EarthExplorer for NAIP imagery in bbox {bbox}...")
@@ -111,7 +112,7 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
     
     downloads = []
     for option in options:
-        if option.get("available") and option.get("downloadSystem") == "EE":
+        if option.get("available") and option.get("downloadSystem") in ("EE", "dds"):
             downloads.append({
                 "entityId": option["entityId"],
                 "productId": option["id"]
@@ -119,7 +120,7 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
             
     if not downloads:
         print("No valid download options found for these scenes.")
-        return
+        return []
         
     print(f"Requesting downloads for {len(downloads)} products...")
     req_payload = {
@@ -171,9 +172,13 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
             try:
                 req = urllib.request.Request(url)
                 with urllib.request.urlopen(req, timeout=timeout) as response:
-                    filename = os.path.basename(urllib.parse.urlparse(url).path)
-                    if not filename or filename == "/":
-                        filename = f"naip_{dl_id}.tif"
+                    filename = response.info().get_filename()
+                    if not filename:
+                        filename = os.path.basename(urllib.parse.urlparse(url).path)
+                        if not filename or filename == "/":
+                            filename = f"naip_{dl_id}.tif"
+                        elif not filename.endswith(".tif"):
+                            filename = f"naip_{dl_id}_{filename[:8]}.tif"
                         
                     out_path = os.path.join(cache_dir, filename)
                     
@@ -234,6 +239,16 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
         scenes = discover_naip_tiles_ee(requested_bbox, api_key)
         
         if scenes:
+            # Sort by date descending
+            scenes.sort(key=lambda s: s.get('temporalCoverage', {}).get('startDate', ''), reverse=True)
+            most_recent_date = scenes[0].get('temporalCoverage', {}).get('startDate', '')
+            most_recent_year = most_recent_date[:4] if most_recent_date else None
+            
+            if most_recent_year:
+                filtered_scenes = [s for s in scenes if s.get('temporalCoverage', {}).get('startDate', '').startswith(most_recent_year)]
+                print(f"Filtering NAIP scenes to the most recent year ({most_recent_year}): {len(filtered_scenes)} of {len(scenes)} scenes.")
+                scenes = filtered_scenes
+
             cache_dir = getattr(args, "cache", "cache")
             # When integrating into PMTiles, we MUST fetch to get local TIFFs
             # unless it's a dry run (where we just print and exit)
