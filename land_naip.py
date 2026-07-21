@@ -80,12 +80,14 @@ def discover_naip_tiles_ee(bbox: Optional[BBox], api_key: str) -> List[Any]:
     # Construct an MBR (Minimum Bounding Rectangle) spatial filter
     payload = {
         "datasetName": "NAIP",
-        "spatialFilter": {
-            "filterType": "mbr",
-            "lowerLeft": {"latitude": min_lat, "longitude": min_lon},
-            "upperRight": {"latitude": max_lat, "longitude": max_lon}
+        "sceneFilter": {
+            "spatialFilter": {
+                "filterType": "mbr",
+                "lowerLeft": {"latitude": min_lat, "longitude": min_lon},
+                "upperRight": {"latitude": max_lat, "longitude": max_lon}
+            }
         },
-        "maxResults": 50000
+        "maxResults": 500
     }
     
     print(f"Querying EarthExplorer for NAIP imagery in bbox {bbox}...")
@@ -239,14 +241,51 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
         scenes = discover_naip_tiles_ee(requested_bbox, api_key)
         
         if scenes:
-            # Sort by date descending
-            scenes.sort(key=lambda s: s.get('temporalCoverage', {}).get('startDate', ''), reverse=True)
-            most_recent_date = scenes[0].get('temporalCoverage', {}).get('startDate', '')
-            most_recent_year = most_recent_date[:4] if most_recent_date else None
-            
-            if most_recent_year:
-                filtered_scenes = [s for s in scenes if s.get('temporalCoverage', {}).get('startDate', '').startswith(most_recent_year)]
-                print(f"Filtering NAIP scenes to the most recent year ({most_recent_year}): {len(filtered_scenes)} of {len(scenes)} scenes.")
+            if requested_bbox:
+                from osgeo import ogr
+                import json
+                
+                # Sort by date descending to prioritize the most recent scenes
+                scenes.sort(key=lambda s: s.get('temporalCoverage', {}).get('startDate', ''), reverse=True)
+                
+                min_lon, min_lat, max_lon, max_lat = requested_bbox
+                ring = ogr.Geometry(ogr.wkbLinearRing)
+                ring.AddPoint(min_lon, min_lat)
+                ring.AddPoint(max_lon, min_lat)
+                ring.AddPoint(max_lon, max_lat)
+                ring.AddPoint(min_lon, max_lat)
+                ring.AddPoint(min_lon, min_lat)
+                target_poly = ogr.Geometry(ogr.wkbPolygon)
+                target_poly.AddGeometry(ring)
+                
+                coverage_union = ogr.Geometry(ogr.wkbPolygon)
+                filtered_scenes = []
+                
+                for s in scenes:
+                    geom_dict = s.get("spatialCoverage")
+                    if not geom_dict:
+                        continue
+                    try:
+                        scene_poly = ogr.CreateGeometryFromJson(json.dumps(geom_dict))
+                    except Exception:
+                        continue
+                        
+                    uncovered = target_poly.Difference(coverage_union)
+                    if scene_poly.Intersects(uncovered):
+                        intersection = scene_poly.Intersection(uncovered)
+                        # Check for a meaningful contribution (e.g., > small epsilon)
+                        if intersection and intersection.GetArea() > 1e-8:
+                            filtered_scenes.append(s)
+                            if coverage_union.IsEmpty():
+                                coverage_union = scene_poly.Clone()
+                            else:
+                                coverage_union = coverage_union.Union(scene_poly)
+                            
+                            # Stop early if the target area is completely covered
+                            if target_poly.Difference(coverage_union).GetArea() < 1e-8:
+                                break
+                                
+                print(f"Greedy spatial fill selected {len(filtered_scenes)} out of {len(scenes)} scenes to cover the bounding box.")
                 scenes = filtered_scenes
 
             cache_dir = getattr(args, "cache", "cache")
