@@ -2589,7 +2589,7 @@ def test_resolve_work_unit_candidate_row_slabs_reuses_cached_subset_and_persists
         *,
         tile_size=512,
         resample_alg="lanczos",
-        parallel=1,
+        parallel=1, resume=True,
     ):
         del date_paths, cache_dir, zoom, tile_size, resample_alg, parallel
         seen_missing_units.extend(work_unit.unit_id for work_unit in missing_work_units)
@@ -2606,6 +2606,7 @@ def test_resolve_work_unit_candidate_row_slabs_reuses_cached_subset_and_persists
         ".cache",
         13,
         cache_path=cache_path,
+        resume=True,
     )
 
     assert seen_missing_units == ["31TDF_0_1"]
@@ -2652,6 +2653,7 @@ def test_resolve_work_unit_candidate_row_slabs_warns_for_changed_cache_settings(
         14,
         cache_path=cache_path,
         cache_settings=current_settings,
+        resume=True,
     )
 
     assert actual == {"31TDF_0_0": ((1, 1, 1),)}
@@ -3470,7 +3472,7 @@ def test_render_land_work_unit_rasters_fast_forwards_existing_outputs(
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
     (tmp_path / ".cache.render").mkdir()
-    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles", prefetch_cache=None)
+    args = argparse.Namespace(parallel=1, cache=".cache", output="output.pmtiles", prefetch_cache=None, resume=True)
     work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
     raster_path = Path(satmaps.SatmapsRunPaths("output.pmtiles", "rasterrun").work_unit_raster("31TDF_0_0"))
     raster_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3793,7 +3795,7 @@ def test_main_reuses_cached_candidate_tile_footprints(
     configure_main_defaults(
         monkeypatch,
         tmp_path,
-        ["--parallel", "1", "--date", "2025/07/01"],
+        ["--resume", "--parallel", "1", "--date", "2025/07/01"],
         mgrs_bases=["31TDF"],
         unique_id="cachedcandidates",
     )
@@ -3897,7 +3899,7 @@ def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
     tiler.save_webp_image(Image.new("RGB", (8, 8), (1, 2, 3)), str(existing_tile), quality=100)
     original_bytes = existing_tile.read_bytes()
 
-    args = argparse.Namespace(max_zoom=13, blocksize=512, resample_alg="lanczos", quality=74)
+    args = argparse.Namespace(max_zoom=13, blocksize=512, resample_alg="lanczos", quality=74, resume=True)
     fake_dataset = object()
     seen_dataset: list[object] = []
     rendered_bounds: list[tuple[float, float, float, float]] = []
@@ -4103,6 +4105,7 @@ def test_render_final_output_tile_skips_existing_tile(monkeypatch: object, tmp_p
         blocksize=8,
         resample_alg="lanczos",
         quality=74,
+        resume=True,
     )
     final_tile_path = Path(satmaps.SatmapsRunPaths("output.pmtiles", "tileskip").final_tile_cache_dir) / "13/1/2.webp"
     tiler.save_webp_image(Image.new("RGB", (8, 8), (10, 20, 30)), str(final_tile_path), quality=100)
@@ -4135,6 +4138,7 @@ def test_render_final_output_tile_marks_and_resumes_empty_tile(
         blocksize=8,
         resample_alg="lanczos",
         quality=74,
+        resume=True,
     )
     work_units_by_id = {"31TDF_0_0": satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))}
 
@@ -4189,7 +4193,7 @@ def test_render_final_output_tile_clears_stale_empty_marker_on_render(
     satmaps.mark_tile_empty(destination_path)
     assert Path(satmaps.build_empty_tile_marker_path(destination_path)).exists()
 
-    args = argparse.Namespace(max_zoom=13, blocksize=512, resample_alg="lanczos", quality=74)
+    args = argparse.Namespace(max_zoom=13, blocksize=512, resample_alg="lanczos", quality=74, resume=True)
     fake_dataset = object()
 
     monkeypatch.setattr("satmaps.gdal.Open", lambda path: fake_dataset)
@@ -4221,7 +4225,7 @@ def test_render_land_output_tiles_fast_forwards_empty_marked_tiles(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
-    args = argparse.Namespace(parallel=4, cache=".cache", output="output.pmtiles", max_zoom=14)
+    args = argparse.Namespace(parallel=4, cache=".cache", output="output.pmtiles", max_zoom=14, resume=True)
     work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
     # ty=5, tx 1..3 -> three output tiles; mark the first two empty on disk.
     contributor_row_slabs = {"31TDF_0_0": ((5, 1, 3),)}
@@ -4274,7 +4278,7 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
     monkeypatch.setattr(
         sys,
         "argv",
-        ["satmaps.py", "--parallel", "1", "--date", "2025/07/01"],
+        ["satmaps.py", "--resume", "--parallel", "1", "--date", "2025/07/01"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
@@ -4333,7 +4337,7 @@ def test_main_warns_when_prior_land_run_settings_change(
     configure_main_defaults(
         monkeypatch,
         tmp_path,
-        ["--parallel", "1", "--date", "2025/07/01"],
+        ["--resume", "--parallel", "1", "--date", "2025/07/01"],
         mgrs_bases=["31TDF"],
         unique_id="landwarn",
     )
@@ -4570,7 +4574,7 @@ def test_main_resume_skips_completed_work_units(
     configure_main_defaults(
         monkeypatch,
         tmp_path,
-        ["--parallel", "1", "--date", "2025/07/01"],
+        ["--resume", "--parallel", "1", "--date", "2025/07/01"],
         mgrs_bases=["31TDF"],
         unique_id="resumefilter",
     )
@@ -4623,7 +4627,7 @@ def test_render_land_output_tiles_fast_forwards_existing_tiles_without_dispatch(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
-    args = argparse.Namespace(parallel=4, cache=".cache", output="output.pmtiles", max_zoom=14)
+    args = argparse.Namespace(parallel=4, cache=".cache", output="output.pmtiles", max_zoom=14, resume=True)
     work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
     # ty=5, tx 1..3 -> three output tiles; pre-render the first two on disk.
     contributor_row_slabs = {"31TDF_0_0": ((5, 1, 3),)}

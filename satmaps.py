@@ -1672,12 +1672,13 @@ def resolve_work_unit_candidate_row_slabs(
     tile_size: int = 512,
     resample_alg: str = "lanczos",
     parallel: int = 1,
+    resume: bool = False,
 ) -> dict[str, tuple[tuple[int, int, int], ...]]:
     """Reuse cached candidate footprints when possible, computing and persisting only missing work."""
     if not work_units:
         return {}
 
-    loaded_record = read_candidate_tile_cache_record(cache_path)
+    loaded_record = read_candidate_tile_cache_record(cache_path) if resume else None
     loaded_cache_path = cache_path if loaded_record is not None else None
     if (
         loaded_record is None
@@ -3376,7 +3377,7 @@ def render_land_work_unit_raster(
     """Render one work unit into a full aligned EPSG:3857 RGBA GeoTIFF."""
     if not folders:
         return None
-    if file_has_content(output_path):
+    if getattr(args, "resume", False) and file_has_content(output_path):
         return output_path
 
     tile_grid = build_work_unit_output_tile_grid(folders, args)
@@ -3640,7 +3641,7 @@ def render_land_work_unit_rasters(
                     except StopIteration:
                         return False
                     output_path = run_paths.work_unit_raster(work_unit.unit_id)
-                    if file_has_content(output_path):
+                    if getattr(args, "resume", False) and file_has_content(output_path):
                         processed_work_units += 1
                         cached_work_units += 1
                         persisted_completed_units.add(work_unit.unit_id)
@@ -3734,9 +3735,9 @@ def render_final_output_tile_batch(
     cached_tiles = 0
     empty_tiles = 0
     for relative_path, destination_path in destination_paths.items():
-        if file_has_content(destination_path):
+        if getattr(args, "resume", False) and file_has_content(destination_path):
             cached_tiles += 1
-        elif file_has_content(build_empty_tile_marker_path(destination_path)):
+        elif getattr(args, "resume", False) and file_has_content(build_empty_tile_marker_path(destination_path)):
             empty_tiles += 1
         else:
             pending_relative_paths.append(relative_path)
@@ -3859,9 +3860,9 @@ def render_final_output_tile(
         run_paths.final_tile_cache_dir,
         relative_path,
     )
-    if file_has_content(destination_path):
+    if getattr(args, "resume", False) and file_has_content(destination_path):
         return LandTileRenderStatus.CACHED
-    if file_has_content(build_empty_tile_marker_path(destination_path)):
+    if getattr(args, "resume", False) and file_has_content(build_empty_tile_marker_path(destination_path)):
         return LandTileRenderStatus.EMPTY
 
     tile_plan = build_land_output_tile_plan(
@@ -4094,9 +4095,9 @@ def render_land_output_tiles(
                     pending_relative_paths: list[str] = []
                     for relative_path in batch.relative_paths:
                         destination_path = os.path.join(final_tile_dir, relative_path)
-                        if file_has_content(destination_path):
+                        if getattr(args, "resume", False) and file_has_content(destination_path):
                             batch_cached_tiles += 1
-                        elif file_has_content(build_empty_tile_marker_path(destination_path)):
+                        elif getattr(args, "resume", False) and file_has_content(build_empty_tile_marker_path(destination_path)):
                             batch_empty_tiles += 1
                         else:
                             pending_relative_paths.append(relative_path)
@@ -4295,7 +4296,12 @@ def add_satmaps_core_cli_args(parser: argparse.ArgumentParser) -> None:
     )
     add("--stats-min", type=float, help="Hardcoded source min")
     add("--stats-max", type=float, help="Hardcoded source max")
-
+    add(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume previous render by reusing cached tiles and intermediate files.",
+    )
 
 def add_satmaps_grading_cli_args(parser: argparse.ArgumentParser) -> None:
     """Register the land grading controls."""
@@ -4303,7 +4309,7 @@ def add_satmaps_grading_cli_args(parser: argparse.ArgumentParser) -> None:
     add(
         "--grade",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable/disable land final grading",
     )
     add(
@@ -4404,6 +4410,7 @@ def add_satmaps_output_cli_args(parser: argparse.ArgumentParser) -> None:
     add(
         "--render-ocean",
         action="store_true",
+        default=False,
         help=(
             "Render the ocean background from the GEBCO zip before the main pipeline, "
             "writing the result to --ocean-background. "
@@ -4424,6 +4431,7 @@ def add_satmaps_discovery_cli_args(parser: argparse.ArgumentParser) -> None:
     add(
         "--download",
         action="store_true",
+        default=False,
         help="Download S3 tiles to local cache and exit",
     )
     add("--bbox", help="WGS84 bounding box as min_lon,min_lat,max_lon,max_lat")
@@ -4437,11 +4445,13 @@ def add_satmaps_discovery_cli_args(parser: argparse.ArgumentParser) -> None:
     add(
         "--estimate",
         action="store_true",
+        default=False,
         help="Print estimated time, RAM, disk space, and network size then exit",
     )
     add(
         "--winter",
         action="store_true",
+        default=False,
         help="Swap the two-date equator blend so the first date favors the south and the second the north",
     )
 
@@ -4543,7 +4553,7 @@ def main() -> None:
     candidate_tile_cache_settings = build_candidate_tile_cache_settings(args)
     candidate_tile_cache_path = run_paths.candidate_tile_cache_path
     completed_units: Set[str] = set()
-    if os.path.exists(state_file):
+    if getattr(args, "resume", False) and os.path.exists(state_file):
         resume_state = restore_resume_state(state_file)
         if resume_state:
             state_file = cast(str, resume_state["state_file"])
@@ -4695,7 +4705,7 @@ def main() -> None:
                 return
 
             master_marker_path = run_paths.tile_cache_marker(FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID)
-            if file_has_content(master_marker_path):
+            if getattr(args, "resume", False) and file_has_content(master_marker_path):
                 print("Raster-first master mosaic already committed to final WebP tiles.")
             else:
                 commit_raster_to_final_tile_cache(
@@ -4704,6 +4714,7 @@ def main() -> None:
                     unique_id,
                     FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID,
                     args,
+                    progress_label="Master mosaic slicing progress:",
                 )
                 print("Committed raster-first master mosaic to final WebP tiles.")
     elif args.land:
@@ -4719,10 +4730,14 @@ def main() -> None:
                 args.cache,
                 args.max_zoom,
                 cache_path=candidate_tile_cache_path,
+                fallback_cache_path=os.path.join(
+                    run_paths.output_temp_dir, "candidate_tiles.json"
+                ),
                 cache_settings=candidate_tile_cache_settings,
                 tile_size=args.blocksize,
                 resample_alg=args.resample_alg,
                 parallel=args.parallel,
+                resume=getattr(args, "resume", False),
             )
             write_resume_state(
                 state_file,
