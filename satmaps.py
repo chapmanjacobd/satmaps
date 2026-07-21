@@ -666,7 +666,7 @@ def build_land_run_settings(
     return {
         "output": os.path.abspath(args.output),
         "date_paths": date_paths,
-        "bbox": requested_bbox,
+        "bbox": list(requested_bbox) if requested_bbox is not None else None,
         "max_zoom": args.max_zoom,
         "resample_alg": args.resample_alg,
         "stats_min": args.stats_min,
@@ -1131,6 +1131,7 @@ def commit_raster_to_final_tile_cache(
     args: argparse.Namespace,
     *,
     source_under_existing: bool = False,
+    progress_label: str = "Tile commit progress:",
 ) -> List[str]:
     """Render and write one contributor directly into the shared final WebP tree."""
     run_paths = SatmapsRunPaths(output_path, unique_id)
@@ -1145,7 +1146,37 @@ def commit_raster_to_final_tile_cache(
     else:
         dataset = input_raster
 
+    # Pre-count tiles so we can show a denominator in the progress bar.
+    bounds = tiler.get_dataset_bounds(dataset)
+    tx_min, ty_min, tx_max, ty_max = tiler.get_chunk_tile_range(bounds, args.max_zoom)
+    total_tiles = (tx_max - tx_min + 1) * (ty_max - ty_min + 1)
+
     tile_relpaths: list[str] = []
+    committed_tiles = 0
+    blended_tiles = 0
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
+    next_progress_at = started_at
+
+    def update_progress(*, force: bool = False) -> None:
+        nonlocal next_progress_at
+        now = time.perf_counter()
+        if not force and now < next_progress_at:
+            return
+        detail = f"{committed_tiles} written"
+        if blended_tiles:
+            detail += f", {blended_tiles} blended"
+        update_count_progress(
+            progress_line,
+            progress_label,
+            len(tile_relpaths),
+            total_tiles,
+            started_at,
+            detail + ".",
+        )
+        next_progress_at = now + LAND_PROGRESS_HEARTBEAT_SECONDS
+
+    update_progress(force=True)
     try:
         for relative_path, tile_image in tiler.iter_dataset_webp_tile_images(
             dataset,
@@ -1174,13 +1205,17 @@ def commit_raster_to_final_tile_cache(
                         derived_images.append(final_image)
                     else:
                         final_image = composed
+                    blended_tiles += 1
                 tiler.save_webp_image(final_image, destination_path, args.quality, lossless=False)
+                committed_tiles += 1
             finally:
                 tile_image.close()
                 for image in reversed(derived_images):
                     if image is not tile_image:
                         image.close()
+            update_progress(force=len(tile_relpaths) >= total_tiles)
     finally:
+        progress_line.finish()
         if close_dataset:
             dataset = None
 
@@ -3420,19 +3455,41 @@ def build_master_vrt(source_rasters: Sequence[str], output_vrt: str) -> str:
     if not source_rasters:
         raise ValueError("source_rasters must not be empty")
     staged_output_vrt = prepare_staged_path(output_vrt)
+    n_sources = len(source_rasters)
 
     # First pass: determine target band count across all sources.
     source_band_counts: list[int] = []
-    for src in source_rasters:
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
+    for i, src in enumerate(source_rasters):
+        update_count_progress(
+            progress_line,
+            "Master VRT: probing sources",
+            i,
+            n_sources,
+            started_at,
+            f"{i}/{n_sources} inspected.",
+        )
         src_ds = gdal.Open(src)
         if src_ds:
             source_band_counts.append(src_ds.RasterCount)
             src_ds = None
         else:
             source_band_counts.append(0)
+    progress_line.finish()
 
     warped_sources = []
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
     for i, (src, band_count) in enumerate(zip(source_rasters, source_band_counts)):
+        update_count_progress(
+            progress_line,
+            "Master VRT: warping sources",
+            i,
+            n_sources,
+            started_at,
+            f"{i}/{n_sources} warped.",
+        )
         warped_vrt = f"{staged_output_vrt}_src_{i}.vrt"
         warp_kwargs: dict[str, object] = {"format": "VRT", "dstSRS": "EPSG:3857"}
 
@@ -3461,6 +3518,16 @@ def build_master_vrt(source_rasters: Sequence[str], output_vrt: str) -> str:
         warped_ds = gdal.Warp(warped_vrt, src, **warp_kwargs)
         warped_ds = None
         warped_sources.append(warped_vrt)
+
+    update_count_progress(
+        progress_line,
+        "Master VRT: warping sources",
+        n_sources,
+        n_sources,
+        started_at,
+        f"{n_sources}/{n_sources} warped.",
+    )
+    progress_line.finish()
 
     merged = gdal.BuildVRT(staged_output_vrt, warped_sources)
     if merged is None:
@@ -4419,16 +4486,19 @@ def main() -> None:
     requested_bbox = parse_bbox(args.bbox) if args.bbox else None
 
     if getattr(args, "render_ocean", False):
-        print(f"Rendering ocean background from {args.gebco_zip} -> {args.ocean_background}...")
-        ocean.generate_ocean_background(
-            gebco_zip=args.gebco_zip,
-            destination=args.ocean_background,
-            bbox=requested_bbox,
-            temp_dir=args.temp_dir,
-            resample_alg=args.resample_alg,
-            max_zoom=args.max_zoom,
-        )
-        print(f"Ocean background ready: {args.ocean_background}")
+        if os.path.exists(args.ocean_background):
+            print(f"Ocean background already exists, skipping render: {args.ocean_background}")
+        else:
+            print(f"Rendering ocean background from {args.gebco_zip} -> {args.ocean_background}...")
+            ocean.generate_ocean_background(
+                gebco_zip=args.gebco_zip,
+                destination=args.ocean_background,
+                bbox=requested_bbox,
+                temp_dir=args.temp_dir,
+                resample_alg=args.resample_alg,
+                max_zoom=args.max_zoom,
+            )
+            print(f"Ocean background ready: {args.ocean_background}")
 
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
@@ -4514,6 +4584,10 @@ def main() -> None:
             if work_unit.unit_id not in completed_units
         )
 
+        if args.bbox and not getattr(args, "grade", False) and not getattr(args, "full_render_first", False):
+            print("Ungraded bbox render detected; automatically enabling full-render-first.")
+            args.full_render_first = True
+
     prepared_ocean_background: Optional[str] = None
     ocean_cleanup_paths: List[str] = []
     prepared_ocean_background = prepare_ocean_background_for_output(
@@ -4598,6 +4672,28 @@ def main() -> None:
             master_vrt_path = run_paths.master_vrt
             print("Building master VRT...")
             build_master_vrt(source_rasters, master_vrt_path)
+
+            if args.bbox and not getattr(args, "grade", False):
+                print("Skipping tile cache commit for ungraded bbox render; converting directly to PMTiles...")
+                packaged_tiles = convert_raster_to_pmtiles(
+                    master_vrt_path,
+                    args.output,
+                    unique_id,
+                    tile_format="webp",
+                    quality=75,
+                    resample_alg=args.resample_alg,
+                    chunk_zoom=args.max_zoom,
+                    parallel=args.parallel,
+                    blocksize=args.blocksize,
+                    name="Sentinel-2 Mosaic",
+                    description="Copernicus Sentinel data",
+                    requested_bbox=requested_bbox,
+                )
+                cleanup_temporary_files([packaged_tiles.temp_mbtiles] + ocean_cleanup_paths)
+                if os.path.exists(state_file):
+                    os.remove(state_file)
+                return
+
             master_marker_path = run_paths.tile_cache_marker(FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID)
             if file_has_content(master_marker_path):
                 print("Raster-first master mosaic already committed to final WebP tiles.")

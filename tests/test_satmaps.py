@@ -4009,6 +4009,8 @@ def test_commit_raster_to_final_tile_cache_streams_tile_images(
         )
 
     monkeypatch.setattr("satmaps.tiler.iter_dataset_webp_tile_images", fake_iter_dataset_webp_tile_images)
+    monkeypatch.setattr("satmaps.tiler.get_dataset_bounds", lambda ds: (0.0, 0.0, 1.0, 1.0))
+    monkeypatch.setattr("satmaps.tiler.get_chunk_tile_range", lambda bounds, zoom: (0, 0, 1, 1))
 
     relpaths = satmaps.commit_raster_to_final_tile_cache(
         fake_dataset,
