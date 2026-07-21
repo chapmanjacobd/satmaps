@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+import concurrent.futures
 from typing import List, Optional, Tuple, Any
 
 BBox = Tuple[float, float, float, float]
@@ -160,24 +161,50 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
         
-    
     downloaded_paths = []
-    for dl_id, url in download_urls.items():
-        filename = os.path.basename(urllib.parse.urlparse(url).path)
-        if not filename or filename == "/":
-            filename = f"naip_{dl_id}.tif"
-            
-        out_path = os.path.join(cache_dir, filename)
-        downloaded_paths.append(out_path)
-        if os.path.exists(out_path):
-            print(f"Skipping {filename} (already exists in cache)")
-            continue
-            
-        print(f"Downloading {filename}...")
-        try:
-            urllib.request.urlretrieve(url, out_path)
-        except Exception as e:
-            print(f"Failed to download {filename}: {e}")
+
+    def _download_worker(dl_id: str, url: str) -> Optional[str]:
+        max_retries = 3
+        timeout = 1200 # 20 minutes
+        
+        for attempt in range(max_retries):
+            try:
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    filename = os.path.basename(urllib.parse.urlparse(url).path)
+                    if not filename or filename == "/":
+                        filename = f"naip_{dl_id}.tif"
+                        
+                    out_path = os.path.join(cache_dir, filename)
+                    
+                    if os.path.exists(out_path):
+                        print(f"Skipping {filename} (already exists in cache)")
+                        return out_path
+                        
+                    print(f"Downloading {filename} (attempt {attempt + 1})...")
+                    with open(out_path, 'wb') as f:
+                        while True:
+                            chunk = response.read(8192 * 16)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                return out_path
+            except Exception as e:
+                # 4. If a download fails, wait before re-attempting
+                if attempt < max_retries - 1:
+                    print(f"Download failed for {url} ({e}), waiting 10s before re-attempting...")
+                    time.sleep(10)
+                else:
+                    print(f"Failed to download {url} after {max_retries} attempts: {e}")
+                    return None
+
+    # 5. Use multi-threading on download URLs, the recommended number of concurrent downloads should be 5 or less
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_download_worker, dl_id, url): dl_id for dl_id, url in download_urls.items()}
+        for future in concurrent.futures.as_completed(futures):
+            path = future.result()
+            if path:
+                downloaded_paths.append(path)
 
     return downloaded_paths
 
