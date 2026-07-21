@@ -3420,27 +3420,44 @@ def build_master_vrt(source_rasters: Sequence[str], output_vrt: str) -> str:
     if not source_rasters:
         raise ValueError("source_rasters must not be empty")
     staged_output_vrt = prepare_staged_path(output_vrt)
-    
-    warped_sources = []
-    for i, src in enumerate(source_rasters):
-        warped_vrt = f"{staged_output_vrt}_src_{i}.vrt"
-        warp_kwargs = {"format": "VRT", "dstSRS": "EPSG:3857"}
-        
+
+    # First pass: determine target band count across all sources.
+    source_band_counts: list[int] = []
+    for src in source_rasters:
         src_ds = gdal.Open(src)
         if src_ds:
-            band_count = src_ds.RasterCount
+            source_band_counts.append(src_ds.RasterCount)
+            src_ds = None
+        else:
+            source_band_counts.append(0)
+
+    warped_sources = []
+    for i, (src, band_count) in enumerate(zip(source_rasters, source_band_counts)):
+        warped_vrt = f"{staged_output_vrt}_src_{i}.vrt"
+        warp_kwargs: dict[str, object] = {"format": "VRT", "dstSRS": "EPSG:3857"}
+
+        if band_count >= 3:
             is_rgba = False
             if band_count == 4:
-                band4 = src_ds.GetRasterBand(4)
-                if band4 and band4.GetColorInterpretation() == gdal.GCI_AlphaBand:
-                    is_rgba = True
-            
-            if band_count >= 3 and not is_rgba:
+                src_ds = gdal.Open(src)
+                if src_ds:
+                    band4 = src_ds.GetRasterBand(4)
+                    if band4 and band4.GetColorInterpretation() == gdal.GCI_AlphaBand:
+                        is_rgba = True
+                    src_ds = None
+
+            if is_rgba:
+                # Already RGBA — warp as-is.
+                pass
+            else:
+                # RGB or RGB+NIR source: always select only RGB and synthesise
+                # a proper alpha band so every warped VRT has a uniform
+                # [R, G, B, Alpha] layout. Forwarding NIR as band 4 leaves it
+                # with GCI_Undefined, which causes gdalbuildvrt to emit
+                # "heterogeneous band color interpretation" and skip that source.
                 warp_kwargs["srcBands"] = [1, 2, 3]
                 warp_kwargs["dstAlpha"] = True
-                
-            src_ds = None
-            
+
         warped_ds = gdal.Warp(warped_vrt, src, **warp_kwargs)
         warped_ds = None
         warped_sources.append(warped_vrt)
@@ -3449,7 +3466,7 @@ def build_master_vrt(source_rasters: Sequence[str], output_vrt: str) -> str:
     if merged is None:
         raise RuntimeError(f"Could not build master VRT: {output_vrt}")
     merged = None
-        
+
     publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
 
@@ -4317,6 +4334,21 @@ def add_satmaps_output_cli_args(parser: argparse.ArgumentParser) -> None:
         default="ocean.tif",
         help="Standalone ocean background GeoTIFF to use under bbox renders",
     )
+    add(
+        "--render-ocean",
+        action="store_true",
+        help=(
+            "Render the ocean background from the GEBCO zip before the main pipeline, "
+            "writing the result to --ocean-background. "
+            f"Requires the GEBCO zip at the default path ({ocean.DEFAULT_GEBCO_ZIP}) "
+            "or set via --gebco-zip."
+        ),
+    )
+    add(
+        "--gebco-zip",
+        default=ocean.DEFAULT_GEBCO_ZIP,
+        help="Path to the GEBCO zip archive used when --render-ocean is set",
+    )
 
 
 def add_satmaps_discovery_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -4385,6 +4417,19 @@ def main() -> None:
     ensure_directory(FULL_RENDER_CACHE_DIR)
 
     requested_bbox = parse_bbox(args.bbox) if args.bbox else None
+
+    if getattr(args, "render_ocean", False):
+        print(f"Rendering ocean background from {args.gebco_zip} -> {args.ocean_background}...")
+        ocean.generate_ocean_background(
+            gebco_zip=args.gebco_zip,
+            destination=args.ocean_background,
+            bbox=requested_bbox,
+            temp_dir=args.temp_dir,
+            resample_alg=args.resample_alg,
+            max_zoom=args.max_zoom,
+        )
+        print(f"Ocean background ready: {args.ocean_background}")
+
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background)
     land_mgrs_source = resolve_land_mgrs_source()
