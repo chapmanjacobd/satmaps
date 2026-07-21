@@ -3416,14 +3416,40 @@ def render_land_work_unit_raster(
 
 
 def build_master_vrt(source_rasters: Sequence[str], output_vrt: str) -> str:
-    """Build a master VRT in the supplied source order."""
+    """Build a master VRT in the supplied source order, warping to EPSG:3857 and RGBA to support heterogeneous projections and band interpretations."""
     if not source_rasters:
         raise ValueError("source_rasters must not be empty")
     staged_output_vrt = prepare_staged_path(output_vrt)
-    merged = gdal.BuildVRT(staged_output_vrt, list(source_rasters))
+    
+    warped_sources = []
+    for i, src in enumerate(source_rasters):
+        warped_vrt = f"{staged_output_vrt}_src_{i}.vrt"
+        warp_kwargs = {"format": "VRT", "dstSRS": "EPSG:3857"}
+        
+        src_ds = gdal.Open(src)
+        if src_ds:
+            band_count = src_ds.RasterCount
+            is_rgba = False
+            if band_count == 4:
+                band4 = src_ds.GetRasterBand(4)
+                if band4 and band4.GetColorInterpretation() == gdal.GCI_AlphaBand:
+                    is_rgba = True
+            
+            if band_count >= 3 and not is_rgba:
+                warp_kwargs["srcBands"] = [1, 2, 3]
+                warp_kwargs["dstAlpha"] = True
+                
+            src_ds = None
+            
+        warped_ds = gdal.Warp(warped_vrt, src, **warp_kwargs)
+        warped_ds = None
+        warped_sources.append(warped_vrt)
+
+    merged = gdal.BuildVRT(staged_output_vrt, warped_sources)
     if merged is None:
         raise RuntimeError(f"Could not build master VRT: {output_vrt}")
     merged = None
+        
     publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
 

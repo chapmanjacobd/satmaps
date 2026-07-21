@@ -15,7 +15,7 @@ dependencies = [
 
 [tool.setuptools]
 packages = ["satmaps_assets"]
-py-modules = ["common", "land_mgrs", "ocean", "satmaps", "terrain", "tiler", "tuner_ui"]
+py-modules = ["common", "land_mgrs", "land_naip", "ocean", "satmaps", "terrain", "tiler", "tuner_ui"]
 
 [tool.setuptools.package-data]
 satmaps_assets = ["templates/*.html"]

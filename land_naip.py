@@ -97,12 +97,44 @@ def discover_naip_tiles_ee(bbox: Optional[BBox], api_key: str) -> List[Any]:
     print(f"Found {len(scenes)} NAIP scenes in the bounding box.")
     return scenes
 
+def get_vrt_path_for_zip(path: str) -> str:
+    import zipfile
+    if path.lower().endswith(".zip"):
+        try:
+            with zipfile.ZipFile(path, 'r') as z:
+                for name in z.namelist():
+                    if name.lower().endswith('.tif'):
+                        return f"/vsizip/{os.path.abspath(path)}/{name}"
+        except Exception as e:
+            print(f"Warning: Failed to inspect zip file {path}: {e}")
+    return path
+
 def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> List[str]:
     """Request download options, queue the downloads, save to cache_dir, and return file paths."""
     if not scenes:
         return []
         
-    entity_ids = [scene["entityId"] for scene in scenes]
+    downloaded_paths = []
+    scenes_to_fetch = []
+    
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+        
+    for scene in scenes:
+        display_id = scene.get("displayId", "").lower()
+        expected_filename = f"{display_id}.ZIP"
+        expected_path = os.path.join(cache_dir, expected_filename)
+        
+        if os.path.exists(expected_path):
+            print(f"Skipping API fetch for {expected_filename} (already exists in cache)")
+            downloaded_paths.append(get_vrt_path_for_zip(expected_path))
+        else:
+            scenes_to_fetch.append(scene)
+            
+    if not scenes_to_fetch:
+        return downloaded_paths
+        
+    entity_ids = [scene["entityId"] for scene in scenes_to_fetch]
     print(f"Requesting download options for {len(entity_ids)} scenes...")
     
     # We must chunk entityIds if there are too many, but up to 50k is usually supported.
@@ -211,7 +243,7 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
         for future in concurrent.futures.as_completed(futures):
             path = future.result()
             if path:
-                downloaded_paths.append(path)
+                downloaded_paths.append(get_vrt_path_for_zip(path))
 
     return downloaded_paths
 
