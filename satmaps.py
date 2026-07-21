@@ -44,6 +44,7 @@ from common import (
     warp_thread_options,
 )
 import land_mgrs as land_mgrs_module
+import land_naip as land_naip_module
 import ocean
 from scipy.ndimage import binary_dilation, distance_transform_edt
 from osgeo import gdal, ogr, osr
@@ -4330,6 +4331,7 @@ def build_satmaps_argument_parser() -> argparse.ArgumentParser:
     add_satmaps_output_cli_args(parser)
     add_satmaps_discovery_cli_args(parser)
     land_mgrs_module.add_land_mgrs_cli_args(parser)
+    land_naip_module.add_naip_cli_args(parser)
     return parser
 
 
@@ -4369,7 +4371,9 @@ def main() -> None:
     ):
         return
 
-    if requested_bbox is None:
+    is_naip, naip_rasters = land_naip_module.handle_naip_workflow(args, requested_bbox)
+
+    if requested_bbox is None and not is_naip:
         populate_s3_cache(date_paths)
 
     unique_id = build_output_namespace(args.output, default_stem="satmaps")
@@ -4407,32 +4411,37 @@ def main() -> None:
             run_paths = SatmapsRunPaths(args.output, unique_id)
             candidate_tile_cache_path = run_paths.candidate_tile_cache_path
 
-    mgrs_bases = discover_mgrs_bases(
-        requested_bbox,
-        land_mgrs_source,
-        land_mgrs_list_path,
-    )
-    plan = LandProcessingPlan(
-        mgrs_bases=tuple(mgrs_bases),
-        work_units=plan_subtile_work_units(
-            mgrs_bases,
-            discover_available_subtiles_from_s3_cache(mgrs_bases),
-        ),
-    )
-    print(describe_land_processing_plan(plan, len(date_paths)))
-
-    if args.download:
-        downloaded = download_source_tiles_to_cache(
-            plan.work_units, date_paths, args.cache, args.parallel
+    if is_naip:
+        plan = LandProcessingPlan(mgrs_bases=(), work_units=())
+        pending_work_units = ()
+        args.full_render_first = True
+    else:
+        mgrs_bases = discover_mgrs_bases(
+            requested_bbox,
+            land_mgrs_source,
+            land_mgrs_list_path,
         )
-        print(f"Download complete. Cached {downloaded} folder(s).")
-        return
+        plan = LandProcessingPlan(
+            mgrs_bases=tuple(mgrs_bases),
+            work_units=plan_subtile_work_units(
+                mgrs_bases,
+                discover_available_subtiles_from_s3_cache(mgrs_bases),
+            ),
+        )
+        print(describe_land_processing_plan(plan, len(date_paths)))
 
-    pending_work_units = tuple(
-        work_unit
-        for work_unit in plan.work_units
-        if work_unit.unit_id not in completed_units
-    )
+        if args.download:
+            downloaded = download_source_tiles_to_cache(
+                plan.work_units, date_paths, args.cache, args.parallel
+            )
+            print(f"Download complete. Cached {downloaded} folder(s).")
+            return
+
+        pending_work_units = tuple(
+            work_unit
+            for work_unit in plan.work_units
+            if work_unit.unit_id not in completed_units
+        )
 
     prepared_ocean_background: Optional[str] = None
     ocean_cleanup_paths: List[str] = []
@@ -4466,7 +4475,10 @@ def main() -> None:
     if args.full_render_first:
         source_rasters: List[str] = []
         if args.land:
-            if plan.work_units:
+            if is_naip:
+                print(f"Using {len(naip_rasters)} NAIP GeoTIFF(s) as land source.")
+                source_rasters.extend(naip_rasters)
+            elif plan.work_units:
                 print(
                     f"Starting full-render-first raster generation for "
                     f"{len(plan.work_units)} sub-tile(s) "
