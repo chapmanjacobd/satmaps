@@ -281,76 +281,79 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
     try:
         api_key = m2m_login()
         scenes = discover_naip_tiles_ee(requested_bbox, api_key)
-        
-        if scenes:
-            if requested_bbox:
-                from osgeo import ogr
-                import json
-                
-                # Sort by date descending to prioritize the most recent scenes
-                scenes.sort(key=lambda s: s.get('temporalCoverage', {}).get('startDate', ''), reverse=True)
-                
-                min_lon, min_lat, max_lon, max_lat = requested_bbox
-                ring = ogr.Geometry(ogr.wkbLinearRing)
-                ring.AddPoint(min_lon, min_lat)
-                ring.AddPoint(max_lon, min_lat)
-                ring.AddPoint(max_lon, max_lat)
-                ring.AddPoint(min_lon, max_lat)
-                ring.AddPoint(min_lon, min_lat)
-                target_poly = ogr.Geometry(ogr.wkbPolygon)
-                target_poly.AddGeometry(ring)
-                
-                coverage_union = ogr.Geometry(ogr.wkbPolygon)
-                filtered_scenes = []
-                
-                for s in scenes:
-                    geom_dict = s.get("spatialCoverage")
-                    if not geom_dict:
-                        continue
-                    try:
-                        scene_poly = ogr.CreateGeometryFromJson(json.dumps(geom_dict))
-                    except Exception:
-                        continue
-                        
-                    uncovered = target_poly.Difference(coverage_union)
-                    if scene_poly.Intersects(uncovered):
-                        intersection = scene_poly.Intersection(uncovered)
-                        # Check for a meaningful contribution (e.g., > small epsilon)
-                        if intersection and intersection.GetArea() > 1e-8:
-                            filtered_scenes.append(s)
-                            if coverage_union.IsEmpty():
-                                coverage_union = scene_poly.Clone()
-                            else:
-                                coverage_union = coverage_union.Union(scene_poly)
-                            
-                            # Stop early if the target area is completely covered
-                            if target_poly.Difference(coverage_union).GetArea() < 1e-8:
-                                break
-                                
-                print(f"Greedy spatial fill selected {len(filtered_scenes)} out of {len(scenes)} scenes to cover the bounding box.")
-                scenes = filtered_scenes
 
-            cache_dir = getattr(args, "cache", "cache")
-            # When integrating into PMTiles, we MUST fetch to get local TIFFs
-            # unless it's a dry run (where we just print and exit)
-            if getattr(args, "download", False) or not getattr(args, "estimate", False):
-                if len(scenes) > 50:
-                    ans = input(f"Warning: you are about to download {len(scenes)} DOQs. Are you sure you want to proceed? (y/N) ")
-                    if ans.lower() not in ('y', 'yes'):
-                        print("Aborting NAIP download.")
-                        sys.exit(0)
-                raster_paths = fetch_naip_downloads(scenes, api_key, cache_dir)
-                if getattr(args, "download", False):
-                    print("NAIP download-only workflow complete. Exiting.")
-                    sys.exit(0)
-                return True, raster_paths
-            else:
-                for scene in scenes[:5]:
-                    print(f"Scene ID: {scene.get('entityId')} - Display ID: {scene.get('displayId')}")
-                if len(scenes) > 5:
-                    print(f"... and {len(scenes) - 5} more. Run with --download to fetch them.")
-                
+        if scenes and requested_bbox:
+            from osgeo import ogr
+            import json
+
+            # Sort by date descending to prioritize the most recent scenes
+            scenes.sort(key=lambda s: s.get('temporalCoverage', {}).get('startDate', ''), reverse=True)
+
+            min_lon, min_lat, max_lon, max_lat = requested_bbox
+            ring = ogr.Geometry(ogr.wkbLinearRing)
+            ring.AddPoint(min_lon, min_lat)
+            ring.AddPoint(max_lon, min_lat)
+            ring.AddPoint(max_lon, max_lat)
+            ring.AddPoint(min_lon, max_lat)
+            ring.AddPoint(min_lon, min_lat)
+            target_poly = ogr.Geometry(ogr.wkbPolygon)
+            target_poly.AddGeometry(ring)
+
+            coverage_union = ogr.Geometry(ogr.wkbPolygon)
+            filtered_scenes = []
+
+            for s in scenes:
+                geom_dict = s.get("spatialCoverage")
+                if not geom_dict:
+                    continue
+                try:
+                    scene_poly = ogr.CreateGeometryFromJson(json.dumps(geom_dict))
+                except Exception:
+                    continue
+
+                uncovered = target_poly.Difference(coverage_union)
+                if scene_poly.Intersects(uncovered):
+                    intersection = scene_poly.Intersection(uncovered)
+                    # Check for a meaningful contribution (e.g., > small epsilon)
+                    if intersection and intersection.GetArea() > 1e-8:
+                        filtered_scenes.append(s)
+                        if coverage_union.IsEmpty():
+                            coverage_union = scene_poly.Clone()
+                        else:
+                            coverage_union = coverage_union.Union(scene_poly)
+
+                        # Stop early if the target area is completely covered
+                        if target_poly.Difference(coverage_union).GetArea() < 1e-8:
+                            break
+
+            print(f"Greedy spatial fill selected {len(filtered_scenes)} out of {len(scenes)} scenes to cover the bounding box.")
+            scenes = filtered_scenes
+
+        if not scenes:
+            print("No NAIP imagery found in the bounding box; aborting NAIP pipeline.")
+            sys.exit(0)
+
         print("NAIP pipeline via EarthExplorer initiated.")
+
+        cache_dir = getattr(args, "cache", "cache")
+        # When integrating into PMTiles, we MUST fetch to get local TIFFs
+        # unless it's a dry run (where we just print and exit)
+        if getattr(args, "download", False) or not getattr(args, "estimate", False):
+            if len(scenes) > 50:
+                ans = input(f"Warning: you are about to download {len(scenes)} DOQs. Are you sure you want to proceed? (y/N) ")
+                if ans.lower() not in ('y', 'yes'):
+                    print("Aborting NAIP download.")
+                    sys.exit(0)
+            raster_paths = fetch_naip_downloads(scenes, api_key, cache_dir)
+            if getattr(args, "download", False):
+                print("NAIP download-only workflow complete. Exiting.")
+                sys.exit(0)
+            return True, raster_paths
+        else:
+            for scene in scenes[:5]:
+                print(f"Scene ID: {scene.get('entityId')} - Display ID: {scene.get('displayId')}")
+            if len(scenes) > 5:
+                print(f"... and {len(scenes) - 5} more. Run with --download to fetch them.")
     except Exception as e:
         print(f"EarthExplorer API Error: {e}")
     finally:
@@ -359,5 +362,5 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
                 m2m_logout(api_key)
             except Exception as e:
                 print(f"Failed to logout gracefully: {e}")
-                
+
     return True, []

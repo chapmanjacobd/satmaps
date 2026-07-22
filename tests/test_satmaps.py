@@ -3667,7 +3667,7 @@ def test_main_bbox_prepares_and_commits_ocean_background(
 
     assert prepare_calls == [
         (
-            "ocean.tif",
+            satmaps.SatmapsRunPaths("output.pmtiles", "bboxrun").rendered_ocean_path,
             (0.0, 0.0, 1.0, 1.0),
             "output.pmtiles",
             "bboxrun",
@@ -3959,7 +3959,7 @@ def test_main_keeps_ocean_after_processing(
     configure_main_defaults(
         monkeypatch,
         tmp_path,
-        ["--no-land", "--parallel", "1"],
+        ["--no-land", "--parallel", "1", "--ocean-background", str(ocean_path)],
         mgrs_bases=[],
     )
     monkeypatch.setattr(
