@@ -122,12 +122,15 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
         
     for scene in scenes:
         display_id = scene.get("displayId", "").lower()
-        expected_filename = f"{display_id}.ZIP"
-        expected_path = os.path.join(cache_dir, expected_filename)
+        jp2_path = os.path.join(cache_dir, f"{display_id}.jp2")
+        zip_path = os.path.join(cache_dir, f"{display_id}.ZIP")
         
-        if os.path.exists(expected_path):
-            print(f"Skipping API fetch for {expected_filename} (already exists in cache)")
-            downloaded_paths.append(get_vrt_path_for_zip(expected_path))
+        if os.path.exists(jp2_path):
+            print(f"Skipping API fetch for {display_id}.jp2 (already exists in cache)")
+            downloaded_paths.append(jp2_path)
+        elif os.path.exists(zip_path):
+            print(f"Skipping API fetch for {display_id}.ZIP (already exists in cache)")
+            downloaded_paths.append(get_vrt_path_for_zip(zip_path))
         else:
             scenes_to_fetch.append(scene)
             
@@ -144,13 +147,20 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
     }
     options = send_m2m_request("download-options", payload, api_key=api_key)
     
-    downloads = []
+    # Group available options by entityId, preferring JP2 (smaller) over ZIP/TIFF
+    options_by_entity = {}
     for option in options:
         if option.get("available") and option.get("downloadSystem") in ("EE", "dds"):
-            downloads.append({
-                "entityId": option["entityId"],
-                "productId": option["id"]
-            })
+            eid = option["entityId"]
+            product_name = option.get("productName", "").lower()
+            is_jp2 = "jp2" in product_name or "jpeg2000" in product_name or "jpeg 2000" in product_name
+            
+            if eid not in options_by_entity:
+                options_by_entity[eid] = option
+            elif is_jp2 and "jp2" not in options_by_entity[eid].get("productName", "").lower():
+                options_by_entity[eid] = option
+    
+    downloads = [{"entityId": opt["entityId"], "productId": opt["id"]} for opt in options_by_entity.values()]
             
     if not downloads:
         print("No valid download options found for these scenes.")
@@ -324,6 +334,11 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
             # When integrating into PMTiles, we MUST fetch to get local TIFFs
             # unless it's a dry run (where we just print and exit)
             if getattr(args, "download", False) or not getattr(args, "estimate", False):
+                if len(scenes) > 50:
+                    ans = input(f"Warning: you are about to download {len(scenes)} DOQs. Are you sure you want to proceed? (y/N) ")
+                    if ans.lower() not in ('y', 'yes'):
+                        print("Aborting NAIP download.")
+                        sys.exit(0)
                 raster_paths = fetch_naip_downloads(scenes, api_key, cache_dir)
                 if getattr(args, "download", False):
                     print("NAIP download-only workflow complete. Exiting.")

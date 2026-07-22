@@ -3517,6 +3517,13 @@ def build_master_vrt(source_rasters: Sequence[str], output_vrt: str) -> str:
                 warp_kwargs["dstAlpha"] = True
 
         warped_ds = gdal.Warp(warped_vrt, src, **warp_kwargs)
+        if warped_ds:
+            for band_idx, gci in enumerate(
+                (gdal.GCI_RedBand, gdal.GCI_GreenBand, gdal.GCI_BlueBand), start=1
+            ):
+                b = warped_ds.GetRasterBand(band_idx)
+                if b and b.GetColorInterpretation() == gdal.GCI_Undefined:
+                    b.SetColorInterpretation(gci)
         warped_ds = None
         warped_sources.append(warped_vrt)
 
