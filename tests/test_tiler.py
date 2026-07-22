@@ -808,20 +808,14 @@ def test_run_tiling_simplified_uses_explicit_chunk_bounds(
     dataset = None
 
     requested_bounds = get_web_mercator_bounds(4, 8, 7)
-    seen_proj_wins: list[tuple[float, float, float, float]] = []
-    seen_chunk_files: list[str] = []
+    captured_kwargs = []
 
-    def fake_process_chunk(task):
-        seen_chunk_files.append(task[1])
-        seen_proj_wins.append(task[-1])
-        return ""
-
-    monkeypatch.setattr(tiler_module, "process_chunk", fake_process_chunk)
-    monkeypatch.setattr(
-        tiler_module,
-        "merge_mbtiles",
-        lambda output, chunks: Path(output).write_text("mbtiles"),
-    )
+    orig_options = gdal.TranslateOptions
+    def fake_options(**kwargs):
+        captured_kwargs.append(kwargs)
+        return orig_options(**kwargs)
+    
+    monkeypatch.setattr(gdal, "TranslateOptions", fake_options)
     monkeypatch.setattr(tiler_module, "finalize_mbtiles_metadata", lambda path: None)
     monkeypatch.setattr(tiler_module.subprocess, "run", lambda cmd, check: None)
 
@@ -840,8 +834,9 @@ def test_run_tiling_simplified_uses_explicit_chunk_bounds(
         },
     )
 
-    assert seen_proj_wins == [requested_bounds]
-    assert seen_chunk_files == [str(tmp_path / "output_chunk_4_8_7.mbtiles")]
+    assert len(captured_kwargs) == 1
+    expected_projwin = [requested_bounds[0], requested_bounds[3], requested_bounds[2], requested_bounds[1]]
+    assert captured_kwargs[0]["projWin"] == expected_projwin
 
 
 def test_run_tiling_simplified_publishes_staged_output_mbtiles(
@@ -855,19 +850,20 @@ def test_run_tiling_simplified_publishes_staged_output_mbtiles(
     dataset.SetGeoTransform((0.0, 1000.0, 0.0, 16000.0, 0.0, -1000.0))
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(3857)
-    dataset.SetProjection(srs.ExportToWkt())
     dataset = None
 
-    merge_outputs: list[str] = []
     finalized: list[str] = []
     gdaladdo_calls: list[list[str]] = []
-
-    monkeypatch.setattr(tiler_module, "process_chunk", lambda task: "")
-    monkeypatch.setattr(
-        tiler_module,
-        "merge_mbtiles",
-        lambda output, chunks: merge_outputs.append(output) or Path(output).write_text("mbtiles"),
-    )
+    gdal_translate_calls: list[str] = []
+    
+    orig_translate = gdal.Translate
+    def fake_translate(destName, srcDS, **kwargs):
+        gdal_translate_calls.append(destName)
+        # Actually create the output file so it can be published
+        Path(destName).write_text("mbtiles")
+        return orig_translate(destName, srcDS, **kwargs)
+        
+    monkeypatch.setattr(gdal, "Translate", fake_translate)
     monkeypatch.setattr(
         tiler_module,
         "finalize_mbtiles_metadata",
@@ -895,7 +891,7 @@ def test_run_tiling_simplified_publishes_staged_output_mbtiles(
     )
 
     staged_output = str(tmp_path / ".temp_output.mbtiles")
-    assert merge_outputs == [staged_output]
+    assert gdal_translate_calls == [staged_output]
     assert finalized == [staged_output, staged_output]
     assert gdaladdo_calls == [
         [

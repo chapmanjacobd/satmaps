@@ -1579,64 +1579,76 @@ def run_tiling_simplified(
     input_vrt: str, output_mbtiles: str, options: Dict[str, Any]
 ) -> TilingArtifacts:
     """Simplified tiling from a pre-processed Byte VRT."""
-    chunk_prefix = os.path.splitext(os.path.basename(output_mbtiles))[0] or "tiles"
-    chunk_dir = os.path.dirname(output_mbtiles) or "."
-    chunk_zoom = options.get("chunk_zoom", 4)
     tile_format = options.get("format", "webp")
-
-    # Determine chunks from the Byte VRT.
-    ds = gdal.Open(input_vrt)
-    dataset_bounds = get_dataset_bounds(ds)
-    ds = None
-
-    requested_bounds = cast(TEBounds, options.get("chunk_bounds", dataset_bounds))
-    bounds = intersect_te_bounds(requested_bounds, dataset_bounds)
-    if bounds is None:
-        raise RuntimeError("Requested chunk bounds do not intersect the input raster")
-
-    tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, chunk_zoom)
-
-    tasks: List[ChunkTask] = []
-    chunk_files: List[str] = []
-    for ty in range(ty_min, ty_max + 1):
-        for tx in range(tx_min, tx_max + 1):
-            chunk_file = os.path.join(chunk_dir, f"{chunk_prefix}_chunk_{chunk_zoom}_{tx}_{ty}.mbtiles")
-            chunk_files.append(chunk_file)
-
-            if os.path.exists(chunk_file):
-                continue
-
-            te_bounds = get_web_mercator_bounds(chunk_zoom, tx, ty)
-            tasks.append(
-                (input_vrt, chunk_file, tile_format, options, te_bounds)
-            )
-
-    # Parallel execution.
-    if tasks:
-        num_workers = options.get("processes", 1)
-        print(
-            f"Processing {len(tasks)} chunk(s) at zoom {chunk_zoom} with {num_workers} worker(s)..."
-        )
-        if num_workers > 1:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                list(executor.map(process_chunk, tasks))
-        else:
-            for task in tasks:
-                process_chunk(task)
-
-    # Merge chunks.
     staged_output_mbtiles = prepare_staged_path(output_mbtiles)
-    merge_mbtiles(staged_output_mbtiles, chunk_files)
 
-    # Refresh metadata before building overviews so GDAL sees the merged extent,
-    # not just the bounds from the first copied chunk.
-    finalize_mbtiles_metadata(staged_output_mbtiles)
+    ds = gdal.Open(input_vrt)
+    if ds is None:
+        raise RuntimeError(f"Could not open input VRT: {input_vrt}")
 
-    # Build overviews (all levels from maxzoom down to 0)
-    build_mbtiles_overviews(staged_output_mbtiles, options["resample_alg"])
+    source_path = input_vrt
+    temp_raster = output_mbtiles.replace(".mbtiles", "_temp.tif")
+    cleanup_paths = []
+    band_list = None
 
-    # Finalize metadata again after gdaladdo adds lower zoom tiles.
-    finalize_mbtiles_metadata(staged_output_mbtiles)
-    publish_staged_path(staged_output_mbtiles, output_mbtiles)
+    try:
+        if options.get("elevation_encoding") == "terrarium":
+            if tile_format.lower() != "png":
+                raise RuntimeError("Terrarium DEM tiles must use PNG output")
+            print(f"Generating temporary Terrarium GeoTIFF: {temp_raster}")
+            write_terrarium_geotiff(ds, temp_raster)
+            source_path = temp_raster
+            cleanup_paths.append(temp_raster)
+        elif has_alpha_band(ds):
+            print("Source has alpha band; dropping it for MBTiles.")
+            band_list = [1, 2, 3]
 
-    return TilingArtifacts(final_vrt=input_vrt, cleanup_paths=chunk_files)
+        proj_win = None
+        if "chunk_bounds" in options:
+            bounds = options["chunk_bounds"]
+            proj_win = [bounds[0], bounds[3], bounds[2], bounds[1]]
+
+        translate_options = gdal.TranslateOptions(
+            format="MBTiles",
+            outputType=gdal.GDT_Byte,
+            bandList=band_list,
+            projWin=proj_win,
+            metadataOptions=[
+                f"format={tile_format.lower()}",
+                f"name={options['name']}",
+                f"description={options['description']}",
+            ],
+            creationOptions=[
+                f"NAME={options['name']}",
+                f"DESCRIPTION={options['description']}",
+                "TYPE=baselayer",
+                f"TILE_FORMAT={'JPEG' if tile_format.lower() == 'jpg' else tile_format.upper()}",
+                f"QUALITY={options['quality']}",
+                f"RESAMPLING={options['resample_alg'] if options['resample_alg'] != 'gauss' else 'bilinear'}",
+                f"BLOCKSIZE={options.get('blocksize', 512)}",
+                "ZOOM_LEVEL_STRATEGY=LOWER",
+            ],
+        )
+
+        if tile_format.lower() == "webp":
+            gdal.SetThreadLocalConfigOption("WEBP_LEVEL", str(options["quality"]))
+
+        print(f"Translating {source_path} to {staged_output_mbtiles} using a single GDAL process...")
+        gdal.Translate(staged_output_mbtiles, source_path, options=translate_options)
+        
+        # Refresh metadata before building overviews
+        finalize_mbtiles_metadata(staged_output_mbtiles)
+
+        # Build overviews (all levels from maxzoom down to 0)
+        build_mbtiles_overviews(staged_output_mbtiles, options["resample_alg"])
+
+        # Finalize metadata again after gdaladdo adds lower zoom tiles.
+        finalize_mbtiles_metadata(staged_output_mbtiles)
+        publish_staged_path(staged_output_mbtiles, output_mbtiles)
+
+    finally:
+        ds = None
+        for p in cleanup_paths:
+            remove_if_exists(p)
+
+    return TilingArtifacts(final_vrt=input_vrt, cleanup_paths=[])
