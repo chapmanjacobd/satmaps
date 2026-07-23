@@ -13,6 +13,25 @@ BBox = Tuple[float, float, float, float]
 
 M2M_BASE_URL = "https://m2m.cr.usgs.gov/api/api/json/stable"
 
+DIGITAL_COAST_DATASETS: List[dict[str, Any]] = [
+    {
+        "name": "HI_NAIP_2021",
+        "id": "9668",
+        "vrt_epsg_codes": ["26904", "26905"],
+        "stac_url": "https://coastalimagery.blob.core.windows.net/digitalcoast/HI_NAIP_2021_9668/stac/noaa_imagery_item_collection_m9668.json",
+        "base_url": "https://coastalimagery.blob.core.windows.net/digitalcoast/HI_NAIP_2021_9668",
+        "bbox": (-160.3, 18.9, -154.7, 22.3),
+    },
+    {
+        "name": "PR_NAIP_2021",
+        "id": "9825",
+        "vrt_epsg_codes": ["26919", "26920"],
+        "stac_url": "https://coastalimagery.blob.core.windows.net/digitalcoast/PR_NAIP_2021_9825/stac/noaa_imagery_item_collection_m9825.json",
+        "base_url": "https://coastalimagery.blob.core.windows.net/digitalcoast/PR_NAIP_2021_9825",
+        "bbox": (-67.3, 17.6, -64.4, 18.6),
+    },
+]
+
 def load_env() -> None:
     """Load variables from a .env file into os.environ if they don't already exist."""
     env_path = os.path.join(os.getcwd(), ".env")
@@ -96,6 +115,126 @@ def discover_naip_tiles_ee(bbox: Optional[BBox], api_key: str) -> List[Any]:
     scenes = results.get("results", [])
     print(f"Found {len(scenes)} NAIP scenes in the bounding box.")
     return scenes
+
+def _bbox_overlaps(bbox_a: BBox, bbox_b: BBox) -> bool:
+    """Check if two bboxes overlap."""
+    min_lon_a, min_lat_a, max_lon_a, max_lat_a = bbox_a
+    min_lon_b, min_lat_b, max_lon_b, max_lat_b = bbox_b
+    return (
+        min_lon_a < max_lon_b and max_lon_a > min_lon_b
+        and min_lat_a < max_lat_b and max_lat_a > min_lat_b
+    )
+
+
+def _find_digital_coast_datasets(bbox: BBox) -> List[dict[str, Any]]:
+    """Return Digital Coast datasets whose extent overlaps the given bbox."""
+    return [
+        ds for ds in DIGITAL_COAST_DATASETS
+        if _bbox_overlaps(bbox, (
+            float(ds["bbox"][0]),
+            float(ds["bbox"][1]),
+            float(ds["bbox"][2]),
+            float(ds["bbox"][3]),
+        ))
+    ]
+
+
+def _fetch_json_cached(url: str, cache_path: str) -> Any:
+    """Fetch a JSON URL, caching the result to disk."""
+    if os.path.exists(cache_path):
+        print(f"Using cached {cache_path}")
+        with open(cache_path) as f:
+            return json.load(f)
+    print(f"Fetching {url}")
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump(data, f)
+    return data
+
+
+def _bbox_overlaps_stac_item(bbox: BBox, item: dict) -> bool:
+    """Check if a bbox overlaps with a STAC item's bbox."""
+    item_bbox = item.get("bbox")
+    if not item_bbox or len(item_bbox) != 4:
+        return False
+    return _bbox_overlaps(bbox, (item_bbox[0], item_bbox[1], item_bbox[2], item_bbox[3]))
+
+
+def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str) -> List[str]:
+    """
+    Fall back to NOAA Digital Coast NAIP imagery when USGS returns no results.
+    Returns a list of raster paths (VRT paths referencing /vsicurl/ URLs).
+    """
+    if not bbox:
+        return []
+
+    datasets = _find_digital_coast_datasets(bbox)
+    if not datasets:
+        print("Bounding box does not overlap any Digital Coast NAIP dataset.")
+        return []
+
+    raster_paths = []
+    for ds in datasets:
+        print(f"Querying Digital Coast dataset: {ds['name']} (id={ds['id']})")
+        stac_cache = os.path.join(cache_dir, f"dc_stac_{ds['id']}.json")
+        collection = _fetch_json_cached(ds["stac_url"], stac_cache)
+
+        features = collection.get("features", [])
+        if not features:
+            print(f"No features found in STAC collection for {ds['name']}")
+            continue
+
+        filtered = [f for f in features if _bbox_overlaps_stac_item(bbox, f)]
+        if not filtered:
+            print(f"No {ds['name']} tiles overlap the bounding box.")
+            continue
+
+        tif_urls = []
+        for feature in filtered:
+            assets = feature.get("assets", {})
+            for key, asset in assets.items():
+                href = asset.get("href", "")
+                if href.endswith(".tif"):
+                    tif_urls.append(href)
+                    break
+
+        if not tif_urls:
+            print(f"No TIFF assets found for {ds['name']}")
+            continue
+
+        print(f"Found {len(tif_urls)} {ds['name']} tiles overlapping the bounding box.")
+
+        jp2_gb = len(tif_urls) * 80 / 1024
+        tif_gb = len(tif_urls) * 500 / 1024
+        print(f"Estimated size: {jp2_gb:.1f} GB (JP2) / {tif_gb:.1f} GB (ZIP/TIF)")
+        if len(tif_urls) > 50:
+            ans = input(f"Warning: you are about to use {len(tif_urls)} tiles from {ds['name']}. Are you sure you want to proceed? (y/N) ")
+            if ans.lower() not in ('y', 'yes'):
+                print("Aborting Digital Coast NAIP fetch.")
+                return []
+
+        ds_cache_dir = os.path.join(cache_dir, f"dc_{ds['id']}")
+        os.makedirs(ds_cache_dir, exist_ok=True)
+        vrt_path = os.path.join(ds_cache_dir, f"{ds['name']}.vrt")
+
+        if os.path.exists(vrt_path):
+            print(f"Using cached VRT: {vrt_path}")
+        else:
+            from osgeo import gdal
+
+            vrt_ds = gdal.BuildVRT(vrt_path, tif_urls, options=gdal.BuildVRTOptions(resolution="highest"))
+            if vrt_ds is None:
+                raise RuntimeError(f"Failed to build VRT for {ds['name']}")
+            vrt_ds = None
+            print(f"Built cached VRT: {vrt_path}")
+
+        raster_paths.append(vrt_path)
+
+    return raster_paths
+
 
 def get_vrt_path_for_zip(path: str) -> str:
     import zipfile
@@ -270,14 +409,18 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
     """
     If NAIP workflow is requested, handle it and return (True, list_of_rasters).
     Otherwise return (False, []).
+    Falls back to NOAA Digital Coast NAIP imagery (HI, PR/USVI) when USGS returns no results.
     """
     if not hasattr(args, "use_naip") or not args.use_naip:
         return False, []
         
-    print("NAIP (EarthExplorer) workflow requested.")
+    print("NAIP workflow requested.")
     load_env()
     
-    api_key = None
+    cache_dir = getattr(args, "cache", "cache")
+
+    scenes: List[Any] = []
+    api_key: Optional[str] = None
     try:
         api_key = m2m_login()
         scenes = discover_naip_tiles_ee(requested_bbox, api_key)
@@ -286,7 +429,6 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
             from osgeo import ogr
             import json
 
-            # Sort by date descending to prioritize the most recent scenes
             scenes.sort(key=lambda s: s.get('temporalCoverage', {}).get('startDate', ''), reverse=True)
 
             min_lon, min_lat, max_lon, max_lat = requested_bbox
@@ -314,7 +456,6 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
                 uncovered = target_poly.Difference(coverage_union)
                 if scene_poly.Intersects(uncovered):
                     intersection = scene_poly.Intersection(uncovered)
-                    # Check for a meaningful contribution (e.g., > small epsilon)
                     if intersection and intersection.GetArea() > 1e-8:
                         filtered_scenes.append(s)
                         if coverage_union.IsEmpty():
@@ -322,38 +463,31 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
                         else:
                             coverage_union = coverage_union.Union(scene_poly)
 
-                        # Stop early if the target area is completely covered
                         if target_poly.Difference(coverage_union).GetArea() < 1e-8:
                             break
 
             print(f"Greedy spatial fill selected {len(filtered_scenes)} out of {len(scenes)} scenes to cover the bounding box.")
             scenes = filtered_scenes
 
-        if not scenes:
-            print("No NAIP imagery found in the bounding box; aborting NAIP pipeline.")
-            sys.exit(0)
-
-        print("NAIP pipeline via EarthExplorer initiated.")
-
-        cache_dir = getattr(args, "cache", "cache")
-        # When integrating into PMTiles, we MUST fetch to get local TIFFs
-        # unless it's a dry run (where we just print and exit)
-        if getattr(args, "download", False) or not getattr(args, "estimate", False):
-            if len(scenes) > 50:
-                ans = input(f"Warning: you are about to download {len(scenes)} DOQs. Are you sure you want to proceed? (y/N) ")
-                if ans.lower() not in ('y', 'yes'):
-                    print("Aborting NAIP download.")
+        if scenes:
+            print("NAIP pipeline via EarthExplorer initiated.")
+            if getattr(args, "download", False) or not getattr(args, "estimate", False):
+                if len(scenes) > 50:
+                    ans = input(f"Warning: you are about to download {len(scenes)} DOQs. Are you sure you want to proceed? (y/N) ")
+                    if ans.lower() not in ('y', 'yes'):
+                        print("Aborting NAIP download.")
+                        sys.exit(0)
+                raster_paths = fetch_naip_downloads(scenes, api_key, cache_dir)
+                if getattr(args, "download", False):
+                    print("NAIP download-only workflow complete. Exiting.")
                     sys.exit(0)
-            raster_paths = fetch_naip_downloads(scenes, api_key, cache_dir)
-            if getattr(args, "download", False):
-                print("NAIP download-only workflow complete. Exiting.")
-                sys.exit(0)
-            return True, raster_paths
-        else:
-            for scene in scenes[:5]:
-                print(f"Scene ID: {scene.get('entityId')} - Display ID: {scene.get('displayId')}")
-            if len(scenes) > 5:
-                print(f"... and {len(scenes) - 5} more. Run with --download to fetch them.")
+                return True, raster_paths
+            else:
+                for scene in scenes[:5]:
+                    print(f"Scene ID: {scene.get('entityId')} - Display ID: {scene.get('displayId')}")
+                if len(scenes) > 5:
+                    print(f"... and {len(scenes) - 5} more. Run with --download to fetch them.")
+                return True, []
     except Exception as e:
         print(f"EarthExplorer API Error: {e}")
     finally:
@@ -362,5 +496,16 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
                 m2m_logout(api_key)
             except Exception as e:
                 print(f"Failed to logout gracefully: {e}")
+
+    # Fall back to Digital Coast (e.g. HI, PR/USVI) when USGS returns nothing or errors
+    if not scenes and requested_bbox:
+        dc_rasters = discover_naip_tiles_digitalcoast(requested_bbox, cache_dir)
+        if dc_rasters:
+            return True, dc_rasters
+
+    if not scenes:
+        print("No NAIP imagery found in the bounding box; aborting NAIP pipeline.")
+        if not getattr(args, "estimate", False) and not getattr(args, "download", False):
+            sys.exit(0)
 
     return True, []
