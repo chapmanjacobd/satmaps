@@ -1680,7 +1680,7 @@ def test_convert_raster_to_pmtiles_stages_final_output(
         description="Test",
     )
 
-    assert converted == [["pmtiles", "convert", ".temp/testrun/output.mbtiles", ".temp_output.pmtiles"]]
+    assert converted == [["pmtiles", "convert", ".temp/testrun/output.mbtiles", ".temp_output.pmtiles", "--tmpdir", ".temp/"]]
     assert Path("output.pmtiles").read_text() == "pmtiles"
     assert not Path(".temp_output.pmtiles").exists()
     assert packaged.temp_mbtiles == ".temp/testrun/output.mbtiles"
@@ -1726,7 +1726,7 @@ def test_convert_raster_to_pmtiles_cleans_inputs_after_mbtiles_before_pmtiles(
         cleanup_input_paths=[str(cleanup_target)],
     )
 
-    assert converted == [["pmtiles", "convert", ".temp/testrun/output.mbtiles", ".temp_output.pmtiles"]]
+    assert converted == [["pmtiles", "convert", ".temp/testrun/output.mbtiles", ".temp_output.pmtiles", "--tmpdir", ".temp/"]]
 
 def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
     tmp_path: Path, monkeypatch: object
@@ -1786,7 +1786,7 @@ def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
         }
     ]
     assert overview_calls == [(".temp/testrun/output.mbtiles", "lanczos")]
-    assert converted == [["pmtiles", "convert", ".temp/testrun/output.mbtiles", ".temp_output.pmtiles"]]
+    assert converted == [["pmtiles", "convert", ".temp/testrun/output.mbtiles", ".temp_output.pmtiles", "--tmpdir", ".temp/"]]
     assert temp_mbtiles == ".temp/testrun/output.mbtiles"
 
 def test_create_hillshade_tif_uses_gdal_demprocessing(monkeypatch: object, tmp_path: Path) -> None:

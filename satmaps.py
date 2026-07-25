@@ -403,7 +403,7 @@ def convert_mbtiles_to_pmtiles(temp_mbtiles: str, output_path: str) -> None:
     """Convert MBTiles into the caller-visible PMTiles output via a staged publish."""
     print("Converting to PMTiles...")
     staged_output_path = prepare_staged_path(output_path)
-    subprocess.run(["pmtiles", "convert", temp_mbtiles, staged_output_path], check=True)
+    subprocess.run(["pmtiles", "convert", temp_mbtiles, staged_output_path, "--tmpdir", ".temp/"], check=True)
     publish_staged_path(staged_output_path, output_path)
     print(f"Success! {output_path}")
 
