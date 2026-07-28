@@ -116,6 +116,18 @@ def build_mgrs_tile_geometry(
     return polygon
 
 
+def _mgrs_tile_intersects_geometry(
+    mgrs_tile: str,
+    geometry: ogr.Geometry,
+    wgs84_srs: osr.SpatialReference,
+) -> bool:
+    """Return True when an MGRS tile's WGS84 polygon intersects the given geometry."""
+    tile_geom = build_mgrs_tile_geometry(mgrs_tile, target_srs=wgs84_srs)
+    if tile_geom is None:
+        return True
+    return tile_geom.Intersects(geometry)
+
+
 def build_candidate_scan_envelopes(
     dataset: gdal.Dataset,
     candidate_tiles: Set[str],
@@ -739,11 +751,19 @@ def discover_mgrs_bases(
     s3_folder_cache: Mapping[str, Iterable[str]],
     discover_mgrs_tiles_in_bbox_fn: Callable[[float, float, float, float], List[str]],
     discover_mgrs_tiles_from_ocean_mask_fn: Callable[[str, Optional[BBox], Optional[Set[str]]], Set[str]],
+    extent_geometry: Optional[ogr.Geometry] = None,
 ) -> List[str]:
     """Resolve the requested MGRS tile list from bbox or the default all-tiles flow."""
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
         bbox_candidates = set(discover_mgrs_tiles_in_bbox_fn(min_lon, min_lat, max_lon, max_lat))
+        if extent_geometry is not None:
+            wgs84_srs = _build_wgs84_srs()
+            bbox_candidates = {
+                tile
+                for tile in bbox_candidates
+                if _mgrs_tile_intersects_geometry(tile, extent_geometry, wgs84_srs)
+            }
         land_mgrs = None
         if not force_refresh:
             land_mgrs = load_saved_land_mgrs_list(

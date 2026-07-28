@@ -424,6 +424,7 @@ def convert_raster_to_pmtiles(
     requested_bbox: Optional[Tuple[float, float, float, float]] = None,
     tiling_options: Optional[Dict[str, object]] = None,
     cleanup_input_paths: Optional[Sequence[str]] = None,
+    extent_geometry: Optional["ogr.Geometry"] = None,
 ) -> PackagedPMTiles:
     """Tile a Web Mercator raster into MBTiles and convert the result to PMTiles."""
     run_paths = SatmapsRunPaths(output_path, unique_id)
@@ -444,8 +445,29 @@ def convert_raster_to_pmtiles(
     if tiling_options:
         run_options.update(tiling_options)
 
+    effective_raster = input_raster
+    if extent_geometry is not None:
+        import json
+        masked_raster = os.path.join(run_paths.output_temp_dir, f"extent_masked_{unique_id}.tif")
+        ensure_directory(os.path.dirname(masked_raster))
+        temp_geojson = os.path.join(run_paths.output_temp_dir, f"extent_mask_{unique_id}.geojson")
+        ensure_directory(os.path.dirname(temp_geojson))
+        with open(temp_geojson, "w") as f:
+            f.write(extent_geometry.ExportToJson())
+        warp_opts = gdal.WarpOptions(
+            format="GTiff",
+            cutlineDSName=temp_geojson,
+            cropToCutline=True,
+            dstAlpha=True,
+            resampleAlg=resample_alg,
+        )
+        gdal.Warp(masked_raster, input_raster, options=warp_opts)
+        remove_if_exists(temp_geojson)
+        effective_raster = masked_raster
+        cleanup_input_paths = list(cleanup_input_paths or []) + [masked_raster]
+
     print("Generating MBTiles...")
-    tiling_artifacts = tiler.run_tiling_simplified(input_raster, temp_mbtiles, run_options)
+    tiling_artifacts = tiler.run_tiling_simplified(effective_raster, temp_mbtiles, run_options)
     if cleanup_input_paths:
         cleanup_temporary_files(cleanup_input_paths)
 
@@ -912,6 +934,61 @@ def parse_bbox(bbox: str) -> Tuple[float, float, float, float]:
         sys.exit(1)
 
 
+def _load_extent(extent_path: str) -> Tuple[Tuple[float, float, float, float], "ogr.Geometry"]:
+    """Load the combined geometry and its WGS84 envelope from a vector file."""
+    ds = ogr.Open(extent_path)
+    if ds is None:
+        print(f"Error: Cannot open vector file: {extent_path}")
+        sys.exit(1)
+
+    extent_geom = None
+    src_srs = None
+    for lyr_idx in range(ds.GetLayerCount()):
+        lyr = ds.GetLayerByIndex(lyr_idx)
+        if lyr is None:
+            continue
+        src_srs = lyr.GetSpatialRef()
+        for feature in lyr:
+            geom = feature.GetGeometryRef()
+            if geom is None:
+                continue
+            cloned = geom.Clone()
+            if extent_geom is None:
+                extent_geom = cloned
+            else:
+                extent_geom = extent_geom.Union(cloned)
+
+    if extent_geom is None:
+        print(f"Error: No geometry found in: {extent_path}")
+        sys.exit(1)
+
+    if src_srs is not None:
+        wgs84_srs = osr.SpatialReference()
+        wgs84_srs.ImportFromEPSG(4326)
+        if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
+            wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        if not src_srs.IsSame(wgs84_srs):
+            extent_geom.Transform(osr.CoordinateTransformation(src_srs, wgs84_srs))
+
+    envelope = extent_geom.GetEnvelope()
+    bbox = (envelope[0], envelope[2], envelope[1], envelope[3])
+    return bbox, extent_geom
+
+
+def resolve_requested_bbox(args: argparse.Namespace) -> Tuple[
+    Optional[Tuple[float, float, float, float]], Optional["ogr.Geometry"]
+]:
+    """Resolve the bbox from --bbox or --extent, erroring if both are given."""
+    if args.bbox and args.extent:
+        print("Error: --bbox and --extent are mutually exclusive")
+        sys.exit(1)
+    if args.extent:
+        return _load_extent(args.extent)
+    if args.bbox:
+        return parse_bbox(args.bbox), None
+    return None, None
+
+
 def discover_mgrs_tiles_in_bbox(
     min_lon: float, min_lat: float, max_lon: float, max_lat: float
 ) -> List[str]:
@@ -1032,6 +1109,7 @@ def discover_mgrs_bases(
     land_mgrs_list_path: Optional[str] = None,
     *,
     force_refresh: bool = False,
+    extent_geometry: Optional["ogr.Geometry"] = None,
 ) -> List[str]:
     """Resolve the requested MGRS tile list from bbox or the default all-tiles flow."""
     if CURRENT_DATASET_NAME == "S2MSI_L3__MCQ_LR":
@@ -1055,6 +1133,7 @@ def discover_mgrs_bases(
         s3_folder_cache=S3_FOLDER_CACHE,
         discover_mgrs_tiles_in_bbox_fn=discover_mgrs_tiles_in_bbox,
         discover_mgrs_tiles_from_ocean_mask_fn=discover_mgrs_tiles_from_ocean_mask,
+        extent_geometry=extent_geometry,
     )
 
 
@@ -4209,7 +4288,7 @@ def render_land_output_tiles(
 
 def calculate_estimates(args: argparse.Namespace) -> None:
     """Calculate and print estimations for the given command."""
-    requested_bbox = parse_bbox(args.bbox) if args.bbox else None
+    requested_bbox, extent_geometry = resolve_requested_bbox(args)
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     num_dates = len(date_paths)
 
@@ -4223,6 +4302,7 @@ def calculate_estimates(args: argparse.Namespace) -> None:
         requested_bbox,
         gebco_vrt_source,
         land_mgrs_list_path,
+        extent_geometry=extent_geometry,
     )
     plan = LandProcessingPlan(
         mgrs_bases=tuple(mgrs_bases),
@@ -4453,6 +4533,15 @@ def add_satmaps_discovery_cli_args(parser: argparse.ArgumentParser) -> None:
     )
     add("--bbox", help="WGS84 bounding box as min_lon,min_lat,max_lon,max_lat")
     add(
+        "--extent",
+        help="Path to a vector file (GeoJSON, FlatGeobuf, Shapefile, etc.) "
+        "whose features define the area of interest. "
+        "MultiPolygons and non-touching features are supported: "
+        "only MGRS tiles that intersect the features are processed, "
+        "and the output is masked to the feature boundaries. "
+        "Mutually exclusive with --bbox.",
+    )
+    add(
         "--max-zoom",
         type=int,
         choices=list(ocean.SUPPORTED_MAX_ZOOMS),
@@ -4510,7 +4599,7 @@ def main() -> None:
     ensure_directory(TEMP_DIR)
     ensure_directory(FULL_RENDER_CACHE_DIR)
 
-    requested_bbox = parse_bbox(args.bbox) if args.bbox else None
+    requested_bbox, extent_geometry = resolve_requested_bbox(args)
 
     # Compute the build namespace early so a build-unique ocean background can
     # be rendered before the land pipeline starts.
@@ -4552,7 +4641,7 @@ def main() -> None:
     ):
         return
 
-    is_naip, naip_rasters = land_naip_module.handle_naip_workflow(args, requested_bbox)
+    is_naip, naip_rasters = land_naip_module.handle_naip_workflow(args, requested_bbox, extent_geometry=extent_geometry)
 
     if requested_bbox is None and not is_naip:
         populate_s3_cache(date_paths)
@@ -4596,6 +4685,7 @@ def main() -> None:
             requested_bbox,
             land_mgrs_source,
             land_mgrs_list_path,
+            extent_geometry=extent_geometry,
         )
         plan = LandProcessingPlan(
             mgrs_bases=tuple(mgrs_bases),
@@ -4619,7 +4709,7 @@ def main() -> None:
             if work_unit.unit_id not in completed_units
         )
 
-        if args.bbox and not getattr(args, "grade", False) and not getattr(args, "full_render_first", False):
+        if (args.bbox or args.extent) and not getattr(args, "grade", False) and not getattr(args, "full_render_first", False):
             print("Ungraded bbox render detected; automatically enabling full-render-first.")
             args.full_render_first = True
 
@@ -4652,7 +4742,7 @@ def main() -> None:
                 )
             ):
                 print("Committed ocean background to final WebP tiles.")
-        elif args.bbox:
+        elif args.bbox or args.extent:
             print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
 
     if args.full_render_first:
@@ -4711,7 +4801,7 @@ def main() -> None:
             print("Building master VRT...")
             build_master_vrt(source_rasters, master_vrt_path)
 
-            if args.bbox and not getattr(args, "grade", False):
+            if (args.bbox or args.extent) and not getattr(args, "grade", False):
                 print("Skipping tile cache commit for ungraded bbox render; converting directly to PMTiles...")
                 packaged_tiles = convert_raster_to_pmtiles(
                     master_vrt_path,
@@ -4726,6 +4816,7 @@ def main() -> None:
                     name="Sentinel-2 Mosaic",
                     description="Copernicus Sentinel data",
                     requested_bbox=requested_bbox,
+                    extent_geometry=extent_geometry,
                 )
                 cleanup_temporary_files([packaged_tiles.temp_mbtiles] + ocean_cleanup_paths)
                 if os.path.exists(state_file):

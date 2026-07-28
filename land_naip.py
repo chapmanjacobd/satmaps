@@ -405,7 +405,11 @@ def add_naip_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Use NAIP imagery as the primary land data source instead of Sentinel-2 MGRS",
     )
 
-def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox]) -> Tuple[bool, List[str]]:
+def handle_naip_workflow(
+    args: argparse.Namespace,
+    requested_bbox: Optional[BBox],
+    extent_geometry: Optional["ogr.Geometry"] = None,
+) -> Tuple[bool, List[str]]:
     """
     If NAIP workflow is requested, handle it and return (True, list_of_rasters).
     Otherwise return (False, []).
@@ -431,15 +435,18 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
 
             scenes.sort(key=lambda s: s.get('temporalCoverage', {}).get('startDate', ''), reverse=True)
 
-            min_lon, min_lat, max_lon, max_lat = requested_bbox
-            ring = ogr.Geometry(ogr.wkbLinearRing)
-            ring.AddPoint(min_lon, min_lat)
-            ring.AddPoint(max_lon, min_lat)
-            ring.AddPoint(max_lon, max_lat)
-            ring.AddPoint(min_lon, max_lat)
-            ring.AddPoint(min_lon, min_lat)
-            target_poly = ogr.Geometry(ogr.wkbPolygon)
-            target_poly.AddGeometry(ring)
+            if extent_geometry is not None:
+                target_poly = extent_geometry.Clone()
+            else:
+                min_lon, min_lat, max_lon, max_lat = requested_bbox
+                ring = ogr.Geometry(ogr.wkbLinearRing)
+                ring.AddPoint(min_lon, min_lat)
+                ring.AddPoint(max_lon, min_lat)
+                ring.AddPoint(max_lon, max_lat)
+                ring.AddPoint(min_lon, max_lat)
+                ring.AddPoint(min_lon, min_lat)
+                target_poly = ogr.Geometry(ogr.wkbPolygon)
+                target_poly.AddGeometry(ring)
 
             coverage_union = ogr.Geometry(ogr.wkbPolygon)
             filtered_scenes = []
@@ -466,7 +473,8 @@ def handle_naip_workflow(args: argparse.Namespace, requested_bbox: Optional[BBox
                         if target_poly.Difference(coverage_union).GetArea() < 1e-8:
                             break
 
-            print(f"Greedy spatial fill selected {len(filtered_scenes)} out of {len(scenes)} scenes to cover the bounding box.")
+            desc = "extent geometry" if extent_geometry is not None else "bounding box"
+            print(f"Greedy spatial fill selected {len(filtered_scenes)} out of {len(scenes)} scenes to cover the {desc}.")
             scenes = filtered_scenes
 
         if scenes:
