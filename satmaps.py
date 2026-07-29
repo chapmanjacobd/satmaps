@@ -448,23 +448,23 @@ def convert_raster_to_pmtiles(
     effective_raster = input_raster
     if extent_geometry is not None:
         import json
-        masked_raster = os.path.join(run_paths.output_temp_dir, f"extent_masked_{unique_id}.tif")
-        ensure_directory(os.path.dirname(masked_raster))
+        masked_vrt = os.path.join(run_paths.output_temp_dir, f"extent_masked_{unique_id}.vrt")
+        ensure_directory(os.path.dirname(masked_vrt))
         temp_geojson = os.path.join(run_paths.output_temp_dir, f"extent_mask_{unique_id}.geojson")
         ensure_directory(os.path.dirname(temp_geojson))
         with open(temp_geojson, "w") as f:
             f.write(extent_geometry.ExportToJson())
         warp_opts = gdal.WarpOptions(
-            format="GTiff",
+            format="VRT",
             cutlineDSName=temp_geojson,
             cropToCutline=True,
             dstAlpha=True,
             resampleAlg=resample_alg,
+            options=["DISABLE_VERTICAL_OFFSET=YES"],
         )
-        gdal.Warp(masked_raster, input_raster, options=warp_opts)
-        remove_if_exists(temp_geojson)
-        effective_raster = masked_raster
-        cleanup_input_paths = list(cleanup_input_paths or []) + [masked_raster]
+        gdal.Warp(masked_vrt, input_raster, options=warp_opts)
+        effective_raster = masked_vrt
+        cleanup_input_paths = list(cleanup_input_paths or []) + [masked_vrt, temp_geojson]
 
     print("Generating MBTiles...")
     tiling_artifacts = tiler.run_tiling_simplified(effective_raster, temp_mbtiles, run_options)
