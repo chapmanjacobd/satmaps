@@ -607,7 +607,7 @@ def _bbox_overlaps_stac_item(bbox: BBox, item: dict) -> bool:
     return _bbox_overlaps(bbox, (item_bbox[0], item_bbox[1], item_bbox[2], item_bbox[3]))
 
 
-def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str) -> List[str]:
+def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str, args: Optional[argparse.Namespace] = None) -> List[str]:
     """
     Discover NOAA Digital Coast NAIP imagery for overlapping island datasets.
     Returns a list of raster paths (VRT paths referencing /vsicurl/ URLs).
@@ -655,10 +655,23 @@ def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str) -> Li
         tif_gb = len(tif_urls) * 500 / 1024
         print(f"Estimated size: {jp2_gb:.1f} GB (JP2) / {tif_gb:.1f} GB (ZIP/TIF)")
         if len(tif_urls) > 50:
-            ans = input(f"Warning: you are about to use {len(tif_urls)} tiles from {ds['name']}. Are you sure you want to proceed? (y/N) ")
-            if ans.lower() not in ('y', 'yes'):
-                print("Aborting Digital Coast NAIP fetch.")
-                return []
+            est_dl_seconds = len(tif_urls) * 15
+            est_dl_hours = int(est_dl_seconds // 3600)
+            est_dl_minutes = int((est_dl_seconds % 3600) // 60)
+            est_dl_str = f"{est_dl_hours}h {est_dl_minutes}m" if est_dl_hours else f"{est_dl_minutes}m"
+            est_proc_seconds = len(tif_urls) * 30 / max(getattr(args, "parallel", 1), 1)
+            est_proc_hours = int(est_proc_seconds // 3600)
+            est_proc_minutes = int((est_proc_seconds % 3600) // 60)
+            est_proc_str = f"{est_proc_hours}h {est_proc_minutes}m" if est_proc_hours else f"{est_proc_minutes}m"
+            print(f"Estimated download time:   {est_dl_str}")
+            print(f"Estimated processing time:  {est_proc_str}")
+            if getattr(args, "yes", False):
+                print("--yes flag set, proceeding without confirmation.")
+            else:
+                ans = input(f"Warning: you are about to use {len(tif_urls)} tiles from {ds['name']}. Are you sure you want to proceed? (y/N) ")
+                if ans.lower() not in ('y', 'yes'):
+                    print("Aborting Digital Coast NAIP fetch.")
+                    return []
 
         ds_cache_dir = os.path.join(cache_dir, f"dc_{ds['id']}")
         os.makedirs(ds_cache_dir, exist_ok=True)
@@ -953,10 +966,23 @@ def handle_naip_workflow(
             print("NAIP pipeline via EarthExplorer initiated.")
             if getattr(args, "download", False) or not getattr(args, "estimate", False):
                 if len(scenes) > 50:
-                    ans = input(f"Warning: you are about to download {len(scenes)} DOQs. Are you sure you want to proceed? (y/N) ")
-                    if ans.lower() not in ('y', 'yes'):
-                        print("Aborting NAIP download.")
-                        sys.exit(0)
+                    est_dl_seconds = len(scenes) * 30
+                    est_dl_hours = int(est_dl_seconds // 3600)
+                    est_dl_minutes = int((est_dl_seconds % 3600) // 60)
+                    est_dl_str = f"{est_dl_hours}h {est_dl_minutes}m" if est_dl_hours else f"{est_dl_minutes}m"
+                    est_proc_seconds = len(scenes) * 60 / max(getattr(args, "parallel", 1), 1)
+                    est_proc_hours = int(est_proc_seconds // 3600)
+                    est_proc_minutes = int((est_proc_seconds % 3600) // 60)
+                    est_proc_str = f"{est_proc_hours}h {est_proc_minutes}m" if est_proc_hours else f"{est_proc_minutes}m"
+                    print(f"Estimated download time:   {est_dl_str}")
+                    print(f"Estimated processing time:  {est_proc_str}")
+                    if getattr(args, "yes", False):
+                        print("--yes flag set, proceeding without confirmation.")
+                    else:
+                        ans = input(f"Warning: you are about to download {len(scenes)} DOQs. Are you sure you want to proceed? (y/N) ")
+                        if ans.lower() not in ('y', 'yes'):
+                            print("Aborting NAIP download.")
+                            sys.exit(1)
                 ee_raster_paths = fetch_naip_downloads(scenes, api_key, cache_dir)
                 if getattr(args, "download", False):
                     print("NAIP download-only workflow complete. Exiting.")
@@ -991,7 +1017,7 @@ def handle_naip_workflow(
         if not dc_bboxes:
             dc_bboxes = [requested_bbox]
         for dc_bbox in dc_bboxes:
-            dc_rasters.extend(discover_naip_tiles_digitalcoast(dc_bbox, cache_dir))
+            dc_rasters.extend(discover_naip_tiles_digitalcoast(dc_bbox, cache_dir, args))
         dc_rasters = list(dict.fromkeys(dc_rasters))
     raster_paths = ee_raster_paths + dc_rasters
     if raster_paths:

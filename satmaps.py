@@ -649,6 +649,28 @@ def parse_positive_int(value: str) -> int:
     return parsed
 
 
+def estimate_processing_time(
+    plan: LandProcessingPlan,
+    num_dates: int,
+    parallel: int,
+) -> str:
+    unique_source_subtiles = {
+        subtile for unit in plan.work_units for subtile in unit.source_subtiles
+    }
+    total_tile_dates = len(unique_source_subtiles) * num_dates
+    total_seconds = (total_tile_dates * 15 / max(parallel, 1)) + (
+        len(plan.work_units) * 30 / max(parallel, 1)
+    )
+    total_seconds += len(plan.work_units) * 2
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return "<1m"
+
+
 def describe_land_processing_plan(plan: LandProcessingPlan, num_dates: int) -> str:
     """Return the summary line printed before land processing starts."""
     return (
@@ -4579,6 +4601,13 @@ def add_satmaps_discovery_cli_args(parser: argparse.ArgumentParser) -> None:
         default=False,
         help="Swap the two-date equator blend so the first date favors the south and the second the north",
     )
+    add(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help="Skip the confirmation prompt before processing",
+    )
 
 
 def build_satmaps_argument_parser() -> argparse.ArgumentParser:
@@ -4719,6 +4748,14 @@ def main() -> None:
             ),
         )
         print(describe_land_processing_plan(plan, len(date_paths)))
+
+        if not args.yes:
+            est = estimate_processing_time(plan, len(date_paths), args.parallel)
+            print(f"Estimated processing time: {est}")
+            ans = input("Proceed? (y/N) ")
+            if ans.lower() not in ("y", "yes"):
+                print("Aborted.")
+                sys.exit(1)
 
         if args.download:
             downloaded = download_source_tiles_to_cache(
