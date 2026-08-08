@@ -10,6 +10,8 @@ import time
 import urllib.parse
 import urllib.request
 from typing import Callable, List, Optional, Sequence, Tuple, Any
+from datetime import datetime, timedelta
+import dateutil.relativedelta as relativedelta
 
 BBox = Tuple[float, float, float, float]
 
@@ -18,7 +20,7 @@ NAIP_METADATA_CACHE_MAX_AGE_DAYS = 90
 EE_MAX_RESULTS = 4000
 EE_SPLIT_THRESHOLD = 3980
 EE_MAX_SPLIT_DEPTH = 12
-EE_INITIAL_MAX_BBOX_SPAN_DEGREES = 2.0
+EE_INITIAL_MAX_BBOX_SPAN_DEGREES = 8.0
 
 DIGITAL_COAST_DATASETS: List[dict[str, Any]] = [
     {
@@ -93,10 +95,10 @@ def m2m_logout(api_key: str) -> None:
     print("Logging out from EarthExplorer...")
     send_m2m_request("logout", {}, api_key=api_key)
 
-def _scene_search_payload(bbox: BBox) -> dict[str, Any]:
+def _scene_search_payload(bbox: BBox, start_date: Optional[str] = None) -> dict[str, Any]:
     """Build the EarthExplorer scene-search request for one bounding box."""
     min_lon, min_lat, max_lon, max_lat = bbox
-    return {
+    payload = {
         "datasetName": "NAIP",
         "sceneFilter": {
             "spatialFilter": {
@@ -107,6 +109,12 @@ def _scene_search_payload(bbox: BBox) -> dict[str, Any]:
         },
         "maxResults": EE_MAX_RESULTS,
     }
+    if start_date:
+        payload["sceneFilter"]["acquisitionFilter"] = {
+            "start": start_date,
+            "end": "2099-12-31"
+        }
+    return payload
 
 
 def _load_fresh_json_cache(cache_path: str, max_age_days: int) -> Optional[Any]:
@@ -235,12 +243,13 @@ def _deduplicate_scenes(scenes: List[Any]) -> List[Any]:
 def _query_naip_tiles_ee(
     bbox: BBox,
     api_key: str,
+    start_date: Optional[str] = None,
 ) -> List[Any]:
     """Query one EarthExplorer bbox for NAIP scene metadata."""
-    print(f"Querying EarthExplorer for NAIP imagery in bbox {bbox}...")
+    date_msg = f" since {start_date}" if start_date else ""
     results = send_m2m_request(
         "scene-search",
-        _scene_search_payload(bbox),
+        _scene_search_payload(bbox, start_date),
         api_key=api_key,
     )
     if not isinstance(results, dict):
@@ -252,9 +261,12 @@ def _query_naip_tiles_ee(
     return scenes
 
 
-def _bbox_manifest_key(bbox: BBox) -> str:
+def _bbox_manifest_key(bbox: BBox, start_date: Optional[str] = None) -> str:
     """Return a stable, human-readable key for a bbox in the metadata manifest."""
-    return json.dumps(list(bbox), separators=(",", ":"))
+    base = list(bbox)
+    if start_date:
+        base.append(start_date)
+    return json.dumps(base, separators=(",", ":"))
 
 
 def _manifest_path(cache_dir: str) -> str:
@@ -262,10 +274,11 @@ def _manifest_path(cache_dir: str) -> str:
     return os.path.join(cache_dir, "naip_metadata", "manifest.db")
 
 
-def _manifest_record(bbox: BBox, split: bool, scenes: List[Any]) -> dict[str, Any]:
+def _manifest_record(bbox: BBox, split: bool, scenes: List[Any], start_date: Optional[str] = None) -> dict[str, Any]:
     """Build one metadata record for a queried bbox."""
     return {
         "bbox": list(bbox),
+        "start_date": start_date,
         "split": split,
         "queried_at": time.time(),
         "scenes": [] if split else scenes,
@@ -321,8 +334,15 @@ class ManifestStore:
         if row is None:
             return None
         split, queried_at, scenes = row
+        
+        # Determine bbox and start_date from key
+        key_list = json.loads(bbox_key)
+        bbox = key_list[:4]
+        start_date = key_list[4] if len(key_list) > 4 else None
+
         return {
-            "bbox": json.loads(bbox_key),
+            "bbox": bbox,
+            "start_date": start_date,
             "split": bool(split),
             "queried_at": queried_at,
             "scenes": json.loads(scenes) if scenes else [],
@@ -332,7 +352,7 @@ class ManifestStore:
         """Insert or refresh the record for a bbox key."""
         self._upsert(
             (
-                _bbox_manifest_key(tuple(record["bbox"])),
+                _bbox_manifest_key(tuple(record["bbox"]), record.get("start_date")),
                 int(bool(record.get("split"))),
                 record.get("queried_at", time.time()),
                 json.dumps(record.get("scenes", []), default=str),
@@ -421,6 +441,7 @@ def _discover_naip_tiles_ee_recursive(
     extent_geometry: Optional[Any],
     split_depth: int,
     manifest: ManifestStore,
+    start_date: Optional[str] = None,
 ) -> List[Any]:
     """Query a bbox and recursively subdivide result sets near the API limit.
 
@@ -430,7 +451,12 @@ def _discover_naip_tiles_ee_recursive(
     if extent_geometry is not None and not _bbox_intersects_geometry(bbox, extent_geometry):
         return []
 
-    recorded = manifest.get(_bbox_manifest_key(bbox))
+    recorded = manifest.get(_bbox_manifest_key(bbox, start_date))
+    
+    # Fallback to existing metadata without temporal limit
+    if recorded is None and start_date is not None:
+        recorded = manifest.get(_bbox_manifest_key(bbox, None))
+        
     if recorded is not None:
         if recorded.get("split"):
             split_bboxes = _split_bbox(bbox)
@@ -445,16 +471,29 @@ def _discover_naip_tiles_ee_recursive(
                         extent_geometry,
                         split_depth + 1,
                         manifest,
+                        start_date,
                     )
                 )
             return _deduplicate_scenes(child_scenes)
-        print(f"Using incremental metadata for bbox {bbox}.")
+        date_msg = f" since {start_date}" if start_date else ""
+        print(f"Using incremental metadata for bbox {bbox}{date_msg}.")
         scenes = recorded.get("scenes", [])
-        return scenes if isinstance(scenes, list) else []
+        if isinstance(scenes, list):
+            if start_date is not None:
+                filtered = []
+                for s in scenes:
+                    tc = s.get("temporalCoverage", {})
+                    sd = tc.get("startDate")
+                    if sd and sd[:10] < start_date:
+                        continue
+                    filtered.append(s)
+                return filtered
+            return scenes
+        return []
 
-    scenes = _query_naip_tiles_ee(bbox, api_key)
+    scenes = _query_naip_tiles_ee(bbox, api_key, start_date)
     if len(scenes) <= EE_SPLIT_THRESHOLD:
-        manifest.put(_manifest_record(bbox, split=False, scenes=scenes))
+        manifest.put(_manifest_record(bbox, split=False, scenes=scenes, start_date=start_date))
         return scenes
 
     split_bboxes = _split_bbox(bbox)
@@ -463,14 +502,14 @@ def _discover_naip_tiles_ee_recursive(
             f"Warning: EarthExplorer returned {len(scenes)} scenes for bbox {bbox}; "
             "using the capped result set because it cannot be subdivided further."
         )
-        manifest.put(_manifest_record(bbox, split=False, scenes=scenes))
+        manifest.put(_manifest_record(bbox, split=False, scenes=scenes, start_date=start_date))
         return scenes
 
     print(
         f"EarthExplorer returned {len(scenes)} scenes (over {EE_SPLIT_THRESHOLD}); "
         f"splitting bbox at depth {split_depth + 1}."
     )
-    manifest.put(_manifest_record(bbox, split=True, scenes=[]))
+    manifest.put(_manifest_record(bbox, split=True, scenes=[], start_date=start_date))
 
     child_scenes = []
     for child_bbox in split_bboxes:
@@ -481,6 +520,7 @@ def _discover_naip_tiles_ee_recursive(
                 extent_geometry,
                 split_depth + 1,
                 manifest,
+                start_date,
             )
         )
     return _deduplicate_scenes(child_scenes)
@@ -523,6 +563,9 @@ def discover_naip_tiles_ee(
             f"Loaded {count} cached bbox records from the NAIP metadata store."
         )
 
+    three_years_ago = datetime.now() - relativedelta.relativedelta(years=3)
+    recent_start = three_years_ago.strftime('%Y-%m-%d')
+
     try:
         for query_region in query_regions:
             query_bbox = bbox
@@ -545,7 +588,18 @@ def discover_naip_tiles_ee(
                     query_region,
                     split_depth=0,
                     manifest=manifest,
+                    start_date=recent_start,
                 )
+                if not cell_scenes:
+                    print(f"No recent scenes (since {recent_start}) found in {initial_bbox}; falling back to full temporal search.")
+                    cell_scenes = _discover_naip_tiles_ee_recursive(
+                        initial_bbox,
+                        api_key,
+                        query_region,
+                        split_depth=0,
+                        manifest=manifest,
+                        start_date=None,
+                    )
                 if per_cell_callback is not None:
                     if cell_scenes:
                         per_cell_callback(cell_scenes)
