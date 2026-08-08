@@ -335,6 +335,14 @@ def test_discover_naip_tiles_ee_resumes_split_without_requerying_parent(
     assert second == first
 
 
+def _incremental_discover_stub(scenes: list[Any], kwargs: dict[str, Any]) -> list[Any]:
+    callback = kwargs.get("per_cell_callback")
+    if callback:
+        callback(scenes)
+        return []
+    return scenes
+
+
 def test_handle_naip_workflow_combines_earth_explorer_and_island_sources(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -359,7 +367,7 @@ def test_handle_naip_workflow_combines_earth_explorer_and_island_sources(
     monkeypatch.setattr(
         land_naip,
         "discover_naip_tiles_ee",
-        lambda bbox, api_key, **kwargs: [scene],
+        lambda bbox, api_key, **kwargs: _incremental_discover_stub([scene], kwargs),
     )
     monkeypatch.setattr(
         land_naip,

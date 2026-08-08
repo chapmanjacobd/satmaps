@@ -9,7 +9,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from typing import List, Optional, Sequence, Tuple, Any
+from typing import Callable, List, Optional, Sequence, Tuple, Any
 
 BBox = Tuple[float, float, float, float]
 
@@ -492,10 +492,16 @@ def discover_naip_tiles_ee(
     cache_dir: str = "cache",
     extent_geometry: Optional[Any] = None,
     extent_geometries: Optional[Sequence[Any]] = None,
+    per_cell_callback: Optional[Callable[[List[Any]], None]] = None,
 ) -> List[Any]:
     """
     Query EarthExplorer for NAIP tiles, subdividing spatial searches near its
     500-result limit and caching each metadata response for 90 days.
+
+    When *per_cell_callback* is provided, scenes from each initial grid cell
+    are passed to the callback immediately instead of being accumulated into a
+    monolithic list, so a single-cell's worth of scenes is held in memory at a
+    time. The return value is an empty list in that mode.
     """
     if not bbox:
         print("Warning: No bounding box provided. Please provide --bbox.")
@@ -533,17 +539,22 @@ def discover_naip_tiles_ee(
                     f"cells (maximum span {EE_INITIAL_MAX_BBOX_SPAN_DEGREES:g} degrees)."
                 )
             for initial_bbox in initial_bboxes:
-                scenes.extend(
-                    _discover_naip_tiles_ee_recursive(
-                        initial_bbox,
-                        api_key,
-                        query_region,
-                        split_depth=0,
-                        manifest=manifest,
-                    )
+                cell_scenes = _discover_naip_tiles_ee_recursive(
+                    initial_bbox,
+                    api_key,
+                    query_region,
+                    split_depth=0,
+                    manifest=manifest,
                 )
+                if per_cell_callback is not None:
+                    if cell_scenes:
+                        per_cell_callback(cell_scenes)
+                else:
+                    scenes.extend(cell_scenes)
     finally:
         manifest.close()
+    if per_cell_callback is not None:
+        return []
     return _deduplicate_scenes(scenes)
 
 def _bbox_overlaps(bbox_a: BBox, bbox_b: BBox) -> bool:
@@ -863,19 +874,9 @@ def handle_naip_workflow(
     api_key: Optional[str] = None
     try:
         api_key = m2m_login()
-        scenes = discover_naip_tiles_ee(
-            requested_bbox,
-            api_key,
-            cache_dir=cache_dir,
-            extent_geometry=extent_geometry,
-            extent_geometries=extent_geometries,
-        )
 
-        if scenes and requested_bbox:
+        if requested_bbox:
             from osgeo import ogr
-            import json
-
-            scenes.sort(key=lambda s: s.get('temporalCoverage', {}).get('startDate', ''), reverse=True)
 
             if extent_geometry is not None:
                 target_poly = extent_geometry.Clone()
@@ -891,33 +892,60 @@ def handle_naip_workflow(
                 target_poly.AddGeometry(ring)
 
             coverage_union = ogr.Geometry(ogr.wkbPolygon)
-            filtered_scenes = []
+            filtered_scenes: List[Any] = []
+            total_discovered = 0
 
-            for s in scenes:
-                geom_dict = s.get("spatialCoverage")
-                if not geom_dict:
-                    continue
-                try:
-                    scene_poly = ogr.CreateGeometryFromJson(json.dumps(geom_dict))
-                except Exception:
-                    continue
-
-                uncovered = target_poly.Difference(coverage_union)
-                if scene_poly.Intersects(uncovered):
+            def _per_cell_callback(cell_scenes: List[Any]) -> None:
+                nonlocal total_discovered, coverage_union
+                total_discovered += len(cell_scenes)
+                cell_scenes.sort(
+                    key=lambda s: s.get("temporalCoverage", {}).get("startDate", ""),
+                    reverse=True,
+                )
+                for s in cell_scenes:
+                    geom_dict = s.get("spatialCoverage")
+                    if not geom_dict:
+                        continue
+                    try:
+                        scene_poly = ogr.CreateGeometryFromJson(json.dumps(geom_dict))
+                    except Exception:
+                        continue
+                    uncovered = target_poly.Difference(coverage_union)
+                    if not scene_poly.Intersects(uncovered):
+                        continue
                     intersection = scene_poly.Intersection(uncovered)
-                    if intersection and intersection.GetArea() > 1e-8:
-                        filtered_scenes.append(s)
-                        if coverage_union.IsEmpty():
-                            coverage_union = scene_poly.Clone()
-                        else:
-                            coverage_union = coverage_union.Union(scene_poly)
+                    if not intersection or intersection.GetArea() <= 1e-8:
+                        continue
+                    filtered_scenes.append(s)
+                    if coverage_union.IsEmpty():
+                        coverage_union = scene_poly.Clone()
+                    else:
+                        coverage_union = coverage_union.Union(scene_poly)
+                    if target_poly.Difference(coverage_union).GetArea() < 1e-8:
+                        break
 
-                        if target_poly.Difference(coverage_union).GetArea() < 1e-8:
-                            break
-
+            scenes = discover_naip_tiles_ee(
+                requested_bbox,
+                api_key,
+                cache_dir=cache_dir,
+                extent_geometry=extent_geometry,
+                extent_geometries=extent_geometries,
+                per_cell_callback=_per_cell_callback,
+            )
             desc = "extent geometry" if extent_geometry is not None else "bounding box"
-            print(f"Greedy spatial fill selected {len(filtered_scenes)} out of {len(scenes)} scenes to cover the {desc}.")
+            print(
+                f"Greedy spatial fill selected {len(filtered_scenes)} "
+                f"out of {total_discovered} scenes to cover the {desc}."
+            )
             scenes = filtered_scenes
+        else:
+            scenes = discover_naip_tiles_ee(
+                requested_bbox,
+                api_key,
+                cache_dir=cache_dir,
+                extent_geometry=extent_geometry,
+                extent_geometries=extent_geometries,
+            )
 
         if scenes:
             print("NAIP pipeline via EarthExplorer initiated.")
