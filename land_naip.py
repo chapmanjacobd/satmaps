@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import concurrent.futures
-import hashlib
 import json
 import math
 import os
@@ -15,10 +14,10 @@ BBox = Tuple[float, float, float, float]
 
 M2M_BASE_URL = "https://m2m.cr.usgs.gov/api/api/json/stable"
 NAIP_METADATA_CACHE_MAX_AGE_DAYS = 90
-EE_MAX_RESULTS = 500
-EE_SPLIT_THRESHOLD = 480
+EE_MAX_RESULTS = 4000
+EE_SPLIT_THRESHOLD = 3980
 EE_MAX_SPLIT_DEPTH = 12
-EE_INITIAL_MAX_BBOX_SPAN_DEGREES = 5.0
+EE_INITIAL_MAX_BBOX_SPAN_DEGREES = 2.0
 
 DIGITAL_COAST_DATASETS: List[dict[str, Any]] = [
     {
@@ -107,17 +106,6 @@ def _scene_search_payload(bbox: BBox) -> dict[str, Any]:
         },
         "maxResults": EE_MAX_RESULTS,
     }
-
-
-def _scene_search_cache_path(cache_dir: str, bbox: BBox) -> str:
-    """Return a stable cache path for one EarthExplorer scene-search request."""
-    cache_key = json.dumps(
-        _scene_search_payload(bbox),
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    digest = hashlib.sha256(cache_key).hexdigest()[:20]
-    return os.path.join(cache_dir, "naip_metadata", f"scene-search-{digest}.json")
 
 
 def _load_fresh_json_cache(cache_path: str, max_age_days: int) -> Optional[Any]:
@@ -246,19 +234,14 @@ def _deduplicate_scenes(scenes: List[Any]) -> List[Any]:
 def _query_naip_tiles_ee(
     bbox: BBox,
     api_key: str,
-    cache_dir: str,
 ) -> List[Any]:
-    """Query one EarthExplorer bbox, using a 90-day metadata cache."""
-    payload = _scene_search_payload(bbox)
-    cache_path = _scene_search_cache_path(cache_dir, bbox)
-    results = _load_fresh_json_cache(cache_path, NAIP_METADATA_CACHE_MAX_AGE_DAYS)
-    if results is None:
-        print(f"Querying EarthExplorer for NAIP imagery in bbox {bbox}...")
-        results = send_m2m_request("scene-search", payload, api_key=api_key)
-        _write_json_cache(cache_path, results)
-    else:
-        print(f"Using cached EarthExplorer metadata for bbox {bbox}.")
-
+    """Query one EarthExplorer bbox for NAIP scene metadata."""
+    print(f"Querying EarthExplorer for NAIP imagery in bbox {bbox}...")
+    results = send_m2m_request(
+        "scene-search",
+        _scene_search_payload(bbox),
+        api_key=api_key,
+    )
     if not isinstance(results, dict):
         raise RuntimeError("EarthExplorer scene-search returned an invalid response.")
     scenes = results.get("results", [])
@@ -268,19 +251,122 @@ def _query_naip_tiles_ee(
     return scenes
 
 
+def _bbox_manifest_key(bbox: BBox) -> str:
+    """Return a stable, human-readable key for a bbox in the metadata manifest."""
+    return json.dumps(list(bbox), separators=(",", ":"))
+
+
+def _manifest_path(cache_dir: str) -> str:
+    """Return the path to the incremental NAIP metadata manifest."""
+    return os.path.join(cache_dir, "naip_metadata", "manifest.jsonl")
+
+
+def _load_manifest(cache_dir: str) -> dict[str, dict[str, Any]]:
+    """Load fresh records from the incremental metadata manifest.
+
+    Returns a dict keyed by bbox key. Malformed or expired lines are skipped so
+    a partially-written tail line does not discard earlier progress.
+    """
+    path = _manifest_path(cache_dir)
+    entries: dict[str, dict[str, Any]] = {}
+    if not os.path.exists(path):
+        return entries
+
+    max_age_seconds = NAIP_METADATA_CACHE_MAX_AGE_DAYS * 24 * 60 * 60
+    now = time.time()
+    try:
+        with open(path) as f:
+            for line_number, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    print(
+                        f"Warning: Ignoring malformed manifest line {line_number} in {path}."
+                    )
+                    continue
+                bbox = record.get("bbox")
+                if not bbox or len(bbox) != 4:
+                    continue
+                if now - record.get("queried_at", 0) >= max_age_seconds:
+                    continue
+                entries[_bbox_manifest_key(tuple(bbox))] = record
+    except OSError as exc:
+        print(f"Warning: Ignoring unreadable metadata manifest {path}: {exc}")
+        return {}
+    return entries
+
+
+def _record_manifest_entry(
+    cache_dir: str,
+    bbox: BBox,
+    split: bool,
+    scenes: List[Any],
+) -> None:
+    """Append one bbox record to the incremental metadata manifest."""
+    path = _manifest_path(cache_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    record: dict[str, Any] = {
+        "bbox": list(bbox),
+        "split": split,
+        "queried_at": time.time(),
+    }
+    if not split:
+        record["scenes"] = scenes
+    with open(path, "a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
 def _discover_naip_tiles_ee_recursive(
     bbox: BBox,
     api_key: str,
     cache_dir: str,
     extent_geometry: Optional[Any],
     split_depth: int,
+    manifest: dict[str, dict[str, Any]],
 ) -> List[Any]:
-    """Query a bbox and recursively subdivide result sets near the API limit."""
+    """Query a bbox and recursively subdivide result sets near the API limit.
+
+    Every queried bbox is recorded in the manifest so an interrupted run can
+    resume without re-querying, including bboxes that returned zero scenes.
+    """
     if extent_geometry is not None and not _bbox_intersects_geometry(bbox, extent_geometry):
         return []
 
-    scenes = _query_naip_tiles_ee(bbox, api_key, cache_dir)
+    recorded = manifest.get(_bbox_manifest_key(bbox))
+    if recorded is not None:
+        if recorded.get("split"):
+            split_bboxes = _split_bbox(bbox)
+            if split_bboxes is None:
+                return []
+            child_scenes: List[Any] = []
+            for child_bbox in split_bboxes:
+                child_scenes.extend(
+                    _discover_naip_tiles_ee_recursive(
+                        child_bbox,
+                        api_key,
+                        cache_dir,
+                        extent_geometry,
+                        split_depth + 1,
+                        manifest,
+                    )
+                )
+            return _deduplicate_scenes(child_scenes)
+        print(f"Using incremental metadata for bbox {bbox}.")
+        scenes = recorded.get("scenes", [])
+        return scenes if isinstance(scenes, list) else []
+
+    scenes = _query_naip_tiles_ee(bbox, api_key)
     if len(scenes) <= EE_SPLIT_THRESHOLD:
+        _record_manifest_entry(cache_dir, bbox, split=False, scenes=scenes)
+        manifest[_bbox_manifest_key(bbox)] = {
+            "bbox": list(bbox),
+            "split": False,
+            "queried_at": time.time(),
+            "scenes": scenes,
+        }
         return scenes
 
     split_bboxes = _split_bbox(bbox)
@@ -289,13 +375,27 @@ def _discover_naip_tiles_ee_recursive(
             f"Warning: EarthExplorer returned {len(scenes)} scenes for bbox {bbox}; "
             "using the capped result set because it cannot be subdivided further."
         )
+        _record_manifest_entry(cache_dir, bbox, split=False, scenes=scenes)
+        manifest[_bbox_manifest_key(bbox)] = {
+            "bbox": list(bbox),
+            "split": False,
+            "queried_at": time.time(),
+            "scenes": scenes,
+        }
         return scenes
 
     print(
         f"EarthExplorer returned {len(scenes)} scenes (over {EE_SPLIT_THRESHOLD}); "
         f"splitting bbox at depth {split_depth + 1}."
     )
-    child_scenes: List[Any] = []
+    _record_manifest_entry(cache_dir, bbox, split=True, scenes=[])
+    manifest[_bbox_manifest_key(bbox)] = {
+        "bbox": list(bbox),
+        "split": True,
+        "queried_at": time.time(),
+    }
+
+    child_scenes = []
     for child_bbox in split_bboxes:
         child_scenes.extend(
             _discover_naip_tiles_ee_recursive(
@@ -304,6 +404,7 @@ def _discover_naip_tiles_ee_recursive(
                 cache_dir,
                 extent_geometry,
                 split_depth + 1,
+                manifest,
             )
         )
     return _deduplicate_scenes(child_scenes)
@@ -332,6 +433,12 @@ def discover_naip_tiles_ee(
     else:
         query_regions = [None]
 
+    manifest = _load_manifest(cache_dir)
+    if manifest:
+        print(
+            f"Loaded {len(manifest)} cached bbox records from the NAIP metadata manifest."
+        )
+
     for query_region in query_regions:
         query_bbox = bbox
         if query_region is not None:
@@ -354,6 +461,7 @@ def discover_naip_tiles_ee(
                     cache_dir,
                     query_region,
                     split_depth=0,
+                    manifest=manifest,
                 )
             )
     return _deduplicate_scenes(scenes)

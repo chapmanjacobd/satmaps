@@ -1,4 +1,4 @@
-import os
+import json
 import sys
 import time
 from argparse import Namespace
@@ -25,7 +25,7 @@ def _payload_bbox(payload: dict[str, Any]) -> land_naip.BBox:
 def test_discover_naip_tiles_ee_splits_capped_searches(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    root_bbox = (-2.0, 0.0, 2.0, 4.0)
+    root_bbox = (-1.0, 0.0, 1.0, 2.0)
     queried_bboxes: list[land_naip.BBox] = []
 
     def fake_request(endpoint: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
@@ -33,7 +33,7 @@ def test_discover_naip_tiles_ee_splits_capped_searches(
         bbox = _payload_bbox(payload)
         queried_bboxes.append(bbox)
         if bbox == root_bbox:
-            return {"results": [{"entityId": f"root-{index}"} for index in range(500)]}
+            return {"results": [{"entityId": f"root-{index}"} for index in range(land_naip.EE_MAX_RESULTS)]}
         return {"results": [{"entityId": f"child-{bbox}"}]}
 
     monkeypatch.setattr(land_naip, "send_m2m_request", fake_request)
@@ -46,16 +46,16 @@ def test_discover_naip_tiles_ee_splits_capped_searches(
 
     assert queried_bboxes == [
         root_bbox,
-        (-2.0, 0.0, 0.0, 2.0),
-        (0.0, 0.0, 2.0, 2.0),
-        (-2.0, 2.0, 0.0, 4.0),
-        (0.0, 2.0, 2.0, 4.0),
+        (-1.0, 0.0, 0.0, 1.0),
+        (0.0, 0.0, 1.0, 1.0),
+        (-1.0, 1.0, 0.0, 2.0),
+        (0.0, 1.0, 1.0, 2.0),
     ]
     assert [scene["entityId"] for scene in scenes] == [
-        "child-(-2.0, 0.0, 0.0, 2.0)",
-        "child-(0.0, 0.0, 2.0, 2.0)",
-        "child-(-2.0, 2.0, 0.0, 4.0)",
-        "child-(0.0, 2.0, 2.0, 4.0)",
+        "child-(-1.0, 0.0, 0.0, 1.0)",
+        "child-(0.0, 0.0, 1.0, 1.0)",
+        "child-(-1.0, 1.0, 0.0, 2.0)",
+        "child-(0.0, 1.0, 1.0, 2.0)",
     ]
 
 
@@ -107,9 +107,22 @@ def test_discover_naip_tiles_ee_prunes_cells_outside_geometry(
     )
 
     assert queried_bboxes == [
-        (0.0, 0.0, 5.0, 5.0),
-        (0.0, 5.0, 5.0, 10.0),
-        (5.0, 5.0, 10.0, 10.0),
+        (0.0, 0.0, 2.0, 2.0),
+        (2.0, 0.0, 4.0, 2.0),
+        (0.0, 2.0, 2.0, 4.0),
+        (2.0, 2.0, 4.0, 4.0),
+        (0.0, 4.0, 2.0, 6.0),
+        (2.0, 4.0, 4.0, 6.0),
+        (0.0, 6.0, 2.0, 8.0),
+        (2.0, 6.0, 4.0, 8.0),
+        (4.0, 6.0, 6.0, 8.0),
+        (6.0, 6.0, 8.0, 8.0),
+        (8.0, 6.0, 10.0, 8.0),
+        (0.0, 8.0, 2.0, 10.0),
+        (2.0, 8.0, 4.0, 10.0),
+        (4.0, 8.0, 6.0, 10.0),
+        (6.0, 8.0, 8.0, 10.0),
+        (8.0, 8.0, 10.0, 10.0),
     ]
 
 
@@ -178,9 +191,12 @@ def test_discover_naip_tiles_ee_reuses_metadata_until_expired(
     land_naip.discover_naip_tiles_ee(bbox, "api-key", cache_dir=str(tmp_path))
     assert calls == 1
 
-    cache_path = next(tmp_path.glob("naip_metadata/*.json"))
-    expired_at = time.time() - (land_naip.NAIP_METADATA_CACHE_MAX_AGE_DAYS + 1) * 24 * 60 * 60
-    os.utime(cache_path, (expired_at, expired_at))
+    manifest_path = tmp_path / "naip_metadata" / "manifest.jsonl"
+    record = json.loads(manifest_path.read_text().strip())
+    record["queried_at"] = time.time() - (
+        land_naip.NAIP_METADATA_CACHE_MAX_AGE_DAYS + 1
+    ) * 24 * 60 * 60
+    manifest_path.write_text(json.dumps(record) + "\n")
 
     land_naip.discover_naip_tiles_ee(bbox, "api-key", cache_dir=str(tmp_path))
     assert calls == 2
@@ -206,6 +222,80 @@ def test_large_bbox_cache_is_reused_for_nearby_extent(
 
     assert first_call_count == len(land_naip._initial_query_bboxes(first_bbox))
     assert calls == first_call_count
+
+
+def test_discover_naip_tiles_ee_negative_caches_zero_results(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    calls: list[land_naip.BBox] = []
+
+    def fake_request(endpoint: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+        calls.append(_payload_bbox(payload))
+        return {"results": []}
+
+    monkeypatch.setattr(land_naip, "send_m2m_request", fake_request)
+    bbox = (-68.0, 18.0, -66.0, 20.0)
+
+    first = land_naip.discover_naip_tiles_ee(bbox, "api-key", cache_dir=str(tmp_path))
+    second = land_naip.discover_naip_tiles_ee(bbox, "api-key", cache_dir=str(tmp_path))
+
+    assert first == []
+    assert second == []
+    assert len(calls) == 1
+
+    manifest_path = tmp_path / "naip_metadata" / "manifest.jsonl"
+    assert manifest_path.exists()
+    assert '"bbox"' in manifest_path.read_text()
+    assert '"scenes": []' in manifest_path.read_text()
+
+
+def test_discover_naip_tiles_ee_resumes_from_manifest(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    calls = 0
+
+    def fake_request(endpoint: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        bbox = _payload_bbox(payload)
+        return {"results": [{"entityId": f"scene-{bbox}-{calls}"}]}
+
+    monkeypatch.setattr(land_naip, "send_m2m_request", fake_request)
+    bbox = (-1.0, 0.0, 1.0, 1.0)
+
+    first = land_naip.discover_naip_tiles_ee(bbox, "api-key", cache_dir=str(tmp_path))
+    assert calls == 1
+    assert first
+
+    second = land_naip.discover_naip_tiles_ee(bbox, "api-key", cache_dir=str(tmp_path))
+    assert calls == 1
+    assert second == first
+
+
+def test_discover_naip_tiles_ee_resumes_split_without_requerying_parent(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    root_bbox = (-1.0, 0.0, 1.0, 2.0)
+    queried_bboxes: list[land_naip.BBox] = []
+
+    def fake_request(endpoint: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+        assert endpoint == "scene-search"
+        bbox = _payload_bbox(payload)
+        queried_bboxes.append(bbox)
+        if bbox == root_bbox:
+            return {"results": [{"entityId": f"root-{index}"} for index in range(land_naip.EE_MAX_RESULTS)]}
+        return {"results": [{"entityId": f"child-{bbox}"}]}
+
+    monkeypatch.setattr(land_naip, "send_m2m_request", fake_request)
+
+    first = land_naip.discover_naip_tiles_ee(root_bbox, "api-key", cache_dir=str(tmp_path))
+    first_queries = list(queried_bboxes)
+    assert root_bbox in first_queries
+    assert len(first) == 4
+
+    second = land_naip.discover_naip_tiles_ee(root_bbox, "api-key", cache_dir=str(tmp_path))
+    assert queried_bboxes == first_queries
+    assert second == first
 
 
 def test_handle_naip_workflow_combines_earth_explorer_and_island_sources(
