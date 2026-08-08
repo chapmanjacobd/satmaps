@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 import time
 from argparse import Namespace
@@ -191,12 +192,15 @@ def test_discover_naip_tiles_ee_reuses_metadata_until_expired(
     land_naip.discover_naip_tiles_ee(bbox, "api-key", cache_dir=str(tmp_path))
     assert calls == 1
 
-    manifest_path = tmp_path / "naip_metadata" / "manifest.jsonl"
-    record = json.loads(manifest_path.read_text().strip())
-    record["queried_at"] = time.time() - (
-        land_naip.NAIP_METADATA_CACHE_MAX_AGE_DAYS + 1
-    ) * 24 * 60 * 60
-    manifest_path.write_text(json.dumps(record) + "\n")
+    db_path = tmp_path / "naip_metadata" / "manifest.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE manifest SET queried_at = ?",
+            (
+                time.time()
+                - (land_naip.NAIP_METADATA_CACHE_MAX_AGE_DAYS + 1) * 24 * 60 * 60,
+            ),
+        )
 
     land_naip.discover_naip_tiles_ee(bbox, "api-key", cache_dir=str(tmp_path))
     assert calls == 2
@@ -243,10 +247,14 @@ def test_discover_naip_tiles_ee_negative_caches_zero_results(
     assert second == []
     assert len(calls) == 1
 
-    manifest_path = tmp_path / "naip_metadata" / "manifest.jsonl"
-    assert manifest_path.exists()
-    assert '"bbox"' in manifest_path.read_text()
-    assert '"scenes": []' in manifest_path.read_text()
+    db_path = tmp_path / "naip_metadata" / "manifest.db"
+    assert db_path.exists()
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT bbox_key, split, scenes FROM manifest").fetchall()
+    assert len(rows) == 1
+    assert json.loads(rows[0][0]) == [bbox[0], bbox[1], bbox[2], bbox[3]]
+    assert rows[0][1] == 0
+    assert json.loads(rows[0][2]) == []
 
 
 def test_discover_naip_tiles_ee_resumes_from_manifest(
@@ -270,6 +278,35 @@ def test_discover_naip_tiles_ee_resumes_from_manifest(
     second = land_naip.discover_naip_tiles_ee(bbox, "api-key", cache_dir=str(tmp_path))
     assert calls == 1
     assert second == first
+
+
+def test_migrates_legacy_jsonl_manifest(tmp_path: Path, monkeypatch: Any) -> None:
+    calls = 0
+
+    def fake_request(endpoint: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"results": [{"entityId": "should-not-be-queried"}]}
+
+    monkeypatch.setattr(land_naip, "send_m2m_request", fake_request)
+    bbox = (-1.0, 0.0, 1.0, 1.0)
+
+    manifest_path = tmp_path / "naip_metadata" / "manifest.jsonl"
+    manifest_path.parent.mkdir(parents=True)
+    record = {
+        "bbox": list(bbox),
+        "split": False,
+        "queried_at": time.time(),
+        "scenes": [{"entityId": "cached-scene-1"}],
+    }
+    manifest_path.write_text(json.dumps(record) + "\n")
+
+    scenes = land_naip.discover_naip_tiles_ee(bbox, "api-key", cache_dir=str(tmp_path))
+
+    assert calls == 0
+    assert scenes == [{"entityId": "cached-scene-1"}]
+    assert not manifest_path.exists()
+    assert (tmp_path / "naip_metadata" / "manifest.db").exists()
 
 
 def test_discover_naip_tiles_ee_resumes_split_without_requerying_parent(

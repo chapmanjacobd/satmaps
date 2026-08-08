@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 import math
 import os
+import sqlite3
 import sys
 import time
 import urllib.parse
@@ -257,75 +258,169 @@ def _bbox_manifest_key(bbox: BBox) -> str:
 
 
 def _manifest_path(cache_dir: str) -> str:
-    """Return the path to the incremental NAIP metadata manifest."""
-    return os.path.join(cache_dir, "naip_metadata", "manifest.jsonl")
+    """Return the path to the SQLite NAIP metadata manifest."""
+    return os.path.join(cache_dir, "naip_metadata", "manifest.db")
 
 
-def _load_manifest(cache_dir: str) -> dict[str, dict[str, Any]]:
-    """Load fresh records from the incremental metadata manifest.
-
-    Returns a dict keyed by bbox key. Malformed or expired lines are skipped so
-    a partially-written tail line does not discard earlier progress.
-    """
-    path = _manifest_path(cache_dir)
-    entries: dict[str, dict[str, Any]] = {}
-    if not os.path.exists(path):
-        return entries
-
-    max_age_seconds = NAIP_METADATA_CACHE_MAX_AGE_DAYS * 24 * 60 * 60
-    now = time.time()
-    try:
-        with open(path) as f:
-            for line_number, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    print(
-                        f"Warning: Ignoring malformed manifest line {line_number} in {path}."
-                    )
-                    continue
-                bbox = record.get("bbox")
-                if not bbox or len(bbox) != 4:
-                    continue
-                if now - record.get("queried_at", 0) >= max_age_seconds:
-                    continue
-                entries[_bbox_manifest_key(tuple(bbox))] = record
-    except OSError as exc:
-        print(f"Warning: Ignoring unreadable metadata manifest {path}: {exc}")
-        return {}
-    return entries
-
-
-def _record_manifest_entry(
-    cache_dir: str,
-    bbox: BBox,
-    split: bool,
-    scenes: List[Any],
-) -> None:
-    """Append one bbox record to the incremental metadata manifest."""
-    path = _manifest_path(cache_dir)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    record: dict[str, Any] = {
+def _manifest_record(bbox: BBox, split: bool, scenes: List[Any]) -> dict[str, Any]:
+    """Build one metadata record for a queried bbox."""
+    return {
         "bbox": list(bbox),
         "split": split,
         "queried_at": time.time(),
+        "scenes": [] if split else scenes,
     }
-    if not split:
-        record["scenes"] = scenes
-    with open(path, "a") as f:
-        f.write(json.dumps(record, default=str) + "\n")
+
+
+class ManifestStore:
+    """Random-access SQLite cache of per-bbox NAIP metadata.
+
+    Unlike an in-memory dict, only the record for the bbox being examined is
+    loaded at a time, so the cache can grow to many gigabytes without using
+    corresponding amounts of RAM. Expired entries are pruned on open so the
+    database does not grow without bound.
+    """
+
+    def __init__(self, cache_dir: str) -> None:
+        self._path = _manifest_path(cache_dir)
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        self.conn = sqlite3.connect(self._path)
+        self.conn.execute("PRAGMA busy_timeout=10000")
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS manifest (
+                bbox_key TEXT PRIMARY KEY,
+                split INTEGER NOT NULL,
+                queried_at REAL NOT NULL,
+                scenes TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS manifest_queried_at ON manifest(queried_at)"
+        )
+        self.conn.commit()
+        self._expire()
+
+    def _expire(self) -> None:
+        """Drop records older than the cache TTL."""
+        cutoff = time.time() - NAIP_METADATA_CACHE_MAX_AGE_DAYS * 24 * 60 * 60
+        self.conn.execute("DELETE FROM manifest WHERE queried_at < ?", (cutoff,))
+        self.conn.commit()
+
+    def __len__(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) FROM manifest").fetchone()
+        return row[0] if row else 0
+
+    def get(self, bbox_key: str) -> Optional[dict[str, Any]]:
+        """Return the recorded metadata for a bbox key, or None if uncached."""
+        row = self.conn.execute(
+            "SELECT split, queried_at, scenes FROM manifest WHERE bbox_key = ?",
+            (bbox_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        split, queried_at, scenes = row
+        return {
+            "bbox": json.loads(bbox_key),
+            "split": bool(split),
+            "queried_at": queried_at,
+            "scenes": json.loads(scenes) if scenes else [],
+        }
+
+    def put(self, record: dict[str, Any]) -> None:
+        """Insert or refresh the record for a bbox key."""
+        self._upsert(
+            (
+                _bbox_manifest_key(tuple(record["bbox"])),
+                int(bool(record.get("split"))),
+                record.get("queried_at", time.time()),
+                json.dumps(record.get("scenes", []), default=str),
+            )
+        )
+        self.conn.commit()
+
+    def insert_many(self, rows: List[Tuple[str, int, float, str]]) -> None:
+        """Bulk-upsert records, e.g. during migration."""
+        for row in rows:
+            self._upsert(row)
+
+    def _upsert(self, row: Tuple[str, int, float, str]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO manifest (bbox_key, split, queried_at, scenes)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(bbox_key) DO UPDATE SET
+                split = excluded.split,
+                queried_at = excluded.queried_at,
+                scenes = excluded.scenes
+            """,
+            row,
+        )
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def _migrate_jsonl_manifest(manifest: ManifestStore, cache_dir: str) -> None:
+    """Import a legacy append-only manifest.jsonl into the SQLite store.
+
+    Lines are streamed one at a time so the migration never needs to hold the
+    whole legacy file in memory. The legacy file is renamed (not deleted) after
+    a successful import.
+    """
+    path = os.path.join(cache_dir, "naip_metadata", "manifest.jsonl")
+    if not os.path.exists(path):
+        return
+
+    print(f"Migrating legacy {path} into the SQLite metadata store...")
+    max_age_seconds = NAIP_METADATA_CACHE_MAX_AGE_DAYS * 24 * 60 * 60
+    now = time.time()
+    migrated = 0
+    batch: List[Tuple[str, int, float, str]] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            bbox = record.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            if now - record.get("queried_at", 0) >= max_age_seconds:
+                continue
+            batch.append(
+                (
+                    _bbox_manifest_key(tuple(bbox)),
+                    int(bool(record.get("split"))),
+                    record.get("queried_at", now),
+                    json.dumps(record.get("scenes", []), default=str),
+                )
+            )
+            migrated += 1
+            if len(batch) >= 1000:
+                manifest.insert_many(batch)
+                manifest.conn.commit()
+                batch = []
+    if batch:
+        manifest.insert_many(batch)
+        manifest.conn.commit()
+    os.rename(path, f"{path}.bak")
+    print(
+        f"Migrated {migrated} records into the SQLite store; "
+        f"legacy file kept as {path}.bak"
+    )
 
 
 def _discover_naip_tiles_ee_recursive(
     bbox: BBox,
     api_key: str,
-    cache_dir: str,
     extent_geometry: Optional[Any],
     split_depth: int,
-    manifest: dict[str, dict[str, Any]],
+    manifest: ManifestStore,
 ) -> List[Any]:
     """Query a bbox and recursively subdivide result sets near the API limit.
 
@@ -347,7 +442,6 @@ def _discover_naip_tiles_ee_recursive(
                     _discover_naip_tiles_ee_recursive(
                         child_bbox,
                         api_key,
-                        cache_dir,
                         extent_geometry,
                         split_depth + 1,
                         manifest,
@@ -360,13 +454,7 @@ def _discover_naip_tiles_ee_recursive(
 
     scenes = _query_naip_tiles_ee(bbox, api_key)
     if len(scenes) <= EE_SPLIT_THRESHOLD:
-        _record_manifest_entry(cache_dir, bbox, split=False, scenes=scenes)
-        manifest[_bbox_manifest_key(bbox)] = {
-            "bbox": list(bbox),
-            "split": False,
-            "queried_at": time.time(),
-            "scenes": scenes,
-        }
+        manifest.put(_manifest_record(bbox, split=False, scenes=scenes))
         return scenes
 
     split_bboxes = _split_bbox(bbox)
@@ -375,25 +463,14 @@ def _discover_naip_tiles_ee_recursive(
             f"Warning: EarthExplorer returned {len(scenes)} scenes for bbox {bbox}; "
             "using the capped result set because it cannot be subdivided further."
         )
-        _record_manifest_entry(cache_dir, bbox, split=False, scenes=scenes)
-        manifest[_bbox_manifest_key(bbox)] = {
-            "bbox": list(bbox),
-            "split": False,
-            "queried_at": time.time(),
-            "scenes": scenes,
-        }
+        manifest.put(_manifest_record(bbox, split=False, scenes=scenes))
         return scenes
 
     print(
         f"EarthExplorer returned {len(scenes)} scenes (over {EE_SPLIT_THRESHOLD}); "
         f"splitting bbox at depth {split_depth + 1}."
     )
-    _record_manifest_entry(cache_dir, bbox, split=True, scenes=[])
-    manifest[_bbox_manifest_key(bbox)] = {
-        "bbox": list(bbox),
-        "split": True,
-        "queried_at": time.time(),
-    }
+    manifest.put(_manifest_record(bbox, split=True, scenes=[]))
 
     child_scenes = []
     for child_bbox in split_bboxes:
@@ -401,7 +478,6 @@ def _discover_naip_tiles_ee_recursive(
             _discover_naip_tiles_ee_recursive(
                 child_bbox,
                 api_key,
-                cache_dir,
                 extent_geometry,
                 split_depth + 1,
                 manifest,
@@ -433,37 +509,41 @@ def discover_naip_tiles_ee(
     else:
         query_regions = [None]
 
-    manifest = _load_manifest(cache_dir)
-    if manifest:
+    manifest = ManifestStore(cache_dir)
+    _migrate_jsonl_manifest(manifest, cache_dir)
+    count = len(manifest)
+    if count:
         print(
-            f"Loaded {len(manifest)} cached bbox records from the NAIP metadata manifest."
+            f"Loaded {count} cached bbox records from the NAIP metadata store."
         )
 
-    for query_region in query_regions:
-        query_bbox = bbox
-        if query_region is not None:
-            envelope = query_region.GetEnvelope()
-            query_bbox = (envelope[0], envelope[2], envelope[1], envelope[3])
-        if query_bbox is None:
-            continue
+    try:
+        for query_region in query_regions:
+            query_bbox = bbox
+            if query_region is not None:
+                envelope = query_region.GetEnvelope()
+                query_bbox = (envelope[0], envelope[2], envelope[1], envelope[3])
+            if query_bbox is None:
+                continue
 
-        initial_bboxes = _initial_query_bboxes(query_bbox)
-        if len(initial_bboxes) > 1:
-            print(
-                f"Splitting large NAIP search bbox into {len(initial_bboxes)} initial "
-                f"cells (maximum span {EE_INITIAL_MAX_BBOX_SPAN_DEGREES:g} degrees)."
-            )
-        for initial_bbox in initial_bboxes:
-            scenes.extend(
-                _discover_naip_tiles_ee_recursive(
-                    initial_bbox,
-                    api_key,
-                    cache_dir,
-                    query_region,
-                    split_depth=0,
-                    manifest=manifest,
+            initial_bboxes = _initial_query_bboxes(query_bbox)
+            if len(initial_bboxes) > 1:
+                print(
+                    f"Splitting large NAIP search bbox into {len(initial_bboxes)} initial "
+                    f"cells (maximum span {EE_INITIAL_MAX_BBOX_SPAN_DEGREES:g} degrees)."
                 )
-            )
+            for initial_bbox in initial_bboxes:
+                scenes.extend(
+                    _discover_naip_tiles_ee_recursive(
+                        initial_bbox,
+                        api_key,
+                        query_region,
+                        split_depth=0,
+                        manifest=manifest,
+                    )
+                )
+    finally:
+        manifest.close()
     return _deduplicate_scenes(scenes)
 
 def _bbox_overlaps(bbox_a: BBox, bbox_b: BBox) -> bool:

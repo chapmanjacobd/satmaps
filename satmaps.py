@@ -449,7 +449,6 @@ def convert_raster_to_pmtiles(
 
     effective_raster = input_raster
     if extent_geometry is not None:
-        import json
         masked_vrt = os.path.join(run_paths.output_temp_dir, f"extent_masked_{unique_id}.vrt")
         ensure_directory(os.path.dirname(masked_vrt))
         temp_geojson = os.path.join(run_paths.output_temp_dir, f"extent_mask_{unique_id}.geojson")
