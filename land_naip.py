@@ -910,6 +910,8 @@ def handle_naip_workflow(
                         scene_poly = ogr.CreateGeometryFromJson(json.dumps(geom_dict))
                     except Exception:
                         continue
+                    if scene_poly.GetGeometryType() not in (ogr.wkbPolygon, ogr.wkbMultiPolygon):
+                        continue
                     uncovered = target_poly.Difference(coverage_union)
                     if not scene_poly.Intersects(uncovered):
                         continue
