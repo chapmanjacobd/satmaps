@@ -929,14 +929,15 @@ def handle_naip_workflow(
                     if not scene_poly.Intersects(uncovered):
                         continue
                     intersection = scene_poly.Intersection(uncovered)
-                    if not intersection or intersection.GetArea() <= 1e-8:
+                    if not intersection or intersection.GetGeometryType() not in (ogr.wkbPolygon, ogr.wkbMultiPolygon) or intersection.GetArea() <= 1e-8:
                         continue
                     filtered_scenes.append(s)
                     if coverage_union.IsEmpty():
                         coverage_union = scene_poly.Clone()
                     else:
                         coverage_union = coverage_union.Union(scene_poly)
-                    if target_poly.Difference(coverage_union).GetArea() < 1e-8:
+                    diff = target_poly.Difference(coverage_union)
+                    if diff.GetGeometryType() not in (ogr.wkbPolygon, ogr.wkbMultiPolygon) or diff.GetArea() < 1e-8:
                         break
 
             scenes = discover_naip_tiles_ee(
