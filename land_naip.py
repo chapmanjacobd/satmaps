@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 import argparse
-import urllib.request
-import urllib.parse
+import concurrent.futures
+import hashlib
 import json
+import math
 import os
 import sys
 import time
-import concurrent.futures
+import urllib.parse
+import urllib.request
 from typing import List, Optional, Tuple, Any
 
 BBox = Tuple[float, float, float, float]
 
 M2M_BASE_URL = "https://m2m.cr.usgs.gov/api/api/json/stable"
+NAIP_METADATA_CACHE_MAX_AGE_DAYS = 90
+EE_MAX_RESULTS = 500
+EE_SPLIT_THRESHOLD = 480
+EE_MAX_SPLIT_DEPTH = 12
+EE_INITIAL_MAX_BBOX_SPAN_DEGREES = 5.0
 
 DIGITAL_COAST_DATASETS: List[dict[str, Any]] = [
     {
@@ -86,35 +93,235 @@ def m2m_logout(api_key: str) -> None:
     print("Logging out from EarthExplorer...")
     send_m2m_request("logout", {}, api_key=api_key)
 
-def discover_naip_tiles_ee(bbox: Optional[BBox], api_key: str) -> List[Any]:
-    """
-    Query the EarthExplorer M2M API for NAIP tiles intersecting the given bbox.
-    """
-    if not bbox:
-        print("Warning: No bounding box provided. Please provide --bbox.")
-        return []
-
+def _scene_search_payload(bbox: BBox) -> dict[str, Any]:
+    """Build the EarthExplorer scene-search request for one bounding box."""
     min_lon, min_lat, max_lon, max_lat = bbox
-    
-    # Construct an MBR (Minimum Bounding Rectangle) spatial filter
-    payload = {
+    return {
         "datasetName": "NAIP",
         "sceneFilter": {
             "spatialFilter": {
                 "filterType": "mbr",
                 "lowerLeft": {"latitude": min_lat, "longitude": min_lon},
-                "upperRight": {"latitude": max_lat, "longitude": max_lon}
+                "upperRight": {"latitude": max_lat, "longitude": max_lon},
             }
         },
-        "maxResults": 500
+        "maxResults": EE_MAX_RESULTS,
     }
-    
-    print(f"Querying EarthExplorer for NAIP imagery in bbox {bbox}...")
-    results = send_m2m_request("scene-search", payload, api_key=api_key)
-    
+
+
+def _scene_search_cache_path(cache_dir: str, bbox: BBox) -> str:
+    """Return a stable cache path for one EarthExplorer scene-search request."""
+    cache_key = json.dumps(
+        _scene_search_payload(bbox),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(cache_key).hexdigest()[:20]
+    return os.path.join(cache_dir, "naip_metadata", f"scene-search-{digest}.json")
+
+
+def _load_fresh_json_cache(cache_path: str, max_age_days: int) -> Optional[Any]:
+    """Load a JSON cache entry when it is present and has not expired."""
+    if not os.path.exists(cache_path):
+        return None
+
+    age_seconds = time.time() - os.path.getmtime(cache_path)
+    if age_seconds >= max_age_days * 24 * 60 * 60:
+        print(f"Cached metadata expired: {cache_path}")
+        return None
+
+    try:
+        with open(cache_path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Warning: Ignoring invalid cached metadata {cache_path}: {exc}")
+        return None
+
+
+def _write_json_cache(cache_path: str, data: Any) -> None:
+    """Write a JSON cache entry atomically."""
+    cache_parent = os.path.dirname(cache_path)
+    if cache_parent:
+        os.makedirs(cache_parent, exist_ok=True)
+    temporary_path = f"{cache_path}.tmp"
+    with open(temporary_path, "w") as f:
+        json.dump(data, f)
+    os.replace(temporary_path, cache_path)
+
+
+def _bbox_intersects_geometry_envelope(bbox: BBox, geometry: Any) -> bool:
+    """Check whether a query bbox overlaps the envelope of a render geometry."""
+    envelope = geometry.GetEnvelope()
+    geometry_bbox = (envelope[0], envelope[2], envelope[1], envelope[3])
+    return _bbox_overlaps(bbox, geometry_bbox)
+
+
+def _split_bbox(bbox: BBox) -> Optional[Tuple[BBox, BBox]]:
+    """Split a bbox in half along its longest dimension."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    lon_span = max_lon - min_lon
+    lat_span = max_lat - min_lat
+    if lon_span <= 0 and lat_span <= 0:
+        return None
+
+    if lon_span >= lat_span:
+        midpoint = min_lon + lon_span / 2
+        return (
+            (min_lon, min_lat, midpoint, max_lat),
+            (midpoint, min_lat, max_lon, max_lat),
+        )
+
+    midpoint = min_lat + lat_span / 2
+    return (
+        (min_lon, min_lat, max_lon, midpoint),
+        (min_lon, midpoint, max_lon, max_lat),
+    )
+
+
+def _initial_query_bboxes(bbox: BBox) -> List[BBox]:
+    """Make a stable coarse grid so nearby large renders reuse metadata caches."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    lon_span = max_lon - min_lon
+    lat_span = max_lat - min_lat
+    if lon_span <= 0 or lat_span <= 0:
+        return [bbox]
+
+    if max(lon_span, lat_span) <= EE_INITIAL_MAX_BBOX_SPAN_DEGREES:
+        return [bbox]
+
+    grid_size = EE_INITIAL_MAX_BBOX_SPAN_DEGREES
+    grid_min_lon = math.floor(min_lon / grid_size) * grid_size
+    grid_min_lat = math.floor(min_lat / grid_size) * grid_size
+    grid_max_lon = math.ceil(max_lon / grid_size) * grid_size
+    grid_max_lat = math.ceil(max_lat / grid_size) * grid_size
+    lon_parts = max(1, round((grid_max_lon - grid_min_lon) / grid_size))
+    lat_parts = max(1, round((grid_max_lat - grid_min_lat) / grid_size))
+    return [
+        (
+            grid_min_lon + lon_index * grid_size,
+            grid_min_lat + lat_index * grid_size,
+            grid_min_lon + (lon_index + 1) * grid_size,
+            grid_min_lat + (lat_index + 1) * grid_size,
+        )
+        for lat_index in range(lat_parts)
+        for lon_index in range(lon_parts)
+    ]
+
+
+def _deduplicate_scenes(scenes: List[Any]) -> List[Any]:
+    """Remove duplicate scenes returned by adjacent spatial searches."""
+    deduplicated: List[Any] = []
+    seen: set[str] = set()
+    for scene in scenes:
+        identity = scene.get("entityId") or scene.get("displayId")
+        if not identity:
+            identity = json.dumps(scene, sort_keys=True, default=str)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduplicated.append(scene)
+    return deduplicated
+
+
+def _query_naip_tiles_ee(
+    bbox: BBox,
+    api_key: str,
+    cache_dir: str,
+) -> List[Any]:
+    """Query one EarthExplorer bbox, using a 90-day metadata cache."""
+    payload = _scene_search_payload(bbox)
+    cache_path = _scene_search_cache_path(cache_dir, bbox)
+    results = _load_fresh_json_cache(cache_path, NAIP_METADATA_CACHE_MAX_AGE_DAYS)
+    if results is None:
+        print(f"Querying EarthExplorer for NAIP imagery in bbox {bbox}...")
+        results = send_m2m_request("scene-search", payload, api_key=api_key)
+        _write_json_cache(cache_path, results)
+    else:
+        print(f"Using cached EarthExplorer metadata for bbox {bbox}.")
+
+    if not isinstance(results, dict):
+        raise RuntimeError("EarthExplorer scene-search returned an invalid response.")
     scenes = results.get("results", [])
+    if not isinstance(scenes, list):
+        raise RuntimeError("EarthExplorer scene-search returned invalid scene results.")
     print(f"Found {len(scenes)} NAIP scenes in the bounding box.")
     return scenes
+
+
+def _discover_naip_tiles_ee_recursive(
+    bbox: BBox,
+    api_key: str,
+    cache_dir: str,
+    extent_geometry: Optional[Any],
+    split_depth: int,
+) -> List[Any]:
+    """Query a bbox and recursively subdivide result sets near the API limit."""
+    if extent_geometry is not None and not _bbox_intersects_geometry_envelope(bbox, extent_geometry):
+        return []
+
+    scenes = _query_naip_tiles_ee(bbox, api_key, cache_dir)
+    if len(scenes) <= EE_SPLIT_THRESHOLD:
+        return scenes
+
+    split_bboxes = _split_bbox(bbox)
+    if split_bboxes is None or split_depth >= EE_MAX_SPLIT_DEPTH:
+        print(
+            f"Warning: EarthExplorer returned {len(scenes)} scenes for bbox {bbox}; "
+            "using the capped result set because it cannot be subdivided further."
+        )
+        return scenes
+
+    print(
+        f"EarthExplorer returned {len(scenes)} scenes (over {EE_SPLIT_THRESHOLD}); "
+        f"splitting bbox at depth {split_depth + 1}."
+    )
+    child_scenes: List[Any] = []
+    for child_bbox in split_bboxes:
+        child_scenes.extend(
+            _discover_naip_tiles_ee_recursive(
+                child_bbox,
+                api_key,
+                cache_dir,
+                extent_geometry,
+                split_depth + 1,
+            )
+        )
+    return _deduplicate_scenes(child_scenes)
+
+
+def discover_naip_tiles_ee(
+    bbox: Optional[BBox],
+    api_key: str,
+    cache_dir: str = "cache",
+    extent_geometry: Optional[Any] = None,
+) -> List[Any]:
+    """
+    Query EarthExplorer for NAIP tiles, subdividing spatial searches near its
+    500-result limit and caching each metadata response for 90 days.
+    """
+    if not bbox:
+        print("Warning: No bounding box provided. Please provide --bbox.")
+        return []
+
+    initial_bboxes = _initial_query_bboxes(bbox)
+    if len(initial_bboxes) > 1:
+        print(
+            f"Splitting large NAIP search bbox into {len(initial_bboxes)} initial "
+            f"cells (maximum span {EE_INITIAL_MAX_BBOX_SPAN_DEGREES:g} degrees)."
+        )
+
+    scenes: List[Any] = []
+    for initial_bbox in initial_bboxes:
+        scenes.extend(
+            _discover_naip_tiles_ee_recursive(
+                initial_bbox,
+                api_key,
+                cache_dir,
+                extent_geometry,
+                split_depth=0,
+            )
+        )
+    return _deduplicate_scenes(scenes)
 
 def _bbox_overlaps(bbox_a: BBox, bbox_b: BBox) -> bool:
     """Check if two bboxes overlap."""
@@ -139,19 +346,22 @@ def _find_digital_coast_datasets(bbox: BBox) -> List[dict[str, Any]]:
     ]
 
 
-def _fetch_json_cached(url: str, cache_path: str) -> Any:
-    """Fetch a JSON URL, caching the result to disk."""
-    if os.path.exists(cache_path):
+def _fetch_json_cached(
+    url: str,
+    cache_path: str,
+    max_age_days: int = NAIP_METADATA_CACHE_MAX_AGE_DAYS,
+) -> Any:
+    """Fetch a JSON URL, caching the result until it expires."""
+    cached = _load_fresh_json_cache(cache_path, max_age_days)
+    if cached is not None:
         print(f"Using cached {cache_path}")
-        with open(cache_path) as f:
-            return json.load(f)
+        return cached
+
     print(f"Fetching {url}")
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req) as response:
         data = json.loads(response.read().decode("utf-8"))
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    with open(cache_path, "w") as f:
-        json.dump(data, f)
+    _write_json_cache(cache_path, data)
     return data
 
 
@@ -165,7 +375,7 @@ def _bbox_overlaps_stac_item(bbox: BBox, item: dict) -> bool:
 
 def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str) -> List[str]:
     """
-    Fall back to NOAA Digital Coast NAIP imagery when USGS returns no results.
+    Discover NOAA Digital Coast NAIP imagery for overlapping island datasets.
     Returns a list of raster paths (VRT paths referencing /vsicurl/ URLs).
     """
     if not bbox:
@@ -408,12 +618,13 @@ def add_naip_cli_args(parser: argparse.ArgumentParser) -> None:
 def handle_naip_workflow(
     args: argparse.Namespace,
     requested_bbox: Optional[BBox],
-    extent_geometry: Optional["ogr.Geometry"] = None,
+    extent_geometry: Optional[Any] = None,
 ) -> Tuple[bool, List[str]]:
     """
     If NAIP workflow is requested, handle it and return (True, list_of_rasters).
     Otherwise return (False, []).
-    Falls back to NOAA Digital Coast NAIP imagery (HI, PR/USVI) when USGS returns no results.
+    Combines EarthExplorer scenes with NOAA Digital Coast imagery for
+    overlapping Hawaii and Puerto Rico/USVI coverage.
     """
     if not hasattr(args, "use_naip") or not args.use_naip:
         return False, []
@@ -424,10 +635,16 @@ def handle_naip_workflow(
     cache_dir = getattr(args, "cache", "cache")
 
     scenes: List[Any] = []
+    ee_raster_paths: List[str] = []
     api_key: Optional[str] = None
     try:
         api_key = m2m_login()
-        scenes = discover_naip_tiles_ee(requested_bbox, api_key)
+        scenes = discover_naip_tiles_ee(
+            requested_bbox,
+            api_key,
+            cache_dir=cache_dir,
+            extent_geometry=extent_geometry,
+        )
 
         if scenes and requested_bbox:
             from osgeo import ogr
@@ -485,17 +702,15 @@ def handle_naip_workflow(
                     if ans.lower() not in ('y', 'yes'):
                         print("Aborting NAIP download.")
                         sys.exit(0)
-                raster_paths = fetch_naip_downloads(scenes, api_key, cache_dir)
+                ee_raster_paths = fetch_naip_downloads(scenes, api_key, cache_dir)
                 if getattr(args, "download", False):
                     print("NAIP download-only workflow complete. Exiting.")
                     sys.exit(0)
-                return True, raster_paths
             else:
                 for scene in scenes[:5]:
                     print(f"Scene ID: {scene.get('entityId')} - Display ID: {scene.get('displayId')}")
                 if len(scenes) > 5:
                     print(f"... and {len(scenes) - 5} more. Run with --download to fetch them.")
-                return True, []
     except Exception as e:
         print(f"EarthExplorer API Error: {e}")
     finally:
@@ -505,11 +720,20 @@ def handle_naip_workflow(
             except Exception as e:
                 print(f"Failed to logout gracefully: {e}")
 
-    # Fall back to Digital Coast (e.g. HI, PR/USVI) when USGS returns nothing or errors
-    if not scenes and requested_bbox:
-        dc_rasters = discover_naip_tiles_digitalcoast(requested_bbox, cache_dir)
-        if dc_rasters:
-            return True, dc_rasters
+    # Digital Coast covers Hawaii and Puerto Rico/USVI, so check it whenever
+    # the requested render bbox intersects those areas, even if EarthExplorer
+    # returned mainland scenes.
+    dc_rasters = (
+        discover_naip_tiles_digitalcoast(requested_bbox, cache_dir)
+        if requested_bbox
+        else []
+    )
+    raster_paths = ee_raster_paths + dc_rasters
+    if raster_paths:
+        return True, raster_paths
+
+    if scenes:
+        return True, []
 
     if not scenes:
         print("No NAIP imagery found in the bounding box; aborting NAIP pipeline.")

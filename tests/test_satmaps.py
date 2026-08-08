@@ -1662,7 +1662,7 @@ def test_convert_raster_to_pmtiles_stages_final_output(
     def fake_subprocess_run(command: list[str], check: bool) -> None:
         assert check is True
         converted.append(command)
-        Path(command[-1]).write_text("pmtiles")
+        Path(command[3]).write_text("pmtiles")
 
     monkeypatch.setattr("satmaps.subprocess.run", fake_subprocess_run)
 
@@ -1706,7 +1706,7 @@ def test_convert_raster_to_pmtiles_cleans_inputs_after_mbtiles_before_pmtiles(
         assert check is True
         assert not cleanup_target.exists()
         converted.append(command)
-        Path(command[-1]).write_text("pmtiles")
+        Path(command[3]).write_text("pmtiles")
 
     monkeypatch.setattr("satmaps.tiler.run_tiling_simplified", fake_run_tiling_simplified)
     monkeypatch.setattr("satmaps.subprocess.run", fake_subprocess_run)
@@ -1761,7 +1761,7 @@ def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
     def fake_subprocess_run(command: list[str], check: bool) -> None:
         assert check is True
         converted.append(command)
-        Path(command[-1]).write_text("pmtiles")
+        Path(command[3]).write_text("pmtiles")
 
     monkeypatch.setattr("satmaps.tiler.build_mbtiles_from_webp_tree", fake_build_mbtiles_from_webp_tree)
     monkeypatch.setattr("satmaps.tiler.build_mbtiles_overviews", fake_build_mbtiles_overviews)
@@ -3045,7 +3045,7 @@ def configure_main_defaults(
     monkeypatch.setattr("satmaps.build_output_namespace", lambda *args, **kwargs: unique_id)
     monkeypatch.setattr(
         "satmaps.discover_mgrs_bases",
-        lambda bbox, gebco_src, land_mgrs_list_path=None: mgrs_bases,
+        lambda bbox, gebco_src, land_mgrs_list_path=None, **kwargs: mgrs_bases,
     )
 
 def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
@@ -3109,6 +3109,9 @@ def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
                 "name": "Sentinel-2 Mosaic",
                 "description": "Copernicus Sentinel data",
                 "requested_bbox": None,
+                "quality": 74,
+                "parallel": 1,
+                "resume": False,
             },
         )
     ]
@@ -3252,6 +3255,9 @@ def test_main_full_render_first_builds_master_vrt_and_commits_to_tile_cache(
             "name": "Sentinel-2 Mosaic",
             "description": "Copernicus Sentinel data",
             "requested_bbox": None,
+            "quality": 74,
+            "parallel": 1,
+            "resume": False,
         }
     ]
 
@@ -3642,7 +3648,7 @@ def test_main_bbox_prepares_and_commits_ocean_background(
     configure_main_defaults(
         monkeypatch,
         tmp_path,
-        ["--bbox", "0,0,1,1", "--no-land", "--parallel", "1"],
+        ["--bbox", "0,0,1,1", "--no-land", "--grade", "--parallel", "1"],
         mgrs_bases=[],
         unique_id="bboxrun",
     )
@@ -3694,6 +3700,9 @@ def test_main_bbox_prepares_and_commits_ocean_background(
             "name": "Sentinel-2 Mosaic",
             "description": "Copernicus Sentinel data",
             "requested_bbox": (0.0, 0.0, 1.0, 1.0),
+            "quality": 74,
+            "parallel": 1,
+            "resume": False,
         }
     ]
 
@@ -3703,7 +3712,7 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
     configure_main_defaults(
         monkeypatch,
         tmp_path,
-        ["--bbox", "0,0,1,1", "--parallel", "1", "--date", "2025/07/01"],
+        ["--bbox", "0,0,1,1", "--grade", "--parallel", "1", "--date", "2025/07/01"],
         mgrs_bases=["31TDF"],
         unique_id="lazyocean",
     )
@@ -3788,6 +3797,9 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
             "name": "Sentinel-2 Mosaic",
             "description": "Copernicus Sentinel data",
             "requested_bbox": (0.0, 0.0, 1.0, 1.0),
+            "quality": 74,
+            "parallel": 1,
+            "resume": False,
         }
     ]
 
@@ -4291,7 +4303,7 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
     monkeypatch.setattr("satmaps.resolve_land_mgrs_source", lambda: None)
     monkeypatch.setattr(
         "satmaps.discover_mgrs_bases",
-        lambda bbox, gebco_src, land_mgrs_list_path=None: ["31TDF"],
+        lambda bbox, gebco_src, land_mgrs_list_path=None, **kwargs: ["31TDF"],
     )
     monkeypatch.setattr(
         "satmaps.prepare_ocean_background_for_output",
