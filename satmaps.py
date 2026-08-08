@@ -460,7 +460,7 @@ def convert_raster_to_pmtiles(
             cropToCutline=True,
             dstAlpha=True,
             resampleAlg=resample_alg,
-            options=["DISABLE_VERTICAL_OFFSET=YES"],
+            warpOptions=["DISABLE_VERTICAL_OFFSET=YES"],
         )
         gdal.Warp(masked_vrt, input_raster, options=warp_opts)
         effective_raster = masked_vrt
