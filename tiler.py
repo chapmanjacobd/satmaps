@@ -1,8 +1,9 @@
+import io
+import json
 import math
 import os
 import shutil
 import sqlite3
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -98,6 +99,7 @@ LUMA_RED = 0.2126
 LUMA_GREEN = 0.7152
 LUMA_BLUE = 0.0722
 DEFAULT_MEMORY_RESERVE_BYTES = 1 << 30
+OverviewTile = Tuple[int, int, bytes]
 
 
 def get_available_memory_bytes() -> int:
@@ -1238,6 +1240,78 @@ def initialize_mbtiles(cursor: sqlite3.Cursor) -> None:
     )
 
 
+def mbtiles_has_tiles(mbtiles_path: str) -> bool:
+    """Return whether an MBTiles file has a readable tiles table with data."""
+    if not os.path.exists(mbtiles_path):
+        return False
+    try:
+        connection = sqlite3.connect(mbtiles_path)
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tiles'"
+            ).fetchone()
+            if row is None:
+                return False
+            return connection.execute("SELECT 1 FROM tiles LIMIT 1").fetchone() is not None
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError:
+        return False
+
+
+def _tiling_resume_manifest_path(staged_mbtiles: str) -> str:
+    """Return the sidecar path describing a resumable staged MBTiles build."""
+    return f"{staged_mbtiles}.resume.json"
+
+
+def _tiling_resume_signature(input_raster: str, options: Dict[str, Any]) -> Dict[str, object]:
+    """Build a signature for the source and output-affecting tiling options."""
+    try:
+        source_stat = os.stat(input_raster)
+        source_size = source_stat.st_size
+        source_mtime_ns = source_stat.st_mtime_ns
+    except OSError:
+        source_size = None
+        source_mtime_ns = None
+    signature_options = {
+        key: value
+        for key, value in options.items()
+        if key not in {"processes", "resume"}
+    }
+    return {
+        "input_raster": os.path.abspath(input_raster),
+        "input_size": source_size,
+        "input_mtime_ns": source_mtime_ns,
+        "options": signature_options,
+    }
+
+
+def _staged_mbtiles_matches_signature(
+    staged_mbtiles: str,
+    manifest_path: str,
+    signature: Dict[str, object],
+) -> bool:
+    """Check whether a staged MBTiles file can safely resume overview generation."""
+    if not mbtiles_has_tiles(staged_mbtiles) or not os.path.exists(manifest_path):
+        return False
+    try:
+        with open(manifest_path) as manifest_file:
+            return json.load(manifest_file) == signature
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _write_tiling_resume_manifest(
+    manifest_path: str,
+    signature: Dict[str, object],
+) -> None:
+    """Atomically persist the staged-build signature before overview generation."""
+    staged_manifest_path = f"{manifest_path}.tmp"
+    with open(staged_manifest_path, "w") as manifest_file:
+        json.dump(signature, manifest_file, sort_keys=True)
+    os.replace(staged_manifest_path, manifest_path)
+
+
 def build_mbtiles_from_webp_tree(
     input_dir: str,
     output_mbtiles: str,
@@ -1304,19 +1378,294 @@ def build_mbtiles_from_webp_tree(
     return inserted_tiles
 
 
-def build_mbtiles_overviews(mbtiles_path: str, resample_alg: str) -> None:
-    """Populate lower zoom levels for an MBTiles archive using gdaladdo."""
-    print("Building overviews...")
-    gdaladdo_cmd = [
-        "gdaladdo",
-        "-r",
-        resample_alg if resample_alg != "gauss" else "bilinear",
-        "--config",
-        "GDAL_NUM_THREADS",
-        "ALL_CPUS",
-        mbtiles_path,
-    ]
-    subprocess.run(gdaladdo_cmd, check=True)
+def _overview_resample_filter(resample_alg: str) -> Image.Resampling:
+    """Map GDAL-style overview kernels to Pillow resampling filters."""
+    filters = {
+        "nearest": Image.Resampling.NEAREST,
+        "average": Image.Resampling.BOX,
+        "gauss": Image.Resampling.BILINEAR,
+        "bilinear": Image.Resampling.BILINEAR,
+        "cubic": Image.Resampling.BICUBIC,
+        "cubicspline": Image.Resampling.BICUBIC,
+        "lanczos": Image.Resampling.LANCZOS,
+    }
+    try:
+        return filters[resample_alg.lower()]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported overview resampling algorithm: {resample_alg}") from exc
+
+
+def _overview_tile_bytes(
+    connection: sqlite3.Connection,
+    source_zoom: int,
+    tile_column: int,
+    tile_row: int,
+    tile_format: str,
+    quality: int,
+    resample_filter: Image.Resampling,
+) -> Optional[bytes]:
+    """Compose one parent tile from its four TMS child tiles."""
+    child_images: dict[Tuple[int, int], Image.Image] = {}
+    for child_x in (tile_column * 2, tile_column * 2 + 1):
+        for child_y_offset in (0, 1):
+            child_y = tile_row * 2 + child_y_offset
+            row = connection.execute(
+                """
+                SELECT tile_data
+                FROM tiles
+                WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?
+                """,
+                (source_zoom, child_x, child_y),
+            ).fetchone()
+            if row is None:
+                continue
+            with Image.open(io.BytesIO(row[0])) as image:
+                if "A" in image.getbands() and image.getchannel("A").getextrema() != (255, 255):
+                    child_images[(child_x, child_y)] = image.convert("RGBA")
+                else:
+                    child_images[(child_x, child_y)] = image.convert("RGB")
+
+    if not child_images:
+        return None
+
+    tile_width, tile_height = next(iter(child_images.values())).size
+    has_alpha = len(child_images) < 4 or any(
+        image.mode == "RGBA" for image in child_images.values()
+    )
+    mode = "RGBA" if has_alpha else "RGB"
+    background = (0, 0, 0, 0) if has_alpha else (0, 0, 0)
+    canvas = Image.new(mode, (tile_width * 2, tile_height * 2), background)
+    try:
+        for child_x in (tile_column * 2, tile_column * 2 + 1):
+            for child_y_offset in (0, 1):
+                child_y = tile_row * 2 + child_y_offset
+                image = child_images.get((child_x, child_y))
+                if image is None:
+                    continue
+                if image.size != (tile_width, tile_height):
+                    image = image.resize((tile_width, tile_height), Image.Resampling.NEAREST)
+                # TMS rows grow from south to north, so the larger child row is
+                # the top half of the parent image.
+                destination_x = 0 if child_x == tile_column * 2 else tile_width
+                destination_y = 0 if child_y_offset == 1 else tile_height
+                canvas.paste(image.convert(mode), (destination_x, destination_y))
+
+        overview = canvas.resize((tile_width, tile_height), resample_filter)
+        if tile_format.lower() in {"jpg", "jpeg"}:
+            overview = overview.convert("RGB")
+
+        encoded = io.BytesIO()
+        output_format = "JPEG" if tile_format.lower() in {"jpg", "jpeg"} else tile_format.upper()
+        save_options: dict[str, object] = {"format": output_format}
+        if output_format in {"JPEG", "WEBP"}:
+            save_options["quality"] = quality
+        overview.save(encoded, **save_options)
+        return encoded.getvalue()
+    finally:
+        canvas.close()
+        for image in child_images.values():
+            image.close()
+
+
+def _render_overview_batch(
+    args: Tuple[str, int, Sequence[Tuple[int, int]], str, int, str],
+) -> List[OverviewTile]:
+    """Render a bounded overview batch using a read-only SQLite connection."""
+    mbtiles_path, source_zoom, coordinates, tile_format, quality, resample_alg = args
+    connection = sqlite3.connect(mbtiles_path)
+    connection.execute("PRAGMA query_only = ON")
+    resample_filter = _overview_resample_filter(resample_alg)
+    try:
+        rendered: List[OverviewTile] = []
+        for tile_column, tile_row in coordinates:
+            tile_bytes = _overview_tile_bytes(
+                connection,
+                source_zoom,
+                tile_column,
+                tile_row,
+                tile_format,
+                quality,
+                resample_filter,
+            )
+            if tile_bytes is not None:
+                rendered.append((tile_column, tile_row, tile_bytes))
+        return rendered
+    finally:
+        connection.close()
+
+
+def _create_overview_work_table(
+    connection: sqlite3.Connection,
+    source_zoom: int,
+    target_zoom: int,
+) -> None:
+    """Materialize missing parent coordinates once for one overview level."""
+    connection.execute("DROP TABLE IF EXISTS temp.satmaps_overview_work")
+    connection.execute(
+        """
+        CREATE TEMP TABLE satmaps_overview_work (
+            tile_column INTEGER NOT NULL,
+            tile_row INTEGER NOT NULL,
+            PRIMARY KEY (tile_column, tile_row)
+        ) WITHOUT ROWID
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO temp.satmaps_overview_work (tile_column, tile_row)
+        SELECT child.tile_column / 2, child.tile_row / 2
+        FROM tiles AS child
+        LEFT JOIN tiles AS existing
+          ON existing.zoom_level = ?
+         AND existing.tile_column = child.tile_column / 2
+         AND existing.tile_row = child.tile_row / 2
+        WHERE child.zoom_level = ?
+          AND existing.zoom_level IS NULL
+        GROUP BY child.tile_column / 2, child.tile_row / 2
+        """,
+        (target_zoom, source_zoom),
+    )
+    connection.commit()
+
+
+def _fetch_overview_work_coordinates(
+    connection: sqlite3.Connection,
+    limit: int,
+) -> List[Tuple[int, int]]:
+    """Fetch a bounded set of materialized overview coordinates."""
+    rows = connection.execute(
+        """
+        SELECT tile_column, tile_row
+        FROM temp.satmaps_overview_work
+        ORDER BY tile_row, tile_column
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [(int(tile_column), int(tile_row)) for tile_column, tile_row in rows]
+
+
+def _overview_min_zoom(
+    connection: sqlite3.Connection,
+    max_zoom: int,
+) -> int:
+    """Match GDAL's default 256-pixel minimum overview size."""
+    extent = connection.execute(
+        """
+        SELECT
+            min(tile_column),
+            max(tile_column),
+            min(tile_row),
+            max(tile_row)
+        FROM tiles
+        WHERE zoom_level = ?
+        """,
+        (max_zoom,),
+    ).fetchone()
+    sample = connection.execute(
+        "SELECT tile_data FROM tiles WHERE zoom_level = ? LIMIT 1",
+        (max_zoom,),
+    ).fetchone()
+    if extent is None or extent[0] is None or sample is None:
+        return max_zoom
+
+    with Image.open(io.BytesIO(sample[0])) as image:
+        pixel_width = (int(extent[1]) - int(extent[0]) + 1) * image.width
+        pixel_height = (int(extent[3]) - int(extent[2]) + 1) * image.height
+
+    min_zoom = max_zoom
+    while min_zoom > 0 and max(pixel_width, pixel_height) > 256:
+        min_zoom -= 1
+        pixel_width = max(1, pixel_width // 2)
+        pixel_height = max(1, pixel_height // 2)
+    return min_zoom
+
+
+def build_mbtiles_overviews(
+    mbtiles_path: str,
+    resample_alg: str,
+    *,
+    quality: int = 75,
+    parallel: int = 1,
+) -> None:
+    """Populate lower zoom levels in parallel, resuming from existing tiles."""
+    connection = sqlite3.connect(mbtiles_path)
+    try:
+        max_zoom_row = connection.execute("SELECT max(zoom_level) FROM tiles").fetchone()
+        max_zoom = max_zoom_row[0] if max_zoom_row else None
+        if max_zoom is None:
+            return
+        format_row = connection.execute(
+            "SELECT value FROM metadata WHERE name = 'format' LIMIT 1"
+        ).fetchone()
+        tile_format = str(format_row[0]).lower() if format_row else "webp"
+        min_zoom = _overview_min_zoom(connection, int(max_zoom))
+
+        worker_count = max(1, int(parallel))
+        batch_size = 128
+        print(
+            f"Building overviews from z{max_zoom} to z{min_zoom} with "
+            f"{worker_count} worker(s), resumable..."
+        )
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for target_zoom in range(int(max_zoom) - 1, min_zoom - 1, -1):
+                source_zoom = target_zoom + 1
+                written = 0
+                _create_overview_work_table(connection, source_zoom, target_zoom)
+                try:
+                    while True:
+                        coordinates = _fetch_overview_work_coordinates(
+                            connection,
+                            batch_size * worker_count,
+                        )
+                        if not coordinates:
+                            break
+
+                        tasks = [
+                            (
+                                mbtiles_path,
+                                source_zoom,
+                                coordinates[offset : offset + batch_size],
+                                tile_format,
+                                quality,
+                                resample_alg,
+                            )
+                            for offset in range(0, len(coordinates), batch_size)
+                        ]
+                        futures = [executor.submit(_render_overview_batch, task) for task in tasks]
+                        rendered_batches: List[List[OverviewTile]] = []
+                        for future in futures:
+                            rendered_batches.append(future.result())
+
+                        for rendered_tiles in rendered_batches:
+                            connection.executemany(
+                                """
+                                INSERT OR IGNORE INTO tiles
+                                    (zoom_level, tile_column, tile_row, tile_data)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                [
+                                    (target_zoom, tile_column, tile_row, tile_bytes)
+                                    for tile_column, tile_row, tile_bytes in rendered_tiles
+                                ],
+                            )
+                            written += len(rendered_tiles)
+                        connection.executemany(
+                            """
+                            DELETE FROM temp.satmaps_overview_work
+                            WHERE tile_column = ? AND tile_row = ?
+                            """,
+                            coordinates,
+                        )
+                        connection.commit()
+                finally:
+                    connection.execute("DROP TABLE IF EXISTS temp.satmaps_overview_work")
+                    connection.commit()
+
+                if written:
+                    print(f"  z{target_zoom}: wrote {written} tile(s)")
+    finally:
+        connection.close()
 
 
 def te_to_src_win(
@@ -1580,11 +1929,39 @@ def run_tiling_simplified(
 ) -> TilingArtifacts:
     """Simplified tiling from a pre-processed Byte VRT."""
     tile_format = options.get("format", "webp")
-    staged_output_mbtiles = prepare_staged_path(output_mbtiles)
+    staged_output_mbtiles = build_staged_path(output_mbtiles)
+    resume_manifest_path = _tiling_resume_manifest_path(staged_output_mbtiles)
+    resume_signature = _tiling_resume_signature(input_vrt, options)
+    resuming_staged_build = bool(options.get("resume")) and _staged_mbtiles_matches_signature(
+        staged_output_mbtiles,
+        resume_manifest_path,
+        resume_signature,
+    )
+    if resuming_staged_build:
+        print(f"Resuming MBTiles overview generation from {staged_output_mbtiles}...")
+    else:
+        prepare_staged_path(output_mbtiles)
+        remove_if_exists(resume_manifest_path)
 
     ds = gdal.Open(input_vrt)
     if ds is None:
         raise RuntimeError(f"Could not open input VRT: {input_vrt}")
+
+    if resuming_staged_build:
+        try:
+            finalize_mbtiles_metadata(staged_output_mbtiles)
+            build_mbtiles_overviews(
+                staged_output_mbtiles,
+                options["resample_alg"],
+                quality=int(options.get("quality", 75)),
+                parallel=int(options.get("processes", 1)),
+            )
+            finalize_mbtiles_metadata(staged_output_mbtiles)
+            publish_staged_path(staged_output_mbtiles, output_mbtiles)
+        finally:
+            ds = None
+        remove_if_exists(resume_manifest_path)
+        return TilingArtifacts(final_vrt=input_vrt, cleanup_paths=[])
 
     source_path = input_vrt
     output_stem, _ = os.path.splitext(output_mbtiles)
@@ -1690,13 +2067,20 @@ def run_tiling_simplified(
 
         # Refresh metadata before building overviews
         finalize_mbtiles_metadata(staged_output_mbtiles)
+        _write_tiling_resume_manifest(resume_manifest_path, resume_signature)
 
-        # Build overviews (all levels from maxzoom down to 0)
-        build_mbtiles_overviews(staged_output_mbtiles, options["resample_alg"])
+        # Build overviews; existing lower-zoom tiles are reused on resume.
+        build_mbtiles_overviews(
+            staged_output_mbtiles,
+            options["resample_alg"],
+            quality=int(options.get("quality", 75)),
+            parallel=int(options.get("processes", 1)),
+        )
 
-        # Finalize metadata again after gdaladdo adds lower zoom tiles.
+        # Finalize metadata again after lower-zoom tiles are added.
         finalize_mbtiles_metadata(staged_output_mbtiles)
         publish_staged_path(staged_output_mbtiles, output_mbtiles)
+        remove_if_exists(resume_manifest_path)
 
     finally:
         ds = None

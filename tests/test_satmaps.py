@@ -1751,7 +1751,11 @@ def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
         Path(output_mbtiles).write_text("mbtiles")
         return 1
 
-    def fake_build_mbtiles_overviews(mbtiles_path: str, resample_alg: str) -> None:
+    def fake_build_mbtiles_overviews(
+        mbtiles_path: str,
+        resample_alg: str,
+        **kwargs: object,
+    ) -> None:
         overview_calls.append((mbtiles_path, resample_alg))
 
     def fake_subprocess_run(command: list[str], check: bool) -> None:

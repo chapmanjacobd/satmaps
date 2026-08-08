@@ -425,6 +425,7 @@ def convert_raster_to_pmtiles(
     tiling_options: Optional[Dict[str, object]] = None,
     cleanup_input_paths: Optional[Sequence[str]] = None,
     extent_geometry: Optional["ogr.Geometry"] = None,
+    resume: bool = False,
 ) -> PackagedPMTiles:
     """Tile a Web Mercator raster into MBTiles and convert the result to PMTiles."""
     run_paths = SatmapsRunPaths(output_path, unique_id)
@@ -439,6 +440,7 @@ def convert_raster_to_pmtiles(
         "blocksize": blocksize,
         "name": name,
         "description": description,
+        "resume": resume,
     }
     if requested_bbox is not None:
         run_options["chunk_bounds"] = tiler.lonlat_bbox_to_mercator_bounds(*requested_bbox)
@@ -488,21 +490,32 @@ def convert_tile_tree_to_pmtiles(
     name: str,
     description: str,
     requested_bbox: Optional[Tuple[float, float, float, float]] = None,
+    quality: int = 75,
+    parallel: int = 1,
+    resume: bool = False,
 ) -> str:
     """Build MBTiles from a final max-zoom WebP tree, then convert it to PMTiles."""
     run_paths = SatmapsRunPaths(output_path, unique_id)
     temp_mbtiles = run_paths.temp_mbtiles
     ensure_parent_dir(temp_mbtiles)
-    print("Generating MBTiles...")
-    tiler.build_mbtiles_from_webp_tree(
-        input_tile_tree,
+    if resume and tiler.mbtiles_has_tiles(temp_mbtiles):
+        print(f"Resuming MBTiles overview generation from {temp_mbtiles}...")
+    else:
+        print("Generating MBTiles...")
+        tiler.build_mbtiles_from_webp_tree(
+            input_tile_tree,
+            temp_mbtiles,
+            name=name,
+            description=description,
+            maxzoom=max_zoom,
+            bounds_wgs84=requested_bbox,
+        )
+    tiler.build_mbtiles_overviews(
         temp_mbtiles,
-        name=name,
-        description=description,
-        maxzoom=max_zoom,
-        bounds_wgs84=requested_bbox,
+        resample_alg,
+        quality=quality,
+        parallel=parallel,
     )
-    tiler.build_mbtiles_overviews(temp_mbtiles, resample_alg)
     tiler.finalize_mbtiles_metadata(temp_mbtiles)
 
     convert_mbtiles_to_pmtiles(temp_mbtiles, output_path)
@@ -4817,6 +4830,7 @@ def main() -> None:
                     description="Copernicus Sentinel data",
                     requested_bbox=requested_bbox,
                     extent_geometry=extent_geometry,
+                    resume=getattr(args, "resume", False),
                 )
                 cleanup_temporary_files([packaged_tiles.temp_mbtiles] + ocean_cleanup_paths)
                 if os.path.exists(state_file):
@@ -4921,6 +4935,9 @@ def main() -> None:
         name="Sentinel-2 Mosaic",
         description="Copernicus Sentinel data",
         requested_bbox=requested_bbox,
+        quality=args.quality,
+        parallel=args.parallel,
+        resume=getattr(args, "resume", False),
     )
     cleanup_temporary_files([temp_mbtiles] + ocean_cleanup_paths)
 

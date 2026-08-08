@@ -1,5 +1,5 @@
 import sqlite3
-import shutil
+
 import sys
 from pathlib import Path
 
@@ -754,28 +754,10 @@ def test_run_tiling_simplified_creates_mbtiles(
         "description": "Test",
     }
 
-    gdaladdo_calls: list[list[str]] = []
-
-    def fake_run(cmd: list[str], check: bool) -> None:
-        gdaladdo_calls.append(cmd)
-
-    monkeypatch.setattr("subprocess.run", fake_run)
-
     artifacts = run_tiling_simplified(str(input_path), str(output_mbtiles), options)
 
     assert output_mbtiles.exists()
     assert artifacts.final_vrt == str(input_path)
-    assert gdaladdo_calls == [
-        [
-            "gdaladdo",
-            "-r",
-            "bilinear",
-            "--config",
-            "GDAL_NUM_THREADS",
-            "ALL_CPUS",
-            str(tmp_path / ".temp_output.mbtiles"),
-        ]
-    ]
 
     # Check if MBTiles has data
     conn = sqlite3.connect(output_mbtiles)
@@ -784,7 +766,6 @@ def test_run_tiling_simplified_creates_mbtiles(
     assert count > 0
 
 
-@pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")
 def test_run_tiling_simplified_parallelizes_mbtiles_chunks(tmp_path: Path) -> None:
     source_path = tmp_path / "world.tif"
     world = WEB_MERCATOR_LIMIT * 2
@@ -822,6 +803,64 @@ def test_run_tiling_simplified_parallelizes_mbtiles_chunks(tmp_path: Path) -> No
     assert not (tmp_path / ".output.mbtiles.chunks").exists()
 
 
+def test_run_tiling_simplified_resumes_interrupted_overviews(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source_path = tmp_path / "input.tif"
+    dataset = gdal.GetDriverByName("GTiff").Create(str(source_path), 256, 256, 3, gdal.GDT_Byte)
+    assert dataset is not None
+    dataset.SetGeoTransform((0.0, 1000.0, 0.0, 256000.0, 0.0, -1000.0))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset.SetProjection(srs.ExportToWkt())
+    for band_index in range(1, 4):
+        dataset.GetRasterBand(band_index).Fill(128)
+    dataset = None
+
+    output_mbtiles = tmp_path / "output.mbtiles"
+    options = {
+        "format": "png",
+        "quality": 75,
+        "resample_alg": "bilinear",
+        "chunk_zoom": 4,
+        "processes": 2,
+        "blocksize": 256,
+        "name": "Test",
+        "description": "Test",
+        "resume": True,
+    }
+    original_overviews = tiler_module.build_mbtiles_overviews
+
+    def fail_overviews(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated overview interruption")
+
+    monkeypatch.setattr(tiler_module, "build_mbtiles_overviews", fail_overviews)
+    with pytest.raises(RuntimeError, match="simulated overview interruption"):
+        run_tiling_simplified(str(source_path), str(output_mbtiles), options)
+
+    staged_output = tmp_path / ".temp_output.mbtiles"
+    resume_manifest = tmp_path / ".temp_output.mbtiles.resume.json"
+    assert staged_output.exists()
+    assert resume_manifest.exists()
+
+    translate_calls: list[str] = []
+    original_translate = gdal.Translate
+
+    def track_translate(destination: str, source: object, **kwargs: object) -> object:
+        translate_calls.append(destination)
+        return original_translate(destination, source, **kwargs)
+
+    monkeypatch.setattr(gdal, "Translate", track_translate)
+    monkeypatch.setattr(tiler_module, "build_mbtiles_overviews", original_overviews)
+    run_tiling_simplified(str(source_path), str(output_mbtiles), options)
+
+    assert translate_calls == []
+    assert output_mbtiles.exists()
+    assert not staged_output.exists()
+    assert not resume_manifest.exists()
+
+
 def test_run_tiling_simplified_uses_explicit_chunk_bounds(
     tmp_path: Path, monkeypatch: object
 ) -> None:
@@ -855,8 +894,6 @@ def test_run_tiling_simplified_uses_explicit_chunk_bounds(
     
     monkeypatch.setattr(gdal, "TranslateOptions", fake_options)
     monkeypatch.setattr(tiler_module, "finalize_mbtiles_metadata", lambda path: None)
-    monkeypatch.setattr(tiler_module.subprocess, "run", lambda cmd, check: None)
-
     run_tiling_simplified(
         str(input_path),
         str(tmp_path / "output.mbtiles"),
@@ -891,7 +928,6 @@ def test_run_tiling_simplified_publishes_staged_output_mbtiles(
     dataset = None
 
     finalized: list[str] = []
-    gdaladdo_calls: list[list[str]] = []
     gdal_translate_calls: list[str] = []
     
     orig_translate = gdal.Translate
@@ -907,12 +943,6 @@ def test_run_tiling_simplified_publishes_staged_output_mbtiles(
         "finalize_mbtiles_metadata",
         lambda path: finalized.append(path),
     )
-    monkeypatch.setattr(
-        tiler_module.subprocess,
-        "run",
-        lambda cmd, check: gdaladdo_calls.append(cmd),
-    )
-
     output_mbtiles = tmp_path / "output.mbtiles"
     run_tiling_simplified(
         str(input_path),
@@ -931,22 +961,10 @@ def test_run_tiling_simplified_publishes_staged_output_mbtiles(
     staged_output = str(tmp_path / ".temp_output.mbtiles")
     assert gdal_translate_calls == [staged_output]
     assert finalized == [staged_output, staged_output]
-    assert gdaladdo_calls == [
-        [
-            "gdaladdo",
-            "-r",
-            "bilinear",
-            "--config",
-            "GDAL_NUM_THREADS",
-            "ALL_CPUS",
-            staged_output,
-        ]
-    ]
     assert output_mbtiles.exists()
     assert not Path(staged_output).exists()
 
 
-@pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")
 def test_run_tiling_simplified_builds_lower_zoom_levels(
     tmp_path: Path, monkeypatch: object
 ) -> None:
@@ -994,7 +1012,6 @@ def test_run_tiling_simplified_builds_lower_zoom_levels(
     assert metadata["maxzoom"] == str(max(zooms))
 
 
-@pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")
 def test_run_tiling_simplified_uses_nominal_zoom_with_512_tiles(
     tmp_path: Path, monkeypatch: object
 ) -> None:
@@ -1037,7 +1054,6 @@ def test_run_tiling_simplified_uses_nominal_zoom_with_512_tiles(
     assert maxzoom == 7
 
 
-@pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")
 def test_run_tiling_simplified_preserves_land_in_multi_chunk_overviews(
     tmp_path: Path, monkeypatch: object
 ) -> None:
@@ -1100,7 +1116,6 @@ def test_run_tiling_simplified_preserves_land_in_multi_chunk_overviews(
     np.testing.assert_array_equal(right_center, np.array([70, 180, 50], dtype=np.uint8))
 
 
-@pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")
 def test_run_tiling_simplified_respects_alpha_masked_sources(
     tmp_path: Path, monkeypatch: object
 ) -> None:
