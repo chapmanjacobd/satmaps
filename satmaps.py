@@ -947,15 +947,19 @@ def parse_bbox(bbox: str) -> Tuple[float, float, float, float]:
         sys.exit(1)
 
 
-def _load_extent(extent_path: str) -> Tuple[Tuple[float, float, float, float], "ogr.Geometry"]:
-    """Load the combined geometry and its WGS84 envelope from a vector file."""
+def _load_extent(extent_path: str) -> Tuple[
+    Tuple[float, float, float, float],
+    "ogr.Geometry",
+    List["ogr.Geometry"],
+]:
+    """Load an extent union, its WGS84 envelope, and the original feature geometries."""
     ds = ogr.Open(extent_path)
     if ds is None:
         print(f"Error: Cannot open vector file: {extent_path}")
         sys.exit(1)
 
     extent_geom = None
-    src_srs = None
+    feature_geometries: List["ogr.Geometry"] = []
     for lyr_idx in range(ds.GetLayerCount()):
         lyr = ds.GetLayerByIndex(lyr_idx)
         if lyr is None:
@@ -966,6 +970,14 @@ def _load_extent(extent_path: str) -> Tuple[Tuple[float, float, float, float], "
             if geom is None:
                 continue
             cloned = geom.Clone()
+            if src_srs is not None:
+                wgs84_srs = osr.SpatialReference()
+                wgs84_srs.ImportFromEPSG(4326)
+                if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
+                    wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+                if not src_srs.IsSame(wgs84_srs):
+                    cloned.Transform(osr.CoordinateTransformation(src_srs, wgs84_srs))
+            feature_geometries.append(cloned.Clone())
             if extent_geom is None:
                 extent_geom = cloned
             else:
@@ -975,21 +987,15 @@ def _load_extent(extent_path: str) -> Tuple[Tuple[float, float, float, float], "
         print(f"Error: No geometry found in: {extent_path}")
         sys.exit(1)
 
-    if src_srs is not None:
-        wgs84_srs = osr.SpatialReference()
-        wgs84_srs.ImportFromEPSG(4326)
-        if hasattr(wgs84_srs, "SetAxisMappingStrategy"):
-            wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        if not src_srs.IsSame(wgs84_srs):
-            extent_geom.Transform(osr.CoordinateTransformation(src_srs, wgs84_srs))
-
     envelope = extent_geom.GetEnvelope()
     bbox = (envelope[0], envelope[2], envelope[1], envelope[3])
-    return bbox, extent_geom
+    return bbox, extent_geom, feature_geometries
 
 
 def resolve_requested_bbox(args: argparse.Namespace) -> Tuple[
-    Optional[Tuple[float, float, float, float]], Optional["ogr.Geometry"]
+    Optional[Tuple[float, float, float, float]],
+    Optional["ogr.Geometry"],
+    Optional[List["ogr.Geometry"]],
 ]:
     """Resolve the bbox from --bbox or --extent, erroring if both are given."""
     if args.bbox and args.extent:
@@ -998,8 +1004,8 @@ def resolve_requested_bbox(args: argparse.Namespace) -> Tuple[
     if args.extent:
         return _load_extent(args.extent)
     if args.bbox:
-        return parse_bbox(args.bbox), None
-    return None, None
+        return parse_bbox(args.bbox), None, None
+    return None, None, None
 
 
 def discover_mgrs_tiles_in_bbox(
@@ -4301,7 +4307,7 @@ def render_land_output_tiles(
 
 def calculate_estimates(args: argparse.Namespace) -> None:
     """Calculate and print estimations for the given command."""
-    requested_bbox, extent_geometry = resolve_requested_bbox(args)
+    requested_bbox, extent_geometry, _extent_geometries = resolve_requested_bbox(args)
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
     num_dates = len(date_paths)
 
@@ -4551,6 +4557,7 @@ def add_satmaps_discovery_cli_args(parser: argparse.ArgumentParser) -> None:
         "whose features define the area of interest. "
         "MultiPolygons and non-touching features are supported: "
         "only MGRS tiles that intersect the features are processed, "
+        "NAIP discovery queries each feature envelope independently, "
         "and the output is masked to the feature boundaries. "
         "Mutually exclusive with --bbox.",
     )
@@ -4612,7 +4619,7 @@ def main() -> None:
     ensure_directory(TEMP_DIR)
     ensure_directory(FULL_RENDER_CACHE_DIR)
 
-    requested_bbox, extent_geometry = resolve_requested_bbox(args)
+    requested_bbox, extent_geometry, extent_geometries = resolve_requested_bbox(args)
 
     # Compute the build namespace early so a build-unique ocean background can
     # be rendered before the land pipeline starts.
@@ -4654,7 +4661,12 @@ def main() -> None:
     ):
         return
 
-    is_naip, naip_rasters = land_naip_module.handle_naip_workflow(args, requested_bbox, extent_geometry=extent_geometry)
+    is_naip, naip_rasters = land_naip_module.handle_naip_workflow(
+        args,
+        requested_bbox,
+        extent_geometry=extent_geometry,
+        extent_geometries=extent_geometries,
+    )
 
     if requested_bbox is None and not is_naip:
         populate_s3_cache(date_paths)

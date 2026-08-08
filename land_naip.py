@@ -9,7 +9,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Sequence, Tuple, Any
 
 BBox = Tuple[float, float, float, float]
 
@@ -18,7 +18,7 @@ NAIP_METADATA_CACHE_MAX_AGE_DAYS = 90
 EE_MAX_RESULTS = 500
 EE_SPLIT_THRESHOLD = 480
 EE_MAX_SPLIT_DEPTH = 12
-EE_INITIAL_MAX_BBOX_SPAN_DEGREES = 5.0
+EE_INITIAL_MAX_BBOX_SPAN_DEGREES = 0.3125
 
 DIGITAL_COAST_DATASETS: List[dict[str, Any]] = [
     {
@@ -294,6 +294,7 @@ def discover_naip_tiles_ee(
     api_key: str,
     cache_dir: str = "cache",
     extent_geometry: Optional[Any] = None,
+    extent_geometries: Optional[Sequence[Any]] = None,
 ) -> List[Any]:
     """
     Query EarthExplorer for NAIP tiles, subdividing spatial searches near its
@@ -303,24 +304,38 @@ def discover_naip_tiles_ee(
         print("Warning: No bounding box provided. Please provide --bbox.")
         return []
 
-    initial_bboxes = _initial_query_bboxes(bbox)
-    if len(initial_bboxes) > 1:
-        print(
-            f"Splitting large NAIP search bbox into {len(initial_bboxes)} initial "
-            f"cells (maximum span {EE_INITIAL_MAX_BBOX_SPAN_DEGREES:g} degrees)."
-        )
-
     scenes: List[Any] = []
-    for initial_bbox in initial_bboxes:
-        scenes.extend(
-            _discover_naip_tiles_ee_recursive(
-                initial_bbox,
-                api_key,
-                cache_dir,
-                extent_geometry,
-                split_depth=0,
+    if extent_geometries:
+        query_regions = list(extent_geometries)
+    elif extent_geometry is not None:
+        query_regions = [extent_geometry]
+    else:
+        query_regions = [None]
+
+    for query_region in query_regions:
+        query_bbox = bbox
+        if query_region is not None:
+            envelope = query_region.GetEnvelope()
+            query_bbox = (envelope[0], envelope[2], envelope[1], envelope[3])
+        if query_bbox is None:
+            continue
+
+        initial_bboxes = _initial_query_bboxes(query_bbox)
+        if len(initial_bboxes) > 1:
+            print(
+                f"Splitting large NAIP search bbox into {len(initial_bboxes)} initial "
+                f"cells (maximum span {EE_INITIAL_MAX_BBOX_SPAN_DEGREES:g} degrees)."
             )
-        )
+        for initial_bbox in initial_bboxes:
+            scenes.extend(
+                _discover_naip_tiles_ee_recursive(
+                    initial_bbox,
+                    api_key,
+                    cache_dir,
+                    query_region,
+                    split_depth=0,
+                )
+            )
     return _deduplicate_scenes(scenes)
 
 def _bbox_overlaps(bbox_a: BBox, bbox_b: BBox) -> bool:
@@ -619,6 +634,7 @@ def handle_naip_workflow(
     args: argparse.Namespace,
     requested_bbox: Optional[BBox],
     extent_geometry: Optional[Any] = None,
+    extent_geometries: Optional[Sequence[Any]] = None,
 ) -> Tuple[bool, List[str]]:
     """
     If NAIP workflow is requested, handle it and return (True, list_of_rasters).
@@ -644,6 +660,7 @@ def handle_naip_workflow(
             api_key,
             cache_dir=cache_dir,
             extent_geometry=extent_geometry,
+            extent_geometries=extent_geometries,
         )
 
         if scenes and requested_bbox:
@@ -720,14 +737,24 @@ def handle_naip_workflow(
             except Exception as e:
                 print(f"Failed to logout gracefully: {e}")
 
-    # Digital Coast covers Hawaii and Puerto Rico/USVI, so check it whenever
-    # the requested render bbox intersects those areas, even if EarthExplorer
-    # returned mainland scenes.
-    dc_rasters = (
-        discover_naip_tiles_digitalcoast(requested_bbox, cache_dir)
-        if requested_bbox
-        else []
-    )
+    # Digital Coast covers Hawaii and Puerto Rico/USVI, so check each requested
+    # extent feature independently, even if EarthExplorer returned mainland scenes.
+    dc_rasters: List[str] = []
+    if requested_bbox:
+        dc_bboxes = [
+            (
+                feature.GetEnvelope()[0],
+                feature.GetEnvelope()[2],
+                feature.GetEnvelope()[1],
+                feature.GetEnvelope()[3],
+            )
+            for feature in (extent_geometries or ())
+        ]
+        if not dc_bboxes:
+            dc_bboxes = [requested_bbox]
+        for dc_bbox in dc_bboxes:
+            dc_rasters.extend(discover_naip_tiles_digitalcoast(dc_bbox, cache_dir))
+        dc_rasters = list(dict.fromkeys(dc_rasters))
     raster_paths = ee_raster_paths + dc_rasters
     if raster_paths:
         return True, raster_paths

@@ -55,6 +55,43 @@ def test_discover_naip_tiles_ee_splits_capped_searches(
     ]
 
 
+def test_discover_naip_tiles_ee_queries_each_extent_feature(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    queried_bboxes: list[land_naip.BBox] = []
+
+    class FeatureGeometry:
+        def __init__(self, envelope: tuple[float, float, float, float]) -> None:
+            self.envelope = envelope
+
+        def GetEnvelope(self) -> tuple[float, float, float, float]:
+            return self.envelope
+
+    def fake_request(endpoint: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+        assert endpoint == "scene-search"
+        bbox = _payload_bbox(payload)
+        queried_bboxes.append(bbox)
+        return {"results": [{"entityId": f"scene-{bbox}"}]}
+
+    monkeypatch.setattr(land_naip, "send_m2m_request", fake_request)
+
+    scenes = land_naip.discover_naip_tiles_ee(
+        (-180.0, -90.0, 180.0, 90.0),
+        "api-key",
+        cache_dir=str(tmp_path),
+        extent_geometries=[
+            FeatureGeometry((-104.1, -103.7, 29.3, 29.8)),
+            FeatureGeometry((-101.0, -100.5, 31.0, 31.5)),
+        ],
+    )
+
+    assert queried_bboxes == [
+        (-104.1, 29.3, -103.7, 29.8),
+        (-101.0, 31.0, -100.5, 31.5),
+    ]
+    assert len(scenes) == 2
+
+
 def test_discover_naip_tiles_ee_reuses_metadata_until_expired(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

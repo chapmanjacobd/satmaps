@@ -140,6 +140,7 @@ satmaps --estimate
 ## Advanced Options
 
 - `--bbox`: Discover MGRS tiles touched by a WGS84 bbox (`min_lon,min_lat,max_lon,max_lat`). When `--bbox` is omitted, `satmaps` processes all discovered land tiles from the source mosaics.
+- `--extent`: Use the features in a vector file as the area of interest. NAIP discovery queries each feature envelope independently, while output masking follows the feature boundaries. Mutually exclusive with `--bbox`.
 - `--date`: Comma-separated list of mosaic dates (default: `2025/07/01,2025/01/01`). Overlapping areas are averaged.
 - `--quality`: Output WebP quality.
 - `--resample-alg`: Resampling algorithm (`lanczos`, `bilinear`, `average`, `gauss`).
