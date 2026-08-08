@@ -784,6 +784,44 @@ def test_run_tiling_simplified_creates_mbtiles(
     assert count > 0
 
 
+@pytest.mark.skipif(shutil.which("gdaladdo") is None, reason="gdaladdo not available")
+def test_run_tiling_simplified_parallelizes_mbtiles_chunks(tmp_path: Path) -> None:
+    source_path = tmp_path / "world.tif"
+    world = WEB_MERCATOR_LIMIT * 2
+    pixel_size = world / 1024
+    dataset = gdal.GetDriverByName("GTiff").Create(str(source_path), 1024, 1024, 3, gdal.GDT_Byte)
+    assert dataset is not None
+    dataset.SetGeoTransform((-WEB_MERCATOR_LIMIT, pixel_size, 0.0, WEB_MERCATOR_LIMIT, 0.0, -pixel_size))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    dataset.SetProjection(srs.ExportToWkt())
+    for band_index in range(1, 4):
+        dataset.GetRasterBand(band_index).Fill(128)
+    dataset = None
+
+    output_mbtiles = tmp_path / "output.mbtiles"
+    run_tiling_simplified(
+        str(source_path),
+        str(output_mbtiles),
+        {
+            "format": "png",
+            "quality": 75,
+            "resample_alg": "bilinear",
+            "chunk_zoom": 1,
+            "processes": 2,
+            "blocksize": 256,
+            "name": "Test",
+            "description": "Test",
+        },
+    )
+
+    conn = sqlite3.connect(output_mbtiles)
+    tile_count = conn.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
+    conn.close()
+    assert tile_count > 0
+    assert not (tmp_path / ".output.mbtiles.chunks").exists()
+
+
 def test_run_tiling_simplified_uses_explicit_chunk_bounds(
     tmp_path: Path, monkeypatch: object
 ) -> None:

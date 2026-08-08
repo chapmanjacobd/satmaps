@@ -143,7 +143,7 @@ satmaps --estimate
 - `--date`: Comma-separated list of mosaic dates (default: `2025/07/01,2025/01/01`). Overlapping areas are averaged.
 - `--quality`: Output WebP quality.
 - `--resample-alg`: Resampling algorithm (`lanczos`, `bilinear`, `average`, `gauss`).
-- `--chunk-zoom`: Chunking zoom used during MBTiles generation (default: `4`).
+- `--chunk-zoom`: Chunking zoom used during MBTiles generation (default: `6`).
 - `--parallel`: Number of worker processes/threads used for tile processing and chunk generation (default: `2`).
 - `--tile-batch-width` / `--ty`: Target number of contiguous output tiles rendered together within one row during the final land pass (default: `32`).
 - `--full-render-first`: Render each land work unit into a full aligned EPSG:3857 GeoTIFF first, cache those rasters under `.cache.render`, build a master VRT, then tile that merged raster once. This usually trades higher disk/RAM for less repeated final-tile work.
@@ -214,7 +214,7 @@ You can override the defaults (tuned via `satmaps-tuner`):
 5.  Processing (NumPy):
     - Soft-Knee Tone Mapping: A 3-segment linear curve to compress high dynamic range while preserving local contrast.
     - Color Grading: Exposure, gamma/shoulder shaping, and contrast controls for a "natural" look.
-6.  Packaging: By default, `satmaps` renders each land work unit and the prepared ocean background into a resumable max-zoom `z/x/y.webp` cache, batching neighboring final land tiles together row-by-row when possible, then copies those WebP bytes into MBTiles, builds lower zooms with `gdaladdo`, and converts the archive to PMTiles. With `--full-render-first`, it instead writes full aligned 3857 land rasters into `.cache.render`, builds a master VRT, and tiles that merged raster tree once before packaging.
+6.  Packaging: By default, `satmaps` renders each land work unit and the prepared ocean background into a resumable max-zoom `z/x/y.webp` cache, batching neighboring final land tiles together row-by-row when possible, then copies those WebP bytes into MBTiles, builds lower zooms with `gdaladdo`, and converts the archive to PMTiles. With `--full-render-first`, it instead writes full aligned 3857 land rasters into `.cache.render`, builds a master VRT, and tiles that merged raster tree once before packaging. Large direct bbox renders split MBTiles translation into independent chunks at `--chunk-zoom` and process them concurrently using `--parallel` workers before merging.
 
 ## Datasets
 

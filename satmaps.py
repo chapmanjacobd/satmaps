@@ -4810,7 +4810,7 @@ def main() -> None:
                     tile_format="webp",
                     quality=75,
                     resample_alg=args.resample_alg,
-                    chunk_zoom=args.max_zoom,
+                    chunk_zoom=args.chunk_zoom,
                     parallel=args.parallel,
                     blocksize=args.blocksize,
                     name="Sentinel-2 Mosaic",

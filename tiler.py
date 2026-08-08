@@ -1347,8 +1347,9 @@ def process_chunk(args: ChunkTask) -> str:
     """Worker function for parallel gdal.Translate."""
     input_vrt, chunk_file, format, options, te_bounds = args
     ds = None
-    temp_chunk_raster = chunk_file.replace(".mbtiles", ".tif")
-    temp_chunk_rgb = chunk_file.replace(".mbtiles", "_rgb.tif")
+    chunk_stem, _ = os.path.splitext(chunk_file)
+    temp_chunk_raster = f"{chunk_stem}.tif"
+    temp_chunk_rgb = f"{chunk_stem}_rgb.tif"
     staged_chunk_file = prepare_staged_path(chunk_file)
     try:
         gdal.UseExceptions()
@@ -1356,7 +1357,7 @@ def process_chunk(args: ChunkTask) -> str:
         # Open VRT to check intersection
         ds = gdal.Open(input_vrt)
         if ds is None:
-            return ""
+            raise RuntimeError(f"Could not open input VRT: {input_vrt}")
 
         dataset_bounds = get_dataset_bounds(ds)
         clipped_te_bounds = intersect_te_bounds(te_bounds, dataset_bounds)
@@ -1429,11 +1430,10 @@ def process_chunk(args: ChunkTask) -> str:
         gdal.Translate(staged_chunk_file, chunk_source, options=translate_options)
         publish_staged_path(staged_chunk_file, chunk_file)
         return chunk_file
-    except Exception as e:
-        print(f"Error processing chunk {chunk_file}: {e}")
+    except Exception:
         if os.path.exists(chunk_file):
             os.remove(chunk_file)
-        return ""
+        raise
     finally:
         ds = None
         if os.path.exists(temp_chunk_raster):
@@ -1587,7 +1587,9 @@ def run_tiling_simplified(
         raise RuntimeError(f"Could not open input VRT: {input_vrt}")
 
     source_path = input_vrt
-    temp_raster = output_mbtiles.replace(".mbtiles", "_temp.tif")
+    output_stem, _ = os.path.splitext(output_mbtiles)
+    temp_raster = f"{output_stem}_temp.tif"
+    chunk_dir: Optional[str] = None
     cleanup_paths = []
     band_list = None
 
@@ -1608,34 +1610,84 @@ def run_tiling_simplified(
             bounds = options["chunk_bounds"]
             proj_win = [bounds[0], bounds[3], bounds[2], bounds[1]]
 
-        translate_options = gdal.TranslateOptions(
-            format="MBTiles",
-            outputType=gdal.GDT_Byte,
-            bandList=band_list,
-            projWin=proj_win,
-            metadataOptions=[
-                f"format={tile_format.lower()}",
-                f"name={options['name']}",
-                f"description={options['description']}",
-            ],
-            creationOptions=[
-                f"NAME={options['name']}",
-                f"DESCRIPTION={options['description']}",
-                "TYPE=baselayer",
-                f"TILE_FORMAT={'JPEG' if tile_format.lower() == 'jpg' else tile_format.upper()}",
-                f"QUALITY={options['quality']}",
-                f"RESAMPLING={options['resample_alg'] if options['resample_alg'] != 'gauss' else 'bilinear'}",
-                f"BLOCKSIZE={options.get('blocksize', 512)}",
-                "ZOOM_LEVEL_STRATEGY=LOWER",
-            ],
-        )
+        requested_bounds = options.get("chunk_bounds")
+        dataset_bounds = get_dataset_bounds(ds)
+        if requested_bounds is not None:
+            dataset_bounds = intersect_te_bounds(dataset_bounds, requested_bounds)
 
-        if tile_format.lower() == "webp":
-            gdal.SetThreadLocalConfigOption("WEBP_LEVEL", str(options["quality"]))
+        chunk_zoom = int(options.get("chunk_zoom", 0))
+        worker_count = max(1, int(options.get("processes", 1)))
+        chunk_tasks: List[ChunkTask] = []
+        if dataset_bounds is not None and worker_count > 1 and chunk_zoom >= 0:
+            tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(dataset_bounds, chunk_zoom)
+            chunk_dir = os.path.join(
+                os.path.dirname(output_mbtiles),
+                f".{os.path.basename(output_mbtiles)}.chunks",
+            )
+            os.makedirs(chunk_dir, exist_ok=True)
+            chunk_options = dict(options)
+            chunk_options.pop("chunk_bounds", None)
+            for ty in range(ty_min, ty_max + 1):
+                for tx in range(tx_min, tx_max + 1):
+                    chunk_path = os.path.join(
+                        chunk_dir,
+                        f"chunk_{chunk_zoom}_{tx}_{ty}.mbtiles",
+                    )
+                    chunk_tasks.append(
+                        (
+                            source_path,
+                            chunk_path,
+                            tile_format,
+                            chunk_options,
+                            get_web_mercator_bounds(chunk_zoom, tx, ty),
+                        )
+                    )
 
-        print(f"Translating {source_path} to {staged_output_mbtiles} using a single GDAL process...")
-        gdal.Translate(staged_output_mbtiles, source_path, options=translate_options)
-        
+        if len(chunk_tasks) > 1:
+            print(
+                f"Translating {len(chunk_tasks)} MBTiles chunks with "
+                f"{min(worker_count, len(chunk_tasks))} worker(s)..."
+            )
+            with ThreadPoolExecutor(
+                max_workers=min(worker_count, len(chunk_tasks))
+            ) as executor:
+                chunk_paths = [
+                    chunk_path
+                    for chunk_path in executor.map(process_chunk, chunk_tasks)
+                    if chunk_path
+                ]
+            if not chunk_paths:
+                raise RuntimeError("No MBTiles chunks were generated")
+            merge_mbtiles(staged_output_mbtiles, chunk_paths)
+        else:
+            translate_options = gdal.TranslateOptions(
+                format="MBTiles",
+                outputType=gdal.GDT_Byte,
+                bandList=band_list,
+                projWin=proj_win,
+                metadataOptions=[
+                    f"format={tile_format.lower()}",
+                    f"name={options['name']}",
+                    f"description={options['description']}",
+                ],
+                creationOptions=[
+                    f"NAME={options['name']}",
+                    f"DESCRIPTION={options['description']}",
+                    "TYPE=baselayer",
+                    f"TILE_FORMAT={'JPEG' if tile_format.lower() == 'jpg' else tile_format.upper()}",
+                    f"QUALITY={options['quality']}",
+                    f"RESAMPLING={options['resample_alg'] if options['resample_alg'] != 'gauss' else 'bilinear'}",
+                    f"BLOCKSIZE={options.get('blocksize', 512)}",
+                    "ZOOM_LEVEL_STRATEGY=LOWER",
+                ],
+            )
+
+            if tile_format.lower() == "webp":
+                gdal.SetThreadLocalConfigOption("WEBP_LEVEL", str(options["quality"]))
+
+            print(f"Translating {source_path} to {staged_output_mbtiles} using a single GDAL process...")
+            gdal.Translate(staged_output_mbtiles, source_path, options=translate_options)
+
         # Refresh metadata before building overviews
         finalize_mbtiles_metadata(staged_output_mbtiles)
 
@@ -1650,5 +1702,7 @@ def run_tiling_simplified(
         ds = None
         for p in cleanup_paths:
             remove_if_exists(p)
+        if chunk_dir is not None and os.path.isdir(chunk_dir):
+            shutil.rmtree(chunk_dir)
 
     return TilingArtifacts(final_vrt=input_vrt, cleanup_paths=[])
