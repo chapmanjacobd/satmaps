@@ -18,7 +18,7 @@ NAIP_METADATA_CACHE_MAX_AGE_DAYS = 90
 EE_MAX_RESULTS = 500
 EE_SPLIT_THRESHOLD = 480
 EE_MAX_SPLIT_DEPTH = 12
-EE_INITIAL_MAX_BBOX_SPAN_DEGREES = 0.3125
+EE_INITIAL_MAX_BBOX_SPAN_DEGREES = 5.0
 
 DIGITAL_COAST_DATASETS: List[dict[str, Any]] = [
     {
@@ -149,33 +149,53 @@ def _write_json_cache(cache_path: str, data: Any) -> None:
     os.replace(temporary_path, cache_path)
 
 
-def _bbox_intersects_geometry_envelope(bbox: BBox, geometry: Any) -> bool:
-    """Check whether a query bbox overlaps the envelope of a render geometry."""
+def _bbox_geometry(bbox: BBox) -> Any:
+    """Build a WGS84 polygon for a bbox."""
+    from osgeo import ogr
+
+    min_lon, min_lat, max_lon, max_lat = bbox
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    ring.AddPoint(min_lon, min_lat)
+    ring.AddPoint(max_lon, min_lat)
+    ring.AddPoint(max_lon, max_lat)
+    ring.AddPoint(min_lon, max_lat)
+    ring.AddPoint(min_lon, min_lat)
+    polygon = ogr.Geometry(ogr.wkbPolygon)
+    polygon.AddGeometry(ring)
+    return polygon
+
+
+def _bbox_intersects_geometry(bbox: BBox, geometry: Any) -> bool:
+    """Check whether a query bbox overlaps a render geometry using its exact
+    shape, so cells that only touch the geometry's envelope corners are skipped."""
     envelope = geometry.GetEnvelope()
     geometry_bbox = (envelope[0], envelope[2], envelope[1], envelope[3])
-    return _bbox_overlaps(bbox, geometry_bbox)
+    if not _bbox_overlaps(bbox, geometry_bbox):
+        return False
+    return _bbox_geometry(bbox).Intersects(geometry)
 
 
-def _split_bbox(bbox: BBox) -> Optional[Tuple[BBox, BBox]]:
-    """Split a bbox in half along its longest dimension."""
+def _split_bbox(bbox: BBox) -> Optional[List[BBox]]:
+    """Split a bbox into four quadrants, halving each axis.
+
+    Sub-cells stay nested within the parent cell, so their metadata cache keys
+    remain deterministic for nearby renders instead of depending on which axis
+    happened to be longest.
+    """
     min_lon, min_lat, max_lon, max_lat = bbox
     lon_span = max_lon - min_lon
     lat_span = max_lat - min_lat
     if lon_span <= 0 and lat_span <= 0:
         return None
 
-    if lon_span >= lat_span:
-        midpoint = min_lon + lon_span / 2
-        return (
-            (min_lon, min_lat, midpoint, max_lat),
-            (midpoint, min_lat, max_lon, max_lat),
-        )
-
-    midpoint = min_lat + lat_span / 2
-    return (
-        (min_lon, min_lat, max_lon, midpoint),
-        (min_lon, midpoint, max_lon, max_lat),
-    )
+    lon_midpoint = min_lon + lon_span / 2
+    lat_midpoint = min_lat + lat_span / 2
+    return [
+        (min_lon, min_lat, lon_midpoint, lat_midpoint),
+        (lon_midpoint, min_lat, max_lon, lat_midpoint),
+        (min_lon, lat_midpoint, lon_midpoint, max_lat),
+        (lon_midpoint, lat_midpoint, max_lon, max_lat),
+    ]
 
 
 def _initial_query_bboxes(bbox: BBox) -> List[BBox]:
@@ -256,7 +276,7 @@ def _discover_naip_tiles_ee_recursive(
     split_depth: int,
 ) -> List[Any]:
     """Query a bbox and recursively subdivide result sets near the API limit."""
-    if extent_geometry is not None and not _bbox_intersects_geometry_envelope(bbox, extent_geometry):
+    if extent_geometry is not None and not _bbox_intersects_geometry(bbox, extent_geometry):
         return []
 
     scenes = _query_naip_tiles_ee(bbox, api_key, cache_dir)

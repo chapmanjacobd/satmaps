@@ -46,12 +46,70 @@ def test_discover_naip_tiles_ee_splits_capped_searches(
 
     assert queried_bboxes == [
         root_bbox,
-        (-2.0, 0.0, 0.0, 4.0),
-        (0.0, 0.0, 2.0, 4.0),
+        (-2.0, 0.0, 0.0, 2.0),
+        (0.0, 0.0, 2.0, 2.0),
+        (-2.0, 2.0, 0.0, 4.0),
+        (0.0, 2.0, 2.0, 4.0),
     ]
     assert [scene["entityId"] for scene in scenes] == [
-        "child-(-2.0, 0.0, 0.0, 4.0)",
-        "child-(0.0, 0.0, 2.0, 4.0)",
+        "child-(-2.0, 0.0, 0.0, 2.0)",
+        "child-(0.0, 0.0, 2.0, 2.0)",
+        "child-(-2.0, 2.0, 0.0, 4.0)",
+        "child-(0.0, 2.0, 2.0, 4.0)",
+    ]
+
+
+def _l_shape_geometry():
+    from osgeo import ogr
+
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    for lon, lat in [
+        (0.5, 0.5),
+        (0.5, 9.5),
+        (9.5, 9.5),
+        (9.5, 6.5),
+        (3.5, 6.5),
+        (3.5, 0.5),
+        (0.5, 0.5),
+    ]:
+        ring.AddPoint(lon, lat)
+    polygon = ogr.Geometry(ogr.wkbPolygon)
+    polygon.AddGeometry(ring)
+    return polygon
+
+
+def test_bbox_intersects_geometry_uses_exact_shape_not_envelope() -> None:
+    geometry = _l_shape_geometry()
+
+    assert land_naip._bbox_intersects_geometry((4.0, 1.0, 4.4, 1.9), geometry) is False
+    assert land_naip._bbox_intersects_geometry((4.0, 7.0, 4.4, 7.9), geometry) is True
+    assert land_naip._bbox_intersects_geometry((20.0, 20.0, 21.0, 21.0), geometry) is False
+
+
+def test_discover_naip_tiles_ee_prunes_cells_outside_geometry(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    queried_bboxes: list[land_naip.BBox] = []
+
+    def fake_request(endpoint: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+        assert endpoint == "scene-search"
+        bbox = _payload_bbox(payload)
+        queried_bboxes.append(bbox)
+        return {"results": [{"entityId": f"scene-{bbox}"}]}
+
+    monkeypatch.setattr(land_naip, "send_m2m_request", fake_request)
+
+    land_naip.discover_naip_tiles_ee(
+        (0.0, 0.0, 10.0, 10.0),
+        "api-key",
+        cache_dir=str(tmp_path),
+        extent_geometry=_l_shape_geometry(),
+    )
+
+    assert queried_bboxes == [
+        (0.0, 0.0, 5.0, 5.0),
+        (0.0, 5.0, 5.0, 10.0),
+        (5.0, 5.0, 10.0, 10.0),
     ]
 
 
@@ -60,12 +118,23 @@ def test_discover_naip_tiles_ee_queries_each_extent_feature(
 ) -> None:
     queried_bboxes: list[land_naip.BBox] = []
 
-    class FeatureGeometry:
-        def __init__(self, envelope: tuple[float, float, float, float]) -> None:
-            self.envelope = envelope
+    def polygon_geometry(
+        min_lon: float, min_lat: float, max_lon: float, max_lat: float
+    ) -> Any:
+        from osgeo import ogr
 
-        def GetEnvelope(self) -> tuple[float, float, float, float]:
-            return self.envelope
+        ring = ogr.Geometry(ogr.wkbLinearRing)
+        for lon, lat in [
+            (min_lon, min_lat),
+            (max_lon, min_lat),
+            (max_lon, max_lat),
+            (min_lon, max_lat),
+            (min_lon, min_lat),
+        ]:
+            ring.AddPoint(lon, lat)
+        polygon = ogr.Geometry(ogr.wkbPolygon)
+        polygon.AddGeometry(ring)
+        return polygon
 
     def fake_request(endpoint: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
         assert endpoint == "scene-search"
@@ -80,8 +149,8 @@ def test_discover_naip_tiles_ee_queries_each_extent_feature(
         "api-key",
         cache_dir=str(tmp_path),
         extent_geometries=[
-            FeatureGeometry((-104.1, -103.7, 29.3, 29.8)),
-            FeatureGeometry((-101.0, -100.5, 31.0, 31.5)),
+            polygon_geometry(-104.1, 29.3, -103.7, 29.8),
+            polygon_geometry(-101.0, 31.0, -100.5, 31.5),
         ],
     )
 
