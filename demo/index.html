@@ -34,6 +34,7 @@
   <select id="area-select">
     <option value="hawaii" selected>Hawaii</option>
     <option value="greenland">Greenland east-coast sliver</option>
+    <option value="eastsound">Eastsound</option>
   </select>
   <div class="row">
     <label>
@@ -87,6 +88,15 @@
       zoom: 8,
       maxzoom: 13,
       bounds: [[-37.6, 80.6], [-37.0, 84.9]],
+    },
+    eastsound: {
+      label: "Eastsound",
+      land: "eastsound.pmtiles",
+      ocean: "eastsound.ocean.pmtiles",
+      center: [-122.9941975, 48.745359],
+      zoom: 10,
+      maxzoom: 13,
+      bounds: [[-123.203075, 48.633139], [-122.785320, 48.857579]],
     },
   };
 
