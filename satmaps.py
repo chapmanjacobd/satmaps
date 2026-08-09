@@ -223,6 +223,16 @@ def temp_basename_from_output(output_path: str) -> str:
    return stem or "satmaps"
 
 
+def build_ocean_output_path(output_path: str) -> str:
+   """Return the split-mode ocean archive path for a land output path.
+
+   ``hawaii.pmtiles`` maps to ``hawaii.ocean.pmtiles`` so the two archives
+   share the base name with a ``.ocean`` marker before the extension.
+   """
+   stem, ext = os.path.splitext(output_path)
+   return f"{stem}.ocean{ext}"
+
+
 @dataclass(frozen=True)
 class SatmapsRunPaths:
    """Run-scoped paths derived from one output path and namespace."""
@@ -4825,7 +4835,7 @@ def main() -> None:
     prepared_ocean_background: Optional[str] = None
     ocean_cleanup_paths: List[str] = []
     combined_output = getattr(args, "combined", False)
-    ocean_output_path = args.output + ".ocean.pmtiles"
+    ocean_output_path = build_ocean_output_path(args.output)
     # NAIP workflow renders land directly from source GeoTIFFs; it has no use
     # for an ocean background, so skip preparation/commit entirely.
     if not is_naip:

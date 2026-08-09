@@ -23,20 +23,18 @@
   #panel .row .swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid #888; }
   #panel .hint { color: #666; font-size: 11px; margin-top: 8px; line-height: 1.4; }
   #panel button { margin-top: 8px; }
+  #panel select { width: 100%; margin-bottom: 8px; padding: 4px; }
   .fade { color: #999; }
 </style>
 </head>
 <body>
 <div id="map"></div>
 <div id="panel">
-  <h1>Layer toggle demo (z13, Hawaii)</h1>
-  <div class="row">
-    <label>
-      <input type="checkbox" id="toggle-ocean" checked />
-      <span class="swatch" style="background:#1a4f8b"></span>
-      Ocean
-    </label>
-  </div>
+  <h1>Layer toggle demo (z13)</h1>
+  <select id="area-select">
+    <option value="hawaii" selected>Hawaii</option>
+    <option value="greenland">Greenland east-coast sliver</option>
+  </select>
   <div class="row">
     <label>
       <input type="checkbox" id="toggle-land" checked />
@@ -46,9 +44,9 @@
   </div>
   <div class="row">
     <label>
-      <input type="checkbox" id="toggle-hillshade" checked />
-      <span class="swatch" style="background:#8b8b8b"></span>
-      Ocean hillshade (alpha)
+      <input type="checkbox" id="toggle-ocean" checked />
+      <span class="swatch" style="background:#1a4f8b"></span>
+      Ocean
     </label>
   </div>
   <div class="row" style="margin-top:6px">
@@ -56,9 +54,9 @@
     <input type="range" id="ocean-opacity" min="0" max="1" step="0.05" value="1" />
   </div>
   <div class="hint">
-    Two independent PMTiles: <code>ocean-hawaii.pmtiles</code> (RGBA, transparent over land)
-    and <code>land-hawaii.pmtiles</code> (RGBA, transparent over water).
-    Toggle each layer to see independent control. Drag to pan, scroll to zoom.
+    Two independent PMTiles per area: <code>&lt;area>.pmtiles</code> (land, RGBA transparent
+    over water) and <code>&lt;area>.ocean.pmtiles</code> (ocean, RGBA transparent over
+    land). Toggle each layer to see independent control. Drag to pan, scroll to zoom.
   </div>
 </div>
 <script>
@@ -71,6 +69,27 @@
     return "pmtiles://" + url.href + "/{z}/{x}/{y}";
   }
 
+  const AREAS = {
+    hawaii: {
+      label: "Hawaii",
+      land: "hawaii.pmtiles",
+      ocean: "hawaii.ocean.pmtiles",
+      center: [-157.2, 21.3],
+      zoom: 9,
+      maxzoom: 13,
+      bounds: [[-158.5, 20.6], [-156.0, 22.0]],
+    },
+    greenland: {
+      label: "Greenland east-coast sliver",
+      land: "greenland.pmtiles",
+      ocean: "greenland.ocean.pmtiles",
+      center: [-37.3, 82.0],
+      zoom: 8,
+      maxzoom: 13,
+      bounds: [[-37.6, 80.6], [-37.0, 84.9]],
+    },
+  };
+
   const map = new maplibregl.Map({
     container: "map",
     style: {
@@ -78,17 +97,15 @@
       sources: {
         ocean: {
           type: "raster",
-          tiles: [pmtilesUrl("ocean-hawaii.pmtiles")],
+          tiles: [pmtilesUrl(AREAS.hawaii.ocean)],
           tileSize: 512,
-          minzoom: 6,
           maxzoom: 13,
           attribution: "GEBCO",
         },
         land: {
           type: "raster",
-          tiles: [pmtilesUrl("land-hawaii.pmtiles")],
+          tiles: [pmtilesUrl(AREAS.hawaii.land)],
           tileSize: 512,
-          minzoom: 5,
           maxzoom: 13,
           attribution: "Copernicus Sentinel-2",
         },
@@ -100,27 +117,53 @@
         { id: "ocean", type: "raster", source: "ocean", paint: { "raster-opacity": 1 } },
       ],
     },
-    center: [-157.2, 21.3],
-    zoom: 10,
+    center: AREAS.hawaii.center,
+    zoom: AREAS.hawaii.zoom,
     maxZoom: 13,
   });
 
-  const oceanEl = document.getElementById("toggle-ocean");
   const landEl = document.getElementById("toggle-land");
-  const hillEl = document.getElementById("toggle-hillshade");
+  const oceanEl = document.getElementById("toggle-ocean");
   const opacityEl = document.getElementById("ocean-opacity");
+  const areaEl = document.getElementById("area-select");
+
+  function applyArea(key) {
+    const area = AREAS[key];
+    // MapLibre has no map.setSource; remove and re-add both raster sources and layers.
+    map.removeLayer("ocean");
+    map.removeLayer("land");
+    map.removeSource("ocean");
+    map.removeSource("land");
+    map.addSource("land", {
+      type: "raster",
+      tiles: [pmtilesUrl(area.land)],
+      tileSize: 512,
+      maxzoom: area.maxzoom,
+      attribution: "Copernicus Sentinel-2",
+    });
+    map.addSource("ocean", {
+      type: "raster",
+      tiles: [pmtilesUrl(area.ocean)],
+      tileSize: 512,
+      maxzoom: area.maxzoom,
+      attribution: "GEBCO",
+    });
+    map.addLayer({ id: "ocean", type: "raster", source: "ocean", paint: { "raster-opacity": 1 } });
+    map.addLayer({ id: "land", type: "raster", source: "land", paint: { "raster-opacity": 1 } }, "ocean");
+    // Re-apply current toggle state (layers are fresh after re-add).
+    map.setLayoutProperty("ocean", "visibility", oceanEl.checked ? "visible" : "none");
+    map.setLayoutProperty("land", "visibility", landEl.checked ? "visible" : "none");
+    map.setPaintProperty("ocean", "raster-opacity", parseFloat(opacityEl.value));
+    map.easeTo({ center: area.center, zoom: area.zoom, duration: 600 });
+  }
+
+  areaEl.addEventListener("change", () => applyArea(areaEl.value));
 
   oceanEl.addEventListener("change", () => {
     map.setLayoutProperty("ocean", "visibility", oceanEl.checked ? "visible" : "none");
   });
   landEl.addEventListener("change", () => {
     map.setLayoutProperty("land", "visibility", landEl.checked ? "visible" : "none");
-  });
-  hillEl.addEventListener("change", () => {
-    // The ocean layer itself is the hillshaded base; toggling it on/off is the
-    // full ocean layer. This checkbox just mirrors ocean visibility for clarity.
-    map.setLayoutProperty("ocean", "visibility", hillEl.checked ? "visible" : "none");
-    if (oceanEl.checked !== hillEl.checked) oceanEl.checked = hillEl.checked;
   });
   opacityEl.addEventListener("input", () => {
     map.setPaintProperty("ocean", "raster-opacity", parseFloat(opacityEl.value));
