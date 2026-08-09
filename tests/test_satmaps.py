@@ -428,16 +428,12 @@ def test_create_alpha_vrt_handles_near_nodata_and_shallow_values(tmp_path: Path)
         np.array([[0.0, 0.0, 255.0, 0.0]], dtype=np.float32),
     )
 
-def test_remove_small_enclosed_ocean_regions_prefers_land() -> None:
+def test_remove_enclosed_ocean_regions_prefers_land() -> None:
     ocean_mask = np.zeros((5, 5), dtype=bool)
     ocean_mask[2, 2] = True
     ocean_mask[0, 0] = True
 
-    cleaned = ocean.remove_small_enclosed_ocean_regions(
-        ocean_mask,
-        (0.0, 10.0, 0.0, 0.0, 0.0, -10.0),
-        150.0,
-    )
+    cleaned = ocean.remove_enclosed_ocean_regions(ocean_mask)
 
     expected = np.zeros((5, 5), dtype=bool)
     expected[0, 0] = True
@@ -1320,38 +1316,6 @@ def test_create_alpha_vrt_large_cleanup_preserves_land_holes(
             dtype=np.uint8,
         ),
     )
-
-def test_create_sieve_cleanup_mask_dataset_prefers_mem(tmp_path: Path, monkeypatch: object) -> None:
-    monkeypatch.setattr(ocean, "max_in_memory_sieve_mask_pixels", lambda: 9)
-    driver = gdal.GetDriverByName("MEM")
-    alpha_ds = driver.Create("", 3, 3, 1, gdal.GDT_Byte)
-
-    cleanup_ds, cleanup_path = ocean.create_sieve_cleanup_mask_dataset(
-        alpha_ds,
-        tmp_path / "cleanup_mask.tif",
-    )
-
-    assert cleanup_ds.GetDriver().ShortName == "MEM"
-    assert cleanup_path is None
-
-def test_create_sieve_cleanup_mask_dataset_uses_uncompressed_gtiff(
-    tmp_path: Path,
-    monkeypatch: object,
-) -> None:
-    monkeypatch.setattr(ocean, "max_in_memory_sieve_mask_pixels", lambda: 0)
-    alpha_ds = gdal.GetDriverByName("MEM").Create("", 3, 3, 1, gdal.GDT_Byte)
-
-    cleanup_ds, cleanup_path = ocean.create_sieve_cleanup_mask_dataset(
-        alpha_ds,
-        tmp_path / "cleanup_mask.tif",
-    )
-
-    assert cleanup_ds.GetDriver().ShortName == "GTiff"
-    assert cleanup_path is not None
-    assert cleanup_ds.GetMetadata("IMAGE_STRUCTURE").get("COMPRESSION") != "ZSTD"
-
-    cleanup_ds = None
-    ocean.remove_if_exists(cleanup_path)
 
 def test_create_ocean_rgb_tif_colorizes_in_blocks(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
