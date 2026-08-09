@@ -546,3 +546,89 @@ def test_blend_land_samples_supports_all_requested_modes() -> None:
     assert tuner_ui.np.allclose(darken, 0.0)
     assert tuner_ui.np.allclose(swipe[:, :, :3], 0.0)
     assert tuner_ui.np.allclose(swipe[:, :, 3:], 1.0)
+
+
+def test_mask_page_exposes_erode_blur_controls(monkeypatch: object) -> None:
+    monkeypatch.setattr(
+        tuner_ui,
+        "load_eastsound_mask_depths",
+        lambda: tuner_ui.np.zeros((16, 16), dtype=tuner_ui.np.float32),
+    )
+    client = tuner_ui.app.test_client()
+
+    response = client.get("/mask")
+
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert 'id="blur"' in html
+    assert 'id="erode"' in html
+    assert "Mask Blur" in html
+    assert "Mask Erode" in html
+    assert "Final ocean mask boundary" in html
+    assert "Raw -50m fade contour" in html
+    assert "copyCLI" in html
+
+
+def test_mask_page_shows_missing_zip_hint(monkeypatch: object) -> None:
+    monkeypatch.setattr(tuner_ui, "load_eastsound_mask_depths", lambda: None)
+    client = tuner_ui.app.test_client()
+
+    response = client.get("/mask")
+
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "No GEBCO zip found" in html
+
+
+def test_mask_render_returns_jpeg(monkeypatch: object) -> None:
+    monkeypatch.setattr(
+        tuner_ui,
+        "load_eastsound_mask_depths",
+        lambda: tuner_ui.np.zeros((16, 16), dtype=tuner_ui.np.float32),
+    )
+    client = tuner_ui.app.test_client()
+
+    response = client.get("/mask/render?blur=8&erode=4")
+
+    assert response.status_code == 200
+    assert response.content_type == "image/jpeg"
+    assert len(response.data) > 0
+
+
+def test_mask_render_missing_zip_returns_404(monkeypatch: object) -> None:
+    monkeypatch.setattr(tuner_ui, "load_eastsound_mask_depths", lambda: None)
+    client = tuner_ui.app.test_client()
+
+    response = client.get("/mask/render")
+
+    assert response.status_code == 404
+
+
+def test_mask_render_clamps_bad_args(monkeypatch: object) -> None:
+    monkeypatch.setattr(
+        tuner_ui,
+        "load_eastsound_mask_depths",
+        lambda: tuner_ui.np.zeros((16, 16), dtype=tuner_ui.np.float32),
+    )
+    client = tuner_ui.app.test_client()
+
+    response = client.get("/mask/render?blur=abc&erode=xyz")
+
+    assert response.status_code == 200
+    assert response.content_type == "image/jpeg"
+
+
+def test_compute_mask_preview_increases_land_with_erode() -> None:
+    depths = tuner_ui.np.zeros((64, 64), dtype=tuner_ui.np.float32)
+    depths[:] = -100.0
+    depths[16:48, 16:48] = 50.0
+
+    no_erode = tuner_ui.compute_mask_preview(depths, 0.0, 0)
+    heavy_erode = tuner_ui.compute_mask_preview(depths, 0.0, 12)
+
+    land_rgb = tuner_ui.MASK_LAND_COLOR
+
+    def land_frac(arr: tuner_ui.FloatArray) -> float:
+        return float((tuner_ui.np.abs(arr - land_rgb[:, None, None]).max(axis=0) < 0.05).mean())
+
+    assert land_frac(heavy_erode) > land_frac(no_erode)

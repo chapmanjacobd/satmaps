@@ -14,7 +14,7 @@ from common import (
     LiveProgressLine,
     build_output_namespace_dir,
     build_output_namespace,
-    build_staged_path,
+    build_staged_path,  # noqa: F401  (deliberate re-export)
     ensure_directory,
     prepare_staged_path,
     file_has_content,
@@ -1251,25 +1251,143 @@ def parse_bbox(bbox: str) -> tuple[float, float, float, float]:
     return parse_bbox_string(bbox)
 
 
-def build_ocean_style_from_args(args: argparse.Namespace) -> OceanStyleOptions:
-    """Build style options from parsed CLI arguments."""
+def build_ocean_style_from_args(
+    args: argparse.Namespace, *, dest_prefix: str = ""
+) -> OceanStyleOptions:
+    """Build style options from parsed CLI arguments.
+
+    ``dest_prefix`` (e.g. ``"ocean_"``) selects namespaced flags registered by
+    :func:`add_ocean_style_cli_args` with the matching ``prefix``.
+    """
+    def get(name: str) -> Any:
+        return getattr(args, f"{dest_prefix}{name}")
+
     return OceanStyleOptions(
-        tonemap=args.tonemap,
-        grade=args.grade,
-        exposure=args.exposure,
-        gamma=args.gamma,
-        shoulder=args.shoulder,
-        saturation=args.sat,
-        vibrance=args.vibrance,
-        black_point=args.black_point,
-        white_point=args.white_point,
-        black_break=args.db,
-        black_slope=args.ls,
-        grade_high_break=args.ghb,
-        grade_mid_slope=args.gms,
-        grade_high_slope=args.ghs,
-        depth_min=args.depth_min,
-        depth_max=args.depth_max,
+        tonemap=get("tonemap"),
+        grade=get("grade"),
+        exposure=get("exposure"),
+        gamma=get("gamma"),
+        shoulder=get("shoulder"),
+        saturation=get("sat"),
+        vibrance=get("vibrance"),
+        black_point=get("black_point"),
+        white_point=get("white_point"),
+        black_break=get("db"),
+        black_slope=get("ls"),
+        grade_high_break=get("ghb"),
+        grade_mid_slope=get("gms"),
+        grade_high_slope=get("ghs"),
+        depth_min=get("depth_min"),
+        depth_max=get("depth_max"),
+    )
+
+
+def add_ocean_style_cli_args(parser: argparse.ArgumentParser, *, prefix: str = "") -> None:
+    """Register the ocean styling and rendering controls on ``parser``.
+
+    ``prefix`` (e.g. ``"ocean-"``) exposes the same controls under namespaced
+    flags on another CLI so they cannot collide with land grading flags. Dest
+    names become ``<prefix>_<name>`` (matching :func:`build_ocean_style_from_args`).
+    """
+    add = parser.add_argument
+    p = prefix
+    add(
+        f"--{p}grade",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable ocean final grading before colorization",
+    )
+    add(
+        f"--{p}tonemap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    add(
+        f"--{p}exposure",
+        type=float,
+        default=OCEAN_DEFAULT_EXPOSURE,
+        help="Global brightness multiplier",
+    )
+    add(f"--{p}gamma", type=float, default=OCEAN_DEFAULT_GAMMA)
+    add(
+        f"--{p}shoulder",
+        type=float,
+        default=OCEAN_DEFAULT_SHOULDER,
+        help="Highlight shaping curve; values above 1 lift the top end",
+    )
+    add(f"--{p}sat", f"--{p}saturation", type=float, default=OCEAN_DEFAULT_SATURATION)
+    add(f"--{p}vibrance", type=float, default=DEFAULT_VIBRANCE)
+    add(f"--{p}black-point", type=float, default=DEFAULT_BLACK_POINT)
+    add(f"--{p}white-point", type=float, default=DEFAULT_WHITE_POINT)
+    add(
+        f"--{p}db",
+        f"--{p}black-break",
+        f"--{p}grade-low-break",
+        type=float,
+        default=OCEAN_DEFAULT_BLACK_BREAK,
+    )
+    add(
+        f"--{p}ls",
+        f"--{p}black-slope",
+        f"--{p}grade-low-slope",
+        type=float,
+        default=OCEAN_DEFAULT_BLACK_SLOPE,
+    )
+    add(
+        f"--{p}ghb",
+        f"--{p}grade-highlight-break",
+        type=float,
+        help="Upper breakpoint for the final grading curve; defaults to the low break",
+    )
+    add(
+        f"--{p}gms",
+        f"--{p}grade-mid-slope",
+        type=float,
+        default=PREVIEW_DARKEN_MID_SLOPE,
+    )
+    add(
+        f"--{p}ghs",
+        f"--{p}grade-highlight-slope",
+        type=float,
+        help="Highlight slope for the final grading curve; defaults to an anchored derived slope",
+    )
+    add(
+        f"--{p}depth-min",
+        type=float,
+        default=-11000.0,
+        help="Depth value mapped to the start of the ocean color ramp",
+    )
+    add(
+        f"--{p}depth-max",
+        type=float,
+        default=0.0,
+        help="Depth value mapped to the end of the ocean color ramp",
+    )
+    add(
+        f"--{p}hillshade-z",
+        type=float,
+        default=5.0,
+        help="Vertical exaggeration passed to gdaldem hillshade",
+    )
+    add(
+        f"--{p}mask-blur",
+        type=float,
+        default=8.0,
+        help=(
+            "Gaussian blur sigma (in output pixels) applied to the depth field before the "
+            f"{OCEAN_FADE_DEPTH}m threshold, smoothing the coastline and removing staircase "
+            "steps from coarse GEBCO cells. 0 disables."
+        ),
+    )
+    add(
+        f"--{p}mask-erode",
+        type=int,
+        default=16,
+        help=(
+            "Erode the ocean mask by this many output pixels so land imagery extends a few "
+            "pixels past the fade depth as coastal clearance. 0 disables."
+        ),
     )
 
 
@@ -1308,73 +1426,6 @@ def build_ocean_argument_parser() -> argparse.ArgumentParser:
         help="Resampling algorithm for the GEBCO upscale into EPSG:3857",
     )
     add(
-        "--hillshade-z",
-        type=float,
-        default=5.0,
-        help="Vertical exaggeration passed to gdaldem hillshade",
-    )
-    add(
-        "--grade",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable/disable ocean final grading before colorization",
-    )
-    add(
-        "--exposure",
-        type=float,
-        default=OCEAN_DEFAULT_EXPOSURE,
-        help="Global brightness multiplier",
-    )
-    add(
-        "--tonemap",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=argparse.SUPPRESS,
-    )
-    add("--gamma", type=float, default=OCEAN_DEFAULT_GAMMA)
-    add(
-        "--shoulder",
-        type=float,
-        default=OCEAN_DEFAULT_SHOULDER,
-        help="Highlight shaping curve; values above 1 lift the top end",
-    )
-    add("--sat", "--saturation", type=float, default=OCEAN_DEFAULT_SATURATION)
-    add("--vibrance", type=float, default=DEFAULT_VIBRANCE)
-    add("--black-point", type=float, default=DEFAULT_BLACK_POINT)
-    add("--white-point", type=float, default=DEFAULT_WHITE_POINT)
-    add("--db", "--black-break", "--grade-low-break", type=float, default=OCEAN_DEFAULT_BLACK_BREAK)
-    add("--ls", "--black-slope", "--grade-low-slope", type=float, default=OCEAN_DEFAULT_BLACK_SLOPE)
-    add(
-        "--ghb",
-        "--grade-highlight-break",
-        type=float,
-        help="Upper breakpoint for the final grading curve; defaults to the low break",
-    )
-    add(
-        "--gms",
-        "--grade-mid-slope",
-        type=float,
-        default=PREVIEW_DARKEN_MID_SLOPE,
-    )
-    add(
-        "--ghs",
-        "--grade-highlight-slope",
-        type=float,
-        help="Highlight slope for the final grading curve; defaults to an anchored derived slope",
-    )
-    add(
-        "--depth-min",
-        type=float,
-        default=-11000.0,
-        help="Depth value mapped to the start of the ocean color ramp",
-    )
-    add(
-        "--depth-max",
-        type=float,
-        default=0.0,
-        help="Depth value mapped to the end of the ocean color ramp",
-    )
-    add(
         "--vrt",
         action="store_true",
         help="Write the final styled RGBA VRT instead of translating it to a GeoTIFF",
@@ -1391,25 +1442,7 @@ def build_ocean_argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OCEAN_CHUNK_SIZE,
         help="Chunk edge length in output pixels for chunked ocean processing",
     )
-    add(
-        "--mask-blur",
-        type=float,
-        default=6.0,
-        help=(
-            "Gaussian blur sigma (in output pixels) applied to the depth field before the "
-            f"{OCEAN_FADE_DEPTH}m threshold, smoothing the coastline and removing staircase "
-            "steps from coarse GEBCO cells. 0 disables."
-        ),
-    )
-    add(
-        "--mask-erode",
-        type=int,
-        default=2,
-        help=(
-            "Erode the ocean mask by this many output pixels so land imagery extends a few "
-            "pixels past the fade depth as coastal clearance. 0 disables."
-        ),
-    )
+    add_ocean_style_cli_args(parser)
     return parser
 
 

@@ -233,6 +233,17 @@ def build_ocean_output_path(output_path: str) -> str:
    return f"{stem}.ocean{ext}"
 
 
+def build_ocean_background_path(output_path: str) -> str:
+   """Return the default cached ocean background path for an output path.
+
+   ``hawaii.pmtiles`` maps to ``hawaii.ocean.tif`` so the rendered GEBCO
+   background is reusable across runs for the same output and is picked up
+   automatically when it already exists.
+   """
+   stem, ext = os.path.splitext(output_path)
+   return f"{stem}.ocean.tif"
+
+
 @dataclass(frozen=True)
 class SatmapsRunPaths:
    """Run-scoped paths derived from one output path and namespace."""
@@ -289,13 +300,6 @@ class SatmapsRunPaths:
    @property
    def prepared_ocean_path(self) -> str:
        return os.path.join(self.output_temp_dir, f"{self.output_stem}_ocean_bbox.tif")
-
-   @property
-   def rendered_ocean_path(self) -> str:
-       # Build-unique path for a freshly rendered GEBCO ocean background so
-       # each run gets its own artifact instead of clobbering or reusing a
-       # shared "ocean.tif" across builds.
-       return os.path.join(self.output_temp_dir, f"{self.output_stem}_ocean.tif")
 
 
 # Compatibility wrappers for callers that still use the legacy path-helper API.
@@ -4490,7 +4494,7 @@ def add_satmaps_grading_cli_args(parser: argparse.ArgumentParser) -> None:
     add(
         "--grade",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Enable/disable land final grading",
     )
     add(
@@ -4549,11 +4553,18 @@ def add_satmaps_grading_cli_args(parser: argparse.ArgumentParser) -> None:
 def add_satmaps_output_cli_args(parser: argparse.ArgumentParser) -> None:
     """Register output and cache controls."""
     add = parser.add_argument
-    add(
-        "--land",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable/disable land tile processing",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--land-only",
+        action="store_true",
+        default=False,
+        help="Skip ocean rendering entirely; produce only the land layer at --output",
+    )
+    mode.add_argument(
+        "--ocean-only",
+        action="store_true",
+        default=False,
+        help="Skip land rendering; produce only the ocean archive at --output",
     )
     add(
         "--full-render-first",
@@ -4587,43 +4598,17 @@ def add_satmaps_output_cli_args(parser: argparse.ArgumentParser) -> None:
         "--ocean-background",
         default=None,
         help=(
-            "Standalone ocean background GeoTIFF to use under bbox renders. "
-            "When omitted, --render-ocean writes to a build-unique path under the temp dir."
-        ),
-    )
-    add(
-        "--render-ocean",
-        action="store_true",
-        default=False,
-        help=(
-            "Render the ocean background from the GEBCO zip before the main pipeline, "
-            "writing the result to --ocean-background. "
-            f"Requires the GEBCO zip at the default path ({ocean.DEFAULT_GEBCO_ZIP}) "
-            "or set via --gebco-zip."
+            "Standalone ocean background GeoTIFF used for the ocean layer. "
+            "When omitted, the default is <output-stem>.ocean.tif; if that file is "
+            "missing it is rendered from the GEBCO zip (see --gebco-zip and --ocean-*)."
         ),
     )
     add(
         "--gebco-zip",
         default=ocean.DEFAULT_GEBCO_ZIP,
-        help="Path to the GEBCO zip archive used when --render-ocean is set",
-    )
-    add(
-        "--mask-blur",
-        type=float,
-        default=6.0,
         help=(
-            "Gaussian blur sigma (in output pixels) applied to the GEBCO depth field before the "
-            f"{ocean.OCEAN_FADE_DEPTH}m threshold when rendering the ocean background. "
-            "Smooths the coastline and removes staircase steps from coarse GEBCO cells. 0 disables."
-        ),
-    )
-    add(
-        "--mask-erode",
-        type=int,
-        default=2,
-        help=(
-            "Erode the ocean mask by this many output pixels so land imagery extends a few "
-            "pixels past the fade depth as coastal clearance. 0 disables."
+            "Path to the GEBCO zip archive used when the ocean background needs rendering "
+            f"(default: {ocean.DEFAULT_GEBCO_ZIP})."
         ),
     )
     add(
@@ -4637,6 +4622,7 @@ def add_satmaps_output_cli_args(parser: argparse.ArgumentParser) -> None:
             "so the layers can be toggled independently in a client."
         ),
     )
+    ocean.add_ocean_style_cli_args(parser, prefix="ocean-")
 
 
 def add_satmaps_discovery_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -4704,7 +4690,8 @@ def build_satmaps_argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
     global CURRENT_DATASET_NAME
 
-    args = build_satmaps_argument_parser().parse_args()
+    parser = build_satmaps_argument_parser()
+    args = parser.parse_args()
 
     if args.max_zoom <= 8:
         CURRENT_DATASET_NAME = "S2MSI_L3__MCQ_LR"
@@ -4733,31 +4720,7 @@ def main() -> None:
     ensure_directory(run_paths.output_temp_dir)
     ensure_directory(run_paths.full_render_cache_dir)
 
-    if args.ocean_background is None:
-        args.ocean_background = run_paths.rendered_ocean_path
-
-    is_naip = getattr(args, "use_naip", False)
-
-    if not is_naip and getattr(args, "render_ocean", False):
-        if os.path.exists(args.ocean_background):
-            print(f"Ocean background already exists, skipping render: {args.ocean_background}")
-        else:
-            ensure_parent_dir(args.ocean_background)
-            print(f"Rendering ocean background from {args.gebco_zip} -> {args.ocean_background}...")
-            ocean.generate_ocean_background(
-                gebco_zip=args.gebco_zip,
-                destination=args.ocean_background,
-                bbox=requested_bbox,
-                temp_dir=args.temp_dir,
-                resample_alg=args.resample_alg,
-                max_zoom=args.max_zoom,
-                mask_blur=args.mask_blur,
-                mask_erode=args.mask_erode,
-            )
-            print(f"Ocean background ready: {args.ocean_background}")
-
     date_paths = [date_path.strip() for date_path in args.date.split(",")]
-    gebco_vrt_source = resolve_ocean_mask_source(args.ocean_background) if not is_naip else None
     land_mgrs_source = resolve_land_mgrs_source()
     land_mgrs_list_path = build_land_mgrs_list_path()
     if land_mgrs_module.handle_land_mgrs_refresh(
@@ -4768,6 +4731,43 @@ def main() -> None:
     ):
         return
 
+    if args.ocean_background is None:
+        args.ocean_background = build_ocean_background_path(args.output)
+
+    is_naip = getattr(args, "use_naip", False)
+    if is_naip and getattr(args, "ocean_only", False):
+        parser.error("--ocean-only cannot be combined with --use-naip")
+
+    # The ocean background is a cache: render it from GEBCO whenever it is
+    # missing (unless --land-only, which wants no ocean at all, or --download,
+    # which only fetches source tiles and exits).
+    if not is_naip and not getattr(args, "land_only", False) and not getattr(args, "download", False):
+        if os.path.exists(args.ocean_background):
+            print(f"Ocean background already exists, reusing: {args.ocean_background}")
+        else:
+            ensure_parent_dir(args.ocean_background)
+            print(f"Rendering ocean background from {args.gebco_zip} -> {args.ocean_background}...")
+            ocean.generate_ocean_background(
+                gebco_zip=args.gebco_zip,
+                destination=args.ocean_background,
+                bbox=requested_bbox,
+                temp_dir=args.temp_dir,
+                resample_alg=args.resample_alg,
+                hillshade_z=args.ocean_hillshade_z,
+                style=ocean.build_ocean_style_from_args(args, dest_prefix="ocean_"),
+                max_zoom=args.max_zoom,
+                parallel=args.parallel,
+                mask_blur=args.ocean_mask_blur,
+                mask_erode=args.ocean_mask_erode,
+            )
+            print(f"Ocean background ready: {args.ocean_background}")
+
+    gebco_vrt_source = (
+        resolve_ocean_mask_source(args.ocean_background)
+        if not is_naip and not getattr(args, "land_only", False)
+        else None
+    )
+
     is_naip, naip_rasters = land_naip_module.handle_naip_workflow(
         args,
         requested_bbox,
@@ -4775,7 +4775,7 @@ def main() -> None:
         extent_geometries=extent_geometries,
     )
 
-    if requested_bbox is None and not is_naip:
+    if requested_bbox is None and not is_naip and not getattr(args, "ocean_only", False):
         populate_s3_cache(date_paths)
     land_run_settings = build_land_run_settings(
         args,
@@ -4808,10 +4808,11 @@ def main() -> None:
             run_paths = SatmapsRunPaths(args.output, unique_id)
             candidate_tile_cache_path = run_paths.candidate_tile_cache_path
 
-    if is_naip:
+    if is_naip or getattr(args, "ocean_only", False):
         plan = LandProcessingPlan(mgrs_bases=(), work_units=())
         pending_work_units = ()
-        args.full_render_first = True
+        if is_naip:
+            args.full_render_first = True
     else:
         mgrs_bases = discover_mgrs_bases(
             requested_bbox,
@@ -4857,9 +4858,9 @@ def main() -> None:
     ocean_cleanup_paths: List[str] = []
     combined_output = getattr(args, "combined", False)
     ocean_output_path = build_ocean_output_path(args.output)
-    # NAIP workflow renders land directly from source GeoTIFFs; it has no use
-    # for an ocean background, so skip preparation/commit entirely.
-    if not is_naip:
+    # NAIP renders land directly from source GeoTIFFs, and --land-only wants no
+    # ocean at all, so both skip ocean preparation/commit entirely.
+    if not is_naip and not getattr(args, "land_only", False):
         prepared_ocean_background = prepare_ocean_background_for_output(
             args.ocean_background,
             requested_bbox,
@@ -4873,10 +4874,26 @@ def main() -> None:
             print(f"Using ocean background: {prepared_ocean_background}")
             if os.path.abspath(prepared_ocean_background) != os.path.abspath(args.ocean_background):
                 ocean_cleanup_paths.append(prepared_ocean_background)
+            if getattr(args, "ocean_only", False):
+                # Ocean-only mode: package the ocean background straight to
+                # --output (there is no land layer and nothing to bake it under).
+                ocean_unique_id = build_output_namespace(args.output, default_stem="ocean")
+                print(f"Building ocean-only archive: {args.output}")
+                build_ocean_only_pmtiles(
+                    prepared_ocean_background,
+                    args.output,
+                    ocean_unique_id,
+                    args,
+                    requested_bbox=requested_bbox,
+                )
+                cleanup_temporary_files(ocean_cleanup_paths)
+                if os.path.exists(state_file):
+                    os.remove(state_file)
+                return
             if combined_output:
                 if (
                     not args.full_render_first
-                    and (not args.land or not plan.work_units)
+                    and not plan.work_units
                     and commit_ocean_to_final_tile_cache(
                         prepared_ocean_background,
                         args.output,
@@ -4898,7 +4915,7 @@ def main() -> None:
                     args,
                     requested_bbox=requested_bbox,
                 )
-                if not args.land or not plan.work_units:
+                if not plan.work_units:
                     print("No land work units to render; only the ocean archive was built.")
                     cleanup_temporary_files(ocean_cleanup_paths)
                     if os.path.exists(state_file):
@@ -4910,7 +4927,7 @@ def main() -> None:
 
     if args.full_render_first:
         source_rasters: List[str] = []
-        if args.land:
+        if not getattr(args, "ocean_only", False):
             if is_naip:
                 print(f"Using {len(naip_rasters)} NAIP GeoTIFF(s) as land source.")
                 source_rasters.extend(naip_rasters)
@@ -4954,7 +4971,7 @@ def main() -> None:
             else:
                 print("No land work units were found.")
         else:
-            print("Skipping land tile processing (--no-land).")
+            print("Skipping land tile processing (--ocean-only).")
 
         if prepared_ocean_background:
             source_rasters.insert(0, prepared_ocean_background)
@@ -5000,7 +5017,7 @@ def main() -> None:
                     progress_label="Master mosaic slicing progress:",
                 )
                 print("Committed raster-first master mosaic to final WebP tiles.")
-    elif args.land:
+    elif not getattr(args, "ocean_only", False):
         if pending_work_units:
             print(
                 f"Starting output-tile rendering for "
@@ -5058,9 +5075,9 @@ def main() -> None:
         else:
             print("All sub-tiles already processed.")
     else:
-        print("Skipping land tile processing (--no-land).")
+        print("Skipping land tile processing (--ocean-only).")
 
-    if args.land and prepared_ocean_background and not args.full_render_first:
+    if prepared_ocean_background and not args.full_render_first:
         backfilled_ocean_tiles = fill_missing_ocean_to_final_tile_cache(
             prepared_ocean_background,
             args.output,

@@ -42,12 +42,12 @@ tune:
 	$(PYTHON) tuner_ui.py
 
 demo:
-	$(PYTHON) satmaps.py --yes --grade --bbox $(DEMO_BBOX_HAWAII) --render-ocean --cache $(DEMO_CACHE) -o demo/hawaii.pmtiles
-	$(PYTHON) satmaps.py --yes --grade --bbox $(DEMO_BBOX_GREENLAND) --render-ocean --cache $(DEMO_CACHE) -o demo/greenland.pmtiles
-	$(PYTHON) satmaps.py --yes --grade --bbox $(DEMO_BBOX_EASTSOUND) --render-ocean --cache $(DEMO_CACHE) -o demo/eastsound.pmtiles
+	#$(PYTHON) satmaps.py --yes --bbox $(DEMO_BBOX_HAWAII) --cache $(DEMO_CACHE) -o demo/hawaii.pmtiles
+	#$(PYTHON) satmaps.py --yes --bbox $(DEMO_BBOX_GREENLAND) --cache $(DEMO_CACHE) -o demo/greenland.pmtiles
+	$(PYTHON) satmaps.py --yes --bbox $(DEMO_BBOX_EASTSOUND) --cache $(DEMO_CACHE) -o demo/eastsound.pmtiles
 
 hawaii: clean
-	$(PYTHON) ocean.py --grade --bbox -158.4172265727475519,20.7947063146676037,-156.1288551802102802,21.8768578466807000
+	$(PYTHON) ocean.py --grade --bbox -158.4172265727475519,20.7947063146676037,-156.1288551802102802,21.8768578466807000 hawaii.ocean.tif
 	$(PYTHON) satmaps.py --grade --max-zoom 14 --bbox -158.4172265727475519,20.7947063146676037,-156.1288551802102802,21.8768578466807000 --output hawaii.pmtiles
 
 clean:

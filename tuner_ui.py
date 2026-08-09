@@ -11,6 +11,7 @@ from flask.typing import ResponseReturnValue
 from numpy.typing import NDArray
 from osgeo import gdal
 from PIL import Image
+from scipy.ndimage import binary_dilation
 
 import ocean
 import satmaps_assets
@@ -43,6 +44,23 @@ LAND_DEFAULT_HDR_HIGHLIGHTS = 0.0
 FloatArray = NDArray[np.float32]
 Hemisphere = Literal["north", "south"]
 GRADE_CONTROL_IDS = ("exp", "gamma", "shoulder", "sat", "vib", "bp", "wp", "db", "ghb", "ls", "gms", "ghs")
+
+# Ocean mask tuner: tries blur/erode values against a GEBCO subset of the Eastsound bbox.
+MASK_GEBCO_ZIP = "gebco_2025_sub_ice_topo_geotiff.zip"
+MASK_EASTSOUND_SUBSET = (-123.02, 48.66, -122.9, 48.76)
+MASK_MAX_ZOOM = 13
+MASK_DEFAULT_BLUR = 8.0
+MASK_DEFAULT_ERODE = 16
+MASK_BLUR_MIN = 0.0
+MASK_BLUR_MAX = 24.0
+MASK_BLUR_STEP = 0.5
+MASK_ERODE_MIN = 0
+MASK_ERODE_MAX = 24
+MASK_SOURCE_VRT = ".temp/tuner_mask_source.vrt"
+MASK_LAND_COLOR = np.array([0.72, 0.66, 0.5], dtype=np.float32)
+MASK_OCEAN_BOUNDARY_COLOR = np.array([1.0, 0.25, 0.1], dtype=np.float32)
+MASK_RAW_FADE_COLOR = np.array([0.0, 0.7, 1.0], dtype=np.float32)
+MASK_PREVIEW_WIDTH = 1024
 
 
 @dataclass(frozen=True)
@@ -411,6 +429,77 @@ def load_gebco_sample() -> FloatArray | None:
     )
     ds = None
     return data
+
+
+@lru_cache(maxsize=1)
+def load_eastsound_mask_depths() -> FloatArray | None:
+    """Load a GEBCO depth subset of the Eastsound bbox warped to EPSG:3857."""
+    if not Path(MASK_GEBCO_ZIP).exists():
+        return None
+
+    source_vrt = ocean.build_gebco_source_vrt(MASK_GEBCO_ZIP, MASK_SOURCE_VRT)
+    bounds, pixel_size, zoom = ocean.snapped_tile_grid_for_bbox(MASK_EASTSOUND_SUBSET, MASK_MAX_ZOOM)
+    warped = gdal.Warp(
+        "",
+        source_vrt,
+        format="MEM",
+        dstSRS="EPSG:3857",
+        outputBounds=bounds,
+        xRes=pixel_size,
+        yRes=pixel_size,
+        resampleAlg="cubicspline",
+        outputType=gdal.GDT_Float32,
+        multithread=True,
+    )
+    if warped is None:
+        raise RuntimeError("Could not warp Eastsound mask subset")
+    depths = cast(FloatArray, warped.GetRasterBand(1).ReadAsArray().astype(np.float32))
+    warped = None
+    return depths
+
+
+def compute_mask_preview(
+    depths: FloatArray,
+    mask_blur: float,
+    mask_erode: int,
+) -> FloatArray:
+    """Return an RGB preview of the land/ocean mask for the given blur/erode.
+
+    Ocean pixels keep their mako ramp color, land pixels are tinted a land
+    color, the final ocean-mask boundary is drawn in red, and the raw fade
+    depth contour (-50m) is drawn in cyan for comparison.
+    """
+    nodata = ocean.GEBCO_OCEAN_NODATA
+    raw_fade_mask = (depths > nodata + 0.1) & (depths < ocean.OCEAN_FADE_DEPTH)
+    raw_fade_boundary = cast(np.ndarray, binary_dilation(raw_fade_mask, iterations=1)) != raw_fade_mask
+
+    blurred_depths = ocean.blur_depth_field(depths, mask_blur, nodata)
+    ocean_mask = ocean.build_ocean_threshold_mask(blurred_depths, nodata)
+    cleaned_mask = ocean.remove_enclosed_ocean_regions(ocean_mask)
+    if mask_erode > 0:
+        cleaned_mask = ocean.erode_ocean_mask(cleaned_mask, mask_erode)
+
+    final_boundary = cast(np.ndarray, binary_dilation(cleaned_mask, iterations=1)) != cleaned_mask
+
+    ramp = ocean.build_ocean_ramp_colors(ocean.OceanStyleOptions())
+    rgb = cast(FloatArray, tiler.colorize_depth_numpy(depths, ramp, -11000.0, 0.0))
+
+    preview = np.where(
+        cleaned_mask[None, :, :],
+        rgb,
+        MASK_LAND_COLOR[:, None, None],
+    )
+    preview = np.where(
+        final_boundary[None, :, :],
+        MASK_OCEAN_BOUNDARY_COLOR[:, None, None],
+        preview,
+    )
+    preview = np.where(
+        raw_fade_boundary[None, :, :] & ~final_boundary[None, :, :],
+        MASK_RAW_FADE_COLOR[:, None, None],
+        preview,
+    )
+    return cast(FloatArray, preview)
 
 
 RAW_GEBCO = load_gebco_sample()
@@ -934,6 +1023,51 @@ def render() -> ResponseReturnValue:
 
     byte_arr = (np.clip(corrected, 0, 1) * 255).astype(np.uint8)
     img = Image.fromarray(np.transpose(byte_arr, (1, 2, 0)))
+
+    img_io = io.BytesIO()
+    img.save(img_io, "JPEG", quality=85)
+    img_io.seek(0)
+    return send_file(img_io, mimetype="image/jpeg")
+
+
+@app.route("/mask")
+def mask_tuner() -> ResponseReturnValue:
+    depths = load_eastsound_mask_depths()
+    return render_template(
+        "mask.html",
+        has_eastsound_sample=depths is not None,
+        default_blur=MASK_DEFAULT_BLUR,
+        default_erode=MASK_DEFAULT_ERODE,
+        blur_min=MASK_BLUR_MIN,
+        blur_max=MASK_BLUR_MAX,
+        blur_step=MASK_BLUR_STEP,
+        erode_min=MASK_ERODE_MIN,
+        erode_max=MASK_ERODE_MAX,
+        fade_depth=ocean.OCEAN_FADE_DEPTH,
+    )
+
+
+@app.route("/mask/render")
+def mask_render() -> ResponseReturnValue:
+    depths = load_eastsound_mask_depths()
+    if depths is None:
+        return "No GEBCO zip found", 404
+
+    try:
+        mask_blur = float(request.args.get("blur", MASK_DEFAULT_BLUR))
+    except ValueError:
+        mask_blur = MASK_DEFAULT_BLUR
+    try:
+        mask_erode = int(request.args.get("erode", MASK_DEFAULT_ERODE))
+    except ValueError:
+        mask_erode = MASK_DEFAULT_ERODE
+    mask_blur = float(np.clip(mask_blur, MASK_BLUR_MIN, MASK_BLUR_MAX))
+    mask_erode = int(np.clip(mask_erode, MASK_ERODE_MIN, MASK_ERODE_MAX))
+
+    preview = compute_mask_preview(depths, mask_blur, mask_erode)
+    byte_arr = (np.clip(preview, 0, 1) * 255).astype(np.uint8)
+    img = Image.fromarray(np.transpose(byte_arr, (1, 2, 0)))
+    img = img.resize((MASK_PREVIEW_WIDTH, int(round(MASK_PREVIEW_WIDTH * img.height / img.width))))
 
     img_io = io.BytesIO()
     img.save(img_io, "JPEG", quality=85)

@@ -111,15 +111,22 @@ Generate PMTiles for either a bbox subset or the default all-tiles run:
 # If land_mgrs.list is missing, build it once before imagery generation
 land-mgrs
 
-# BBox render using either a full-coverage or bbox-matched standalone ocean background.
-# The default split output emits two archives: the land layer at -o hawaii.pmtiles and
-# a separate ocean layer at hawaii.ocean.pmtiles, so a client can toggle the
+# BBox render. The ocean background is rendered from GEBCO automatically when
+# missing and cached at hawaii.ocean.tif (the default <output-stem>.ocean.tif);
+# the default split output emits two archives: the land layer at -o hawaii.pmtiles
+# and a separate ocean layer at hawaii.ocean.pmtiles, so a client can toggle the
 # layers independently. Land tiles keep alpha where there is no imagery.
 land-mgrs --bbox -161,18,-154,23
-satmaps --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii.pmtiles
+satmaps --bbox -161,18,-154,23 -o hawaii.pmtiles
+
+# Land-only render: skip the ocean layer entirely
+satmaps --land-only --bbox -161,18,-154,23 -o hawaii-land.pmtiles
+
+# Ocean-only render: build just the ocean archive at --output
+satmaps --ocean-only --bbox -161,18,-154,23 -o hawaii-ocean.pmtiles
 
 # Single-file output with the ocean baked beneath land (pre-split behavior)
-satmaps --combined --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii-combined.pmtiles
+satmaps --combined --bbox -161,18,-154,23 -o hawaii-combined.pmtiles
 
 # Lower-data global run using a coarser ocean background and imagery zoom
 satmaps --max-zoom 4 --ocean-background ocean-z4.tif -o all-tiles-z4.pmtiles
@@ -127,12 +134,12 @@ satmaps --max-zoom 4 --ocean-background ocean-z4.tif -o all-tiles-z4.pmtiles
 # Makefile shortcut for the graded Hawaii bbox preset
 make hawaii
 
-# Default all-tiles run
-satmaps --ocean-background ocean.tif -o all-tiles.pmtiles
+# Default all-tiles run (renders/caches a global ocean background at all-tiles.ocean.tif)
+satmaps -o all-tiles.pmtiles
 
 # Optional raster-first variant: render full aligned 3857 land rasters first,
 # then tile the merged master raster once
-satmaps --full-render-first --ocean-background ocean.tif -o all-tiles-raster-first.pmtiles
+satmaps --full-render-first --ocean-background all-tiles.ocean.tif -o all-tiles-raster-first.pmtiles
 ```
 
 ### 6. Estimate Resources
@@ -155,10 +162,12 @@ satmaps --estimate
 - `--tile-batch-width` / `--ty`: Target number of contiguous output tiles rendered together within one row during the final land pass (default: `32`).
 - `--full-render-first`: Render each land work unit into a full aligned EPSG:3857 GeoTIFF first, cache those rasters under `.cache.render`, build a master VRT, then tile that merged raster once. This usually trades higher disk/RAM for less repeated final-tile work.
 - `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
-- `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before max-zoom tile caching. Coarser ocean masks (for example z4-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass.
+- `--ocean-background`: Ocean background GeoTIFF to use for the ocean layer (default: `<output-stem>.ocean.tif`, for example `hawaii.ocean.tif`). If the file is missing it is rendered from the GEBCO zip automatically. Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before max-zoom tile caching. Coarser ocean masks (for example z4-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass.
 - `--combined` / `--no-combined`: By default, `satmaps` emits a **split** output: the land layer at `--output` and a separate ocean layer at `<stem>.ocean.pmtiles` (for example `hawaii.pmtiles` → `hawaii.ocean.pmtiles`), each keeping alpha so a client (for example MapLibre) can toggle the two layers independently. Pass `--combined` to instead bake the ocean beneath the land into a single opaque PMTiles archive at `--output` (the pre-split behavior).
 - Final Web Mercator land outputs target `--max-zoom` (supported: 4-14; default zoom 13, ~19.11 m/px at the equator). Ocean backgrounds may be reused from the same or a coarser zoom level and are resampled onto that final output grid during composition. Low-resolution runs at `--max-zoom 7` and below use a coarse-grid-first land renderer to avoid the full per-subtile pipeline.
-- `--land` / `--no-land`: Enable or skip Sentinel-2 land tile processing entirely.
+- `--land-only`: Skip the ocean entirely and produce only the land layer at `--output`. No ocean background is rendered, prepared, or packaged.
+- `--ocean-only`: Skip land and produce only the ocean archive at `--output`.
+- `--gebco-zip`: Path to the GEBCO zip used when the ocean background must be rendered (default: `gebco_2025_sub_ice_topo_geotiff.zip`).
 - `--grade` / `--no-grade`: Enable or disable final land grading.
 - `--exposure`: Global brightness multiplier.
 - `--hdr-highlights` / `--no-hdr-highlights`: Blend the HDR land look into bright near-neutral highlights so snow and ice keep more detail without flattening the rest of the map.
@@ -180,17 +189,18 @@ satmaps --estimate
 
 ### Ocean Background Options
 
-`ocean` supports the same grading controls as `satmaps`, plus:
+`ocean` and `satmaps` share the same ocean styling and rendering controls. The standalone `ocean` CLI exposes them unprefixed (`--exposure`, `--grade`, ...), while `satmaps` exposes the same controls namespaced as `--ocean-exposure`, `--ocean-grade`, and so on, so they never collide with the land grading flags:
 
 - `--bbox`: Export a Web Mercator ocean background cropped to a WGS84 bbox and snapped outward to the requested Web Mercator tile grid used for bbox renders in `satmaps`.
 - `--max-zoom`: Target Web Mercator zoom used for output resolution (`4` through `14`).
+- `--grade` / `--no-grade`: Enable or disable ocean final grading (default: on).
 - `--hillshade-z`: Vertical exaggeration passed to `gdaldem hillshade`.
 - `--depth-min` / `--depth-max`: Depth range mapped onto the ocean color ramp.
 - `--resample-alg`: GEBCO upscale kernel (`cubicspline` or `lanczos`).
 - `--mask-blur`: Gaussian blur sigma (in output pixels) applied to the depth field before the `OCEAN_FADE_DEPTH` (`-50m`) threshold. Smooths the coastline and removes staircase steps from coarse GEBCO cells; `0` disables.
 - `--mask-erode`: Erode the ocean mask by this many output pixels so land imagery extends a few pixels past the fade depth as coastal clearance; `0` disables.
 - `--temp-dir`: Directory for intermediate rasters/VRTs.
-- `--vrt`: Write the final styled RGBA VRT instead of translating to GeoTIFF.
+- `--vrt`: Write the final styled RGBA VRT instead of translating to GeoTIFF (standalone `ocean` only).
 
 ### Terrain Options
 

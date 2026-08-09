@@ -3085,6 +3085,28 @@ def configure_main_defaults(
         "satmaps.discover_mgrs_bases",
         lambda bbox, gebco_src, land_mgrs_list_path=None, **kwargs: mgrs_bases,
     )
+    # main() confirms before land processing; main-scoped tests just say yes.
+    monkeypatch.setattr("builtins.input", lambda *args, **kwargs: "y")
+
+    def fake_generate_ocean_background(*, destination: str, **kwargs: object) -> None:
+        # Stand-in for a real GEBCO render so the default ocean-background
+        # cache is created without downloading or processing bathymetry.
+        make_fake_ocean_background(destination)
+
+    monkeypatch.setattr(
+        "satmaps.ocean.generate_ocean_background",
+        fake_generate_ocean_background,
+    )
+
+
+def make_fake_ocean_background(destination: str) -> None:
+    """Write a minimal RGBA GeoTIFF that stands in for a rendered ocean background."""
+    satmaps.ensure_parent_dir(destination)
+    ds = gdal.GetDriverByName("GTiff").Create(destination, 1, 1, 4, gdal.GDT_Byte)
+    assert ds is not None
+    ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    ds.GetRasterBand(4).Fill(255)
+    ds = None
 
 def test_main_packages_webp_tiles(monkeypatch: object, tmp_path: Path) -> None:
     configure_main_defaults(
@@ -3686,7 +3708,7 @@ def test_main_bbox_prepares_and_commits_ocean_background(
     configure_main_defaults(
         monkeypatch,
         tmp_path,
-        ["--bbox", "0,0,1,1", "--no-land", "--grade", "--parallel", "1"],
+        ["--bbox", "0,0,1,1", "--ocean-only", "--grade", "--parallel", "1"],
         mgrs_bases=[],
         unique_id="bboxrun",
     )
@@ -3715,7 +3737,7 @@ def test_main_bbox_prepares_and_commits_ocean_background(
 
     assert prepare_calls == [
         (
-            satmaps.SatmapsRunPaths("output.pmtiles", "bboxrun").rendered_ocean_path,
+            satmaps.build_ocean_background_path("output.pmtiles"),
             (0.0, 0.0, 1.0, 1.0),
             "output.pmtiles",
             "bboxrun",
@@ -3735,8 +3757,8 @@ def test_main_bbox_prepares_and_commits_ocean_background(
         {
             "resample_alg": "lanczos",
             "max_zoom": ocean.DEFAULT_MAX_ZOOM,
-            "name": "Sentinel-2 Mosaic",
-            "description": "Copernicus Sentinel data",
+            "name": "Ocean Background",
+            "description": "GEBCO styled ocean background",
             "requested_bbox": (0.0, 0.0, 1.0, 1.0),
             "quality": 74,
             "parallel": 1,
@@ -3750,7 +3772,16 @@ def test_main_land_run_passes_prepared_ocean_to_output_tile_renderer_without_eag
     configure_main_defaults(
         monkeypatch,
         tmp_path,
-        ["--bbox", "0,0,1,1", "--grade", "--parallel", "1", "--date", "2025/07/01"],
+        [
+            "--bbox",
+            "0,0,1,1",
+            "--combined",
+            "--grade",
+            "--parallel",
+            "1",
+            "--date",
+            "2025/07/01",
+        ],
         mgrs_bases=["31TDF"],
         unique_id="lazyocean",
     )
@@ -3911,7 +3942,7 @@ def test_main_reuses_cached_candidate_tile_footprints(
 def test_main_passes_requested_zoom_to_webp_pipeline(
     monkeypatch: object, tmp_path: Path, max_zoom: int
 ) -> None:
-    argv = ["--no-land", "--parallel", "1"]
+    argv = ["--ocean-only", "--parallel", "1"]
     if max_zoom != ocean.DEFAULT_MAX_ZOOM:
         argv.extend(["--max-zoom", str(max_zoom)])
     configure_main_defaults(monkeypatch, tmp_path, argv, mgrs_bases=[])
@@ -4013,7 +4044,7 @@ def test_main_keeps_ocean_after_processing(
     configure_main_defaults(
         monkeypatch,
         tmp_path,
-        ["--no-land", "--parallel", "1", "--ocean-background", str(ocean_path)],
+        ["--ocean-only", "--parallel", "1", "--ocean-background", str(ocean_path)],
         mgrs_bases=[],
     )
     monkeypatch.setattr(
@@ -4030,6 +4061,195 @@ def test_main_keeps_ocean_after_processing(
     main()
 
     assert ocean_path.exists()
+
+def test_main_default_renders_ocean_when_background_missing(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--bbox", "0,0,1,1", "--grade", "--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
+        unique_id="oceanrender",
+    )
+    generate_calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_generate(*, destination: str, **kwargs: object) -> None:
+        generate_calls.append((destination, kwargs))
+        make_fake_ocean_background(destination)
+
+    monkeypatch.setattr("satmaps.ocean.generate_ocean_background", fake_generate)
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "satmaps.render_land_output_tiles",
+        lambda *args, **kwargs: satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0),
+    )
+    monkeypatch.setattr(
+        "satmaps.resolve_work_unit_candidate_row_slabs",
+        lambda *args, **kwargs: {work_unit.unit_id: ((2, 1, 1),) for work_unit in args[0]},
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    assert len(generate_calls) == 1
+    destination, kwargs = generate_calls[0]
+    assert destination == satmaps.build_ocean_background_path("output.pmtiles")
+    assert kwargs["bbox"] == (0.0, 0.0, 1.0, 1.0)
+    assert kwargs["max_zoom"] == ocean.DEFAULT_MAX_ZOOM
+    assert isinstance(kwargs["style"], ocean.OceanStyleOptions)
+    assert kwargs["style"].exposure == ocean.OCEAN_DEFAULT_EXPOSURE
+
+def test_main_default_reuses_existing_ocean_background(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    make_fake_ocean_background(str(tmp_path / "output.ocean.tif"))
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--bbox", "0,0,1,1", "--grade", "--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
+        unique_id="oceanreuse",
+    )
+    generate_calls: list[object] = []
+    monkeypatch.setattr(
+        "satmaps.ocean.generate_ocean_background",
+        lambda **kwargs: generate_calls.append(kwargs),
+    )
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "satmaps.render_land_output_tiles",
+        lambda *args, **kwargs: satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0),
+    )
+    monkeypatch.setattr(
+        "satmaps.resolve_work_unit_candidate_row_slabs",
+        lambda *args, **kwargs: {work_unit.unit_id: ((2, 1, 1),) for work_unit in args[0]},
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    assert generate_calls == []
+
+def test_main_ocean_style_flags_flow_into_render(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        [
+            "--bbox",
+            "0,0,1,1",
+            "--grade",
+            "--parallel",
+            "1",
+            "--date",
+            "2025/07/01",
+            "--ocean-exposure",
+            "2.5",
+            "--no-ocean-grade",
+            "--ocean-mask-blur",
+            "0",
+            "--ocean-mask-erode",
+            "4",
+            "--ocean-hillshade-z",
+            "9",
+        ],
+        mgrs_bases=["31TDF"],
+        unique_id="oceanstyle",
+    )
+    generate_calls: list[dict[str, object]] = []
+
+    def fake_generate(**kwargs: object) -> None:
+        generate_calls.append(kwargs)
+        make_fake_ocean_background(str(kwargs["destination"]))
+
+    monkeypatch.setattr("satmaps.ocean.generate_ocean_background", fake_generate)
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "satmaps.render_land_output_tiles",
+        lambda *args, **kwargs: satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0),
+    )
+    monkeypatch.setattr(
+        "satmaps.resolve_work_unit_candidate_row_slabs",
+        lambda *args, **kwargs: {work_unit.unit_id: ((2, 1, 1),) for work_unit in args[0]},
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    assert len(generate_calls) == 1
+    kwargs = generate_calls[0]
+    style = kwargs["style"]
+    assert isinstance(style, ocean.OceanStyleOptions)
+    assert style.exposure == 2.5
+    assert style.grade is False
+    assert kwargs["hillshade_z"] == 9.0
+    assert kwargs["mask_blur"] == 0.0
+    assert kwargs["mask_erode"] == 4
+
+def test_main_land_only_skips_ocean_entirely(monkeypatch: object, tmp_path: Path) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--land-only", "--bbox", "0,0,1,1", "--grade", "--parallel", "1", "--date", "2025/07/01"],
+        mgrs_bases=["31TDF"],
+        unique_id="landonly",
+    )
+    generate_calls: list[object] = []
+    prepare_calls: list[object] = []
+    monkeypatch.setattr(
+        "satmaps.ocean.generate_ocean_background",
+        lambda **kwargs: generate_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        "satmaps.prepare_ocean_background_for_output",
+        lambda *args, **kwargs: prepare_calls.append(args),
+    )
+    render_kwargs: dict[str, object] = {}
+    monkeypatch.setattr(
+        "satmaps.render_land_output_tiles",
+        lambda *args, **kwargs: render_kwargs.update(kwargs)
+        or satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0),
+    )
+    monkeypatch.setattr(
+        "satmaps.resolve_work_unit_candidate_row_slabs",
+        lambda *args, **kwargs: {work_unit.unit_id: ((2, 1, 1),) for work_unit in args[0]},
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    assert generate_calls == []
+    assert prepare_calls == []
+    assert render_kwargs.get("gebco_src") is None
+    assert render_kwargs.get("prepared_ocean_background") is None
+
+def test_main_ocean_only_rejects_naip(monkeypatch: object, tmp_path: Path) -> None:
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        ["--ocean-only", "--use-naip", "--parallel", "1"],
+        mgrs_bases=[],
+    )
+    with pytest.raises(SystemExit):
+        main()
 
 def test_commit_raster_to_final_tile_cache_streams_tile_images(
     monkeypatch: object, tmp_path: Path
@@ -4332,7 +4552,7 @@ def test_main_webp_resume_reuses_existing_final_tiles_without_latest_state_fallb
     monkeypatch.setattr(
         sys,
         "argv",
-        ["satmaps.py", "--resume", "--parallel", "1", "--date", "2025/07/01"],
+        ["satmaps.py", "--land-only", "--resume", "--parallel", "1", "--date", "2025/07/01", "--yes"],
     )
     monkeypatch.setattr("satmaps.setup_gdal_cdse", lambda: None)
     monkeypatch.setattr("satmaps.populate_s3_cache", lambda date_paths: None)
