@@ -439,6 +439,80 @@ def test_remove_enclosed_ocean_regions_prefers_land() -> None:
     expected[0, 0] = True
     np.testing.assert_array_equal(cleaned, expected)
 
+def test_create_alpha_vrt_mask_erode_shrinks_ocean(tmp_path: Path) -> None:
+    driver = gdal.GetDriverByName("GTiff")
+
+    alpha_source = tmp_path / "ocean_erode_source.tif"
+    alpha_ds = driver.Create(str(alpha_source), 5, 3, 1, gdal.GDT_Float32)
+    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    alpha_ds.SetProjection(srs.ExportToWkt())
+    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    alpha_ds.GetRasterBand(1).WriteArray(
+        np.full((3, 5), -100.0, dtype=np.float32)
+    )
+    alpha_ds = None
+
+    alpha_source_vrt = tmp_path / "ocean_erode_source.vrt"
+    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+
+    plain_vrt = tmp_path / "alpha_erode_plain.vrt"
+    ocean.create_alpha_vrt(str(alpha_source_vrt), str(plain_vrt))
+    plain = gdal.Open(str(plain_vrt)).ReadAsArray()
+
+    eroded_vrt = tmp_path / "alpha_erode.vrt"
+    ocean.create_alpha_vrt(str(alpha_source_vrt), str(eroded_vrt), mask_erode=1)
+    eroded = gdal.Open(str(eroded_vrt)).ReadAsArray()
+
+    assert (plain > 0).sum() == 15
+    assert (eroded > 0).sum() == 3
+    expected = np.zeros((3, 5), dtype=np.uint8)
+    expected[1, 1:4] = 255
+    np.testing.assert_array_equal(eroded, expected)
+
+def test_create_alpha_vrt_mask_blur_reduces_boundary(tmp_path: Path) -> None:
+    driver = gdal.GetDriverByName("GTiff")
+
+    alpha_source = tmp_path / "ocean_blur_source.tif"
+    alpha_ds = driver.Create(str(alpha_source), 21, 21, 1, gdal.GDT_Float32)
+    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    alpha_ds.SetProjection(srs.ExportToWkt())
+    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    # A jagged staircase "cliff": land on the left, deep ocean on the right,
+    # with each row's coastline stepping by 2px so the -50m isobath is stair-shaped.
+    depths = np.full((21, 21), 5.0, dtype=np.float32)
+    for row in range(21):
+        step = 9 - row % 4
+        for col in range(step, 21):
+            depths[row, col] = -100.0 - col
+    alpha_ds.GetRasterBand(1).WriteArray(depths)
+    alpha_ds = None
+
+    alpha_source_vrt = tmp_path / "ocean_blur_source.vrt"
+    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+
+    plain_vrt = tmp_path / "alpha_blur_plain.vrt"
+    ocean.create_alpha_vrt(str(alpha_source_vrt), str(plain_vrt))
+    plain = gdal.Open(str(plain_vrt)).ReadAsArray()
+
+    blurred_vrt = tmp_path / "alpha_blur.vrt"
+    ocean.create_alpha_vrt(str(alpha_source_vrt), str(blurred_vrt), mask_blur=1.5)
+    blurred = gdal.Open(str(blurred_vrt)).ReadAsArray()
+
+    def boundary_count(mask: np.ndarray) -> int:
+        binary = mask > 0
+        e = np.zeros(binary.shape, bool)
+        e[1:, :] |= binary[1:, :] != binary[:-1, :]
+        e[:-1, :] |= binary[:-1, :] != binary[1:, :]
+        e[:, 1:] |= binary[:, 1:] != binary[:, :-1]
+        e[:, :-1] |= binary[:, :-1] != binary[:, 1:]
+        return int(e.sum())
+
+    assert boundary_count(plain) > boundary_count(blurred)
+
 def test_average_tile_blocks_skips_horizontal_ocean(monkeypatch: object) -> None:
     from satmaps import OceanMaskSlab, ProcessingWindow, average_tile_blocks
 

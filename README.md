@@ -187,6 +187,8 @@ satmaps --estimate
 - `--hillshade-z`: Vertical exaggeration passed to `gdaldem hillshade`.
 - `--depth-min` / `--depth-max`: Depth range mapped onto the ocean color ramp.
 - `--resample-alg`: GEBCO upscale kernel (`cubicspline` or `lanczos`).
+- `--mask-blur`: Gaussian blur sigma (in output pixels) applied to the depth field before the `OCEAN_FADE_DEPTH` (`-50m`) threshold. Smooths the coastline and removes staircase steps from coarse GEBCO cells; `0` disables.
+- `--mask-erode`: Erode the ocean mask by this many output pixels so land imagery extends a few pixels past the fade depth as coastal clearance; `0` disables.
 - `--temp-dir`: Directory for intermediate rasters/VRTs.
 - `--vrt`: Write the final styled RGBA VRT instead of translating to GeoTIFF.
 

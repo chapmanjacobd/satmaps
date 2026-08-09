@@ -4608,6 +4608,25 @@ def add_satmaps_output_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Path to the GEBCO zip archive used when --render-ocean is set",
     )
     add(
+        "--mask-blur",
+        type=float,
+        default=6.0,
+        help=(
+            "Gaussian blur sigma (in output pixels) applied to the GEBCO depth field before the "
+            f"{ocean.OCEAN_FADE_DEPTH}m threshold when rendering the ocean background. "
+            "Smooths the coastline and removes staircase steps from coarse GEBCO cells. 0 disables."
+        ),
+    )
+    add(
+        "--mask-erode",
+        type=int,
+        default=2,
+        help=(
+            "Erode the ocean mask by this many output pixels so land imagery extends a few "
+            "pixels past the fade depth as coastal clearance. 0 disables."
+        ),
+    )
+    add(
         "--combined",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -4732,6 +4751,8 @@ def main() -> None:
                 temp_dir=args.temp_dir,
                 resample_alg=args.resample_alg,
                 max_zoom=args.max_zoom,
+                mask_blur=args.mask_blur,
+                mask_erode=args.mask_erode,
             )
             print(f"Ocean background ready: {args.ocean_background}")
 

@@ -29,7 +29,7 @@ from common import (
     warp_thread_options,
 )
 from osgeo import gdal
-from scipy.ndimage import label
+from scipy.ndimage import binary_erosion, gaussian_filter, label
 
 from tiler import (
     MAKO_RAMP,
@@ -435,8 +435,18 @@ def create_alpha_vrt(
     output_vrt: str,
     alpha_tif: str | None = None,
     cleanup_path: Path | None = None,
+    *,
+    mask_blur: float = 0.0,
+    mask_erode: int = 0,
 ) -> str:
-    """Create an explicit alpha mask VRT from depth thresholds and land-preferred cleanup."""
+    """Create an explicit alpha mask VRT from depth thresholds and land-preferred cleanup.
+
+    ``mask_blur`` applies a Gaussian blur to the depth field before thresholding so the
+    isobath (and therefore the coastline) is smoothed, removing staircase steps from the
+    coarse GEBCO cells. ``mask_erode`` erodes the resulting ocean mask by that many output
+    pixels, so land imagery extends a few pixels past the ``OCEAN_FADE_DEPTH`` contour as a
+    minimum coastal clearance.
+    """
     ds = gdal.Open(source_vrt)
     if ds is None:
         raise RuntimeError(f"Could not open source VRT for alpha generation: {source_vrt}")
@@ -458,10 +468,15 @@ def create_alpha_vrt(
     alpha_ds.SetGeoTransform(ds.GetGeoTransform())
     alpha_band = alpha_ds.GetRasterBand(1)
 
-    if xsize * ysize <= max_in_memory_alpha_pixels():
+    blur_requires_full_depth = mask_blur > 0.0 and xsize * ysize > max_in_memory_alpha_pixels()
+    if xsize * ysize <= max_in_memory_alpha_pixels() or blur_requires_full_depth:
         depths = band.ReadAsArray().astype(np.float32)
+        if mask_blur > 0.0:
+            depths = blur_depth_field(depths, mask_blur, nodata_value)
         ocean_mask = build_ocean_threshold_mask(depths, nodata_value)
         cleaned_mask = remove_enclosed_ocean_regions(ocean_mask)
+        if mask_erode > 0:
+            cleaned_mask = erode_ocean_mask(cleaned_mask, mask_erode)
         alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
         alpha_band.FlushCache()
     else:
@@ -482,6 +497,8 @@ def create_alpha_vrt(
         alpha_band.FlushCache()
         ocean_mask = alpha_band.ReadAsArray().astype(bool)
         cleaned_mask = remove_enclosed_ocean_regions(ocean_mask)
+        if mask_erode > 0:
+            cleaned_mask = erode_ocean_mask(cleaned_mask, mask_erode)
         alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
         alpha_band.FlushCache()
     alpha_ds = None
@@ -491,6 +508,23 @@ def create_alpha_vrt(
     gdal.BuildVRT(staged_output_vrt, [alpha_tif])
     publish_staged_path(staged_output_vrt, output_vrt)
     return output_vrt
+
+
+def blur_depth_field(depths: np.ndarray, sigma: float, nodata_value: float) -> np.ndarray:
+    """Gaussian-blur valid depth pixels while preserving nodata markers."""
+    valid = depths > nodata_value + 0.1
+    blurred = gaussian_filter(np.where(valid, depths, 0.0).astype(np.float32), sigma)
+    return np.asarray(np.where(valid, blurred, nodata_value), dtype=np.float32)
+
+
+def erode_ocean_mask(ocean_mask: np.ndarray, pixels: int) -> np.ndarray:
+    """Erode the ocean mask by ``pixels`` to give land imagery coastal clearance."""
+    if pixels <= 0:
+        return ocean_mask
+    return np.asarray(
+        binary_erosion(ocean_mask, structure=np.ones((3, 3), dtype=bool), iterations=pixels),
+        dtype=bool,
+    )
 
 
 def build_ocean_threshold_mask(depths: np.ndarray, nodata_value: float) -> np.ndarray:
@@ -852,6 +886,8 @@ def build_ocean_run_settings(
     resample_alg: str,
     hillshade_z: float,
     style: OceanStyleOptions,
+    mask_blur: float = 0.0,
+    mask_erode: int = 0,
 ) -> dict[str, Any]:
     """Return the resumable ocean-processing settings for one destination."""
     return {
@@ -861,6 +897,8 @@ def build_ocean_run_settings(
         "chunk_size": chunk_size,
         "resample_alg": resample_alg,
         "hillshade_z": hillshade_z,
+        "mask_blur": mask_blur,
+        "mask_erode": mask_erode,
         "style": asdict(style),
     }
 
@@ -955,6 +993,8 @@ def process_ocean_chunk(
     resample_alg: str,
     hillshade_z: float,
     style: OceanStyleOptions,
+    mask_blur: float = 0.0,
+    mask_erode: int = 0,
 ) -> str:
     """Generate one final RGBA chunk from the masked GEBCO source."""
     artifacts = build_ocean_chunk_artifacts(temp_dir, stem, unique_id, chunk)
@@ -971,6 +1011,8 @@ def process_ocean_chunk(
         artifacts.alpha_vrt,
         alpha_tif=artifacts.alpha_tif,
         cleanup_path=artifacts.cleanup_mask_tif,
+        mask_blur=mask_blur,
+        mask_erode=mask_erode,
     )
     create_hillshade_tif(artifacts.depth_tif, artifacts.hillshade_tif, hillshade_z)
     create_ocean_rgb_tif(artifacts.depth_tif, artifacts.hillshade_tif, artifacts.color_tif, style)
@@ -1029,8 +1071,15 @@ def generate_ocean_background(
     max_zoom: int = DEFAULT_MAX_ZOOM,
     parallel: int | None = None,
     chunk_size: int = DEFAULT_OCEAN_CHUNK_SIZE,
+    mask_blur: float = 0.0,
+    mask_erode: int = 0,
 ) -> OceanBackgroundArtifacts:
-    """Generate a standalone RGBA ocean background output."""
+    """Generate a standalone RGBA ocean background output.
+
+    ``mask_blur`` smooths the depth field before the ``OCEAN_FADE_DEPTH`` threshold so the
+    coastline is smoothed; ``mask_erode`` erodes the ocean mask by that many output pixels so
+    land imagery extends a few pixels past the fade depth as coastal clearance.
+    """
     if not hasattr(gdal, "DEMProcessing"):
         raise RuntimeError("GDAL DEMProcessing is required to generate the ocean background")
 
@@ -1052,6 +1101,8 @@ def generate_ocean_background(
         resample_alg=resample_alg,
         hillshade_z=hillshade_z,
         style=style,
+        mask_blur=mask_blur,
+        mask_erode=mask_erode,
     )
     metadata_path = build_ocean_run_metadata_path(output_temp_dir, unique_id)
     previous_ocean_run_settings = read_settings_file(
@@ -1127,6 +1178,8 @@ def generate_ocean_background(
                         resample_alg=resample_alg,
                         hillshade_z=hillshade_z,
                         style=style,
+                        mask_blur=mask_blur,
+                        mask_erode=mask_erode,
                     )
                 )
                 completed += 1
@@ -1147,6 +1200,8 @@ def generate_ocean_background(
                         resample_alg=resample_alg,
                         hillshade_z=hillshade_z,
                         style=style,
+                        mask_blur=mask_blur,
+                        mask_erode=mask_erode,
                     ): chunk
                     for chunk in remaining_chunks
                 }
@@ -1336,6 +1391,25 @@ def build_ocean_argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OCEAN_CHUNK_SIZE,
         help="Chunk edge length in output pixels for chunked ocean processing",
     )
+    add(
+        "--mask-blur",
+        type=float,
+        default=6.0,
+        help=(
+            "Gaussian blur sigma (in output pixels) applied to the depth field before the "
+            f"{OCEAN_FADE_DEPTH}m threshold, smoothing the coastline and removing staircase "
+            "steps from coarse GEBCO cells. 0 disables."
+        ),
+    )
+    add(
+        "--mask-erode",
+        type=int,
+        default=2,
+        help=(
+            "Erode the ocean mask by this many output pixels so land imagery extends a few "
+            "pixels past the fade depth as coastal clearance. 0 disables."
+        ),
+    )
     return parser
 
 
@@ -1354,6 +1428,8 @@ def main() -> None:
         max_zoom=args.max_zoom,
         parallel=args.parallel,
         chunk_size=args.chunk_size,
+        mask_blur=args.mask_blur,
+        mask_erode=args.mask_erode,
     )
     print(artifacts.output_tif)
 
