@@ -877,39 +877,36 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
         
         print(f"Initial request: {len(available_downloads)} available, {len(preparing_downloads)} preparing.")
         
-        download_urls = {d["downloadId"]: d["url"] for d in available_downloads}
-        
-        if preparing_downloads:
-            print("Polling for preparing downloads...")
-            pending_ids = {d["downloadId"] for d in preparing_downloads}
-            
-            while pending_ids:
-                time.sleep(10)
-                print(f"Checking status for {len(pending_ids)} pending downloads...")
-                retrieve_payload = {"label": "satmaps-naip-download"}
-                try:
-                    retrieved = send_m2m_request("download-retrieve", retrieve_payload, api_key=api_key)
-                    new_available = retrieved.get("available", [])
-                    for item in new_available:
-                        if item["downloadId"] in pending_ids:
-                            download_urls[item["downloadId"]] = item["url"]
-                            pending_ids.remove(item["downloadId"])
-                            print(f"Resolved URL for {item['downloadId']}")
-                except Exception as e:
-                    print(f"Warning: Polling failed: {e}")
-                    # Might want to break or retry, for now we will just wait and retry loop
-                    pass
-                    
-                if not pending_ids:
-                    break
-                    
-        if not download_urls:
-            continue
-            
-        print(f"Downloading {len(download_urls)} files for chunk...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {executor.submit(_download_worker, dl_id, url): dl_id for dl_id, url in download_urls.items()}
-            for future in concurrent.futures.as_completed(futures):
+            download_futures = []
+            
+            # Start immediately available downloads
+            for d in available_downloads:
+                download_futures.append(executor.submit(_download_worker, d["downloadId"], d["url"]))
+            
+            if preparing_downloads:
+                print("Polling for preparing downloads while starting available ones...")
+                pending_ids = {d["downloadId"] for d in preparing_downloads}
+                
+                while pending_ids:
+                    time.sleep(10)
+                    print(f"Checking status for {len(pending_ids)} pending downloads...")
+                    retrieve_payload = {"label": "satmaps-naip-download"}
+                    try:
+                        retrieved = send_m2m_request("download-retrieve", retrieve_payload, api_key=api_key)
+                        new_available = retrieved.get("available", [])
+                        for item in new_available:
+                            if item["downloadId"] in pending_ids:
+                                download_futures.append(executor.submit(_download_worker, item["downloadId"], item["url"]))
+                                pending_ids.remove(item["downloadId"])
+                                print(f"Resolved and started download for {item['downloadId']}")
+                    except Exception as e:
+                        print(f"Warning: Polling failed: {e}")
+                        # Might want to break or retry, for now we will just wait and retry loop
+                        pass
+                        
+            # Wait for all downloads in this chunk to finish
+            for future in concurrent.futures.as_completed(download_futures):
                 path = future.result()
                 if path:
                     downloaded_paths.append(get_vrt_path_for_zip(path))
