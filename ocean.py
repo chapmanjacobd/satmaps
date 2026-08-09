@@ -461,11 +461,7 @@ def create_alpha_vrt(
     if xsize * ysize <= max_in_memory_alpha_pixels():
         depths = band.ReadAsArray().astype(np.float32)
         ocean_mask = build_ocean_threshold_mask(depths, nodata_value)
-        cleaned_mask = remove_small_enclosed_ocean_regions(
-            ocean_mask,
-            ds.GetGeoTransform(),
-            SMALL_OCEAN_MAX_AREA_SQ_M,
-        )
+        cleaned_mask = remove_enclosed_ocean_regions(ocean_mask)
         alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
         alpha_band.FlushCache()
     else:
@@ -484,24 +480,10 @@ def create_alpha_vrt(
                 alpha_band.WriteArray(ocean_mask.astype(np.uint8) * 255, xoff=xoff, yoff=yoff)
 
         alpha_band.FlushCache()
-        if xsize * ysize <= MAX_COMPONENT_CLEANUP_PIXELS:
-            ocean_mask = alpha_band.ReadAsArray().astype(bool)
-            cleaned_mask = remove_small_enclosed_ocean_regions(
-                ocean_mask,
-                ds.GetGeoTransform(),
-                SMALL_OCEAN_MAX_AREA_SQ_M,
-            )
-            alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
-            alpha_band.FlushCache()
-        else:
-            cleanup_mask_path = cleanup_path or Path(alpha_tif).with_suffix(".land_mask.tif")
-            remove_small_ocean_regions_sieve(
-                alpha_ds,
-                alpha_band,
-                ds.GetGeoTransform(),
-                SMALL_OCEAN_MAX_AREA_SQ_M,
-                cleanup_mask_path,
-            )
+        ocean_mask = alpha_band.ReadAsArray().astype(bool)
+        cleaned_mask = remove_enclosed_ocean_regions(ocean_mask)
+        alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
+        alpha_band.FlushCache()
     alpha_ds = None
     ds = None
     publish_staged_path(staged_alpha_tif, alpha_tif)
@@ -516,132 +498,31 @@ def build_ocean_threshold_mask(depths: np.ndarray, nodata_value: float) -> np.nd
     return (depths > nodata_value + 0.1) & (depths < OCEAN_FADE_DEPTH)
 
 
-def remove_small_enclosed_ocean_regions(
-    ocean_mask: np.ndarray,
-    geotransform: Sequence[float],
-    max_area_sq_m: float,
-) -> np.ndarray:
-    """Remove enclosed ocean components smaller than the configured area threshold."""
+def remove_enclosed_ocean_regions(ocean_mask: np.ndarray) -> np.ndarray:
+    """Remove enclosed ocean components completely surrounded by land."""
     if ocean_mask.ndim != 2:
         raise ValueError("ocean_mask must be 2D")
-    if ocean_mask.size == 0 or max_area_sq_m <= 0.0:
+    if ocean_mask.size == 0:
         return ocean_mask
-
-    pixel_area_sq_m = abs(geotransform[1] * geotransform[5] - geotransform[2] * geotransform[4])
-    if pixel_area_sq_m <= 0.0:
-        raise ValueError("geotransform must define a positive pixel area")
 
     labels, component_count = label(ocean_mask, structure=np.ones((3, 3), dtype=np.uint8))
     if component_count == 0:
         return ocean_mask
 
-    component_sizes = np.bincount(labels.ravel(), minlength=component_count + 1)
     edge_labels = np.unique(
         np.concatenate((labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]))
     )
-    enclosed_small_labels = [
+    enclosed_labels = [
         label_id
         for label_id in range(1, component_count + 1)
-        if label_id not in edge_labels and component_sizes[label_id] * pixel_area_sq_m < max_area_sq_m
+        if label_id not in edge_labels
     ]
-    if not enclosed_small_labels:
+    if not enclosed_labels:
         return ocean_mask
 
     cleaned_mask = ocean_mask.copy()
-    cleaned_mask[np.isin(labels, enclosed_small_labels)] = False
+    cleaned_mask[np.isin(labels, enclosed_labels)] = False
     return cleaned_mask
-
-
-def remove_small_ocean_regions_sieve(
-    alpha_dataset: gdal.Dataset,
-    alpha_band: gdal.Band,
-    geotransform: Sequence[float],
-    max_area_sq_m: float,
-    cleanup_mask_path: Path,
-) -> None:
-    """Remove small ocean regions with GDAL sieve while preserving original land pixels."""
-    pixel_area_sq_m = abs(geotransform[1] * geotransform[5] - geotransform[2] * geotransform[4])
-    if pixel_area_sq_m <= 0.0:
-        raise ValueError("geotransform must define a positive pixel area")
-
-    sieve_threshold_pixels = max(1, int(np.ceil(max_area_sq_m / pixel_area_sq_m)))
-    land_mask_ds, staged_cleanup_mask = create_sieve_cleanup_mask_dataset(
-        alpha_dataset,
-        cleanup_mask_path,
-    )
-
-    land_mask_ds.SetProjection(alpha_dataset.GetProjection())
-    land_mask_ds.SetGeoTransform(alpha_dataset.GetGeoTransform())
-    land_mask_band = land_mask_ds.GetRasterBand(1)
-
-    block_width, block_height = alpha_band.GetBlockSize()
-    if block_width <= 0:
-        block_width = 512
-    if block_height <= 0:
-        block_height = 512
-
-    for yoff in range(0, alpha_dataset.RasterYSize, block_height):
-        bh = min(block_height, alpha_dataset.RasterYSize - yoff)
-        for xoff in range(0, alpha_dataset.RasterXSize, block_width):
-            bw = min(block_width, alpha_dataset.RasterXSize - xoff)
-            alpha_block = alpha_band.ReadAsArray(xoff, yoff, bw, bh)
-            land_mask_band.WriteArray((alpha_block == 0).astype(np.uint8) * 255, xoff=xoff, yoff=yoff)
-
-    land_mask_band.FlushCache()
-    gdal.SieveFilter(alpha_band, None, alpha_band, sieve_threshold_pixels, 8)
-
-    for yoff in range(0, alpha_dataset.RasterYSize, block_height):
-        bh = min(block_height, alpha_dataset.RasterYSize - yoff)
-        for xoff in range(0, alpha_dataset.RasterXSize, block_width):
-            bw = min(block_width, alpha_dataset.RasterXSize - xoff)
-            cleaned_block = alpha_band.ReadAsArray(xoff, yoff, bw, bh)
-            land_block = land_mask_band.ReadAsArray(xoff, yoff, bw, bh)
-            cleaned_block[land_block != 0] = 0
-            alpha_band.WriteArray(cleaned_block, xoff=xoff, yoff=yoff)
-
-    alpha_band.FlushCache()
-    land_mask_ds = None
-    if staged_cleanup_mask is not None:
-        remove_if_exists(staged_cleanup_mask)
-
-
-def create_sieve_cleanup_mask_dataset(
-    alpha_dataset: gdal.Dataset,
-    cleanup_mask_path: Path,
-) -> tuple[gdal.Dataset, str | None]:
-    """Create the temporary land-mask dataset used to restore original land after sieving."""
-    pixel_count = alpha_dataset.RasterXSize * alpha_dataset.RasterYSize
-    if pixel_count <= max_in_memory_sieve_mask_pixels():
-        mem_driver = gdal.GetDriverByName("MEM")
-        if mem_driver is not None:
-            land_mask_ds = mem_driver.Create(
-                "",
-                alpha_dataset.RasterXSize,
-                alpha_dataset.RasterYSize,
-                1,
-                gdal.GDT_Byte,
-            )
-            if land_mask_ds is not None:
-                return land_mask_ds, None
-
-    mask_driver = gdal.GetDriverByName("GTiff")
-    if mask_driver is None:
-        raise RuntimeError("Could not load GTiff driver for ocean cleanup")
-
-    staged_cleanup_mask = build_staged_path(str(cleanup_mask_path))
-    remove_if_exists(staged_cleanup_mask)
-    land_mask_ds = mask_driver.Create(
-        staged_cleanup_mask,
-        alpha_dataset.RasterXSize,
-        alpha_dataset.RasterYSize,
-        1,
-        gdal.GDT_Byte,
-        options=list(TEMPORARY_TILED_GTIFF_OPTIONS),
-    )
-    if land_mask_ds is None:
-        raise RuntimeError(f"Could not create temporary cleanup mask: {cleanup_mask_path}")
-    return land_mask_ds, staged_cleanup_mask
-
 
 def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
     """Return the styled MAKO depth ramp as float32 RGB triples in [0, 1]."""
