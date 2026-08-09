@@ -1458,6 +1458,43 @@ def fill_missing_ocean_to_final_tile_cache(
     return written_tiles
 
 
+def build_ocean_only_pmtiles(
+    prepared_ocean_background: str,
+    output_path: str,
+    unique_id: str,
+    args: argparse.Namespace,
+    *,
+    requested_bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> str:
+    """Package the prepared ocean background into its own PMTiles archive.
+
+    The ocean background is committed to a build-unique final WebP tile cache
+    (preserving RGBA transparency), then that tree is converted to PMTiles. This
+    is the ocean half of the default split output; the land half keeps alpha where
+    no imagery exists so a client can toggle the two layers independently.
+    """
+    run_paths = SatmapsRunPaths(output_path, unique_id)
+    ensure_directory(run_paths.output_temp_dir)
+    ensure_directory(run_paths.full_render_cache_dir)
+    commit_ocean_to_final_tile_cache(prepared_ocean_background, output_path, unique_id, args)
+    final_tile_tree = run_paths.final_tile_cache_dir
+    temp_mbtiles = convert_tile_tree_to_pmtiles(
+        final_tile_tree,
+        output_path,
+        unique_id,
+        resample_alg=args.resample_alg,
+        max_zoom=args.max_zoom,
+        name="Ocean Background",
+        description="GEBCO styled ocean background",
+        requested_bbox=requested_bbox,
+        quality=args.quality,
+        parallel=args.parallel,
+        resume=getattr(args, "resume", False),
+    )
+    cleanup_temporary_files([temp_mbtiles])
+    return output_path
+
+
 def render_raster_tile_image(
     input_raster: str,
     relative_path: str,
@@ -4560,6 +4597,17 @@ def add_satmaps_output_cli_args(parser: argparse.ArgumentParser) -> None:
         default=ocean.DEFAULT_GEBCO_ZIP,
         help="Path to the GEBCO zip archive used when --render-ocean is set",
     )
+    add(
+        "--combined",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Emit a single PMTiles archive with the ocean baked beneath land. "
+            "By default, satmaps emits two archives: the land layer at the "
+            "requested --output and a separate ocean layer at <output>.ocean.pmtiles "
+            "so the layers can be toggled independently in a client."
+        ),
+    )
 
 
 def add_satmaps_discovery_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -4776,6 +4824,8 @@ def main() -> None:
 
     prepared_ocean_background: Optional[str] = None
     ocean_cleanup_paths: List[str] = []
+    combined_output = getattr(args, "combined", False)
+    ocean_output_path = args.output + ".ocean.pmtiles"
     # NAIP workflow renders land directly from source GeoTIFFs; it has no use
     # for an ocean background, so skip preparation/commit entirely.
     if not is_naip:
@@ -4792,17 +4842,38 @@ def main() -> None:
             print(f"Using ocean background: {prepared_ocean_background}")
             if os.path.abspath(prepared_ocean_background) != os.path.abspath(args.ocean_background):
                 ocean_cleanup_paths.append(prepared_ocean_background)
-            if (
-                not args.full_render_first
-                and (not args.land or not plan.work_units)
-                and commit_ocean_to_final_tile_cache(
+            if combined_output:
+                if (
+                    not args.full_render_first
+                    and (not args.land or not plan.work_units)
+                    and commit_ocean_to_final_tile_cache(
+                        prepared_ocean_background,
+                        args.output,
+                        unique_id,
+                        args,
+                    )
+                ):
+                    print("Committed ocean background to final WebP tiles.")
+            else:
+                # Split output: package the ocean background into its own PMTiles
+                # archive first, then render land without baking the ocean beneath
+                # it so a client can toggle the two layers independently.
+                ocean_unique_id = build_output_namespace(ocean_output_path, default_stem="ocean")
+                print(f"Building standalone ocean archive: {ocean_output_path}")
+                build_ocean_only_pmtiles(
                     prepared_ocean_background,
-                    args.output,
-                    unique_id,
+                    ocean_output_path,
+                    ocean_unique_id,
                     args,
+                    requested_bbox=requested_bbox,
                 )
-            ):
-                print("Committed ocean background to final WebP tiles.")
+                if not args.land or not plan.work_units:
+                    print("No land work units to render; only the ocean archive was built.")
+                    cleanup_temporary_files(ocean_cleanup_paths)
+                    if os.path.exists(state_file):
+                        os.remove(state_file)
+                    return
+                prepared_ocean_background = None
         elif args.bbox or args.extent:
             print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
 

@@ -111,9 +111,15 @@ Generate PMTiles for either a bbox subset or the default all-tiles run:
 # If land_mgrs.list is missing, build it once before imagery generation
 land-mgrs
 
-# BBox render using either a full-coverage or bbox-matched standalone ocean background
+# BBox render using either a full-coverage or bbox-matched standalone ocean background.
+# The default split output emits two archives: the land layer at -o hawaii.pmtiles and
+# a separate ocean layer at hawaii.pmtiles.ocean.pmtiles, so a client can toggle the
+# layers independently. Land tiles keep alpha where there is no imagery.
 land-mgrs --bbox -161,18,-154,23
 satmaps --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii.pmtiles
+
+# Single-file output with the ocean baked beneath land (pre-split behavior)
+satmaps --combined --bbox -161,18,-154,23 --ocean-background ocean.tif -o hawaii-combined.pmtiles
 
 # Lower-data global run using a coarser ocean background and imagery zoom
 satmaps --max-zoom 4 --ocean-background ocean-z4.tif -o all-tiles-z4.pmtiles
@@ -150,6 +156,7 @@ satmaps --estimate
 - `--full-render-first`: Render each land work unit into a full aligned EPSG:3857 GeoTIFF first, cache those rasters under `.cache.render`, build a master VRT, then tile that merged raster once. This usually trades higher disk/RAM for less repeated final-tile work.
 - `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
 - `--ocean-background`: Prebuilt standalone ocean background GeoTIFF (default: `ocean.tif`). Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before max-zoom tile caching. Coarser ocean masks (for example z4-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass.
+- `--combined` / `--no-combined`: By default, `satmaps` emits a **split** output: the land layer at `--output` and a separate ocean layer at `<output>.ocean.pmtiles`, each keeping alpha so a client (for example MapLibre) can toggle the two layers independently. Pass `--combined` to instead bake the ocean beneath the land into a single opaque PMTiles archive at `--output` (the pre-split behavior).
 - Final Web Mercator land outputs target `--max-zoom` (supported: 4-14; default zoom 13, ~19.11 m/px at the equator). Ocean backgrounds may be reused from the same or a coarser zoom level and are resampled onto that final output grid during composition. Low-resolution runs at `--max-zoom 7` and below use a coarse-grid-first land renderer to avoid the full per-subtile pipeline.
 - `--land` / `--no-land`: Enable or skip Sentinel-2 land tile processing entirely.
 - `--grade` / `--no-grade`: Enable or disable final land grading.
@@ -215,7 +222,7 @@ You can override the defaults (tuned via `satmaps-tuner`):
 5.  Processing (NumPy):
     - Soft-Knee Tone Mapping: A 3-segment linear curve to compress high dynamic range while preserving local contrast.
     - Color Grading: Exposure, gamma/shoulder shaping, and contrast controls for a "natural" look.
-6.  Packaging: By default, `satmaps` renders each land work unit and the prepared ocean background into a resumable max-zoom `z/x/y.webp` cache, batching neighboring final land tiles together row-by-row when possible, then copies those WebP bytes into MBTiles, builds lower zooms with a parallel, resumable tile-overview pass, and converts the archive to PMTiles. With `--full-render-first`, it instead writes full aligned 3857 land rasters into `.cache.render`, builds a master VRT, and tiles that merged raster tree once before packaging. Large direct bbox renders split MBTiles translation into independent chunks at `--chunk-zoom` and process them concurrently using `--parallel` workers before merging.
+6.  Packaging: By default, `satmaps` emits a **split** archive: it first commits the prepared ocean background into its own build-unique `z/x/y.webp` cache (preserving RGBA transparency) and converts it to `<output>.ocean.pmtiles`, then renders each land work unit into a separate resumable max-zoom cache (batching neighboring final land tiles together row-by-row when possible) and converts that to `--output`. Land tiles keep alpha where there is no imagery, so the two archives can be toggled independently in a client. With `--combined`, it instead renders each land work unit and the prepared ocean background into one shared final WebP cache so the ocean is baked beneath the land, then packages that single archive. In both modes the WebP bytes are copied into MBTiles, lower zooms are built with a parallel, resumable tile-overview pass, and the archive is converted to PMTiles. With `--full-render-first`, it instead writes full aligned 3857 land rasters into `.cache.render`, builds a master VRT, and tiles that merged raster tree once before packaging. Large direct bbox renders split MBTiles translation into independent chunks at `--chunk-zoom` and process them concurrently using `--parallel` workers before merging.
 
 ## Datasets
 
