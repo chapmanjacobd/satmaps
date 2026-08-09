@@ -786,77 +786,6 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
             
     if not scenes_to_fetch:
         return downloaded_paths
-        
-    entity_ids = [scene["entityId"] for scene in scenes_to_fetch]
-    print(f"Requesting download options for {len(entity_ids)} scenes...")
-    
-    # We must chunk entityIds if there are too many, but up to 50k is usually supported.
-    payload = {
-        "datasetName": "NAIP",
-        "entityIds": entity_ids
-    }
-    options = send_m2m_request("download-options", payload, api_key=api_key)
-    
-    # Group available options by entityId, preferring JP2 (smaller) over ZIP/TIFF
-    options_by_entity = {}
-    for option in options:
-        if option.get("available") and option.get("downloadSystem") in ("EE", "dds"):
-            eid = option["entityId"]
-            product_name = option.get("productName", "").lower()
-            is_jp2 = "jp2" in product_name or "jpeg2000" in product_name or "jpeg 2000" in product_name
-            
-            if eid not in options_by_entity:
-                options_by_entity[eid] = option
-            elif is_jp2 and "jp2" not in options_by_entity[eid].get("productName", "").lower():
-                options_by_entity[eid] = option
-    
-    downloads = [{"entityId": opt["entityId"], "productId": opt["id"]} for opt in options_by_entity.values()]
-            
-    if not downloads:
-        print("No valid download options found for these scenes.")
-        return []
-        
-    print(f"Requesting downloads for {len(downloads)} products...")
-    req_payload = {
-        "downloads": downloads,
-        "label": "satmaps-naip-download"
-    }
-    req_resp = send_m2m_request("download-request", req_payload, api_key=api_key)
-    
-    available_downloads = req_resp.get("availableDownloads", [])
-    preparing_downloads = req_resp.get("preparingDownloads", [])
-    
-    print(f"Initial request: {len(available_downloads)} available, {len(preparing_downloads)} preparing.")
-    
-    download_urls = {d["downloadId"]: d["url"] for d in available_downloads}
-    
-    # Poll for preparing downloads
-    if preparing_downloads:
-        print("Polling for preparing downloads (this may take a while)...")
-        pending_ids = {d["downloadId"] for d in preparing_downloads}
-        
-        while pending_ids:
-            time.sleep(10)
-            print(f"Checking status for {len(pending_ids)} pending downloads...")
-            retrieve_payload = {"label": "satmaps-naip-download"}
-            retrieved = send_m2m_request("download-retrieve", retrieve_payload, api_key=api_key)
-            
-            new_available = retrieved.get("available", [])
-            for item in new_available:
-                if item["downloadId"] in pending_ids:
-                    download_urls[item["downloadId"]] = item["url"]
-                    pending_ids.remove(item["downloadId"])
-                    print(f"Resolved URL for {item['downloadId']}")
-                    
-            if not pending_ids:
-                break
-    
-    print(f"All {len(download_urls)} download URLs resolved. Starting fetch to {cache_dir}...")
-    
-    if not os.path.exists(cache_dir):
-        os.makedirs(cache_dir)
-        
-    downloaded_paths = []
 
     def _download_worker(dl_id: str, url: str) -> Optional[str]:
         max_retries = 3
@@ -889,7 +818,6 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
                             f.write(chunk)
                 return out_path
             except Exception as e:
-                # 4. If a download fails, wait before re-attempting
                 if attempt < max_retries - 1:
                     print(f"Download failed for {url} ({e}), waiting 10s before re-attempting...")
                     time.sleep(10)
@@ -897,13 +825,94 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
                     print(f"Failed to download {url} after {max_retries} attempts: {e}")
                     return None
 
-    # 5. Use multi-threading on download URLs, the recommended number of concurrent downloads should be 5 or less
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(_download_worker, dl_id, url): dl_id for dl_id, url in download_urls.items()}
-        for future in concurrent.futures.as_completed(futures):
-            path = future.result()
-            if path:
-                downloaded_paths.append(get_vrt_path_for_zip(path))
+    chunk_size = 20
+    for i in range(0, len(scenes_to_fetch), chunk_size):
+        chunk = scenes_to_fetch[i:i + chunk_size]
+        entity_ids = [scene["entityId"] for scene in chunk]
+        print(f"Processing chunk {i//chunk_size + 1}/{(len(scenes_to_fetch) + chunk_size - 1)//chunk_size} ({len(entity_ids)} scenes)...")
+        
+        payload = {
+            "datasetName": "NAIP",
+            "entityIds": entity_ids
+        }
+        
+        try:
+            options = send_m2m_request("download-options", payload, api_key=api_key)
+        except Exception as e:
+            print(f"Warning: Failed to get download options for chunk: {e}")
+            continue
+            
+        options_by_entity = {}
+        for option in options:
+            if option.get("available") and option.get("downloadSystem") in ("EE", "dds"):
+                eid = option["entityId"]
+                product_name = option.get("productName", "").lower()
+                is_jp2 = "jp2" in product_name or "jpeg2000" in product_name or "jpeg 2000" in product_name
+                
+                if eid not in options_by_entity:
+                    options_by_entity[eid] = option
+                elif is_jp2 and "jp2" not in options_by_entity[eid].get("productName", "").lower():
+                    options_by_entity[eid] = option
+                    
+        downloads = [{"entityId": opt["entityId"], "productId": opt["id"]} for opt in options_by_entity.values()]
+        
+        if not downloads:
+            print("No valid download options found for this chunk.")
+            continue
+            
+        print(f"Requesting downloads for {len(downloads)} products...")
+        req_payload = {
+            "downloads": downloads,
+            "label": "satmaps-naip-download"
+        }
+        
+        try:
+            req_resp = send_m2m_request("download-request", req_payload, api_key=api_key)
+        except Exception as e:
+            print(f"Warning: Failed to request downloads for chunk: {e}")
+            continue
+            
+        available_downloads = req_resp.get("availableDownloads", [])
+        preparing_downloads = req_resp.get("preparingDownloads", [])
+        
+        print(f"Initial request: {len(available_downloads)} available, {len(preparing_downloads)} preparing.")
+        
+        download_urls = {d["downloadId"]: d["url"] for d in available_downloads}
+        
+        if preparing_downloads:
+            print("Polling for preparing downloads...")
+            pending_ids = {d["downloadId"] for d in preparing_downloads}
+            
+            while pending_ids:
+                time.sleep(10)
+                print(f"Checking status for {len(pending_ids)} pending downloads...")
+                retrieve_payload = {"label": "satmaps-naip-download"}
+                try:
+                    retrieved = send_m2m_request("download-retrieve", retrieve_payload, api_key=api_key)
+                    new_available = retrieved.get("available", [])
+                    for item in new_available:
+                        if item["downloadId"] in pending_ids:
+                            download_urls[item["downloadId"]] = item["url"]
+                            pending_ids.remove(item["downloadId"])
+                            print(f"Resolved URL for {item['downloadId']}")
+                except Exception as e:
+                    print(f"Warning: Polling failed: {e}")
+                    # Might want to break or retry, for now we will just wait and retry loop
+                    pass
+                    
+                if not pending_ids:
+                    break
+                    
+        if not download_urls:
+            continue
+            
+        print(f"Downloading {len(download_urls)} files for chunk...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(_download_worker, dl_id, url): dl_id for dl_id, url in download_urls.items()}
+            for future in concurrent.futures.as_completed(futures):
+                path = future.result()
+                if path:
+                    downloaded_paths.append(get_vrt_path_for_zip(path))
 
     return downloaded_paths
 
