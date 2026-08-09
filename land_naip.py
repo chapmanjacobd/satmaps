@@ -736,7 +736,12 @@ def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str, args:
         else:
             from osgeo import gdal
 
-            vrt_ds = gdal.BuildVRT(vrt_path, tif_urls, options=gdal.BuildVRTOptions(resolution="highest"))
+            vsi_urls = [f"/vsicurl/{u}" for u in tif_urls]
+            gdal.SetConfigOption("GDAL_HTTP_CONNECTTIMEOUT", "30")
+            gdal.SetConfigOption("GDAL_HTTP_TIMEOUT", "120")
+            gdal.SetConfigOption("GDAL_HTTP_MAX_RETRY", "2")
+            print(f"Building VRT from {len(vsi_urls)} remote tiles (this may take a minute)...")
+            vrt_ds = gdal.BuildVRT(vrt_path, vsi_urls, options=gdal.BuildVRTOptions(resolution="highest"))
             if vrt_ds is None:
                 raise RuntimeError(f"Failed to build VRT for {ds['name']}")
             vrt_ds = None
