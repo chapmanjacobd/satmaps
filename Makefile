@@ -42,6 +42,9 @@ tune:
 	$(PYTHON) tuner_ui.py
 
 demo:
+	$(PYTHON) satmaps.py --yes --download --bbox $(DEMO_BBOX_HAWAII) --cache $(DEMO_CACHE)
+	$(PYTHON) satmaps.py --yes --download --bbox $(DEMO_BBOX_GREENLAND) --cache $(DEMO_CACHE)
+	$(PYTHON) satmaps.py --yes --download --bbox $(DEMO_BBOX_EASTSOUND) --cache $(DEMO_CACHE)
 	$(PYTHON) satmaps.py --yes --bbox $(DEMO_BBOX_HAWAII) --cache $(DEMO_CACHE) -o demo/hawaii.pmtiles
 	$(PYTHON) satmaps.py --yes --bbox $(DEMO_BBOX_GREENLAND) --cache $(DEMO_CACHE) -o demo/greenland.pmtiles
 	$(PYTHON) satmaps.py --yes --bbox $(DEMO_BBOX_EASTSOUND) --cache $(DEMO_CACHE) -o demo/eastsound.pmtiles
