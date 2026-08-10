@@ -137,6 +137,15 @@
   const opacityEl = document.getElementById("ocean-opacity");
   const areaEl = document.getElementById("area-select");
 
+  function loadState() {
+    return {
+      area: areaEl.value,
+      land: landEl.checked,
+      ocean: oceanEl.checked,
+      opacity: parseFloat(opacityEl.value),
+    };
+  }
+
   function applyArea(key) {
     const area = AREAS[key];
     // MapLibre has no map.setSource; remove and re-add both raster sources and layers.
@@ -167,6 +176,10 @@
     map.easeTo({ center: area.center, zoom: area.zoom, duration: 600 });
   }
 
+  // The browser restores the form fields from the previous session; read back
+  // whatever values are actually in the DOM now and drive the map from them.
+  const saved = loadState();
+
   areaEl.addEventListener("change", () => applyArea(areaEl.value));
 
   oceanEl.addEventListener("change", () => {
@@ -178,6 +191,12 @@
   opacityEl.addEventListener("input", () => {
     map.setPaintProperty("ocean", "raster-opacity", parseFloat(opacityEl.value));
   });
+
+  // Apply the restored state to the map on load.
+  applyArea(saved.area);
+  // The browser may finish restoring the form fields slightly after scripts run,
+  // so re-check the DOM values shortly after and update the map if they changed.
+  setTimeout(() => applyArea(loadState().area), 800);
 </script>
 </body>
 </html>

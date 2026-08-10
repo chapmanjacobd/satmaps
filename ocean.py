@@ -15,6 +15,7 @@ from common import (
     build_output_namespace_dir,
     build_output_namespace,
     build_staged_path,  # noqa: F401  (deliberate re-export)
+    describe_settings_differences,
     ensure_directory,
     prepare_staged_path,
     file_has_content,
@@ -908,13 +909,60 @@ def build_ocean_run_metadata_path(temp_dir: str, unique_id: str) -> str:
     return os.path.join(temp_dir, "run.json")
 
 
+def ocean_background_matches_current_settings(
+    destination: str,
+    bbox: tuple[float, float, float, float] | None,
+    temp_dir: str,
+    *,
+    max_zoom: int,
+    chunk_size: int,
+    resample_alg: str,
+    hillshade_z: float,
+    style: OceanStyleOptions,
+    mask_blur: float = 0.0,
+    mask_erode: int = 0,
+) -> bool:
+    """Return True when an existing ocean background was built with the current run settings.
+
+    A missing settings sidecar (e.g. a legacy background) is treated as reusable so
+    pre-settings backgrounds are not needlessly rebuilt.
+    """
+    unique_id = build_output_namespace(destination, default_stem="ocean")
+    output_temp_dir = build_output_namespace_dir(temp_dir, unique_id)
+    metadata_path = build_ocean_run_metadata_path(output_temp_dir, unique_id)
+    previous_settings = read_settings_file(metadata_path, description="ocean run metadata")
+    if previous_settings is None:
+        return True
+    current_settings = build_ocean_run_settings(
+        destination,
+        bbox,
+        max_zoom=max_zoom,
+        chunk_size=chunk_size,
+        resample_alg=resample_alg,
+        hillshade_z=hillshade_z,
+        style=style,
+        mask_blur=mask_blur,
+        mask_erode=mask_erode,
+    )
+    return not describe_settings_differences(previous_settings, current_settings)
+
+
 def recover_ocean_chunk_outputs(
     temp_dir: str,
     stem: str,
     unique_id: str,
     chunks: Sequence[OceanChunkPlan],
+    *,
+    reuse: bool = True,
 ) -> tuple[set[tuple[int, int]], list[str]]:
-    """Return reusable chunk RGBA outputs and drop stale zero-byte leftovers."""
+    """Return reusable chunk RGBA outputs and drop stale zero-byte leftovers.
+
+    Pass ``reuse=False`` when the stored artifacts were built with different run
+    settings so stale chunks are never served as if they matched the current run.
+    """
+    if not reuse:
+        return set(), []
+
     recovered_keys: set[tuple[int, int]] = set()
     recovered_paths: list[str] = []
     for chunk in chunks:
@@ -1109,8 +1157,9 @@ def generate_ocean_background(
         metadata_path,
         description="ocean run metadata",
     )
+    ocean_settings_mismatch = False
     if previous_ocean_run_settings is not None:
-        print_settings_diff_warning(
+        ocean_settings_mismatch = print_settings_diff_warning(
             "Ocean run",
             previous_ocean_run_settings,
             ocean_run_settings,
@@ -1139,10 +1188,16 @@ def generate_ocean_background(
     print(f"Processing {len(plan.chunks):,} chunk(s) with {chunk_workers} worker(s)...")
 
     recovered_chunk_keys, recovered_chunk_paths = recover_ocean_chunk_outputs(
-        output_temp_dir, stem, unique_id, plan.chunks
+        output_temp_dir,
+        stem,
+        unique_id,
+        plan.chunks,
+        reuse=not ocean_settings_mismatch,
     )
     if recovered_chunk_paths:
         print(f"Reusing {len(recovered_chunk_paths):,} existing ocean chunk(s).")
+    elif ocean_settings_mismatch:
+        print("Ocean run settings changed; rebuilding all chunks with current settings.")
     remaining_chunks = [
         chunk for chunk in plan.chunks if (chunk.row, chunk.col) not in recovered_chunk_keys
     ]
@@ -1373,7 +1428,7 @@ def add_ocean_style_cli_args(parser: argparse.ArgumentParser, *, prefix: str = "
     add(
         f"--{p}mask-blur",
         type=float,
-        default=8.0,
+        default=15.0,
         help=(
             "Gaussian blur sigma (in output pixels) applied to the depth field before the "
             f"{OCEAN_FADE_DEPTH}m threshold, smoothing the coastline and removing staircase "
@@ -1383,7 +1438,7 @@ def add_ocean_style_cli_args(parser: argparse.ArgumentParser, *, prefix: str = "
     add(
         f"--{p}mask-erode",
         type=int,
-        default=16,
+        default=32,
         help=(
             "Erode the ocean mask by this many output pixels so land imagery extends a few "
             "pixels past the fade depth as coastal clearance. 0 disables."

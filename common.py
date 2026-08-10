@@ -169,6 +169,15 @@ def describe_settings_differences(
 ) -> list[str]:
     """Return dotted-key setting diffs between two JSON-like mappings."""
 
+    def normalize_value(value: Any) -> Any:
+        if isinstance(value, tuple):
+            return [normalize_value(item) for item in value]
+        if isinstance(value, list):
+            return [normalize_value(item) for item in value]
+        if isinstance(value, Mapping):
+            return {key: normalize_value(item) for key, item in value.items()}
+        return value
+
     def flatten_settings(
         value: Mapping[str, Any],
         *,
@@ -180,7 +189,7 @@ def describe_settings_differences(
             if isinstance(item, Mapping):
                 flattened.update(flatten_settings(item, prefix=key_path))
             else:
-                flattened[key_path] = item
+                flattened[key_path] = normalize_value(item)
         return flattened
 
     def format_value(value: Any) -> str:

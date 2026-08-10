@@ -17,6 +17,7 @@ import ocean
 import land_mgrs
 import satmaps
 import tiler
+import common
 from satmaps import (
     fill_nan_nearest,
     get_tile_paths,
@@ -2281,10 +2282,32 @@ def test_generate_ocean_warns_for_changed_run_settings(
         temp_dir=str(temp_dir),
     )
 
-    assert processed_chunks == []
+    assert processed_chunks == [(0, 0)]
     out = capsys.readouterr().out
     assert "Warning: Ocean run setting mismatch: hillshade_z: 4.0 -> 5.0" in out
-    assert "Reusing 1 existing ocean chunk(s)." in out
+    assert "Reusing 1 existing ocean chunk(s)." not in out
+    assert "Ocean run settings changed; rebuilding all chunks with current settings." in out
+
+
+def test_describe_settings_differences_ignores_tuple_list_representation() -> None:
+    previous = {
+        "destination": "/tmp/ocean.tif",
+        "bbox": [-123.203075, 48.633139, -122.78532, 48.857579],
+        "mask_erode": 4,
+    }
+    current = {
+        "destination": "/tmp/ocean.tif",
+        "bbox": (-123.203075, 48.633139, -122.78532, 48.857579),
+        "mask_erode": 4,
+    }
+    assert common.describe_settings_differences(previous, current) == []
+
+
+def test_describe_settings_differences_reports_real_changes() -> None:
+    previous = {"destination": "/tmp/ocean.tif", "mask_erode": 4}
+    current = {"destination": "/tmp/ocean.tif", "mask_erode": 16}
+    differences = common.describe_settings_differences(previous, current)
+    assert differences == ["mask_erode: 4 -> 16"]
 
 
 def test_generate_ocean_without_bbox_reports_chunk_progress(
@@ -4139,6 +4162,69 @@ def test_main_default_reuses_existing_ocean_background(
 
     assert generate_calls == []
 
+def test_main_rerebuilds_existing_ocean_background_when_settings_changed(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    destination = str(tmp_path / "output.ocean.tif")
+    make_fake_ocean_background(destination)
+    configure_main_defaults(
+        monkeypatch,
+        tmp_path,
+        [
+            "--bbox",
+            "0,0,1,1",
+            "--grade",
+            "--parallel",
+            "1",
+            "--date",
+            "2025/07/01",
+            "--ocean-mask-erode",
+            "32",
+        ],
+        mgrs_bases=["31TDF"],
+        unique_id="oceanstale",
+    )
+    ocean_unique_id = ocean.build_output_namespace(destination, default_stem="ocean")
+    output_temp_dir = tmp_path / ".temp" / ocean_unique_id
+    output_temp_dir.mkdir(parents=True)
+    ocean.write_settings_file(
+        str(output_temp_dir / "run.json"),
+        {
+            "destination": destination,
+            "bbox": [0.0, 0.0, 1.0, 1.0],
+            "max_zoom": ocean.DEFAULT_MAX_ZOOM,
+            "chunk_size": ocean.DEFAULT_OCEAN_CHUNK_SIZE,
+            "resample_alg": "cubicspline",
+            "hillshade_z": 5.0,
+            "style": {},
+            "mask_blur": 15.0,
+            "mask_erode": 8,
+        },
+    )
+    generate_calls: list[object] = []
+    monkeypatch.setattr(
+        "satmaps.ocean.generate_ocean_background",
+        lambda **kwargs: generate_calls.append(kwargs),
+    )
+    monkeypatch.setattr("satmaps.prepare_ocean_background_for_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "satmaps.render_land_output_tiles",
+        lambda *args, **kwargs: satmaps.LandOutputRenderStats(total_tiles=1, rendered_tiles=1, skipped_tiles=0),
+    )
+    monkeypatch.setattr(
+        "satmaps.resolve_work_unit_candidate_row_slabs",
+        lambda *args, **kwargs: {work_unit.unit_id: ((2, 1, 1),) for work_unit in args[0]},
+    )
+    monkeypatch.setattr("satmaps.tiler.iter_tile_tree_paths", lambda root: ["13/1/2.webp"])
+    monkeypatch.setattr(
+        "satmaps.convert_tile_tree_to_pmtiles",
+        lambda *args, **kwargs: str(tmp_path / ".temp" / "output.mbtiles"),
+    )
+
+    main()
+
+    assert len(generate_calls) == 1
+
 def test_main_ocean_style_flags_flow_into_render(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -4531,6 +4617,137 @@ def test_render_land_output_tiles_fast_forwards_empty_marked_tiles(
     assert stats.empty_tiles == 2
     assert stats.cached_tiles == 0
     assert stats.rendered_tiles == 1
+
+
+def build_test_ocean_mask(path: Path, *, land_patch: bool = False) -> str:
+    """Build a WGS84 GeoTIFF with an alpha band usable as a GEBCO-style ocean mask."""
+    if not land_patch:
+        width, height, pixel_deg, top, left = 4, 4, 1.0, 2.0, -2.0
+        data = np.full((height, width), 255.0, dtype=np.float32)
+    else:
+        width, height, pixel_deg, top, left = 1000, 1000, 0.001, 0.5, -0.5
+        lon_centers = left + (np.arange(width) + 0.5) * pixel_deg
+        lat_centers = top - (np.arange(height) + 0.5) * pixel_deg
+        lon_grid, lat_grid = np.meshgrid(lon_centers, lat_centers)
+        data = np.where(
+            (np.abs(lon_grid) <= 0.1) & (np.abs(lat_grid) <= 0.1),
+            0.0,
+            255.0,
+        ).astype(np.float32)
+    dataset = gdal.GetDriverByName("GTiff").Create(
+        str(path), width, height, 1, gdal.GDT_Float32
+    )
+    assert dataset is not None
+    dataset.SetGeoTransform((left, pixel_deg, 0.0, top, 0.0, -pixel_deg))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    dataset.SetProjection(srs.ExportToWkt())
+    band = dataset.GetRasterBand(1)
+    band.SetColorInterpretation(gdal.GCI_AlphaBand)
+    band.SetNoDataValue(-1.0)
+    band.WriteArray(data)
+    dataset = None
+    return str(path)
+
+
+def test_render_land_output_tiles_preclassifies_all_ocean_batches(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    args = argparse.Namespace(
+        parallel=4,
+        cache=".cache",
+        output="output.pmtiles",
+        max_zoom=14,
+        resume=False,
+        tile_batch_width=32,
+        blocksize=256,
+        resample_alg="lanczos",
+        quality=75,
+    )
+    work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
+    # ty=8192, tx 8192..8195 -> four contiguous same-row output tiles.
+    contributor_row_slabs = {"31TDF_0_0": ((8192, 8192, 8195),)}
+    mask_path = build_test_ocean_mask(tmp_path / "ocean_mask.tif", land_patch=False)
+
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        "satmaps.render_final_output_tile",
+        lambda relative_path, *args, **kwargs: dispatched.append(relative_path)
+        or satmaps.LandTileRenderStatus.RENDERED,
+    )
+    monkeypatch.setattr(
+        "satmaps.render_final_output_tile_batch",
+        lambda batch, *args, **kwargs: dispatched.append(batch.relative_paths[0])
+        or satmaps.LandOutputBatchRenderResult(rendered_tiles=len(batch.relative_paths)),
+    )
+
+    stats = satmaps.render_land_output_tiles(
+        work_units,
+        ["2025/07/01"],
+        args,
+        "preclassify",
+        contributor_row_slabs,
+        gebco_src=mask_path,
+    )
+
+    # Every tile is ocean, so the whole batch is pre-classified empty without a worker.
+    assert dispatched == []
+    assert stats == satmaps.LandOutputRenderStats(
+        total_tiles=4,
+        rendered_tiles=0,
+        skipped_tiles=4,
+        cached_tiles=0,
+        empty_tiles=4,
+    )
+    final_dir = Path(satmaps.SatmapsRunPaths("output.pmtiles", "preclassify").final_tile_cache_dir)
+    for tx in (8192, 8193, 8194, 8195):
+        assert (final_dir / f"14/{tx}/8192.webp.empty").exists()
+
+
+def test_render_land_output_tiles_dispatches_rows_with_mask_land(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    args = argparse.Namespace(
+        parallel=4,
+        cache=".cache",
+        output="output.pmtiles",
+        max_zoom=14,
+        resume=False,
+        tile_batch_width=32,
+        blocksize=256,
+        resample_alg="lanczos",
+        quality=75,
+    )
+    work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
+    contributor_row_slabs = {"31TDF_0_0": ((8192, 8192, 8192),)}
+    mask_path = build_test_ocean_mask(tmp_path / "ocean_mask.tif", land_patch=True)
+
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        "satmaps.render_final_output_tile",
+        lambda relative_path, *args, **kwargs: dispatched.append(relative_path)
+        or satmaps.LandTileRenderStatus.RENDERED,
+    )
+
+    stats = satmaps.render_land_output_tiles(
+        work_units,
+        ["2025/07/01"],
+        args,
+        "preclassify-land",
+        contributor_row_slabs,
+        gebco_src=mask_path,
+    )
+
+    # The mask has a land patch under this tile, so the batch still dispatches.
+    assert dispatched == [os.path.join("14", "8192", "8192.webp")]
+    assert stats.rendered_tiles == 1
+    assert stats.empty_tiles == 0
 
 
 def test_envelopes_overlap_rejects_touching_edges() -> None:

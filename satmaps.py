@@ -2774,6 +2774,70 @@ def build_land_output_batch_grid(batch_plan: LandOutputBatchPlan) -> TileGrid:
     )
 
 
+def build_land_output_row_grid(
+    zoom: int,
+    ty: int,
+    tx_min: int,
+    tx_max: int,
+    tile_size: int,
+    resample_alg: str,
+) -> TileGrid:
+    """Build the expanded EPSG:3857 grid covering one full candidate output-tile row.
+
+    A row grid spans every output tile one work unit may contribute to on a single
+    ``ty`` row (plus the same edge halo as an individual batch), so a single GEBCO
+    mask warp can serve the emptiness pre-check for every batch in that row.
+    """
+    halo_pixels = compute_land_output_tile_halo_pixels(resample_alg)
+    full_world_width = (1 << zoom) * tile_size
+    expanded_xoff = max(0, tx_min * tile_size - halo_pixels)
+    expanded_yoff = max(0, ty * tile_size - halo_pixels)
+    expanded_xend = min(full_world_width, (tx_max + 1) * tile_size + halo_pixels)
+    expanded_yend = min(full_world_width, (ty + 1) * tile_size + halo_pixels)
+    pixel_size = tiler.web_mercator_pixel_size_for_tile_size(zoom, tile_size)
+    world_bounds = ocean.WEB_MERCATOR_WORLD_BOUNDS
+    expanded_minx = world_bounds[0] + expanded_xoff * pixel_size
+    expanded_maxy = world_bounds[3] - expanded_yoff * pixel_size
+    return TileGrid(
+        projection=build_web_mercator_srs().ExportToWkt(),
+        geotransform=(expanded_minx, pixel_size, 0.0, expanded_maxy, 0.0, -pixel_size),
+        width=expanded_xend - expanded_xoff,
+        height=expanded_yend - expanded_yoff,
+    )
+
+
+def ocean_mask_region_has_land(
+    alpha_band: gdal.Band,
+    xoff: int,
+    yoff: int,
+    width: int,
+    height: int,
+) -> bool:
+    """Return whether any pixel in a warped ocean-mask region is land-eligible.
+
+    Mirrors the land detection in ``collect_ocean_mask_slabs``: a region counts as
+    land whenever any pixel is both covered by the mask and inside the fill-allowed
+    (land) band, including a one-pixel dilation so pre-classified emptiness matches
+    the render path's per-contributor skip decision.
+    """
+    alpha_block = alpha_band.ReadAsArray(xoff, yoff, width, height).astype(np.float32)
+    mask_nodata = alpha_band.GetNoDataValue()
+    if mask_nodata is None:
+        coverage_block = np.ones(alpha_block.shape, dtype=bool)
+    else:
+        coverage_block = alpha_block != mask_nodata
+    fill_allowed_block = build_fill_allowed_mask(
+        alpha_block,
+        coverage_block,
+        nodata_value=mask_nodata,
+    )
+    slab_crop_block = coverage_block & binary_dilation(
+        fill_allowed_block,
+        structure=np.ones((3, 3), dtype=bool),
+    )
+    return bool(np.any(slab_crop_block))
+
+
 def build_output_tile_contributor_rows(
     work_units: Sequence[LandWorkUnit],
     contributor_row_slabs: dict[str, tuple[tuple[int, int, int], ...]],
@@ -4140,6 +4204,27 @@ def render_land_output_tiles(
                 work_unit_refcounts.get(work_unit.unit_id, 0) + (tx_max - tx_min + 1)
             )
 
+    # When no ocean background will be baked beneath land (split/land-only output),
+    # all-ocean batches produce only empty tiles. Pre-classify them from the GEBCO
+    # ocean mask in the dispatcher so they never occupy a worker thread, warping the
+    # mask once per (work unit, row) and reusing it for every batch in that row.
+    can_preclassify_empty = gebco_src is not None and prepared_ocean_background is None
+    row_mask_extents: dict[tuple[str, int], tuple[int, int]] = {}
+    if can_preclassify_empty:
+        for unit_id, slabs in contributor_row_slabs.items():
+            for ty, tx_min, tx_max in slabs:
+                previous_extent = row_mask_extents.get((unit_id, ty))
+                if previous_extent is None:
+                    row_mask_extents[(unit_id, ty)] = (tx_min, tx_max)
+                else:
+                    row_mask_extents[(unit_id, ty)] = (
+                        min(previous_extent[0], tx_min),
+                        max(previous_extent[1], tx_max),
+                    )
+    row_mask_cache: dict[
+        tuple[str, int], tuple[Optional[OceanMaskWarp], Optional[bool]]
+    ] = {}
+
     batch_width = max(1, int(getattr(args, "tile_batch_width", 1)))
     total_tiles, contributor_batches = build_output_tile_batch_iterator(
         work_units,
@@ -4220,6 +4305,95 @@ def render_land_output_tiles(
             ),
         )
 
+    last_preclassify_ty: Optional[int] = None
+
+    def close_stale_row_masks(current_ty: int) -> None:
+        """Drop cached row masks once their row is fully consumed (batches advance by ty)."""
+        nonlocal last_preclassify_ty
+        if last_preclassify_ty is not None and current_ty <= last_preclassify_ty:
+            return
+        for key in list(row_mask_cache.keys()):
+            if key[1] < current_ty:
+                entry = row_mask_cache.pop(key)
+                if entry[0] is not None:
+                    entry[0].alpha_band = None
+                    entry[0].dataset = None
+        last_preclassify_ty = current_ty
+
+    def get_row_mask(unit_id: str, ty: int) -> Optional[OceanMaskWarp]:
+        """Warp the GEBCO mask once per (work unit, row), cached for every batch in the row."""
+        if not can_preclassify_empty:
+            return None
+        key = (unit_id, ty)
+        cached = row_mask_cache.get(key)
+        if cached is not None:
+            return cached[0]
+        extents = row_mask_extents.get(key)
+        if extents is None:
+            row_mask_cache[key] = (None, None)
+            return None
+        tx_min, tx_max = extents
+        mask = open_gebco_mask(
+            gebco_src,
+            build_land_output_row_grid(
+                args.max_zoom,
+                ty,
+                tx_min,
+                tx_max,
+                args.blocksize,
+                args.resample_alg,
+            ),
+            unit_id,
+        )
+        row_has_land: Optional[bool] = None
+        if mask is not None:
+            row_has_land = ocean_mask_region_has_land(
+                mask.alpha_band,
+                0,
+                0,
+                mask.dataset.RasterXSize,
+                mask.dataset.RasterYSize,
+            )
+        row_mask_cache[key] = (mask, row_has_land)
+        return mask
+
+    def batch_is_all_ocean(batch: LandOutputTileBatch) -> bool:
+        """Return whether every contributor renders no land pixels for this batch.
+
+        Mirrors the render path's per-contributor mask skip so pre-classified batches
+        produce exactly the same empty tiles without occupying a worker thread.
+        """
+        if not can_preclassify_empty:
+            return False
+        batch_plan = build_land_output_batch_plan(
+            batch.relative_paths,
+            args.blocksize,
+            args.resample_alg,
+        )
+        close_stale_row_masks(batch_plan.ty)
+        halo_pixels = batch_plan.halo_pixels
+        for contributor_id in batch.contributor_ids:
+            key = (contributor_id, batch_plan.ty)
+            row_mask = get_row_mask(contributor_id, batch_plan.ty)
+            if row_mask is None:
+                return False
+            if row_mask_cache[key][1] is False:
+                continue
+            extents = row_mask_extents.get(key)
+            if extents is None:
+                return False
+            row_expanded_xoff = max(0, extents[0] * args.blocksize - halo_pixels)
+            batch_expanded_xoff = max(0, batch_plan.tx_start * args.blocksize - halo_pixels)
+            if ocean_mask_region_has_land(
+                row_mask.alpha_band,
+                batch_expanded_xoff - row_expanded_xoff,
+                0,
+                batch_plan.width,
+                batch_plan.height,
+            ):
+                return False
+        return True
+
     previous_sigint_handler: Any = None
     handler_installed = False
 
@@ -4290,6 +4464,15 @@ def render_land_output_tiles(
                             batch,
                             cached_count=batch_cached_tiles,
                             empty_count=batch_empty_tiles,
+                        )
+                        continue
+                    if batch_is_all_ocean(batch):
+                        for relative_path in pending_relative_paths:
+                            mark_tile_empty(os.path.join(final_tile_dir, relative_path))
+                        account_fast_forwarded(
+                            batch,
+                            cached_count=batch_cached_tiles,
+                            empty_count=batch_empty_tiles + len(pending_relative_paths),
                         )
                         continue
                     if batch.tile_count == 1:
@@ -4742,7 +4925,23 @@ def main() -> None:
     # missing (unless --land-only, which wants no ocean at all, or --download,
     # which only fetches source tiles and exits).
     if not is_naip and not getattr(args, "land_only", False) and not getattr(args, "download", False):
-        if os.path.exists(args.ocean_background):
+        ocean_style = ocean.build_ocean_style_from_args(args, dest_prefix="ocean_")
+        ocean_background_matches = (
+            os.path.exists(args.ocean_background)
+            and ocean.ocean_background_matches_current_settings(
+                args.ocean_background,
+                requested_bbox,
+                args.temp_dir,
+                max_zoom=args.max_zoom,
+                chunk_size=ocean.DEFAULT_OCEAN_CHUNK_SIZE,
+                resample_alg=args.resample_alg,
+                hillshade_z=args.ocean_hillshade_z,
+                style=ocean_style,
+                mask_blur=args.ocean_mask_blur,
+                mask_erode=args.ocean_mask_erode,
+            )
+        )
+        if ocean_background_matches:
             print(f"Ocean background already exists, reusing: {args.ocean_background}")
         else:
             ensure_parent_dir(args.ocean_background)
@@ -4754,7 +4953,7 @@ def main() -> None:
                 temp_dir=args.temp_dir,
                 resample_alg=args.resample_alg,
                 hillshade_z=args.ocean_hillshade_z,
-                style=ocean.build_ocean_style_from_args(args, dest_prefix="ocean_"),
+                style=ocean_style,
                 max_zoom=args.max_zoom,
                 parallel=args.parallel,
                 mask_blur=args.ocean_mask_blur,
