@@ -73,6 +73,7 @@ PROCESS_SLAB_HEIGHT = 24
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
 OCEAN_MASK_SOURCE_CROP_HALO_PIXELS = 2
 DEFAULT_PREFETCH_IF_LAND = 100.0
+REMOTE_BAND_DOWNLOAD_ATTEMPTS = 3
 DEFAULT_MAX_IN_MEMORY_WRITE_PIXELS = 4_000_000
 DEFAULT_TILE_BATCH_WIDTH = 32
 DEFAULT_TEMP_DIR = ".temp"
@@ -964,11 +965,52 @@ def get_tile_band_path(
         ensure_parent_dir(download_path)
         if not quiet:
             print(f"Downloading {s3_path} to {download_path}...")
-        src_ds = gdal.Open(s3_path)
-        if src_ds is None:
-            raise RuntimeError(f"Could not open {s3_path}")
-        gdal.GetDriverByName("GTiff").CreateCopy(download_path, src_ds, callback=None)
-        return download_path
+        last_error: Optional[RuntimeError] = None
+        for attempt in range(1, REMOTE_BAND_DOWNLOAD_ATTEMPTS + 1):
+            staged_path = (
+                f"{download_path}.part-{os.getpid()}-{threading.get_ident()}"
+            )
+            src_ds: Optional[gdal.Dataset] = None
+            dst_ds: Optional[gdal.Dataset] = None
+            try:
+                remove_if_exists(staged_path)
+                src_ds = gdal.Open(s3_path)
+                if src_ds is None:
+                    raise RuntimeError(f"Could not open {s3_path}")
+                driver = gdal.GetDriverByName("GTiff")
+                if driver is None:
+                    raise RuntimeError("GTiff driver is unavailable")
+                dst_ds = driver.CreateCopy(staged_path, src_ds, callback=None)
+                if dst_ds is None:
+                    raise RuntimeError(f"Could not create cached band: {staged_path}")
+                dst_ds.FlushCache()
+                dst_ds = None
+                src_ds = None
+                os.replace(staged_path, download_path)
+                return download_path
+            except RuntimeError as exc:
+                last_error = exc
+            finally:
+                dst_ds = None
+                src_ds = None
+                remove_if_exists(staged_path)
+
+            if attempt < REMOTE_BAND_DOWNLOAD_ATTEMPTS:
+                if not quiet:
+                    print(
+                        f"Warning: Download attempt {attempt}/"
+                        f"{REMOTE_BAND_DOWNLOAD_ATTEMPTS} failed for {s3_path}: {last_error}; retrying..."
+                    )
+                clear_vsi_cache = getattr(gdal, "VSICurlClearCache", None)
+                if clear_vsi_cache is not None:
+                    clear_vsi_cache()
+                time.sleep(attempt)
+
+        assert last_error is not None
+        raise RuntimeError(
+            f"Could not download {s3_path} after "
+            f"{REMOTE_BAND_DOWNLOAD_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
 
     return s3_path
 
@@ -3200,12 +3242,32 @@ def open_warped_date_band_sets(
             paths = get_tile_paths(folder_name, date_path, cache_dir, download=False, ephemeral_cache_dir=ephemeral_cache_dir)
             datasets: List[gdal.Dataset] = []
             bands: List[gdal.Band] = []
-            for _band_id, color_name in RGB_BANDS:
-                dataset = warp_band_dataset_to_tile_grid(
-                    paths[color_name],
-                    tile_grid,
-                    resample_alg,
-                )
+            for band_id, color_name in RGB_BANDS:
+                source_path = paths[color_name]
+                try:
+                    dataset = warp_band_dataset_to_tile_grid(
+                        source_path,
+                        tile_grid,
+                        resample_alg,
+                    )
+                except RuntimeError:
+                    if not os.path.isfile(source_path):
+                        raise
+                    remove_if_exists(source_path)
+                    source_path = get_tile_band_path(
+                        folder_name,
+                        date_path,
+                        band_id,
+                        cache_dir,
+                        download=True,
+                        ephemeral_cache_dir=ephemeral_cache_dir,
+                        quiet=True,
+                    )
+                    dataset = warp_band_dataset_to_tile_grid(
+                        source_path,
+                        tile_grid,
+                        resample_alg,
+                    )
                 band = dataset.GetRasterBand(1)
                 if band is None:
                     raise RuntimeError(

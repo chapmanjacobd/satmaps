@@ -119,6 +119,114 @@ def test_get_tile_paths_returns_s3_paths(monkeypatch: object) -> None:
     )
 
 
+def test_get_tile_band_path_retries_and_publishes_download_atomically(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    folder_name = "Sentinel-2_mosaic_2025_Q3_31TDF_0_0"
+    date_path = "2025/07/01"
+    cache_dir = tmp_path / ".cache"
+    create_copy_attempts = 0
+    cleared_vsi_cache = 0
+
+    class FakeDataset:
+        def FlushCache(self) -> None:
+            pass
+
+    class FakeDriver:
+        def CreateCopy(self, path: str, _source: object, callback: object = None) -> FakeDataset:
+            nonlocal create_copy_attempts
+            create_copy_attempts += 1
+            Path(path).write_bytes(b"partial" if create_copy_attempts == 1 else b"complete")
+            if create_copy_attempts == 1:
+                raise RuntimeError("short remote read")
+            return FakeDataset()
+
+    def clear_vsi_cache() -> None:
+        nonlocal cleared_vsi_cache
+        cleared_vsi_cache += 1
+
+    monkeypatch.setattr(satmaps.gdal, "Open", lambda _path: object())
+    monkeypatch.setattr(satmaps.gdal, "GetDriverByName", lambda _name: FakeDriver())
+    monkeypatch.setattr(satmaps.gdal, "VSICurlClearCache", clear_vsi_cache)
+    monkeypatch.setattr(satmaps.time, "sleep", lambda _seconds: None)
+
+    result = satmaps.get_tile_band_path(
+        folder_name,
+        date_path,
+        "B04",
+        str(cache_dir),
+        download=True,
+        quiet=True,
+    )
+
+    assert Path(result).read_bytes() == b"complete"
+    assert create_copy_attempts == 2
+    assert cleared_vsi_cache == 1
+    assert not list(Path(result).parent.glob("*.part-*"))
+
+
+def test_open_warped_date_band_sets_redownloads_unreadable_local_band(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    stale_path = tmp_path / "stale.tif"
+    fresh_path = tmp_path / "fresh.tif"
+    stale_path.write_bytes(b"stale")
+    source_paths = {
+        "red": str(stale_path),
+        "green": str(tmp_path / "green.tif"),
+        "blue": str(tmp_path / "blue.tif"),
+    }
+    opened_paths: list[str] = []
+    refreshed_bands: list[str] = []
+
+    class FakeDataset:
+        def GetRasterBand(self, _index: int) -> object:
+            return object()
+
+    def fake_warp(source_path: str, _tile_grid: object, _resample_alg: str) -> FakeDataset:
+        opened_paths.append(source_path)
+        if source_path == str(stale_path):
+            raise RuntimeError("corrupt cached TIFF")
+        return FakeDataset()
+
+    def fake_get_tile_band_path(
+        _folder_name: str,
+        _date_path: str,
+        band_id: str,
+        _cache_dir: str,
+        **_kwargs: object,
+    ) -> str:
+        refreshed_bands.append(band_id)
+        fresh_path.write_bytes(b"fresh")
+        return str(fresh_path)
+
+    monkeypatch.setattr(
+        satmaps,
+        "get_tile_paths",
+        lambda *_args, **_kwargs: source_paths,
+    )
+    monkeypatch.setattr(satmaps, "warp_band_dataset_to_tile_grid", fake_warp)
+    monkeypatch.setattr(satmaps, "get_tile_band_path", fake_get_tile_band_path)
+
+    result = satmaps.open_warped_date_band_sets(
+        [("folder", "2025/07/01")],
+        str(tmp_path / ".cache"),
+        object(),
+        "near",
+        ephemeral_cache_dir=str(tmp_path / ".cache.temp"),
+    )
+
+    assert len(result) == 1
+    assert opened_paths == [
+        str(stale_path),
+        str(fresh_path),
+        source_paths["green"],
+        source_paths["blue"],
+    ]
+    assert refreshed_bands == ["B04"]
+    assert not stale_path.exists()
+
+
 def test_prefetch_tile_bands_locally_reuses_persistent_cache(
     monkeypatch: object, tmp_path: Path
 ) -> None:
