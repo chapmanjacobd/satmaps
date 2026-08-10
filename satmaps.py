@@ -546,6 +546,23 @@ def cleanup_temporary_files(paths: Sequence[str]) -> None:
                 print(f"Warning: Could not remove temporary file {path}: {exc}")
 
 
+def remove_ocean_background_tif(args: argparse.Namespace, *, packaged: bool) -> None:
+    """Delete the cached ocean background tif once it has been packaged to PMTiles.
+
+    The ocean background is a heavyweight cache built from GEBCO; after it has been
+    consumed to produce an ocean (or combined) PMTiles archive it is no longer
+    needed on disk, so remove it to reclaim space. ``packaged`` guards against
+    removing a pre-existing tif on runs that never used it (e.g. ``--land-only``,
+    NAIP, or ``--download``).
+    """
+    if not packaged:
+        return
+    if not args.ocean_background or not os.path.exists(args.ocean_background):
+        return
+    print(f"Removing ocean background after packaging: {args.ocean_background}")
+    remove_if_exists(args.ocean_background)
+
+
 def write_tile_cache_marker(
     marker_path: str,
     contributor_id: str,
@@ -5295,6 +5312,7 @@ def main() -> None:
 
     prepared_ocean_background: Optional[str] = None
     ocean_cleanup_paths: List[str] = []
+    ocean_background_packaged = False
     combined_output = getattr(args, "combined", False)
     ocean_output_path = build_ocean_output_path(args.output)
     # NAIP renders land directly from source GeoTIFFs, and --land-only wants no
@@ -5310,6 +5328,7 @@ def main() -> None:
             args.blocksize,
         )
         if prepared_ocean_background:
+            ocean_background_packaged = True
             print(f"Using ocean background: {prepared_ocean_background}")
             if os.path.abspath(prepared_ocean_background) != os.path.abspath(args.ocean_background):
                 ocean_cleanup_paths.append(prepared_ocean_background)
@@ -5326,6 +5345,7 @@ def main() -> None:
                     requested_bbox=requested_bbox,
                 )
                 cleanup_temporary_files(ocean_cleanup_paths)
+                remove_ocean_background_tif(args, packaged=ocean_background_packaged)
                 if os.path.exists(state_file):
                     os.remove(state_file)
                 return
@@ -5357,6 +5377,7 @@ def main() -> None:
                 if not plan.work_units:
                     print("No land work units to render; only the ocean archive was built.")
                     cleanup_temporary_files(ocean_cleanup_paths)
+                    remove_ocean_background_tif(args, packaged=ocean_background_packaged)
                     if os.path.exists(state_file):
                         os.remove(state_file)
                     return
@@ -5439,6 +5460,7 @@ def main() -> None:
                     resume=getattr(args, "resume", False),
                 )
                 cleanup_temporary_files([packaged_tiles.temp_mbtiles] + ocean_cleanup_paths)
+                remove_ocean_background_tif(args, packaged=ocean_background_packaged)
                 if os.path.exists(state_file):
                     os.remove(state_file)
                 return
@@ -5546,6 +5568,7 @@ def main() -> None:
         resume=getattr(args, "resume", False),
     )
     cleanup_temporary_files([temp_mbtiles] + ocean_cleanup_paths)
+    remove_ocean_background_tif(args, packaged=ocean_background_packaged)
 
     if os.path.exists(state_file):
         os.remove(state_file)

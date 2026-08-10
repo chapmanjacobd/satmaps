@@ -4167,7 +4167,7 @@ def test_fill_missing_ocean_to_final_tile_cache_writes_only_missing_tiles(
     assert "Ocean backfill progress: 2/2 (100%);" in out
     assert "1 written, 1 present." in out
 
-def test_main_keeps_ocean_after_processing(
+def test_main_deletes_ocean_after_packaging(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     ocean_path = tmp_path / "ocean.tif"
@@ -4191,7 +4191,7 @@ def test_main_keeps_ocean_after_processing(
 
     main()
 
-    assert ocean_path.exists()
+    assert not ocean_path.exists()
 
 def test_main_default_renders_ocean_when_background_missing(
     monkeypatch: object, tmp_path: Path

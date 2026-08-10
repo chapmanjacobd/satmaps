@@ -112,10 +112,11 @@ Generate PMTiles for either a bbox subset or the default all-tiles run:
 land-mgrs
 
 # BBox render. The ocean background is rendered from GEBCO automatically when
-# missing and cached at hawaii.ocean.tif (the default <output-stem>.ocean.tif);
-# the default split output emits two archives: the land layer at -o hawaii.pmtiles
-# and a separate ocean layer at hawaii.ocean.pmtiles, so a client can toggle the
-# layers independently. Land tiles keep alpha where there is no imagery.
+# missing at hawaii.ocean.tif (the default <output-stem>.ocean.tif) and removed
+# again once its PMTiles archive has been written; the default split output emits
+# two archives: the land layer at -o hawaii.pmtiles and a separate ocean layer at
+# hawaii.ocean.pmtiles, so a client can toggle the layers independently. Land
+# tiles keep alpha where there is no imagery.
 land-mgrs --bbox -161,18,-154,23
 satmaps --bbox -161,18,-154,23 -o hawaii.pmtiles
 
@@ -134,7 +135,8 @@ satmaps --max-zoom 4 --ocean-background ocean-z4.tif -o all-tiles-z4.pmtiles
 # Makefile shortcut for the graded Hawaii bbox preset
 make hawaii
 
-# Default all-tiles run (renders/caches a global ocean background at all-tiles.ocean.tif)
+# Default all-tiles run (renders a global ocean background at all-tiles.ocean.tif,
+# then removes it after packaging the ocean layer)
 satmaps -o all-tiles.pmtiles
 
 # Optional raster-first variant: render full aligned 3857 land rasters first,
@@ -162,7 +164,7 @@ satmaps --estimate
 - `--tile-batch-width` / `--ty`: Target number of contiguous output tiles rendered together within one row during the final land pass (default: `32`).
 - `--full-render-first`: Render each land work unit into a full aligned EPSG:3857 GeoTIFF first, cache those rasters under `.cache.render`, build a master VRT, then tile that merged raster once. This usually trades higher disk/RAM for less repeated final-tile work.
 - `--blocksize`: GDAL tile block size used for MBTiles output (default: `512`).
-- `--ocean-background`: Ocean background GeoTIFF to use for the ocean layer (default: `<output-stem>.ocean.tif`, for example `hawaii.ocean.tif`). If the file is missing it is rendered from the GEBCO zip automatically. Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before max-zoom tile caching. Coarser ocean masks (for example z4-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass.
+- `--ocean-background`: Ocean background GeoTIFF to use for the ocean layer (default: `<output-stem>.ocean.tif`, for example `hawaii.ocean.tif`). If the file is missing it is rendered from the GEBCO zip automatically. Bbox runs use a bbox-local 3857 ocean raster snapped outward to the target Web Mercator tile pixel grid before max-zoom tile caching. Coarser ocean masks (for example z4-z13) can still be reused under finer land renders (for example z13-z14), including the initial tile discovery pass. The background is deleted once its PMTiles archive has been produced, so a later run re-renders it from GEBCO.
 - `--combined` / `--no-combined`: By default, `satmaps` emits a **split** output: the land layer at `--output` and a separate ocean layer at `<stem>.ocean.pmtiles` (for example `hawaii.pmtiles` → `hawaii.ocean.pmtiles`), each keeping alpha so a client (for example MapLibre) can toggle the two layers independently. Pass `--combined` to instead bake the ocean beneath the land into a single opaque PMTiles archive at `--output` (the pre-split behavior).
 - Final Web Mercator land outputs target `--max-zoom` (supported: 4-14; default zoom 13, ~19.11 m/px at the equator). Ocean backgrounds may be reused from the same or a coarser zoom level and are resampled onto that final output grid during composition. Low-resolution runs at `--max-zoom 7` and below use a coarse-grid-first land renderer to avoid the full per-subtile pipeline.
 - `--land-only`: Skip the ocean entirely and produce only the land layer at `--output`. No ocean background is rendered, prepared, or packaged.
