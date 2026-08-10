@@ -952,10 +952,26 @@ def tile_array_to_image(tile_array: np.ndarray) -> Optional[Image.Image]:
     return Image.fromarray(np.moveaxis(tile_array, 0, -1), mode=mode)
 
 
-def iter_dataset_tile_relpaths(dataset: gdal.Dataset, zoom: int) -> Iterator[str]:
-    """Yield max-zoom z/x/y tile paths for a dataset's covered tile range."""
+def iter_dataset_tile_relpaths(
+    dataset: gdal.Dataset,
+    zoom: int,
+    tile_range: Optional[Tuple[int, int, int, int]] = None,
+) -> Iterator[str]:
+    """Yield max-zoom z/x/y tile paths for a dataset's covered tile range.
+
+    ``tile_range`` optionally restricts the iteration to a (tx_min, ty_min,
+    tx_max, ty_max) sub-range of the dataset's footprint, clipping both to the
+    dataset's actual bounds so callers can iterate a requested output extent
+    without ever touching tiles outside it.
+    """
     bounds = get_dataset_bounds(dataset)
     tx_min, ty_min, tx_max, ty_max = get_chunk_tile_range(bounds, zoom)
+    if tile_range is not None:
+        clip_tx_min, clip_ty_min, clip_tx_max, clip_ty_max = tile_range
+        tx_min = max(tx_min, clip_tx_min)
+        ty_min = max(ty_min, clip_ty_min)
+        tx_max = min(tx_max, clip_tx_max)
+        ty_max = min(ty_max, clip_ty_max)
     for ty in range(ty_min, ty_max + 1):
         for tx in range(tx_min, tx_max + 1):
             yield os.path.join(str(zoom), str(tx), f"{ty}.webp")
@@ -966,9 +982,10 @@ def iter_dataset_webp_tile_images(
     zoom: int,
     tile_size: int,
     resample_alg: str,
+    tile_range: Optional[Tuple[int, int, int, int]] = None,
 ) -> Iterator[tuple[str, Image.Image]]:
     """Yield max-zoom z/x/y tile images for a dataset without buffering the full tile tree."""
-    for relative_path in iter_dataset_tile_relpaths(dataset, zoom):
+    for relative_path in iter_dataset_tile_relpaths(dataset, zoom, tile_range):
         _parsed_zoom, tx, ty_filename = os.path.normpath(relative_path).split(os.sep)
         tile_array = render_dataset_tile(
             dataset,

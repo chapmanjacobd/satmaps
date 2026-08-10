@@ -1347,12 +1347,17 @@ def commit_raster_to_final_tile_cache(
     *,
     source_under_existing: bool = False,
     progress_label: str = "Tile commit progress:",
+    requested_bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> List[str]:
     """Render and write one contributor directly into the shared final WebP tree.
 
     Path inputs are sliced as whole-row batches across ``args.parallel`` worker
     threads (amortizing per-tile ``gdal.Translate`` setup, like the Sentinel-2
     land pass). Already-open datasets fall back to sequential per-tile rendering.
+
+    ``requested_bbox`` optionally restricts the commit to the max-zoom tiles
+    covering that WGS84 extent, so bbox runs never slice tiles beyond the
+    requested output area.
     """
     run_paths = SatmapsRunPaths(output_path, unique_id)
     final_tile_tree = run_paths.final_tile_cache_dir
@@ -1369,7 +1374,16 @@ def commit_raster_to_final_tile_cache(
     # Pre-count tiles so we can show a denominator in the progress bar.
     bounds = tiler.get_dataset_bounds(dataset)
     tx_min, ty_min, tx_max, ty_max = tiler.get_chunk_tile_range(bounds, args.max_zoom)
+    if requested_bbox is not None:
+        bbox_tx_min, bbox_ty_min, bbox_tx_max, bbox_ty_max = build_bbox_tile_range(
+            requested_bbox, args.max_zoom
+        )
+        tx_min = max(tx_min, bbox_tx_min)
+        ty_min = max(ty_min, bbox_ty_min)
+        tx_max = min(tx_max, bbox_tx_max)
+        ty_max = min(ty_max, bbox_ty_max)
     total_tiles = (tx_max - tx_min + 1) * (ty_max - ty_min + 1)
+    tile_range = (tx_min, ty_min, tx_max, ty_max)
 
     try:
         if isinstance(input_raster, str):
@@ -1379,7 +1393,7 @@ def commit_raster_to_final_tile_cache(
                 args.max_zoom,
                 args.blocksize,
                 args.resample_alg,
-                (tx_min, ty_min, tx_max, ty_max),
+                tile_range,
                 getattr(args, "parallel", 1),
                 source_under_existing,
                 args.quality,
@@ -1397,6 +1411,7 @@ def commit_raster_to_final_tile_cache(
                 args.quality,
                 progress_label,
                 total_tiles,
+                tile_range if requested_bbox is not None else None,
             )
     finally:
         if close_dataset:
@@ -1457,6 +1472,7 @@ def _commit_raster_to_final_tile_cache_sequential(
     quality: int,
     progress_label: str,
     total_tiles: int,
+    tile_range: Optional[Tuple[int, int, int, int]] = None,
 ) -> List[str]:
     """Render and write one contributor tile-by-tile from an already-open dataset."""
     tile_relpaths: list[str] = []
@@ -1485,11 +1501,13 @@ def _commit_raster_to_final_tile_cache_sequential(
 
     update_progress(force=True)
     try:
+        tile_range_kwargs = {"tile_range": tile_range} if tile_range is not None else {}
         for relative_path, tile_image in tiler.iter_dataset_webp_tile_images(
             dataset,
             zoom,
             blocksize,
             resample_alg,
+            **tile_range_kwargs,
         ):
             tile_relpaths.append(relative_path)
             destination_path = os.path.join(final_tile_tree, relative_path)
@@ -1845,6 +1863,39 @@ def build_row_slabs_for_tile_bounds(
         (ty, tx_min, tx_max)
         for ty in range(ty_min, ty_max + 1)
     )
+
+
+def build_bbox_tile_range(
+    requested_bbox: tuple[float, float, float, float],
+    zoom: int,
+) -> tuple[int, int, int, int]:
+    """Return the max-zoom tile range ``(tx_min, ty_min, tx_max, ty_max)`` covering a WGS84 bbox."""
+    return tiler.get_chunk_tile_range(
+        tiler.lonlat_bbox_to_mercator_bounds(*requested_bbox),
+        zoom,
+    )
+
+
+def intersect_row_slabs_with_tile_range(
+    slabs: Sequence[tuple[int, int, int]],
+    tile_range: tuple[int, int, int, int],
+) -> tuple[tuple[int, int, int], ...]:
+    """Restrict (ty, tx_min, tx_max) row slabs to a max-zoom ``(tx_min, ty_min, tx_max, ty_max)`` range.
+
+    Slabs that fall entirely outside the range are dropped, so callers that only
+    care about a requested output extent never iterate over the surrounding
+    source footprint.
+    """
+    range_tx_min, range_ty_min, range_tx_max, range_ty_max = tile_range
+    clipped: list[tuple[int, int, int]] = []
+    for ty, slab_tx_min, slab_tx_max in slabs:
+        if ty < range_ty_min or ty > range_ty_max:
+            continue
+        clipped_tx_min = max(slab_tx_min, range_tx_min)
+        clipped_tx_max = min(slab_tx_max, range_tx_max)
+        if clipped_tx_min <= clipped_tx_max:
+            clipped.append((ty, clipped_tx_min, clipped_tx_max))
+    return tuple(clipped)
 
 
 def build_web_mercator_warp_options(
@@ -4468,8 +4519,26 @@ def render_land_output_tiles(
     prepared_ocean_background: Optional[str] = None,
     state_file: Optional[str] = None,
     completed_units: Optional[Set[str]] = None,
+    requested_bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> LandOutputRenderStats:
-    """Render the final max-zoom land tile tree directly, one output tile per worker task."""
+    """Render the final max-zoom land tile tree directly, one output tile per worker task.
+
+    ``requested_bbox`` optionally restricts rendering to the max-zoom tiles
+    covering that WGS84 extent, intersecting the discovered candidate footprints
+    so a bbox run never iterates (or renders) output tiles beyond the requested
+    area.
+    """
+    if requested_bbox is not None:
+        bbox_tile_range = build_bbox_tile_range(requested_bbox, args.max_zoom)
+        contributor_row_slabs = {
+            unit_id: intersect_row_slabs_with_tile_range(slabs, bbox_tile_range)
+            for unit_id, slabs in contributor_row_slabs.items()
+        }
+        contributor_row_slabs = {
+            unit_id: slabs
+            for unit_id, slabs in contributor_row_slabs.items()
+            if slabs
+        }
     work_unit_refcounts: dict[str, int] = {}
     for work_unit in work_units:
         for ty, tx_min, tx_max in contributor_row_slabs.get(work_unit.unit_id, ()):
@@ -5493,6 +5562,7 @@ def main() -> None:
                     FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID,
                     args,
                     progress_label="Master mosaic slicing progress:",
+                    requested_bbox=requested_bbox,
                 )
                 LOGGER.info("Committed raster-first master mosaic to final WebP tiles.")
     elif not getattr(args, "ocean_only", False):
@@ -5533,6 +5603,7 @@ def main() -> None:
                 prepared_ocean_background=prepared_ocean_background,
                 state_file=state_file,
                 completed_units=completed_units,
+                requested_bbox=requested_bbox,
             )
             if tile_stats.total_tiles <= 0:
                 LOGGER.info("No candidate land output tiles were found.")

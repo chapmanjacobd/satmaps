@@ -4830,6 +4830,52 @@ def test_render_land_output_tiles_fast_forwards_empty_marked_tiles(
     assert stats.rendered_tiles == 1
 
 
+def test_intersect_row_slabs_with_tile_range_clips_and_drops_outside_rows() -> None:
+    slabs = ((0, 1, 5), (1, 0, 2), (2, 3, 4), (4, 1, 3))
+    clipped = satmaps.intersect_row_slabs_with_tile_range(slabs, (1, 1, 3, 2))
+    assert clipped == ((1, 1, 2), (2, 3, 3))
+    assert satmaps.intersect_row_slabs_with_tile_range(((0, 0, 9),), (5, 5, 6, 6)) == ()
+
+
+def test_render_land_output_tiles_restricts_bbox_to_output_extent(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+    args = argparse.Namespace(
+        parallel=1, cache=".cache", output="output.pmtiles", max_zoom=14, resume=False
+    )
+    work_units = [satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))]
+    # Whole-footprint candidates span ty 0..3, tx 0..3; the bbox covers only ty 1..2, tx 1..1.
+    contributor_row_slabs = {"31TDF_0_0": ((0, 0, 3), (1, 0, 3), (2, 0, 3), (3, 0, 3))}
+    monkeypatch.setattr("satmaps.list_mosaic_folders_for_tile", lambda *args, **kwargs: [])
+    monkeypatch.setattr("satmaps.build_bbox_tile_range", lambda bbox, zoom: (1, 1, 1, 2))
+
+    dispatched: list[str] = []
+
+    def fake_render(
+        relative_path: str, *args: object, **kwargs: object
+    ) -> satmaps.LandTileRenderStatus:
+        dispatched.append(relative_path)
+        return satmaps.LandTileRenderStatus.RENDERED
+
+    monkeypatch.setattr("satmaps.render_final_output_tile", fake_render)
+
+    stats = satmaps.render_land_output_tiles(
+        work_units,
+        ["2025/07/01"],
+        args,
+        "bboxextent",
+        contributor_row_slabs,
+        requested_bbox=(-37.0, 80.0, -36.0, 81.0),
+    )
+
+    assert stats.total_tiles == 2
+    assert stats.rendered_tiles == 2
+    assert stats.skipped_tiles == 0
+    assert sorted(dispatched) == ["14/1/1.webp", "14/1/2.webp"]
+
+
 def build_test_ocean_mask(path: Path, *, land_patch: bool = False) -> str:
     """Build a WGS84 GeoTIFF with an alpha band usable as a GEBCO-style ocean mask."""
     if not land_patch:
