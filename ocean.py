@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,6 +13,7 @@ from xml.sax.saxutils import escape
 import numpy as np
 from common import (
     LiveProgressLine,
+    configure_logging,
     build_output_namespace_dir,
     build_output_namespace,
     build_staged_path,  # noqa: F401  (deliberate re-export)
@@ -49,6 +51,8 @@ from tiler import (
     DEFAULT_VIBRANCE,
     DEFAULT_WHITE_POINT,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 gdal.UseExceptions()
 
@@ -358,14 +362,14 @@ def build_ocean_output_plan(
 
 def describe_ocean_output_plan(plan: OceanBuildPlan, *, vrt: bool, destination: str) -> None:
     """Print a compact summary of the planned final grid and merge shape."""
-    print(
+    LOGGER.info(
         "Ocean target grid: "
         f"{plan.width}x{plan.height} px "
         f"({plan.total_pixels:,} pixels) at ~{plan.pixel_size:.2f} m/px; "
         f"{len(plan.chunks):,} chunk(s) of up to {plan.chunk_size}px with {plan.halo_pixels}px halo."
     )
     if not vrt and plan.total_pixels > DEFAULT_MAX_FINAL_TRANSLATE_PIXELS:
-        print(
+        LOGGER.warning(
             "Warning: Final GeoTIFF translation may still be very slow for this grid size. "
             f"Consider rerunning with --vrt or a smaller bbox before writing {destination}."
         )
@@ -1147,7 +1151,7 @@ def generate_ocean_background(
     ensure_directory(temp_dir)
     stem = Path(destination).stem or "ocean"
     run_mode = "bbox" if bbox is not None else "global"
-    print(f"Ocean build: {run_mode} run at z{max_zoom} -> {destination}")
+    LOGGER.info(f"Ocean build: {run_mode} run at z{max_zoom} -> {destination}")
 
     if style is None:
         style = OceanStyleOptions()
@@ -1187,18 +1191,18 @@ def generate_ocean_background(
     color_tif = os.path.join(output_temp_dir, f"{stem}_color_chunks.vrt")
     rgba_vrt = os.path.join(output_temp_dir, f"{stem}_rgba.vrt")
 
-    print("[1/6] Building GEBCO source VRT...")
+    LOGGER.info("[1/6] Building GEBCO source VRT...")
     build_gebco_source_vrt(gebco_zip, source_vrt)
-    print("[2/6] Masking land from GEBCO source...")
+    LOGGER.info("[2/6] Masking land from GEBCO source...")
     create_gebco_ocean_vrt(source_vrt, masked_vrt)
 
-    print("[3/6] Planning aligned Web Mercator chunks...")
+    LOGGER.info("[3/6] Planning aligned Web Mercator chunks...")
     plan = build_ocean_output_plan(bbox, max_zoom=max_zoom, chunk_size=chunk_size)
     describe_ocean_output_plan(plan, vrt=vrt, destination=destination)
 
-    print("[4/6] Processing ocean chunks...")
+    LOGGER.info("[4/6] Processing ocean chunks...")
     chunk_workers = choose_ocean_parallel_workers(parallel, len(plan.chunks))
-    print(f"Processing {len(plan.chunks):,} chunk(s) with {chunk_workers} worker(s)...")
+    LOGGER.info(f"Processing {len(plan.chunks):,} chunk(s) with {chunk_workers} worker(s)...")
 
     recovered_chunk_keys, recovered_chunk_paths = recover_ocean_chunk_outputs(
         output_temp_dir,
@@ -1208,9 +1212,9 @@ def generate_ocean_background(
         reuse=not ocean_settings_mismatch,
     )
     if recovered_chunk_paths:
-        print(f"Reusing {len(recovered_chunk_paths):,} existing ocean chunk(s).")
+        LOGGER.info(f"Reusing {len(recovered_chunk_paths):,} existing ocean chunk(s).")
     elif ocean_settings_mismatch:
-        print("Ocean run settings changed; rebuilding all chunks with current settings.")
+        LOGGER.info("Ocean run settings changed; rebuilding all chunks with current settings.")
     remaining_chunks = [
         chunk for chunk in plan.chunks if (chunk.row, chunk.col) not in recovered_chunk_keys
     ]
@@ -1289,7 +1293,7 @@ def generate_ocean_background(
     )
     if vrt:
         translate_path = str(Path(destination).with_suffix(".vrt"))
-        print("[6/6] Writing final RGBA VRT...")
+        LOGGER.info("[6/6] Writing final RGBA VRT...")
         write_rgba_vrt(rgba_vrt, translate_path)
         destination = translate_path
     else:
@@ -1300,7 +1304,7 @@ def generate_ocean_background(
         for path in chunk_rgba_paths:
             remove_if_exists(path)
 
-    print(f"Ocean build complete: {destination}")
+    LOGGER.info(f"Ocean build complete: {destination}")
 
     return OceanBackgroundArtifacts(
         source_vrt=source_vrt,
@@ -1516,6 +1520,7 @@ def build_ocean_argument_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_ocean_argument_parser().parse_args()
+    configure_logging()
 
     artifacts = generate_ocean_background(
         gebco_zip=args.gebco_zip,

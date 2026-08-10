@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import argparse
 import json
+import logging
 import math
 import os
 import sys
@@ -13,12 +14,14 @@ import mgrs
 from mgrs import core as mgrs_core
 import numpy as np
 import ocean
-from common import file_has_content, write_text_file
+from common import configure_logging, file_has_content, write_text_file
 from osgeo import gdal, ogr, osr
 
 import tiler
 
 gdal.UseExceptions()
+
+LOGGER = logging.getLogger(__name__)
 
 OCEAN_MASK_ALPHA_THRESHOLD = 254.5
 OCEAN_MASK_SCAN_PROCESS_BLOCKS = 4
@@ -387,13 +390,13 @@ def discover_mgrs_tiles_from_ocean_mask(
     try:
         scan_source, cleanup_path = resolve_ocean_mask_scan_source(ocean_mask_src)
     except RuntimeError as exc:
-        print(f"Warning: Could not prepare ocean mask source {ocean_mask_src}: {exc}")
+        LOGGER.warning(f"Warning: Could not prepare ocean mask source {ocean_mask_src}: {exc}")
         return set()
 
     try:
         ds = gdal.Open(scan_source)
     except RuntimeError as exc:
-        print(f"Warning: Could not open ocean mask source {ocean_mask_src}: {exc}")
+        LOGGER.warning(f"Warning: Could not open ocean mask source {ocean_mask_src}: {exc}")
         ds = None
     if ds is None:
         if cleanup_path is not None:
@@ -456,7 +459,7 @@ def discover_mgrs_tiles_from_ocean_mask(
             ):
                 candidate_row_blocks.append((block_yoff, block_height))
 
-        print(
+        LOGGER.info(
             "Ocean mask scan window: "
             f"{scan_width}x{scan_height} px across {len(candidate_row_blocks)} candidate row blocks "
             f"via {len(candidate_row_blocks)} targeted sequential reads."
@@ -500,7 +503,7 @@ def discover_mgrs_tiles_from_ocean_mask(
                     f"candidate row blocks {completed_candidates}/{len(candidate_row_blocks)}; {len(mgrs_tiles)} tiles found so far.",
                 )
     else:
-        print(
+        LOGGER.info(
             "Ocean mask scan window: "
             f"{scan_width}x{scan_height} px across {total_row_blocks} row blocks "
             f"covering {total_covered_blocks} blocks via {total_row_blocks} sequential reads."
@@ -589,7 +592,7 @@ def _read_saved_land_mgrs_list(
         try:
             parsed_metadata = json.loads(lines[0][len(LAND_MGRS_HEADER_PREFIX) :])
         except json.JSONDecodeError as exc:
-            print(
+            LOGGER.warning(
                 f"Warning: Could not parse land MGRS list metadata {land_mgrs_list_path}: {exc}; "
                 "ignoring header."
             )
@@ -621,12 +624,12 @@ def _print_land_mgrs_reuse_message(
     if metadata is not None:
         generated_from = metadata.get("ocean_mask_source")
         if isinstance(generated_from, str) and generated_from:
-            print(
+            LOGGER.info(
                 f"Reusing land MGRS list from {land_mgrs_list_path} "
                 f"(generated from {generated_from})."
             )
             return
-    print(f"Reusing land MGRS list from {land_mgrs_list_path}.")
+    LOGGER.info(f"Reusing land MGRS list from {land_mgrs_list_path}.")
 
 
 def load_saved_land_mgrs_list(
@@ -643,7 +646,7 @@ def load_saved_land_mgrs_list(
     try:
         metadata, land_mgrs = _read_saved_land_mgrs_list(land_mgrs_list_path)
     except OSError as exc:
-        print(f"Warning: Could not read land MGRS list {land_mgrs_list_path}: {exc}")
+        LOGGER.warning(f"Warning: Could not read land MGRS list {land_mgrs_list_path}: {exc}")
         return None
 
     if bbox is None:
@@ -682,7 +685,7 @@ def save_land_mgrs_list(
     payload_lines = [f"{LAND_MGRS_HEADER_PREFIX}{json.dumps(metadata, sort_keys=True)}"]
     payload_lines.extend(sorted(land_mgrs))
     write_text_file(land_mgrs_list_path, "\n".join(payload_lines) + "\n")
-    print(f"Saved land MGRS list to {land_mgrs_list_path}.")
+    LOGGER.info(f"Saved land MGRS list to {land_mgrs_list_path}.")
 
 
 def resolve_land_mgrs_source() -> Optional[str]:
@@ -713,11 +716,11 @@ def generate_land_mgrs_list(
             return destination
 
     if force_refresh:
-        print(f"Force regenerating land MGRS list at {destination}...")
+        LOGGER.info(f"Force regenerating land MGRS list at {destination}...")
     if bbox is None:
-        print("Scanning GEBCO for land tiles...")
+        LOGGER.info("Scanning GEBCO for land tiles...")
     else:
-        print("Scanning GEBCO for land tiles within bbox...")
+        LOGGER.info("Scanning GEBCO for land tiles within bbox...")
 
     land_mgrs = discover_mgrs_tiles_from_ocean_mask(gebco_zip, bbox=bbox)
     save_land_mgrs_list(
@@ -777,8 +780,8 @@ def discover_mgrs_bases(
                     land_mgrs = global_land_mgrs.intersection(bbox_candidates)
         if land_mgrs is None and land_mgrs_source:
             if force_refresh:
-                print(f"Force regenerating land MGRS list at {land_mgrs_list_path}...")
-            print("Scanning GEBCO for land tiles within bbox...")
+                LOGGER.info(f"Force regenerating land MGRS list at {land_mgrs_list_path}...")
+            LOGGER.info("Scanning GEBCO for land tiles within bbox...")
             land_mgrs = discover_mgrs_tiles_from_ocean_mask_fn(
                 land_mgrs_source,
                 bbox,
@@ -792,15 +795,15 @@ def discover_mgrs_bases(
             )
         if land_mgrs is not None:
             mgrs_bases = sorted(list(land_mgrs.intersection(bbox_candidates)))
-            print(f"Discovered {len(mgrs_bases)} MGRS tiles with land/shallow water inside bbox.")
+            LOGGER.info(f"Discovered {len(mgrs_bases)} MGRS tiles with land/shallow water inside bbox.")
         else:
             mgrs_bases = sorted(list(bbox_candidates))
-            print(f"Discovered {len(mgrs_bases)} MGRS tiles in bbox.")
+            LOGGER.info(f"Discovered {len(mgrs_bases)} MGRS tiles in bbox.")
         return mgrs_bases
 
     s3_mgrs_set = _extract_s3_mgrs_tiles(s3_folder_cache)
     if not s3_mgrs_set and not (land_mgrs_source and force_refresh):
-        print("Error: non-bbox discovery found no tiles in the S3 cache.")
+        LOGGER.error("Error: non-bbox discovery found no tiles in the S3 cache.")
         sys.exit(1)
 
     land_mgrs = None
@@ -808,8 +811,8 @@ def discover_mgrs_bases(
         land_mgrs = _load_global_land_mgrs_list(land_mgrs_list_path)
     if land_mgrs is None and land_mgrs_source:
         if force_refresh:
-            print(f"Force regenerating land MGRS list at {land_mgrs_list_path}...")
-        print("Scanning GEBCO for land tiles...")
+            LOGGER.info(f"Force regenerating land MGRS list at {land_mgrs_list_path}...")
+        LOGGER.info("Scanning GEBCO for land tiles...")
         land_mgrs = discover_mgrs_tiles_from_ocean_mask_fn(
             land_mgrs_source,
             None,
@@ -825,17 +828,17 @@ def discover_mgrs_bases(
     if land_mgrs is not None:
         if s3_mgrs_set:
             mgrs_bases = sorted(list(land_mgrs.intersection(s3_mgrs_set)))
-            print(
+            LOGGER.info(
                 f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water after S3 intersection."
             )
         else:
             mgrs_bases = sorted(list(land_mgrs))
-            print(
+            LOGGER.info(
                 f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found with land/shallow water from land_mgrs.list."
             )
     else:
         mgrs_bases = sorted(list(s3_mgrs_set))
-        print(f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found from S3 cache (no ocean mask provided).")
+        LOGGER.info(f"All-tiles mode: {len(mgrs_bases)} MGRS tiles found from S3 cache (no ocean mask provided).")
 
     return mgrs_bases
 
@@ -861,7 +864,7 @@ def handle_land_mgrs_refresh(
     if not args.refresh_land_mgrs_list:
         return False
     if land_mgrs_source is None:
-        print(
+        LOGGER.info(
             f"Error: --refresh-land-mgrs-list requires {ocean.DEFAULT_GEBCO_ZIP} in the current directory."
         )
         sys.exit(1)
@@ -914,6 +917,7 @@ def build_land_mgrs_argument_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_land_mgrs_argument_parser().parse_args()
+    configure_logging()
 
     try:
         output_path = generate_land_mgrs_list(
@@ -923,7 +927,7 @@ def main() -> None:
             force_refresh=args.refresh,
         )
     except FileNotFoundError as exc:
-        print(f"Error: {exc}")
+        LOGGER.error(f"Error: {exc}")
         sys.exit(1)
     print(output_path)
 

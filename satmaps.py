@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -24,6 +25,7 @@ from mgrs import core as mgrs_core
 import numpy as np
 from common import (
     LiveProgressLine,
+    configure_logging,
     build_output_namespace_dir,
     build_output_namespace,
     build_staged_path,
@@ -51,6 +53,8 @@ from osgeo import gdal, ogr, osr
 from PIL import Image
 
 import tiler
+
+LOGGER = logging.getLogger(__name__)
 
 # Re-exported for existing callers/tests.
 _ = build_staged_path
@@ -416,11 +420,23 @@ class PackagedPMTiles:
 
 def convert_mbtiles_to_pmtiles(temp_mbtiles: str, output_path: str) -> None:
     """Convert MBTiles into the caller-visible PMTiles output via a staged publish."""
-    print("Converting to PMTiles...")
     staged_output_path = prepare_staged_path(output_path)
-    subprocess.run(["pmtiles", "convert", temp_mbtiles, staged_output_path, "--tmpdir", ".temp/"], check=True)
+    try:
+        subprocess.run(
+            ["pmtiles", "convert", temp_mbtiles, staged_output_path, "--tmpdir", ".temp/"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        details = "\n".join(part for part in (exc.stdout, exc.stderr) if part)
+        LOGGER.error(
+            "pmtiles convert failed with exit code %s%s",
+            exc.returncode,
+            f":\n{details}" if details else "",
+        )
+        raise
     publish_staged_path(staged_output_path, output_path)
-    print(f"Success! {output_path}")
 
 
 def convert_raster_to_pmtiles(
@@ -482,7 +498,7 @@ def convert_raster_to_pmtiles(
         effective_raster = masked_vrt
         cleanup_input_paths = list(cleanup_input_paths or []) + [masked_vrt, temp_geojson]
 
-    print("Generating MBTiles...")
+    LOGGER.info("Generating MBTiles...")
     tiling_artifacts = tiler.run_tiling_simplified(effective_raster, temp_mbtiles, run_options)
     if cleanup_input_paths:
         cleanup_temporary_files(cleanup_input_paths)
@@ -513,9 +529,9 @@ def convert_tile_tree_to_pmtiles(
     temp_mbtiles = run_paths.temp_mbtiles
     ensure_parent_dir(temp_mbtiles)
     if resume and tiler.mbtiles_has_tiles(temp_mbtiles):
-        print(f"Resuming MBTiles overview generation from {temp_mbtiles}...")
+        LOGGER.info(f"Resuming MBTiles overview generation from {temp_mbtiles}...")
     else:
-        print("Generating MBTiles...")
+        LOGGER.info("Generating MBTiles...")
         tiler.build_mbtiles_from_webp_tree(
             input_tile_tree,
             temp_mbtiles,
@@ -543,7 +559,7 @@ def cleanup_temporary_files(paths: Sequence[str]) -> None:
             try:
                 os.remove(path)
             except OSError as exc:
-                print(f"Warning: Could not remove temporary file {path}: {exc}")
+                LOGGER.warning(f"Warning: Could not remove temporary file {path}: {exc}")
 
 
 def remove_ocean_background_tif(args: argparse.Namespace, *, packaged: bool) -> None:
@@ -559,7 +575,7 @@ def remove_ocean_background_tif(args: argparse.Namespace, *, packaged: bool) -> 
         return
     if not args.ocean_background or not os.path.exists(args.ocean_background):
         return
-    print(f"Removing ocean background after packaging: {args.ocean_background}")
+    LOGGER.info(f"Removing ocean background after packaging: {args.ocean_background}")
     remove_if_exists(args.ocean_background)
 
 
@@ -649,7 +665,7 @@ def read_candidate_tile_cache_record(cache_path: str) -> Optional["CandidateTile
             settings=cast(Optional[dict[str, Any]], raw_settings),
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        print(f"Warning: Could not load candidate tile cache {cache_path}: {exc}")
+        LOGGER.warning(f"Warning: Could not load candidate tile cache {cache_path}: {exc}")
         return None
 
 
@@ -920,7 +936,7 @@ def list_mosaic_folders_for_tile(
                     if first_match_only:
                         return found
             except RuntimeError as exc:
-                print(f"Warning: Could not inspect remote folder {s3_path}: {exc}")
+                LOGGER.warning(f"Warning: Could not inspect remote folder {s3_path}: {exc}")
 
     return found
 
@@ -981,7 +997,7 @@ def get_tile_band_path(
     if download and download_path:
         ensure_parent_dir(download_path)
         if not quiet:
-            print(f"Downloading {s3_path} to {download_path}...")
+            LOGGER.info(f"Downloading {s3_path} to {download_path}...")
         last_error: Optional[RuntimeError] = None
         for attempt in range(1, REMOTE_BAND_DOWNLOAD_ATTEMPTS + 1):
             staged_path = (
@@ -1014,7 +1030,7 @@ def get_tile_band_path(
 
             if attempt < REMOTE_BAND_DOWNLOAD_ATTEMPTS:
                 if not quiet:
-                    print(
+                    LOGGER.warning(
                         f"Warning: Download attempt {attempt}/"
                         f"{REMOTE_BAND_DOWNLOAD_ATTEMPTS} failed for {s3_path}: {last_error}; retrying..."
                     )
@@ -1037,7 +1053,7 @@ def parse_bbox(bbox: str) -> Tuple[float, float, float, float]:
     try:
         return tiler.parse_bbox_string(bbox)
     except ValueError:
-        print(f"Error: Invalid bbox format: {bbox}")
+        LOGGER.error(f"Error: Invalid bbox format: {bbox}")
         sys.exit(1)
 
 
@@ -1049,7 +1065,7 @@ def _load_extent(extent_path: str) -> Tuple[
     """Load an extent union, its WGS84 envelope, and the original feature geometries."""
     ds = ogr.Open(extent_path)
     if ds is None:
-        print(f"Error: Cannot open vector file: {extent_path}")
+        LOGGER.error(f"Error: Cannot open vector file: {extent_path}")
         sys.exit(1)
 
     extent_geom = None
@@ -1078,7 +1094,7 @@ def _load_extent(extent_path: str) -> Tuple[
                 extent_geom = extent_geom.Union(cloned)
 
     if extent_geom is None:
-        print(f"Error: No geometry found in: {extent_path}")
+        LOGGER.error(f"Error: No geometry found in: {extent_path}")
         sys.exit(1)
 
     envelope = extent_geom.GetEnvelope()
@@ -1093,7 +1109,7 @@ def resolve_requested_bbox(args: argparse.Namespace) -> Tuple[
 ]:
     """Resolve the bbox from --bbox or --extent, erroring if both are given."""
     if args.bbox and args.extent:
-        print("Error: --bbox and --extent are mutually exclusive")
+        LOGGER.error("Error: --bbox and --extent are mutually exclusive")
         sys.exit(1)
     if args.extent:
         return _load_extent(args.extent)
@@ -1232,10 +1248,10 @@ def discover_mgrs_bases(
         # Even for bbox requests, just returning all 52 chunks is fast enough.
         s3_mgrs_set = land_mgrs_module._extract_s3_mgrs_tiles(S3_FOLDER_CACHE)
         if not s3_mgrs_set:
-            print("Error: LR mode found no tiles in the S3 cache.")
+            LOGGER.error("Error: LR mode found no tiles in the S3 cache.")
             sys.exit(1)
         bases = sorted(list(s3_mgrs_set))
-        print(f"All-tiles mode: {len(bases)} LR chunks found from S3 cache.")
+        LOGGER.info(f"All-tiles mode: {len(bases)} LR chunks found from S3 cache.")
         return bases
 
     return land_mgrs_module.discover_mgrs_bases(
@@ -1309,12 +1325,12 @@ def restore_resume_state(resume_path: str) -> Optional[Dict[str, Any]]:
         if not all(isinstance(unit_id, str) for unit_id in completed_units_raw):
             raise ValueError("completed_units entries must be strings")
     except (OSError, ValueError, TypeError, KeyError) as e:
-        print(f"Warning: Could not load state file: {e}")
+        LOGGER.warning(f"Warning: Could not load state file: {e}")
         return None
 
     completed_units = set(completed_units_raw)
-    print(f"Resuming from state file: {resume_path} (unique_id: {unique_id})")
-    print(f"Already completed {len(completed_units)} sub-tile(s).")
+    LOGGER.info(f"Resuming from state file: {resume_path} (unique_id: {unique_id})")
+    LOGGER.info(f"Already completed {len(completed_units)} sub-tile(s).")
     return {
         "state_file": resume_path,
         "unique_id": unique_id,
@@ -1964,7 +1980,7 @@ def build_work_unit_candidate_row_slabs_from_sources(
             )
             inspected_any_source = True
         except RuntimeError as exc:
-            print(
+            LOGGER.info(
                 f"Warning: Could not inspect source footprint for {source_subtile} "
                 f"({folder_name}): {exc}"
             )
@@ -2116,9 +2132,9 @@ def resolve_work_unit_candidate_row_slabs(
         loaded_record.contributor_row_slabs if loaded_record is not None else None
     )
     if loaded_candidates is None:
-        print(f"No usable candidate tile cache found at {cache_path}; computing source footprints.")
+        LOGGER.info(f"No usable candidate tile cache found at {cache_path}; computing source footprints.")
     else:
-        print(
+        LOGGER.info(
             f"Loaded candidate tile cache from {loaded_cache_path} "
             f"with {len(loaded_candidates)} sub-tile(s)."
         )
@@ -2138,14 +2154,14 @@ def resolve_work_unit_candidate_row_slabs(
     if reused_candidates and not missing_work_units:
         if loaded_cache_path and loaded_cache_path != cache_path:
             write_candidate_tile_cache(cache_path, cached_candidates, settings=cache_settings)
-        print(
+        LOGGER.info(
             f"Reusing cached candidate tile footprints for "
             f"{len(reused_candidates)} sub-tile(s)."
         )
         return reused_candidates
 
     if reused_candidates:
-        print(
+        LOGGER.info(
             f"Reusing cached candidate tile footprints for "
             f"{len(reused_candidates)} sub-tile(s); "
             f"computing {len(missing_work_units)} missing."
@@ -2177,11 +2193,11 @@ def resolve_ocean_mask_source(ocean_background: str) -> Optional[str]:
     try:
         dataset = gdal.Open(ocean_background)
     except RuntimeError as exc:
-        print(f"Warning: Could not open ocean mask source {ocean_background}: {exc}")
+        LOGGER.warning(f"Warning: Could not open ocean mask source {ocean_background}: {exc}")
         return None
 
     if dataset is None:
-        print(f"Warning: Could not open ocean mask source {ocean_background}")
+        LOGGER.warning(f"Warning: Could not open ocean mask source {ocean_background}")
         return None
 
     if get_ocean_mask_band_index(dataset) is None:
@@ -2388,7 +2404,7 @@ def get_tile_grid_source_src_win(
 
 def populate_s3_cache(date_paths: List[str]) -> None:
     """Cache remote folder listings for all-tiles runs."""
-    print(f"Populating S3 folder cache for {len(date_paths)} date(s)...")
+    LOGGER.info(f"Populating S3 folder cache for {len(date_paths)} date(s)...")
     total_folders = 0
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
@@ -2408,9 +2424,9 @@ def populate_s3_cache(date_paths: List[str]) -> None:
             total_folders += len(dirs)
         else:
             progress_line.finish()
-            print(f"Warning: Could not list folders for {date_path}")
+            LOGGER.warning(f"Warning: Could not list folders for {date_path}")
     progress_line.finish()
-    print(
+    LOGGER.info(
         f"S3 folder cache ready: {len(S3_FOLDER_CACHE)} date(s), "
         f"{total_folders} folders total."
     )
@@ -2431,10 +2447,10 @@ def download_source_tiles_to_cache(
                 seen.add(folder)
                 folders.append(folder)
     if not folders:
-        print("No source tiles found to download.")
+        LOGGER.info("No source tiles found to download.")
         return 0
 
-    print(f"Downloading source tiles for {len(folders)} folder(s) into {cache_dir}...")
+    LOGGER.info(f"Downloading source tiles for {len(folders)} folder(s) into {cache_dir}...")
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
     completed = 0
@@ -2669,7 +2685,7 @@ def open_gebco_mask(
             dataset=warped_mask_ds,
         )
     except RuntimeError as e:
-        print(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
+        LOGGER.warning(f"Warning: Could not apply GEBCO mask to {mgrs_subtile}: {e}")
         return None
 
 
@@ -2790,7 +2806,7 @@ def cleanup_work_unit_cache_files(
             except FileNotFoundError:
                 pass
             except OSError as exc:
-                print(f"Warning: Could not remove cache file {path}: {exc}")
+                LOGGER.warning(f"Warning: Could not remove cache file {path}: {exc}")
 
 def estimate_subtile_land_percentage(
     mask_slabs: Optional[dict[int, OceanMaskSlab]],
@@ -4119,7 +4135,7 @@ def render_land_work_unit_rasters(
         if not shutdown_requested.is_set():
             shutdown_requested.set()
             progress_line.finish()
-            print(
+            LOGGER.warning(
                 "Interrupt received; finishing in-flight rasters and saving resume state. "
                 "Re-run to continue."
             )
@@ -4658,7 +4674,7 @@ def render_land_output_tiles(
         if not shutdown_requested.is_set():
             shutdown_requested.set()
             progress_line.finish()
-            print(
+            LOGGER.info(
                 "Interrupt received; finishing in-flight tiles and saving resume state. "
                 "Re-run to continue."
             )
@@ -4869,18 +4885,18 @@ def calculate_estimates(args: argparse.Namespace) -> None:
     hours = int(total_seconds // 3600)
     minutes = int((total_seconds % 3600) // 60)
 
-    print("--- Processing Estimates ---")
-    print(f"MGRS Tiles (100km): {num_mgrs}")
-    print(f"MGRS Sub-tiles (4x): {num_work_units}")
-    print(f"Date(s):            {num_dates} ({', '.join(date_paths)})")
-    print(f"Total tile-dates:   {total_tile_dates} (3 bands each)")
-    print("---------------------------")
-    print(f"Estimated Time:       {hours}h {minutes}m")
-    print(f"Estimated RAM Usage:  {ram_gb:.1f} GB (peak)")
-    print(f"Estimated Disk Peak:  {disk_peak_gb:.2f} GB")
-    print(f"Estimated Disk End:   {disk_end_gb:.2f} GB")
-    print(f"Estimated Network:    {network_gb:.2f} GB")
-    print("---------------------------")
+    LOGGER.info("--- Processing Estimates ---")
+    LOGGER.info(f"MGRS Tiles (100km): {num_mgrs}")
+    LOGGER.info(f"MGRS Sub-tiles (4x): {num_work_units}")
+    LOGGER.info(f"Date(s):            {num_dates} ({', '.join(date_paths)})")
+    LOGGER.info(f"Total tile-dates:   {total_tile_dates} (3 bands each)")
+    LOGGER.info("---------------------------")
+    LOGGER.info(f"Estimated Time:       {hours}h {minutes}m")
+    LOGGER.info(f"Estimated RAM Usage:  {ram_gb:.1f} GB (peak)")
+    LOGGER.info(f"Estimated Disk Peak:  {disk_peak_gb:.2f} GB")
+    LOGGER.info(f"Estimated Disk End:   {disk_end_gb:.2f} GB")
+    LOGGER.info(f"Estimated Network:    {network_gb:.2f} GB")
+    LOGGER.info("---------------------------")
 
 
 def add_satmaps_core_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -5132,6 +5148,7 @@ def main() -> None:
 
     parser = build_satmaps_argument_parser()
     args = parser.parse_args()
+    configure_logging()
 
     if args.max_zoom <= 8:
         CURRENT_DATASET_NAME = "S2MSI_L3__MCQ_LR"
@@ -5199,10 +5216,10 @@ def main() -> None:
             )
         )
         if ocean_background_matches:
-            print(f"Ocean background already exists, reusing: {args.ocean_background}")
+            LOGGER.info(f"Ocean background already exists, reusing: {args.ocean_background}")
         else:
             ensure_parent_dir(args.ocean_background)
-            print(f"Rendering ocean background from {args.gebco_zip} -> {args.ocean_background}...")
+            LOGGER.info(f"Rendering ocean background from {args.gebco_zip} -> {args.ocean_background}...")
             ocean.generate_ocean_background(
                 gebco_zip=args.gebco_zip,
                 destination=args.ocean_background,
@@ -5216,7 +5233,7 @@ def main() -> None:
                 mask_blur=args.ocean_mask_blur,
                 mask_erode=args.ocean_mask_erode,
             )
-            print(f"Ocean background ready: {args.ocean_background}")
+            LOGGER.info(f"Ocean background ready: {args.ocean_background}")
 
     gebco_vrt_source = (
         resolve_ocean_mask_source(args.ocean_background)
@@ -5283,21 +5300,21 @@ def main() -> None:
                 discover_available_subtiles_from_s3_cache(mgrs_bases),
             ),
         )
-        print(describe_land_processing_plan(plan, len(date_paths)))
+        LOGGER.info(describe_land_processing_plan(plan, len(date_paths)))
 
         if not args.yes:
             est = estimate_processing_time(plan, len(date_paths), args.parallel)
-            print(f"Estimated processing time: {est}")
+            LOGGER.info(f"Estimated processing time: {est}")
             ans = input("Proceed? (y/N) ")
             if ans.lower() not in ("y", "yes"):
-                print("Aborted.")
+                LOGGER.info("Aborted.")
                 sys.exit(1)
 
         if args.download:
             downloaded = download_source_tiles_to_cache(
                 plan.work_units, date_paths, args.cache, args.parallel
             )
-            print(f"Download complete. Cached {downloaded} folder(s).")
+            LOGGER.info(f"Download complete. Cached {downloaded} folder(s).")
             return
 
         pending_work_units = tuple(
@@ -5307,7 +5324,7 @@ def main() -> None:
         )
 
         if (args.bbox or args.extent) and not getattr(args, "grade", False) and not getattr(args, "full_render_first", False):
-            print("Ungraded bbox render detected; automatically enabling full-render-first.")
+            LOGGER.info("Ungraded bbox render detected; automatically enabling full-render-first.")
             args.full_render_first = True
 
     prepared_ocean_background: Optional[str] = None
@@ -5329,14 +5346,14 @@ def main() -> None:
         )
         if prepared_ocean_background:
             ocean_background_packaged = True
-            print(f"Using ocean background: {prepared_ocean_background}")
+            LOGGER.info(f"Using ocean background: {prepared_ocean_background}")
             if os.path.abspath(prepared_ocean_background) != os.path.abspath(args.ocean_background):
                 ocean_cleanup_paths.append(prepared_ocean_background)
             if getattr(args, "ocean_only", False):
                 # Ocean-only mode: package the ocean background straight to
                 # --output (there is no land layer and nothing to bake it under).
                 ocean_unique_id = build_output_namespace(args.output, default_stem="ocean")
-                print(f"Building ocean-only archive: {args.output}")
+                LOGGER.info(f"Building ocean-only archive: {args.output}")
                 build_ocean_only_pmtiles(
                     prepared_ocean_background,
                     args.output,
@@ -5360,13 +5377,13 @@ def main() -> None:
                         args,
                     )
                 ):
-                    print("Committed ocean background to final WebP tiles.")
+                    LOGGER.info("Committed ocean background to final WebP tiles.")
             else:
                 # Split output: package the ocean background into its own PMTiles
                 # archive first, then render land without baking the ocean beneath
                 # it so a client can toggle the two layers independently.
                 ocean_unique_id = build_output_namespace(ocean_output_path, default_stem="ocean")
-                print(f"Building standalone ocean archive: {ocean_output_path}")
+                LOGGER.info(f"Building standalone ocean archive: {ocean_output_path}")
                 build_ocean_only_pmtiles(
                     prepared_ocean_background,
                     ocean_output_path,
@@ -5375,7 +5392,7 @@ def main() -> None:
                     requested_bbox=requested_bbox,
                 )
                 if not plan.work_units:
-                    print("No land work units to render; only the ocean archive was built.")
+                    LOGGER.info("No land work units to render; only the ocean archive was built.")
                     cleanup_temporary_files(ocean_cleanup_paths)
                     remove_ocean_background_tif(args, packaged=ocean_background_packaged)
                     if os.path.exists(state_file):
@@ -5383,16 +5400,16 @@ def main() -> None:
                     return
                 prepared_ocean_background = None
         elif args.bbox or args.extent:
-            print(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
+            LOGGER.warning(f"Warning: Ocean background not found, skipping: {args.ocean_background}")
 
     if args.full_render_first:
         source_rasters: List[str] = []
         if not getattr(args, "ocean_only", False):
             if is_naip:
-                print(f"Using {len(naip_rasters)} NAIP GeoTIFF(s) as land source.")
+                LOGGER.info(f"Using {len(naip_rasters)} NAIP GeoTIFF(s) as land source.")
                 source_rasters.extend(naip_rasters)
             elif plan.work_units:
-                print(
+                LOGGER.info(
                     f"Starting full-render-first raster generation for "
                     f"{len(plan.work_units)} sub-tile(s) "
                     f"with {args.parallel} worker(s)."
@@ -5419,7 +5436,7 @@ def main() -> None:
                 ]
                 source_rasters.extend(land_raster_paths)
                 if raster_stats.rendered_work_units <= 0 and raster_stats.cached_work_units == raster_stats.total_work_units:
-                    print("All land rasters already rendered (reused from cache).")
+                    LOGGER.info("All land rasters already rendered (reused from cache).")
                 else:
                     land_summary = (
                         f"Rendered {raster_stats.rendered_work_units} land raster(s); "
@@ -5427,22 +5444,22 @@ def main() -> None:
                     )
                     if raster_stats.skipped_work_units > 0:
                         land_summary += f" Skipped {raster_stats.skipped_work_units} empty work unit(s)."
-                    print(land_summary)
+                    LOGGER.info(land_summary)
             else:
-                print("No land work units were found.")
+                LOGGER.info("No land work units were found.")
         else:
-            print("Skipping land tile processing (--ocean-only).")
+            LOGGER.info("Skipping land tile processing (--ocean-only).")
 
         if prepared_ocean_background:
             source_rasters.insert(0, prepared_ocean_background)
 
         if source_rasters:
             master_vrt_path = run_paths.master_vrt
-            print("Building master VRT...")
+            LOGGER.info("Building master VRT...")
             build_master_vrt(source_rasters, master_vrt_path)
 
             if (args.bbox or args.extent) and not getattr(args, "grade", False):
-                print("Skipping tile cache commit for ungraded bbox render; converting directly to PMTiles...")
+                LOGGER.info("Skipping tile cache commit for ungraded bbox render; converting directly to PMTiles...")
                 packaged_tiles = convert_raster_to_pmtiles(
                     master_vrt_path,
                     args.output,
@@ -5467,7 +5484,7 @@ def main() -> None:
 
             master_marker_path = run_paths.tile_cache_marker(FULL_RENDER_FIRST_TILE_CACHE_CONTRIBUTOR_ID)
             if getattr(args, "resume", False) and file_has_content(master_marker_path):
-                print("Raster-first master mosaic already committed to final WebP tiles.")
+                LOGGER.info("Raster-first master mosaic already committed to final WebP tiles.")
             else:
                 commit_raster_to_final_tile_cache(
                     master_vrt_path,
@@ -5477,10 +5494,10 @@ def main() -> None:
                     args,
                     progress_label="Master mosaic slicing progress:",
                 )
-                print("Committed raster-first master mosaic to final WebP tiles.")
+                LOGGER.info("Committed raster-first master mosaic to final WebP tiles.")
     elif not getattr(args, "ocean_only", False):
         if pending_work_units:
-            print(
+            LOGGER.info(
                 f"Starting output-tile rendering for "
                 f"{len(pending_work_units)} sub-tile(s) "
                 f"with {args.parallel} worker(s)."
@@ -5518,13 +5535,13 @@ def main() -> None:
                 completed_units=completed_units,
             )
             if tile_stats.total_tiles <= 0:
-                print("No candidate land output tiles were found.")
+                LOGGER.info("No candidate land output tiles were found.")
             elif (
                 tile_stats.rendered_tiles <= 0
                 and tile_stats.cached_tiles == tile_stats.total_tiles
                 and tile_stats.empty_tiles == 0
             ):
-                print("All land output tiles already rendered (reused from cache).")
+                LOGGER.info("All land output tiles already rendered (reused from cache).")
             else:
                 land_summary = (
                     f"Rendered {tile_stats.rendered_tiles} land tile(s); "
@@ -5532,11 +5549,11 @@ def main() -> None:
                 )
                 if tile_stats.empty_tiles > 0:
                     land_summary += f" Skipped {tile_stats.empty_tiles} empty tile(s)."
-                print(land_summary)
+                LOGGER.info(land_summary)
         else:
-            print("All sub-tiles already processed.")
+            LOGGER.info("All sub-tiles already processed.")
     else:
-        print("Skipping land tile processing (--ocean-only).")
+        LOGGER.info("Skipping land tile processing (--ocean-only).")
 
     if prepared_ocean_background and not args.full_render_first:
         backfilled_ocean_tiles = fill_missing_ocean_to_final_tile_cache(
@@ -5546,12 +5563,12 @@ def main() -> None:
             args,
         )
         if backfilled_ocean_tiles > 0:
-            print(f"Backfilled {backfilled_ocean_tiles} ocean-only tile(s).")
+            LOGGER.info(f"Backfilled {backfilled_ocean_tiles} ocean-only tile(s).")
 
     final_tile_tree = run_paths.final_tile_cache_dir
     has_final_tiles = next(iter(tiler.iter_tile_tree_paths(final_tile_tree)), None) is not None
     if not has_final_tiles:
-        print("Error: No max-zoom tiles were generated.")
+        LOGGER.error("Error: No max-zoom tiles were generated.")
         sys.exit(1)
 
     temp_mbtiles = convert_tile_tree_to_pmtiles(

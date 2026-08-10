@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import math
 import os
 import shutil
@@ -20,6 +21,8 @@ from common import (
 )
 from osgeo import gdal
 from PIL import Image
+
+LOGGER = logging.getLogger(__name__)
 
 # Re-exported for existing callers/tests.
 _ = build_staged_path
@@ -1603,7 +1606,7 @@ def build_mbtiles_overviews(
 
         worker_count = max(1, int(parallel))
         batch_size = 128
-        print(
+        LOGGER.info(
             f"Building overviews from z{max_zoom} to z{min_zoom} with "
             f"{worker_count} worker(s), resumable..."
         )
@@ -1663,7 +1666,7 @@ def build_mbtiles_overviews(
                     connection.commit()
 
                 if written:
-                    print(f"  z{target_zoom}: wrote {written} tile(s)")
+                    LOGGER.info(f"  z{target_zoom}: wrote {written} tile(s)")
     finally:
         connection.close()
 
@@ -1797,7 +1800,7 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
     if not input_mbtiles:
         return
 
-    print(f"Merging {len(input_mbtiles)} chunks into {output_mbtiles}...")
+    LOGGER.info(f"Merging {len(input_mbtiles)} chunks into {output_mbtiles}...")
 
     # Sort chunks to ensure consistent merging
     input_mbtiles = sorted([f for f in input_mbtiles if f and os.path.exists(f)])
@@ -1859,7 +1862,7 @@ def merge_mbtiles(output_mbtiles: str, input_mbtiles: List[str]) -> None:
             conn.commit()
         except sqlite3.OperationalError as e:
             # If inserting into tiles failed and we have no map table, it's a real error
-            print(f"Warning: Error merging {db_path}: {e}")
+            LOGGER.warning(f"Warning: Error merging {db_path}: {e}")
         finally:
             if attached:
                 try:
@@ -1938,7 +1941,7 @@ def run_tiling_simplified(
         resume_signature,
     )
     if resuming_staged_build:
-        print(f"Resuming MBTiles overview generation from {staged_output_mbtiles}...")
+        LOGGER.info(f"Resuming MBTiles overview generation from {staged_output_mbtiles}...")
     else:
         prepare_staged_path(output_mbtiles)
         remove_if_exists(resume_manifest_path)
@@ -1974,12 +1977,12 @@ def run_tiling_simplified(
         if options.get("elevation_encoding") == "terrarium":
             if tile_format.lower() != "png":
                 raise RuntimeError("Terrarium DEM tiles must use PNG output")
-            print(f"Generating temporary Terrarium GeoTIFF: {temp_raster}")
+            LOGGER.info(f"Generating temporary Terrarium GeoTIFF: {temp_raster}")
             write_terrarium_geotiff(ds, temp_raster)
             source_path = temp_raster
             cleanup_paths.append(temp_raster)
         elif has_alpha_band(ds):
-            print("Source has alpha band; dropping it for MBTiles.")
+            LOGGER.info("Source has alpha band; dropping it for MBTiles.")
             band_list = [1, 2, 3]
 
         proj_win = None
@@ -2021,7 +2024,7 @@ def run_tiling_simplified(
                     )
 
         if len(chunk_tasks) > 1:
-            print(
+            LOGGER.info(
                 f"Translating {len(chunk_tasks)} MBTiles chunks with "
                 f"{min(worker_count, len(chunk_tasks))} worker(s)..."
             )
@@ -2062,7 +2065,7 @@ def run_tiling_simplified(
             if tile_format.lower() == "webp":
                 gdal.SetThreadLocalConfigOption("WEBP_LEVEL", str(options["quality"]))
 
-            print(f"Translating {source_path} to {staged_output_mbtiles} using a single GDAL process...")
+            LOGGER.info(f"Translating {source_path} to {staged_output_mbtiles} using a single GDAL process...")
             gdal.Translate(staged_output_mbtiles, source_path, options=translate_options)
 
         # Refresh metadata before building overviews

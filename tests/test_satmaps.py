@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import signal
 import sys
@@ -1844,8 +1845,9 @@ def test_convert_raster_to_pmtiles_stages_final_output(
         ),
     )
 
-    def fake_subprocess_run(command: list[str], check: bool) -> None:
+    def fake_subprocess_run(command: list[str], check: bool, **kwargs: object) -> None:
         assert check is True
+        assert kwargs == {"capture_output": True, "text": True}
         converted.append(command)
         Path(command[3]).write_text("pmtiles")
 
@@ -1887,8 +1889,9 @@ def test_convert_raster_to_pmtiles_cleans_inputs_after_mbtiles_before_pmtiles(
         assert cleanup_target.exists()
         return tiler.TilingArtifacts(final_vrt=input_raster, cleanup_paths=[])
 
-    def fake_subprocess_run(command: list[str], check: bool) -> None:
+    def fake_subprocess_run(command: list[str], check: bool, **kwargs: object) -> None:
         assert check is True
+        assert kwargs == {"capture_output": True, "text": True}
         assert not cleanup_target.exists()
         converted.append(command)
         Path(command[3]).write_text("pmtiles")
@@ -1943,8 +1946,9 @@ def test_convert_tile_tree_to_pmtiles_uses_requested_bbox(
     ) -> None:
         overview_calls.append((mbtiles_path, resample_alg))
 
-    def fake_subprocess_run(command: list[str], check: bool) -> None:
+    def fake_subprocess_run(command: list[str], check: bool, **kwargs: object) -> None:
         assert check is True
+        assert kwargs == {"capture_output": True, "text": True}
         converted.append(command)
         Path(command[3]).write_text("pmtiles")
 
@@ -2346,7 +2350,9 @@ def test_generate_ocean_warns_for_changed_run_settings(
     tmp_path: Path,
     monkeypatch: object,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO)
     monkeypatch.chdir(tmp_path)
     temp_dir = tmp_path / ".temp"
     temp_dir.mkdir()
@@ -2429,7 +2435,7 @@ def test_generate_ocean_warns_for_changed_run_settings(
     )
 
     assert processed_chunks == [(0, 0)]
-    out = capsys.readouterr().out
+    out = capsys.readouterr().out + caplog.text
     assert "Warning: Ocean run setting mismatch: hillshade_z: 4.0 -> 5.0" in out
     assert "Reusing 1 existing ocean chunk(s)." not in out
     assert "Ocean run settings changed; rebuilding all chunks with current settings." in out
@@ -2457,8 +2463,9 @@ def test_describe_settings_differences_reports_real_changes() -> None:
 
 
 def test_generate_ocean_without_bbox_reports_chunk_progress(
-    monkeypatch: object, capsys: pytest.CaptureFixture[str]
+    monkeypatch: object, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
 ) -> None:
+    caplog.set_level(logging.INFO)
     plan = ocean.OceanBuildPlan(
         bounds=ocean.WEB_MERCATOR_WORLD_BOUNDS,
         pixel_size=satmaps.tiler.web_mercator_pixel_size(ocean.DEFAULT_MAX_ZOOM),
@@ -2526,7 +2533,7 @@ def test_generate_ocean_without_bbox_reports_chunk_progress(
         parallel=1,
     )
 
-    out = capsys.readouterr().out
+    out = capsys.readouterr().out + caplog.text
     assert "Ocean build: global run at z13 -> ocean.tif" in out
     assert "[3/6] Planning aligned Web Mercator chunks..." in out
     assert "Ocean target grid: 16x8 px (128 pixels)" in out
@@ -2749,7 +2756,9 @@ def test_build_work_unit_candidate_row_slabs_from_sources_uses_actual_source_bou
 def test_build_work_unit_candidate_row_slabs_from_sources_falls_back_on_inspection_error(
     monkeypatch: object,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO)
     work_unit = satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",))
     monkeypatch.setattr(
         "satmaps.list_mosaic_folders_for_tile",
@@ -2772,13 +2781,14 @@ def test_build_work_unit_candidate_row_slabs_from_sources_falls_back_on_inspecti
     )
 
     assert actual == satmaps.build_work_unit_candidate_row_slabs(work_unit, 13)
-    assert "Could not inspect source footprint for 31TDF_0_0" in capsys.readouterr().out
+    assert "Could not inspect source footprint for 31TDF_0_0" in caplog.text
 
 def test_resolve_work_unit_candidate_row_slabs_reuses_cached_subset_and_persists_missing(
     monkeypatch: object,
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO)
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
     work_units = (
@@ -2826,7 +2836,7 @@ def test_resolve_work_unit_candidate_row_slabs_reuses_cached_subset_and_persists
         "31TDF_0_1": ((2, 2, 2),),
     }
     assert satmaps.read_candidate_tile_cache_record(cache_path).contributor_row_slabs == actual
-    out = capsys.readouterr().out
+    out = caplog.text
     assert f"Loaded candidate tile cache from {cache_path} with 1 sub-tile(s)." in out
     assert "Reusing cached candidate tile footprints for 1 sub-tile(s); computing 1 missing." in out
 
@@ -2834,8 +2844,9 @@ def test_resolve_work_unit_candidate_row_slabs_reuses_cached_subset_and_persists
 def test_resolve_work_unit_candidate_row_slabs_warns_for_changed_cache_settings(
     monkeypatch: object,
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO)
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".temp").mkdir()
     work_units = (satmaps.LandWorkUnit("31TDF_0_0", ("31TDF_0_0",)),)
@@ -2868,7 +2879,7 @@ def test_resolve_work_unit_candidate_row_slabs_warns_for_changed_cache_settings(
     )
 
     assert actual == {"31TDF_0_0": ((1, 1, 1),)}
-    out = capsys.readouterr().out
+    out = caplog.text
     assert "Warning: Candidate tile cache setting mismatch: max_zoom: 13 -> 14" in out
     assert "Reusing cached candidate tile footprints for 1 sub-tile(s)." in out
 

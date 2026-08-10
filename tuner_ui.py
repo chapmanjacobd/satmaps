@@ -1,5 +1,6 @@
 import argparse
 import io
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -13,9 +14,13 @@ from osgeo import gdal
 from PIL import Image
 from scipy.ndimage import binary_dilation
 
+from common import configure_logging
+
 import ocean
 import satmaps_assets
 import tiler
+
+LOGGER = logging.getLogger(__name__)
 
 app = Flask(__name__, template_folder=str(Path(satmaps_assets.__file__).resolve().parent / "templates"))
 
@@ -1101,6 +1106,7 @@ def main() -> None:
         help="Parallel sample downloads to run with --download-samples.",
     )
     args = parser.parse_args()
+    configure_logging()
 
     if args.download_samples:
         downloaded = download_configured_land_samples(
@@ -1108,7 +1114,7 @@ def main() -> None:
             cache_dir=args.cache,
             parallel=args.parallel,
         )
-        print(f"Download complete. Cached {downloaded} folder(s) for the tuner.")
+        LOGGER.info(f"Download complete. Cached {downloaded} folder(s) for the tuner.")
         return
 
     app.run(debug=True, port=5001)

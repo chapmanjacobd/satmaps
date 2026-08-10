@@ -2,6 +2,7 @@
 import argparse
 import concurrent.futures
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -12,6 +13,8 @@ import urllib.request
 from typing import Callable, List, Optional, Sequence, Tuple, Any, cast
 from datetime import datetime
 import dateutil.relativedelta as relativedelta
+
+LOGGER = logging.getLogger(__name__)
 
 BBox = Tuple[float, float, float, float]
 
@@ -83,16 +86,16 @@ def m2m_login() -> str:
     username = os.environ.get("USGS_USERNAME")
     
     if not token or not username:
-        print("Error: USGS_USERNAME and USGS_TOKEN environment variables are required.")
+        LOGGER.error("Error: USGS_USERNAME and USGS_TOKEN environment variables are required.")
         sys.exit(1)
         
-    print("Authenticating with EarthExplorer M2M...")
+    LOGGER.info("Authenticating with EarthExplorer M2M...")
     payload = {"username": username, "token": token}
     return cast(str, send_m2m_request("login-token", payload))
 
 def m2m_logout(api_key: str) -> None:
     """Log out from EarthExplorer M2M."""
-    print("Logging out from EarthExplorer...")
+    LOGGER.info("Logging out from EarthExplorer...")
     send_m2m_request("logout", {}, api_key=api_key)
 
 def _scene_search_payload(bbox: BBox, start_date: Optional[str] = None) -> dict[str, Any]:
@@ -124,14 +127,14 @@ def _load_fresh_json_cache(cache_path: str, max_age_days: int) -> Optional[Any]:
 
     age_seconds = time.time() - os.path.getmtime(cache_path)
     if age_seconds >= max_age_days * 24 * 60 * 60:
-        print(f"Cached metadata expired: {cache_path}")
+        LOGGER.info(f"Cached metadata expired: {cache_path}")
         return None
 
     try:
         with open(cache_path) as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"Warning: Ignoring invalid cached metadata {cache_path}: {exc}")
+        LOGGER.warning(f"Warning: Ignoring invalid cached metadata {cache_path}: {exc}")
         return None
 
 
@@ -251,7 +254,7 @@ def _query_naip_tiles_ee(
     scenes = results.get("results", [])
     if not isinstance(scenes, list):
         raise RuntimeError("EarthExplorer scene-search returned invalid scene results.")
-    print(f"Found {len(scenes)} NAIP scenes in the bounding box.")
+    LOGGER.info(f"Found {len(scenes)} NAIP scenes in the bounding box.")
     return scenes
 
 
@@ -387,7 +390,7 @@ def _migrate_jsonl_manifest(manifest: ManifestStore, cache_dir: str) -> None:
     if not os.path.exists(path):
         return
 
-    print(f"Migrating legacy {path} into the SQLite metadata store...")
+    LOGGER.info(f"Migrating legacy {path} into the SQLite metadata store...")
     max_age_seconds = NAIP_METADATA_CACHE_MAX_AGE_DAYS * 24 * 60 * 60
     now = time.time()
     migrated = 0
@@ -423,7 +426,7 @@ def _migrate_jsonl_manifest(manifest: ManifestStore, cache_dir: str) -> None:
         manifest.insert_many(batch)
         manifest.conn.commit()
     os.rename(path, f"{path}.bak")
-    print(
+    LOGGER.info(
         f"Migrated {migrated} records into the SQLite store; "
         f"legacy file kept as {path}.bak"
     )
@@ -470,7 +473,7 @@ def _discover_naip_tiles_ee_recursive(
                 )
             return _deduplicate_scenes(child_scenes)
         date_msg = f" since {start_date}" if start_date else ""
-        print(f"Using incremental metadata for bbox {bbox}{date_msg}.")
+        LOGGER.info(f"Using incremental metadata for bbox {bbox}{date_msg}.")
         scenes = recorded.get("scenes", [])
         if isinstance(scenes, list):
             if start_date is not None:
@@ -492,14 +495,14 @@ def _discover_naip_tiles_ee_recursive(
 
     split_bboxes = _split_bbox(bbox)
     if split_bboxes is None or split_depth >= EE_MAX_SPLIT_DEPTH:
-        print(
+        LOGGER.info(
             f"Warning: EarthExplorer returned {len(scenes)} scenes for bbox {bbox}; "
             "using the capped result set because it cannot be subdivided further."
         )
         manifest.put(_manifest_record(bbox, split=False, scenes=scenes, start_date=start_date))
         return scenes
 
-    print(
+    LOGGER.info(
         f"EarthExplorer returned {len(scenes)} scenes (over {EE_SPLIT_THRESHOLD}); "
         f"splitting bbox at depth {split_depth + 1}."
     )
@@ -538,7 +541,7 @@ def discover_naip_tiles_ee(
     time. The return value is an empty list in that mode.
     """
     if not bbox:
-        print("Warning: No bounding box provided. Please provide --bbox.")
+        LOGGER.warning("Warning: No bounding box provided. Please provide --bbox.")
         return []
 
     scenes: List[Any] = []
@@ -553,7 +556,7 @@ def discover_naip_tiles_ee(
     _migrate_jsonl_manifest(manifest, cache_dir)
     count = len(manifest)
     if count:
-        print(
+        LOGGER.info(
             f"Loaded {count} cached bbox records from the NAIP metadata store."
         )
 
@@ -571,7 +574,7 @@ def discover_naip_tiles_ee(
 
             initial_bboxes = _initial_query_bboxes(query_bbox)
             if len(initial_bboxes) > 1:
-                print(
+                LOGGER.info(
                     f"Splitting large NAIP search bbox into {len(initial_bboxes)} initial "
                     f"cells (maximum span {EE_INITIAL_MAX_BBOX_SPAN_DEGREES:g} degrees)."
                 )
@@ -585,7 +588,7 @@ def discover_naip_tiles_ee(
                     start_date=recent_start,
                 )
                 if not cell_scenes:
-                    print(f"No recent scenes (since {recent_start}) found in {initial_bbox}; falling back to full temporal search.")
+                    LOGGER.info(f"No recent scenes (since {recent_start}) found in {initial_bbox}; falling back to full temporal search.")
                     cell_scenes = _discover_naip_tiles_ee_recursive(
                         initial_bbox,
                         api_key,
@@ -636,10 +639,10 @@ def _fetch_json_cached(
     """Fetch a JSON URL, caching the result until it expires."""
     cached = _load_fresh_json_cache(cache_path, max_age_days)
     if cached is not None:
-        print(f"Using cached {cache_path}")
+        LOGGER.info(f"Using cached {cache_path}")
         return cached
 
-    print(f"Fetching {url}")
+    LOGGER.info(f"Fetching {url}")
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req) as response:
         data = json.loads(response.read().decode("utf-8"))
@@ -665,23 +668,23 @@ def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str, args:
 
     datasets = _find_digital_coast_datasets(bbox)
     if not datasets:
-        print("Bounding box does not overlap any Digital Coast NAIP dataset.")
+        LOGGER.info("Bounding box does not overlap any Digital Coast NAIP dataset.")
         return []
 
     raster_paths = []
     for ds in datasets:
-        print(f"Querying Digital Coast dataset: {ds['name']} (id={ds['id']})")
+        LOGGER.info(f"Querying Digital Coast dataset: {ds['name']} (id={ds['id']})")
         stac_cache = os.path.join(cache_dir, f"dc_stac_{ds['id']}.json")
         collection = _fetch_json_cached(ds["stac_url"], stac_cache)
 
         features = collection.get("features", [])
         if not features:
-            print(f"No features found in STAC collection for {ds['name']}")
+            LOGGER.info(f"No features found in STAC collection for {ds['name']}")
             continue
 
         filtered = [f for f in features if _bbox_overlaps_stac_item(bbox, f)]
         if not filtered:
-            print(f"No {ds['name']} tiles overlap the bounding box.")
+            LOGGER.info(f"No {ds['name']} tiles overlap the bounding box.")
             continue
 
         tif_urls = []
@@ -694,14 +697,14 @@ def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str, args:
                     break
 
         if not tif_urls:
-            print(f"No TIFF assets found for {ds['name']}")
+            LOGGER.info(f"No TIFF assets found for {ds['name']}")
             continue
 
-        print(f"Found {len(tif_urls)} {ds['name']} tiles overlapping the bounding box.")
+        LOGGER.info(f"Found {len(tif_urls)} {ds['name']} tiles overlapping the bounding box.")
 
         jp2_gb = len(tif_urls) * 80 / 1024
         tif_gb = len(tif_urls) * 500 / 1024
-        print(f"Estimated size: {jp2_gb:.1f} GB (JP2) / {tif_gb:.1f} GB (ZIP/TIF)")
+        LOGGER.info(f"Estimated size: {jp2_gb:.1f} GB (JP2) / {tif_gb:.1f} GB (ZIP/TIF)")
         if len(tif_urls) > 50:
             est_dl_seconds = len(tif_urls) * 15
             est_dl_hours = int(est_dl_seconds // 3600)
@@ -711,14 +714,14 @@ def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str, args:
             est_proc_hours = int(est_proc_seconds // 3600)
             est_proc_minutes = int((est_proc_seconds % 3600) // 60)
             est_proc_str = f"{est_proc_hours}h {est_proc_minutes}m" if est_proc_hours else f"{est_proc_minutes}m"
-            print(f"Estimated download time:   {est_dl_str}")
-            print(f"Estimated processing time:  {est_proc_str}")
+            LOGGER.info(f"Estimated download time:   {est_dl_str}")
+            LOGGER.info(f"Estimated processing time:  {est_proc_str}")
             if getattr(args, "yes", False):
-                print("--yes flag set, proceeding without confirmation.")
+                LOGGER.info("--yes flag set, proceeding without confirmation.")
             else:
                 ans = input(f"Warning: you are about to use {len(tif_urls)} tiles from {ds['name']}. Are you sure you want to proceed? (y/N) ")
                 if ans.lower() not in ('y', 'yes'):
-                    print("Aborting Digital Coast NAIP fetch.")
+                    LOGGER.info("Aborting Digital Coast NAIP fetch.")
                     return []
 
         ds_cache_dir = os.path.join(cache_dir, f"dc_{ds['id']}")
@@ -726,7 +729,7 @@ def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str, args:
         vrt_path = os.path.join(ds_cache_dir, f"{ds['name']}.vrt")
 
         if os.path.exists(vrt_path):
-            print(f"Using cached VRT: {vrt_path}")
+            LOGGER.info(f"Using cached VRT: {vrt_path}")
         else:
             from osgeo import gdal
 
@@ -734,12 +737,12 @@ def discover_naip_tiles_digitalcoast(bbox: Optional[BBox], cache_dir: str, args:
             gdal.SetConfigOption("GDAL_HTTP_CONNECTTIMEOUT", "30")
             gdal.SetConfigOption("GDAL_HTTP_TIMEOUT", "120")
             gdal.SetConfigOption("GDAL_HTTP_MAX_RETRY", "2")
-            print(f"Building VRT from {len(vsi_urls)} remote tiles (this may take a minute)...")
+            LOGGER.info(f"Building VRT from {len(vsi_urls)} remote tiles (this may take a minute)...")
             vrt_ds = gdal.BuildVRT(vrt_path, vsi_urls, options=gdal.BuildVRTOptions(resolution="highest"))
             if vrt_ds is None:
                 raise RuntimeError(f"Failed to build VRT for {ds['name']}")
             vrt_ds = None
-            print(f"Built cached VRT: {vrt_path}")
+            LOGGER.info(f"Built cached VRT: {vrt_path}")
 
         raster_paths.append(vrt_path)
 
@@ -755,7 +758,7 @@ def get_vrt_path_for_zip(path: str) -> str:
                     if name.lower().endswith('.tif'):
                         return f"/vsizip/{os.path.abspath(path)}/{name}"
         except Exception as e:
-            print(f"Warning: Failed to inspect zip file {path}: {e}")
+            LOGGER.warning(f"Warning: Failed to inspect zip file {path}: {e}")
     return path
 
 def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> List[str]:
@@ -775,10 +778,10 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
         zip_path = os.path.join(cache_dir, f"{display_id}.ZIP")
         
         if os.path.exists(jp2_path):
-            print(f"Skipping API fetch for {display_id}.jp2 (already exists in cache)")
+            LOGGER.info(f"Skipping API fetch for {display_id}.jp2 (already exists in cache)")
             downloaded_paths.append(jp2_path)
         elif os.path.exists(zip_path):
-            print(f"Skipping API fetch for {display_id}.ZIP (already exists in cache)")
+            LOGGER.info(f"Skipping API fetch for {display_id}.ZIP (already exists in cache)")
             downloaded_paths.append(get_vrt_path_for_zip(zip_path))
         else:
             scenes_to_fetch.append(scene)
@@ -805,10 +808,10 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
                     out_path = os.path.join(cache_dir, filename)
                     
                     if os.path.exists(out_path):
-                        print(f"Skipping {filename} (already exists in cache)")
+                        LOGGER.info(f"Skipping {filename} (already exists in cache)")
                         return out_path
                         
-                    print(f"Downloading {filename} (attempt {attempt + 1})...")
+                    LOGGER.info(f"Downloading {filename} (attempt {attempt + 1})...")
                     with open(out_path, 'wb') as f:
                         while True:
                             chunk = response.read(8192 * 16)
@@ -818,10 +821,10 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
                 return out_path
             except Exception as e:
                 if attempt < max_retries - 1:
-                    print(f"Download failed for {url} ({e}), waiting 10s before re-attempting...")
+                    LOGGER.warning(f"Download failed for {url} ({e}), waiting 10s before re-attempting...")
                     time.sleep(10)
                 else:
-                    print(f"Failed to download {url} after {max_retries} attempts: {e}")
+                    LOGGER.error(f"Failed to download {url} after {max_retries} attempts: {e}")
                     return None
 
         return None
@@ -830,7 +833,7 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
     for i in range(0, len(scenes_to_fetch), chunk_size):
         chunk = scenes_to_fetch[i:i + chunk_size]
         entity_ids = [scene["entityId"] for scene in chunk]
-        print(f"Processing chunk {i//chunk_size + 1}/{(len(scenes_to_fetch) + chunk_size - 1)//chunk_size} ({len(entity_ids)} scenes)...")
+        LOGGER.info(f"Processing chunk {i//chunk_size + 1}/{(len(scenes_to_fetch) + chunk_size - 1)//chunk_size} ({len(entity_ids)} scenes)...")
         
         payload = {
             "datasetName": "NAIP",
@@ -840,7 +843,7 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
         try:
             options = send_m2m_request("download-options", payload, api_key=api_key)
         except Exception as e:
-            print(f"Warning: Failed to get download options for chunk: {e}")
+            LOGGER.warning(f"Warning: Failed to get download options for chunk: {e}")
             continue
             
         options_by_entity = {}
@@ -858,10 +861,10 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
         downloads = [{"entityId": opt["entityId"], "productId": opt["id"]} for opt in options_by_entity.values()]
         
         if not downloads:
-            print("No valid download options found for this chunk.")
+            LOGGER.info("No valid download options found for this chunk.")
             continue
             
-        print(f"Requesting downloads for {len(downloads)} products...")
+        LOGGER.info(f"Requesting downloads for {len(downloads)} products...")
         req_payload = {
             "downloads": downloads,
             "label": "satmaps-naip-download"
@@ -870,13 +873,13 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
         try:
             req_resp = send_m2m_request("download-request", req_payload, api_key=api_key)
         except Exception as e:
-            print(f"Warning: Failed to request downloads for chunk: {e}")
+            LOGGER.warning(f"Warning: Failed to request downloads for chunk: {e}")
             continue
             
         available_downloads = req_resp.get("availableDownloads", [])
         preparing_downloads = req_resp.get("preparingDownloads", [])
         
-        print(f"Initial request: {len(available_downloads)} available, {len(preparing_downloads)} preparing.")
+        LOGGER.info(f"Initial request: {len(available_downloads)} available, {len(preparing_downloads)} preparing.")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             download_futures = []
@@ -886,12 +889,12 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
                 download_futures.append(executor.submit(_download_worker, d["downloadId"], d["url"]))
             
             if preparing_downloads:
-                print("Polling for preparing downloads while starting available ones...")
+                LOGGER.info("Polling for preparing downloads while starting available ones...")
                 pending_ids = {d["downloadId"] for d in preparing_downloads}
                 
                 while pending_ids:
                     time.sleep(10)
-                    print(f"Checking status for {len(pending_ids)} pending downloads...")
+                    LOGGER.info(f"Checking status for {len(pending_ids)} pending downloads...")
                     retrieve_payload = {"label": "satmaps-naip-download"}
                     try:
                         retrieved = send_m2m_request("download-retrieve", retrieve_payload, api_key=api_key)
@@ -900,9 +903,9 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
                             if item["downloadId"] in pending_ids:
                                 download_futures.append(executor.submit(_download_worker, item["downloadId"], item["url"]))
                                 pending_ids.remove(item["downloadId"])
-                                print(f"Resolved and started download for {item['downloadId']}")
+                                LOGGER.info(f"Resolved and started download for {item['downloadId']}")
                     except Exception as e:
-                        print(f"Warning: Polling failed: {e}")
+                        LOGGER.warning(f"Warning: Polling failed: {e}")
                         # Might want to break or retry, for now we will just wait and retry loop
                         pass
                         
@@ -938,7 +941,7 @@ def handle_naip_workflow(
     if not hasattr(args, "use_naip") or not args.use_naip:
         return False, []
         
-    print("NAIP workflow requested.")
+    LOGGER.info("NAIP workflow requested.")
     load_env()
     
     cache_dir = getattr(args, "cache", "cache")
@@ -1002,7 +1005,7 @@ def handle_naip_workflow(
                 per_cell_callback=_per_cell_callback,
             )
             desc = "extent geometry" if extent_geometry is not None else "bounding box"
-            print(
+            LOGGER.info(
                 f"Greedy spatial fill selected {len(filtered_scenes)} "
                 f"out of {total_discovered} scenes to cover the {desc}."
             )
@@ -1017,7 +1020,7 @@ def handle_naip_workflow(
             )
 
         if scenes:
-            print("NAIP pipeline via EarthExplorer initiated.")
+            LOGGER.info("NAIP pipeline via EarthExplorer initiated.")
             if getattr(args, "download", False) or not getattr(args, "estimate", False):
                 if len(scenes) > 50:
                     est_dl_seconds = len(scenes) * 30
@@ -1028,32 +1031,32 @@ def handle_naip_workflow(
                     est_proc_hours = int(est_proc_seconds // 3600)
                     est_proc_minutes = int((est_proc_seconds % 3600) // 60)
                     est_proc_str = f"{est_proc_hours}h {est_proc_minutes}m" if est_proc_hours else f"{est_proc_minutes}m"
-                    print(f"Estimated download time:   {est_dl_str}")
-                    print(f"Estimated processing time:  {est_proc_str}")
+                    LOGGER.info(f"Estimated download time:   {est_dl_str}")
+                    LOGGER.info(f"Estimated processing time:  {est_proc_str}")
                     if getattr(args, "yes", False):
-                        print("--yes flag set, proceeding without confirmation.")
+                        LOGGER.info("--yes flag set, proceeding without confirmation.")
                     else:
                         ans = input(f"Warning: you are about to download {len(scenes)} DOQs. Are you sure you want to proceed? (y/N) ")
                         if ans.lower() not in ('y', 'yes'):
-                            print("Aborting NAIP download.")
+                            LOGGER.info("Aborting NAIP download.")
                             sys.exit(1)
                 ee_raster_paths = fetch_naip_downloads(scenes, api_key, cache_dir)
                 if getattr(args, "download", False):
-                    print("NAIP download-only workflow complete. Exiting.")
+                    LOGGER.info("NAIP download-only workflow complete. Exiting.")
                     sys.exit(0)
             else:
                 for scene in scenes[:5]:
-                    print(f"Scene ID: {scene.get('entityId')} - Display ID: {scene.get('displayId')}")
+                    LOGGER.info(f"Scene ID: {scene.get('entityId')} - Display ID: {scene.get('displayId')}")
                 if len(scenes) > 5:
-                    print(f"... and {len(scenes) - 5} more. Run with --download to fetch them.")
+                    LOGGER.info(f"... and {len(scenes) - 5} more. Run with --download to fetch them.")
     except Exception as e:
-        print(f"EarthExplorer API Error: {e}")
+        LOGGER.error(f"EarthExplorer API Error: {e}")
     finally:
         if api_key:
             try:
                 m2m_logout(api_key)
             except Exception as e:
-                print(f"Failed to logout gracefully: {e}")
+                LOGGER.warning(f"Failed to logout gracefully: {e}")
 
     # Digital Coast covers Hawaii and Puerto Rico/USVI, so check each requested
     # extent feature independently, even if EarthExplorer returned mainland scenes.
@@ -1081,7 +1084,7 @@ def handle_naip_workflow(
         return True, []
 
     if not scenes:
-        print("No NAIP imagery found in the bounding box; aborting NAIP pipeline.")
+        LOGGER.info("No NAIP imagery found in the bounding box; aborting NAIP pipeline.")
         if not getattr(args, "estimate", False) and not getattr(args, "download", False):
             sys.exit(0)
 

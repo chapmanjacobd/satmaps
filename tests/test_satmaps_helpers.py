@@ -1,4 +1,5 @@
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -73,8 +74,9 @@ def build_projected_ocean_mask(
 
 
 def test_restore_resume_state_round_trip(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    caplog.set_level(logging.INFO)
     state_file = tmp_path / "state.json"
     state_file.write_text(
         json.dumps(
@@ -93,7 +95,7 @@ def test_restore_resume_state_round_trip(
         "unique_id": "resume-id",
         "completed_units": {"31TDF_0_0", "31TDF_1_0"},
     }
-    assert "Resuming from state file" in capsys.readouterr().out
+    assert "Resuming from state file" in caplog.text
 
 
 def test_restore_resume_state_accepts_files_without_legacy_processed_tifs(
@@ -172,23 +174,25 @@ def test_discover_mgrs_bases_reuses_saved_land_mgrs_list_ignoring_source_metadat
 
 
 def test_restore_resume_state_returns_none_for_invalid_json(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    caplog.set_level(logging.INFO)
     state_file = tmp_path / "state.json"
     state_file.write_text("{not json")
 
     assert restore_resume_state(str(state_file)) is None
-    assert "Warning: Could not load state file" in capsys.readouterr().out
+    assert "Warning: Could not load state file" in caplog.text
 
 def test_parse_bbox_parses_numbers_and_exits_on_invalid_input(
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO)
     assert parse_bbox("-10.5,20,30.25,40") == (-10.5, 20.0, 30.25, 40.0)
 
     with pytest.raises(SystemExit, match="1"):
         parse_bbox("not,a,bbox")
 
-    assert "Error: Invalid bbox format: not,a,bbox" in capsys.readouterr().out
+    assert "Error: Invalid bbox format: not,a,bbox" in caplog.text
 
 
 def test_discover_mgrs_bases_uses_bbox_clipped_ocean_mask_when_available(
@@ -471,8 +475,9 @@ def test_format_progress_covers_long_runs() -> None:
 
 
 def test_populate_s3_cache_reports_progress(
-    monkeypatch: object, capsys: pytest.CaptureFixture[str]
+    monkeypatch: object, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
 ) -> None:
+    caplog.set_level(logging.INFO)
     satmaps.S3_FOLDER_CACHE.clear()
 
     def fake_readdir(path: str) -> list[str] | None:
@@ -486,7 +491,7 @@ def test_populate_s3_cache_reports_progress(
 
     satmaps.populate_s3_cache(["2025/07/01", "2025/01/01"])
 
-    out = capsys.readouterr().out
+    out = capsys.readouterr().out + caplog.text
     assert "Populating S3 folder cache for 2 date(s)..." in out
     assert "S3 cache progress: 1/2 (50%);" in out
     assert "listing 2025/07/01..." in out

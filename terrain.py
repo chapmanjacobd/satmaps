@@ -6,6 +6,7 @@ from common import (
     build_output_namespace,
     build_output_namespace_dir,
     build_staged_path,
+    configure_logging,
     ensure_directory,
     publish_staged_path,
     remove_if_exists,
@@ -174,6 +175,7 @@ def build_terrain_argument_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_terrain_argument_parser().parse_args()
+    configure_logging()
 
     output = generate_terrain_pmtiles(
         args.gebco_zip,

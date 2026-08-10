@@ -1,12 +1,35 @@
 import contextlib
 import hashlib
 import json
+import logging
 import math
 import os
+import sys
 from collections.abc import Mapping
-from typing import Any, Iterator
+from typing import Any, Iterator, TextIO
 
 from osgeo import gdal
+
+LOGGER = logging.getLogger("satmaps")
+
+
+class _CurrentStdoutHandler(logging.StreamHandler[TextIO]):
+    """Keep CLI logs visible when stdout is temporarily redirected."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.stream = sys.stdout
+        super().emit(record)
+
+
+def configure_logging(level: int = logging.INFO, *, stream: TextIO | None = None) -> None:
+    """Configure concise process-wide logging for the command-line tools."""
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(level)
+    handler = logging.StreamHandler(stream) if stream is not None else _CurrentStdoutHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root_logger.addHandler(handler)
+
 
 # Active GDAL warp NUM_THREADS budget. Defaults to "ALL_CPUS" so sequential warps
 # use the whole machine; worker pools temporarily lower it (see warp_thread_budget)
@@ -79,9 +102,10 @@ def format_eta(
 class LiveProgressLine:
     """Render a single in-place progress line without hiding later errors."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, stream: TextIO | None = None) -> None:
         self._active = False
         self._last_width = 0
+        self._stream = stream or sys.stdout
 
     def update(self, message: str) -> None:
         padded_message = message
@@ -89,13 +113,15 @@ class LiveProgressLine:
             padded_message += " " * (self._last_width - len(message))
         else:
             self._last_width = len(message)
-        print(f"\r{padded_message}", end="", flush=True)
+        self._stream.write(f"\r{padded_message}")
+        self._stream.flush()
         self._active = True
 
     def finish(self) -> None:
         if not self._active:
             return
-        print()
+        self._stream.write("\n")
+        self._stream.flush()
         self._active = False
         self._last_width = 0
 
@@ -219,7 +245,7 @@ def print_settings_diff_warning(
         return False
 
     for difference in differences:
-        print(f"Warning: {label} setting mismatch: {difference}")
+        LOGGER.warning(f"Warning: {label} setting mismatch: {difference}")
     return True
 
 
@@ -238,7 +264,7 @@ def read_settings_file(path: str, *, description: str) -> dict[str, Any] | None:
             raise ValueError("settings file payload must be an object")
         return settings
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        print(f"Warning: Could not load {description} {path}: {exc}")
+        LOGGER.warning(f"Warning: Could not load {description} {path}: {exc}")
         return None
 
 
