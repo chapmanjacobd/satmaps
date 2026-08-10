@@ -4393,6 +4393,60 @@ def test_commit_raster_to_final_tile_cache_streams_tile_images(
             Path(satmaps.SatmapsRunPaths("output.pmtiles", "streamraster").final_tile_cache_dir) / relative_path
         ).exists()
 
+def test_commit_raster_to_final_tile_cache_parallel_row_batches(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".temp").mkdir()
+
+    args = argparse.Namespace(
+        max_zoom=13,
+        blocksize=8,
+        resample_alg="lanczos",
+        quality=75,
+        parallel=3,
+    )
+    fake_dataset = object()
+    monkeypatch.setattr("satmaps.gdal.Open", lambda path: fake_dataset)
+    monkeypatch.setattr("satmaps.tiler.get_dataset_bounds", lambda ds: (0.0, 0.0, 1.0, 1.0))
+    monkeypatch.setattr("satmaps.tiler.get_chunk_tile_range", lambda bounds, zoom: (0, 0, 1, 1))
+
+    submitted_plans: list[satmaps.LandOutputBatchPlan] = []
+
+    def fake_render_raster_batch_image(input_raster, batch_plan, resample_alg):
+        assert input_raster == "output.pmtiles"
+        submitted_plans.append(batch_plan)
+        image = Image.new("RGBA", (batch_plan.width, batch_plan.height), (10, 20, 30, 255))
+        left, top, core_width, core_height = batch_plan.tile_core_src_wins[-1]
+        for x in range(left, left + core_width):
+            for y in range(top, top + core_height):
+                image.putpixel((x, y), (10, 20, 30, 0))
+        return image
+
+    monkeypatch.setattr("satmaps.render_raster_batch_image", fake_render_raster_batch_image)
+
+    relpaths = satmaps.commit_raster_to_final_tile_cache(
+        "output.pmtiles",
+        "output.pmtiles",
+        "parallelraster",
+        "31TDF_0_0",
+        args,
+    )
+
+    assert sorted(plan.relative_paths for plan in submitted_plans) == [
+        ("13/0/0.webp", "13/1/0.webp"),
+        ("13/0/1.webp", "13/1/1.webp"),
+    ]
+    assert relpaths == ["13/0/0.webp", "13/0/1.webp"]
+    run_paths = satmaps.SatmapsRunPaths("output.pmtiles", "parallelraster")
+    marker_path = Path(run_paths.tile_cache_marker("31TDF_0_0"))
+    assert marker_path.exists()
+    assert read_tile_cache_marker_helper(str(marker_path)) == ("31TDF_0_0", relpaths)
+    for relative_path in relpaths:
+        assert (Path(run_paths.final_tile_cache_dir) / relative_path).exists()
+    assert not (Path(run_paths.final_tile_cache_dir) / "13/1/0.webp").exists()
+    assert not (Path(run_paths.final_tile_cache_dir) / "13/1/1.webp").exists()
+
 def test_render_final_output_tile_composites_ocean_and_ordered_contributors(
     monkeypatch: object, tmp_path: Path
 ) -> None:

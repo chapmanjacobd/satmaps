@@ -1273,7 +1273,12 @@ def commit_raster_to_final_tile_cache(
     source_under_existing: bool = False,
     progress_label: str = "Tile commit progress:",
 ) -> List[str]:
-    """Render and write one contributor directly into the shared final WebP tree."""
+    """Render and write one contributor directly into the shared final WebP tree.
+
+    Path inputs are sliced as whole-row batches across ``args.parallel`` worker
+    threads (amortizing per-tile ``gdal.Translate`` setup, like the Sentinel-2
+    land pass). Already-open datasets fall back to sequential per-tile rendering.
+    """
     run_paths = SatmapsRunPaths(output_path, unique_id)
     final_tile_tree = run_paths.final_tile_cache_dir
     marker_path = run_paths.tile_cache_marker(contributor_id)
@@ -1291,8 +1296,95 @@ def commit_raster_to_final_tile_cache(
     tx_min, ty_min, tx_max, ty_max = tiler.get_chunk_tile_range(bounds, args.max_zoom)
     total_tiles = (tx_max - tx_min + 1) * (ty_max - ty_min + 1)
 
+    try:
+        if isinstance(input_raster, str):
+            tile_relpaths = _commit_raster_to_final_tile_cache_parallel(
+                input_raster,
+                final_tile_tree,
+                args.max_zoom,
+                args.blocksize,
+                args.resample_alg,
+                (tx_min, ty_min, tx_max, ty_max),
+                getattr(args, "parallel", 1),
+                source_under_existing,
+                args.quality,
+                progress_label,
+                total_tiles,
+            )
+        else:
+            tile_relpaths = _commit_raster_to_final_tile_cache_sequential(
+                dataset,
+                final_tile_tree,
+                args.max_zoom,
+                args.blocksize,
+                args.resample_alg,
+                source_under_existing,
+                args.quality,
+                progress_label,
+                total_tiles,
+            )
+    finally:
+        if close_dataset:
+            dataset = None
+
+    write_tile_cache_marker(marker_path, contributor_id, tile_relpaths)
+    return tile_relpaths
+
+
+def _commit_webp_tile_image(
+    tile_image: Image.Image,
+    destination_path: str,
+    *,
+    source_under_existing: bool,
+    quality: int,
+) -> bool:
+    """Blend one rendered tile into the final tree and write it as WebP.
+
+    Returns True when the tile was composited with an already-present tile.
+    """
+    final_image: Image.Image = tile_image
+    derived_images: list[Image.Image] = []
+    blended = False
+    try:
+        if file_has_content(destination_path):
+            with Image.open(destination_path) as destination_image:
+                destination_rgba = destination_image.convert("RGBA")
+            derived_images.append(destination_rgba)
+            source_rgba = tile_image.convert("RGBA")
+            derived_images.append(source_rgba)
+            if source_under_existing:
+                composed = Image.alpha_composite(source_rgba, destination_rgba)
+            else:
+                composed = Image.alpha_composite(destination_rgba, source_rgba)
+            derived_images.append(composed)
+            if composed.getchannel("A").getextrema() == (255, 255):
+                final_image = composed.convert("RGB")
+                derived_images.append(final_image)
+            else:
+                final_image = composed
+            blended = True
+        tiler.save_webp_image(final_image, destination_path, quality, lossless=False)
+    finally:
+        tile_image.close()
+        for image in reversed(derived_images):
+            if image is not tile_image:
+                image.close()
+    return blended
+
+
+def _commit_raster_to_final_tile_cache_sequential(
+    dataset: gdal.Dataset,
+    final_tile_tree: str,
+    zoom: int,
+    blocksize: int,
+    resample_alg: str,
+    source_under_existing: bool,
+    quality: int,
+    progress_label: str,
+    total_tiles: int,
+) -> List[str]:
+    """Render and write one contributor tile-by-tile from an already-open dataset."""
     tile_relpaths: list[str] = []
-    committed_tiles = 0
     blended_tiles = 0
     progress_line = LiveProgressLine()
     started_at = time.perf_counter()
@@ -1303,7 +1395,7 @@ def commit_raster_to_final_tile_cache(
         now = time.perf_counter()
         if not force and now < next_progress_at:
             return
-        detail = f"{committed_tiles} written"
+        detail = f"{len(tile_relpaths)} written"
         if blended_tiles:
             detail += f", {blended_tiles} blended"
         update_count_progress(
@@ -1320,47 +1412,133 @@ def commit_raster_to_final_tile_cache(
     try:
         for relative_path, tile_image in tiler.iter_dataset_webp_tile_images(
             dataset,
-            args.max_zoom,
-            args.blocksize,
-            args.resample_alg,
+            zoom,
+            blocksize,
+            resample_alg,
         ):
             tile_relpaths.append(relative_path)
             destination_path = os.path.join(final_tile_tree, relative_path)
-            final_image: Image.Image = tile_image
-            derived_images: list[Image.Image] = []
-            try:
-                if file_has_content(destination_path):
-                    with Image.open(destination_path) as destination_image:
-                        destination_rgba = destination_image.convert("RGBA")
-                    derived_images.append(destination_rgba)
-                    source_rgba = tile_image.convert("RGBA")
-                    derived_images.append(source_rgba)
-                    if source_under_existing:
-                        composed = Image.alpha_composite(source_rgba, destination_rgba)
-                    else:
-                        composed = Image.alpha_composite(destination_rgba, source_rgba)
-                    derived_images.append(composed)
-                    if composed.getchannel("A").getextrema() == (255, 255):
-                        final_image = composed.convert("RGB")
-                        derived_images.append(final_image)
-                    else:
-                        final_image = composed
-                    blended_tiles += 1
-                tiler.save_webp_image(final_image, destination_path, args.quality, lossless=False)
-                committed_tiles += 1
-            finally:
-                tile_image.close()
-                for image in reversed(derived_images):
-                    if image is not tile_image:
-                        image.close()
+            if _commit_webp_tile_image(
+                tile_image,
+                destination_path,
+                source_under_existing=source_under_existing,
+                quality=quality,
+            ):
+                blended_tiles += 1
             update_progress(force=len(tile_relpaths) >= total_tiles)
+        update_progress(force=True)
     finally:
         progress_line.finish()
-        if close_dataset:
-            dataset = None
-
     tile_relpaths.sort()
-    write_tile_cache_marker(marker_path, contributor_id, tile_relpaths)
+    return tile_relpaths
+
+
+def _commit_raster_to_final_tile_cache_parallel(
+    input_raster: str,
+    final_tile_tree: str,
+    zoom: int,
+    blocksize: int,
+    resample_alg: str,
+    tile_range: Tuple[int, int, int, int],
+    parallel: int,
+    source_under_existing: bool,
+    quality: int,
+    progress_label: str,
+    total_tiles: int,
+) -> List[str]:
+    """Render and write one contributor as whole-row batches across worker threads.
+
+    Each max-zoom ``ty`` row is rendered at once with ``render_raster_batch_image``
+    so the ``gdal.Translate`` setup cost is amortized, then tile cores are cropped
+    and committed in the calling thread to keep progress and disk writes ordered.
+    """
+    tx_min, ty_min, tx_max, ty_max = tile_range
+    row_batch_plans = [
+        build_land_output_batch_plan(
+            [
+                os.path.join(str(zoom), str(tx), f"{ty}.webp")
+                for tx in range(tx_min, tx_max + 1)
+            ],
+            blocksize,
+            resample_alg,
+        )
+        for ty in range(ty_min, ty_max + 1)
+    ]
+
+    tile_relpaths: list[str] = []
+    blended_tiles = 0
+    progress_line = LiveProgressLine()
+    started_at = time.perf_counter()
+    next_progress_at = started_at
+
+    def update_progress(*, force: bool = False) -> None:
+        nonlocal next_progress_at
+        now = time.perf_counter()
+        if not force and now < next_progress_at:
+            return
+        detail = f"{len(tile_relpaths)} written"
+        if blended_tiles:
+            detail += f", {blended_tiles} blended"
+        update_count_progress(
+            progress_line,
+            progress_label,
+            len(tile_relpaths),
+            total_tiles,
+            started_at,
+            detail + ".",
+        )
+        next_progress_at = now + LAND_PROGRESS_HEARTBEAT_SECONDS
+
+    update_progress(force=True)
+    try:
+        with warp_thread_budget(per_worker_warp_threads(parallel)), ThreadPoolExecutor(
+            max_workers=max(1, parallel)
+        ) as executor:
+            future_to_plan = {
+                executor.submit(render_raster_batch_image, input_raster, plan, resample_alg): plan
+                for plan in row_batch_plans
+            }
+            for future in as_completed(future_to_plan):
+                batch_plan = future_to_plan[future]
+                batch_image = future.result()
+                try:
+                    if batch_image is None:
+                        update_progress()
+                        continue
+                    for relative_path, core_window in zip(
+                        batch_plan.relative_paths,
+                        batch_plan.tile_core_src_wins,
+                    ):
+                        left, top, core_width, core_height = core_window
+                        tile_image = batch_image.crop(
+                            (left, top, left + core_width, top + core_height)
+                        )
+                        if tile_image.mode == "RGBA":
+                            alpha_extrema = tile_image.getchannel("A").getextrema()
+                            if alpha_extrema == (0, 0):
+                                tile_image.close()
+                                continue
+                            if alpha_extrema == (255, 255):
+                                rgb_image = tile_image.convert("RGB")
+                                tile_image.close()
+                                tile_image = rgb_image
+                        tile_relpaths.append(relative_path)
+                        destination_path = os.path.join(final_tile_tree, relative_path)
+                        if _commit_webp_tile_image(
+                            tile_image,
+                            destination_path,
+                            source_under_existing=source_under_existing,
+                            quality=quality,
+                        ):
+                            blended_tiles += 1
+                        update_progress(force=len(tile_relpaths) >= total_tiles)
+                finally:
+                    if batch_image is not None:
+                        batch_image.close()
+            update_progress(force=True)
+    finally:
+        progress_line.finish()
+    tile_relpaths.sort()
     return tile_relpaths
 
 

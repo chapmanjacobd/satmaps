@@ -1428,7 +1428,7 @@ def add_ocean_style_cli_args(parser: argparse.ArgumentParser, *, prefix: str = "
     add(
         f"--{p}mask-blur",
         type=float,
-        default=15.0,
+        default=14.0,
         help=(
             "Gaussian blur sigma (in output pixels) applied to the depth field before the "
             f"{OCEAN_FADE_DEPTH}m threshold, smoothing the coastline and removing staircase "
@@ -1438,7 +1438,7 @@ def add_ocean_style_cli_args(parser: argparse.ArgumentParser, *, prefix: str = "
     add(
         f"--{p}mask-erode",
         type=int,
-        default=32,
+        default=28,
         help=(
             "Erode the ocean mask by this many output pixels so land imagery extends a few "
             "pixels past the fade depth as coastal clearance. 0 disables."
