@@ -548,37 +548,75 @@ def test_remove_enclosed_ocean_regions_prefers_land() -> None:
     expected[0, 0] = True
     np.testing.assert_array_equal(cleaned, expected)
 
-def test_create_alpha_vrt_mask_erode_shrinks_ocean(tmp_path: Path) -> None:
+def test_create_alpha_vrt_mask_erode_shrinks_at_coastline_preserves_border(
+    tmp_path: Path,
+) -> None:
     driver = gdal.GetDriverByName("GTiff")
 
-    alpha_source = tmp_path / "ocean_erode_source.tif"
+    alpha_source = tmp_path / "ocean_erode_coast.tif"
     alpha_ds = driver.Create(str(alpha_source), 5, 3, 1, gdal.GDT_Float32)
     alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(3857)
     alpha_ds.SetProjection(srs.ExportToWkt())
     alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    # Land on the left, ocean on the right touching the raster border.
     alpha_ds.GetRasterBand(1).WriteArray(
-        np.full((3, 5), -100.0, dtype=np.float32)
+        np.array(
+            [
+                [-5.0, -5.0, -5.0, -60.0, -60.0],
+                [-5.0, -5.0, -5.0, -60.0, -60.0],
+                [-5.0, -5.0, -5.0, -60.0, -60.0],
+            ],
+            dtype=np.float32,
+        )
     )
     alpha_ds = None
 
-    alpha_source_vrt = tmp_path / "ocean_erode_source.vrt"
+    alpha_source_vrt = tmp_path / "ocean_erode_coast.vrt"
     gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
 
-    plain_vrt = tmp_path / "alpha_erode_plain.vrt"
-    ocean.create_alpha_vrt(str(alpha_source_vrt), str(plain_vrt))
-    plain = gdal.Open(str(plain_vrt)).ReadAsArray()
-
-    eroded_vrt = tmp_path / "alpha_erode.vrt"
+    eroded_vrt = tmp_path / "alpha_erode_coast.vrt"
     ocean.create_alpha_vrt(str(alpha_source_vrt), str(eroded_vrt), mask_erode=1)
     eroded = gdal.Open(str(eroded_vrt)).ReadAsArray()
 
-    assert (plain > 0).sum() == 15
-    assert (eroded > 0).sum() == 3
+    # The coastline recedes one column, but the ocean column at the border survives.
     expected = np.zeros((3, 5), dtype=np.uint8)
-    expected[1, 1:4] = 255
+    expected[:, 4] = 255
     np.testing.assert_array_equal(eroded, expected)
+
+def test_create_alpha_vrt_mask_erode_preserves_border_ocean(tmp_path: Path) -> None:
+    driver = gdal.GetDriverByName("GTiff")
+
+    alpha_source = tmp_path / "ocean_erode_border.tif"
+    alpha_ds = driver.Create(str(alpha_source), 5, 5, 1, gdal.GDT_Float32)
+    alpha_ds.SetGeoTransform((0, 1, 0, 0, 0, -1))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    alpha_ds.SetProjection(srs.ExportToWkt())
+    alpha_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
+    alpha_ds.GetRasterBand(1).WriteArray(
+        np.array(
+            [
+                [-60.0, -60.0, -60.0, -60.0, -60.0],
+                [-60.0, -60.0, -60.0, -60.0, -60.0],
+                [-60.0, -60.0, -60.0, -60.0, -60.0],
+                [-60.0, -60.0, -60.0, -60.0, -60.0],
+                [-60.0, -60.0, -60.0, -60.0, -60.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    alpha_ds = None
+
+    alpha_source_vrt = tmp_path / "ocean_erode_border.vrt"
+    gdal.BuildVRT(str(alpha_source_vrt), [str(alpha_source)])
+
+    eroded_vrt = tmp_path / "alpha_erode_border.vrt"
+    ocean.create_alpha_vrt(str(alpha_source_vrt), str(eroded_vrt), mask_erode=1)
+    eroded = gdal.Open(str(eroded_vrt)).ReadAsArray()
+
+    np.testing.assert_array_equal(eroded, np.full((5, 5), 255, dtype=np.uint8))
 
 def test_create_alpha_vrt_mask_blur_reduces_boundary(tmp_path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")

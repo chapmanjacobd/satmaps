@@ -446,7 +446,8 @@ def create_alpha_vrt(
     isobath (and therefore the coastline) is smoothed, removing staircase steps from the
     coarse GEBCO cells. ``mask_erode`` erodes the resulting ocean mask by that many output
     pixels, so land imagery extends a few pixels past the ``OCEAN_FADE_DEPTH`` contour as a
-    minimum coastal clearance.
+    minimum coastal clearance; ocean at the raster edge is preserved via a temporary padding
+    ring so the map border reflects the underlying data rather than erosion.
     """
     ds = gdal.Open(source_vrt)
     if ds is None:
@@ -475,9 +476,7 @@ def create_alpha_vrt(
         if mask_blur > 0.0:
             depths = blur_depth_field(depths, mask_blur, nodata_value)
         ocean_mask = build_ocean_threshold_mask(depths, nodata_value)
-        cleaned_mask = remove_enclosed_ocean_regions(ocean_mask)
-        if mask_erode > 0:
-            cleaned_mask = erode_ocean_mask(cleaned_mask, mask_erode)
+        cleaned_mask = clean_ocean_mask(ocean_mask, mask_erode=mask_erode)
         alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
         alpha_band.FlushCache()
     else:
@@ -497,9 +496,7 @@ def create_alpha_vrt(
 
         alpha_band.FlushCache()
         ocean_mask = alpha_band.ReadAsArray().astype(bool)
-        cleaned_mask = remove_enclosed_ocean_regions(ocean_mask)
-        if mask_erode > 0:
-            cleaned_mask = erode_ocean_mask(cleaned_mask, mask_erode)
+        cleaned_mask = clean_ocean_mask(ocean_mask, mask_erode=mask_erode)
         alpha_band.WriteArray(cleaned_mask.astype(np.uint8) * 255)
         alpha_band.FlushCache()
     alpha_ds = None
@@ -558,6 +555,22 @@ def remove_enclosed_ocean_regions(ocean_mask: np.ndarray) -> np.ndarray:
     cleaned_mask = ocean_mask.copy()
     cleaned_mask[np.isin(labels, enclosed_labels)] = False
     return cleaned_mask
+
+
+def clean_ocean_mask(ocean_mask: np.ndarray, *, mask_erode: int = 0) -> np.ndarray:
+    """Remove enclosed ocean and apply coastal erosion while preserving border ocean.
+
+    The mask is padded with a ring of ocean pixels before erosion so the raster edge
+    is treated as continuing ocean; the padding is stripped afterwards so both land
+    and ocean can legitimately reach the image border.
+    """
+    if mask_erode > 0:
+        padded = np.pad(ocean_mask, mask_erode, mode="constant", constant_values=True)
+        cleaned = remove_enclosed_ocean_regions(padded)
+        cleaned = erode_ocean_mask(cleaned, mask_erode)
+        return cleaned[mask_erode:-mask_erode, mask_erode:-mask_erode]
+    return remove_enclosed_ocean_regions(ocean_mask)
+
 
 def build_ocean_ramp_colors(style: OceanStyleOptions) -> np.ndarray:
     """Return the styled MAKO depth ramp as float32 RGB triples in [0, 1]."""
