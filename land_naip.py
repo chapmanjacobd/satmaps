@@ -9,8 +9,8 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from typing import Callable, List, Optional, Sequence, Tuple, Any
-from datetime import datetime, timedelta
+from typing import Callable, List, Optional, Sequence, Tuple, Any, cast
+from datetime import datetime
 import dateutil.relativedelta as relativedelta
 
 BBox = Tuple[float, float, float, float]
@@ -57,7 +57,7 @@ def load_env() -> None:
                     if key not in os.environ:
                         os.environ[key] = value
 
-def send_m2m_request(endpoint: str, payload: dict, api_key: Optional[str] = None) -> Any:
+def send_m2m_request(endpoint: str, payload: dict[str, Any], api_key: Optional[str] = None) -> Any:
     """Send a POST request to the M2M API."""
     url = f"{M2M_BASE_URL}/{endpoint}"
     headers = {'Content-Type': 'application/json'}
@@ -88,7 +88,7 @@ def m2m_login() -> str:
         
     print("Authenticating with EarthExplorer M2M...")
     payload = {"username": username, "token": token}
-    return send_m2m_request("login-token", payload)
+    return cast(str, send_m2m_request("login-token", payload))
 
 def m2m_logout(api_key: str) -> None:
     """Log out from EarthExplorer M2M."""
@@ -98,7 +98,7 @@ def m2m_logout(api_key: str) -> None:
 def _scene_search_payload(bbox: BBox, start_date: Optional[str] = None) -> dict[str, Any]:
     """Build the EarthExplorer scene-search request for one bounding box."""
     min_lon, min_lat, max_lon, max_lat = bbox
-    payload = {
+    payload: dict[str, Any] = {
         "datasetName": "NAIP",
         "sceneFilter": {
             "spatialFilter": {
@@ -147,19 +147,14 @@ def _write_json_cache(cache_path: str, data: Any) -> None:
 
 
 def _bbox_geometry(bbox: BBox) -> Any:
-    """Build a WGS84 polygon for a bbox."""
+    """Build a 2D WGS84 polygon for a bbox."""
     from osgeo import ogr
 
     min_lon, min_lat, max_lon, max_lat = bbox
-    ring = ogr.Geometry(ogr.wkbLinearRing)
-    ring.AddPoint(min_lon, min_lat)
-    ring.AddPoint(max_lon, min_lat)
-    ring.AddPoint(max_lon, max_lat)
-    ring.AddPoint(min_lon, max_lat)
-    ring.AddPoint(min_lon, min_lat)
-    polygon = ogr.Geometry(ogr.wkbPolygon)
-    polygon.AddGeometry(ring)
-    return polygon
+    return ogr.CreateGeometryFromWkt(
+        f"POLYGON (({min_lon} {min_lat}, {max_lon} {min_lat}, "
+        f"{max_lon} {max_lat}, {min_lon} {max_lat}, {min_lon} {min_lat}))"
+    )
 
 
 def _bbox_intersects_geometry(bbox: BBox, geometry: Any) -> bool:
@@ -169,7 +164,7 @@ def _bbox_intersects_geometry(bbox: BBox, geometry: Any) -> bool:
     geometry_bbox = (envelope[0], envelope[2], envelope[1], envelope[3])
     if not _bbox_overlaps(bbox, geometry_bbox):
         return False
-    return _bbox_geometry(bbox).Intersects(geometry)
+    return bool(_bbox_geometry(bbox).Intersects(geometry))
 
 
 def _split_bbox(bbox: BBox) -> Optional[List[BBox]]:
@@ -246,7 +241,6 @@ def _query_naip_tiles_ee(
     start_date: Optional[str] = None,
 ) -> List[Any]:
     """Query one EarthExplorer bbox for NAIP scene metadata."""
-    date_msg = f" since {start_date}" if start_date else ""
     results = send_m2m_request(
         "scene-search",
         _scene_search_payload(bbox, start_date),
@@ -263,7 +257,7 @@ def _query_naip_tiles_ee(
 
 def _bbox_manifest_key(bbox: BBox, start_date: Optional[str] = None) -> str:
     """Return a stable, human-readable key for a bbox in the metadata manifest."""
-    base = list(bbox)
+    base: List[Any] = list(bbox)
     if start_date:
         base.append(start_date)
     return json.dumps(base, separators=(",", ":"))
@@ -653,7 +647,7 @@ def _fetch_json_cached(
     return data
 
 
-def _bbox_overlaps_stac_item(bbox: BBox, item: dict) -> bool:
+def _bbox_overlaps_stac_item(bbox: BBox, item: dict[str, Any]) -> bool:
     """Check if a bbox overlaps with a STAC item's bbox."""
     item_bbox = item.get("bbox")
     if not item_bbox or len(item_bbox) != 4:
@@ -830,6 +824,8 @@ def fetch_naip_downloads(scenes: List[Any], api_key: str, cache_dir: str) -> Lis
                     print(f"Failed to download {url} after {max_retries} attempts: {e}")
                     return None
 
+        return None
+
     chunk_size = 20
     for i in range(0, len(scenes_to_fetch), chunk_size):
         chunk = scenes_to_fetch[i:i + chunk_size]
@@ -959,15 +955,7 @@ def handle_naip_workflow(
             if extent_geometry is not None:
                 target_poly = extent_geometry.Clone()
             else:
-                min_lon, min_lat, max_lon, max_lat = requested_bbox
-                ring = ogr.Geometry(ogr.wkbLinearRing)
-                ring.AddPoint(min_lon, min_lat)
-                ring.AddPoint(max_lon, min_lat)
-                ring.AddPoint(max_lon, max_lat)
-                ring.AddPoint(min_lon, max_lat)
-                ring.AddPoint(min_lon, min_lat)
-                target_poly = ogr.Geometry(ogr.wkbPolygon)
-                target_poly.AddGeometry(ring)
+                target_poly = _bbox_geometry(requested_bbox)
 
             coverage_union = ogr.Geometry(ogr.wkbPolygon)
             filtered_scenes: List[Any] = []

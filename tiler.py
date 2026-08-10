@@ -1296,7 +1296,7 @@ def _staged_mbtiles_matches_signature(
         return False
     try:
         with open(manifest_path) as manifest_file:
-            return json.load(manifest_file) == signature
+            return bool(json.load(manifest_file) == signature)
     except (OSError, ValueError, TypeError):
         return False
 
@@ -1419,11 +1419,11 @@ def _overview_tile_bytes(
             ).fetchone()
             if row is None:
                 continue
-            with Image.open(io.BytesIO(row[0])) as image:
-                if "A" in image.getbands() and image.getchannel("A").getextrema() != (255, 255):
-                    child_images[(child_x, child_y)] = image.convert("RGBA")
+            with Image.open(io.BytesIO(row[0])) as source_image:
+                if "A" in source_image.getbands() and source_image.getchannel("A").getextrema() != (255, 255):
+                    child_images[(child_x, child_y)] = source_image.convert("RGBA")
                 else:
-                    child_images[(child_x, child_y)] = image.convert("RGB")
+                    child_images[(child_x, child_y)] = source_image.convert("RGB")
 
     if not child_images:
         return None
@@ -1456,7 +1456,7 @@ def _overview_tile_bytes(
 
         encoded = io.BytesIO()
         output_format = "JPEG" if tile_format.lower() in {"jpg", "jpeg"} else tile_format.upper()
-        save_options: dict[str, object] = {"format": output_format}
+        save_options: dict[str, Any] = {"format": output_format}
         if output_format in {"JPEG", "WEBP"}:
             save_options["quality"] = quality
         overview.save(encoded, **save_options)
@@ -1988,9 +1988,9 @@ def run_tiling_simplified(
             proj_win = [bounds[0], bounds[3], bounds[2], bounds[1]]
 
         requested_bounds = options.get("chunk_bounds")
-        dataset_bounds = get_dataset_bounds(ds)
+        dataset_bounds: TEBounds = get_dataset_bounds(ds)
         if requested_bounds is not None:
-            dataset_bounds = intersect_te_bounds(dataset_bounds, requested_bounds)
+            dataset_bounds = cast(TEBounds, intersect_te_bounds(dataset_bounds, requested_bounds))
 
         chunk_zoom = int(options.get("chunk_zoom", 0))
         worker_count = max(1, int(options.get("processes", 1)))

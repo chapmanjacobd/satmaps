@@ -125,7 +125,7 @@ def _mgrs_tile_intersects_geometry(
     tile_geom = build_mgrs_tile_geometry(mgrs_tile, target_srs=wgs84_srs)
     if tile_geom is None:
         return True
-    return tile_geom.Intersects(geometry)
+    return bool(tile_geom.Intersects(geometry))
 
 
 def build_candidate_scan_envelopes(

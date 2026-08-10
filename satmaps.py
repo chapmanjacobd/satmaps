@@ -5266,7 +5266,7 @@ def main() -> None:
 
     if is_naip or getattr(args, "ocean_only", False):
         plan = LandProcessingPlan(mgrs_bases=(), work_units=())
-        pending_work_units = ()
+        pending_work_units: tuple[LandWorkUnit, ...] = ()
         if is_naip:
             args.full_render_first = True
     else:

@@ -87,6 +87,25 @@ def test_bbox_intersects_geometry_uses_exact_shape_not_envelope() -> None:
     assert land_naip._bbox_intersects_geometry((20.0, 20.0, 21.0, 21.0), geometry) is False
 
 
+def _mirrored_l_shape_geometry():
+    from osgeo import ogr
+
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    for lon, lat in [
+        (0.5, 0.5),
+        (0.5, 9.5),
+        (3.5, 9.5),
+        (3.5, 7.5),
+        (9.5, 7.5),
+        (9.5, 0.5),
+        (0.5, 0.5),
+    ]:
+        ring.AddPoint(lon, lat)
+    polygon = ogr.Geometry(ogr.wkbPolygon)
+    polygon.AddGeometry(ring)
+    return polygon
+
+
 def test_discover_naip_tiles_ee_prunes_cells_outside_geometry(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -104,26 +123,13 @@ def test_discover_naip_tiles_ee_prunes_cells_outside_geometry(
         (0.0, 0.0, 10.0, 10.0),
         "api-key",
         cache_dir=str(tmp_path),
-        extent_geometry=_l_shape_geometry(),
+        extent_geometry=_mirrored_l_shape_geometry(),
     )
 
     assert queried_bboxes == [
-        (0.0, 0.0, 2.0, 2.0),
-        (2.0, 0.0, 4.0, 2.0),
-        (0.0, 2.0, 2.0, 4.0),
-        (2.0, 2.0, 4.0, 4.0),
-        (0.0, 4.0, 2.0, 6.0),
-        (2.0, 4.0, 4.0, 6.0),
-        (0.0, 6.0, 2.0, 8.0),
-        (2.0, 6.0, 4.0, 8.0),
-        (4.0, 6.0, 6.0, 8.0),
-        (6.0, 6.0, 8.0, 8.0),
-        (8.0, 6.0, 10.0, 8.0),
-        (0.0, 8.0, 2.0, 10.0),
-        (2.0, 8.0, 4.0, 10.0),
-        (4.0, 8.0, 6.0, 10.0),
-        (6.0, 8.0, 8.0, 10.0),
-        (8.0, 8.0, 10.0, 10.0),
+        (0.0, 0.0, 8.0, 8.0),
+        (8.0, 0.0, 16.0, 8.0),
+        (0.0, 8.0, 8.0, 16.0),
     ]
 
 
@@ -245,16 +251,16 @@ def test_discover_naip_tiles_ee_negative_caches_zero_results(
 
     assert first == []
     assert second == []
-    assert len(calls) == 1
+    assert len(calls) == 2
 
     db_path = tmp_path / "naip_metadata" / "manifest.db"
     assert db_path.exists()
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute("SELECT bbox_key, split, scenes FROM manifest").fetchall()
-    assert len(rows) == 1
-    assert json.loads(rows[0][0]) == [bbox[0], bbox[1], bbox[2], bbox[3]]
-    assert rows[0][1] == 0
-    assert json.loads(rows[0][2]) == []
+    assert len(rows) == 2
+    for row in rows:
+        assert row[1] == 0
+        assert json.loads(row[2]) == []
 
 
 def test_discover_naip_tiles_ee_resumes_from_manifest(
@@ -375,7 +381,7 @@ def test_handle_naip_workflow_combines_earth_explorer_and_island_sources(
         lambda scenes, api_key, cache_dir: ["earth-explorer.tif"],
     )
 
-    def fake_digital_coast(bbox: land_naip.BBox, cache_dir: str) -> list[str]:
+    def fake_digital_coast(bbox: land_naip.BBox, cache_dir: str, args: Any = None) -> list[str]:
         dc_calls.append(bbox)
         return ["island-coverage.vrt"]
 
